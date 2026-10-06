@@ -1,0 +1,4 @@
+# Link the C runtime statically so qingpdf.exe runs on a clean Windows
+# without the Visual C++ redistributable (hard rule 5: nothing to install).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

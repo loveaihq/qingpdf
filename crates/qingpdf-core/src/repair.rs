@@ -23,6 +23,11 @@ pub struct Repaired {
     pub entries: HashMap<u32, XrefEntry>,
     pub trailer: Dict,
     pub uses_xref_streams: bool,
+    /// Set when an object stream could not be opened because it uses a filter
+    /// this layer does not decode: the objects inside it are missing from
+    /// `entries`, and the message says which filter (for example
+    /// `BrotliDecode filter in an object stream`).
+    pub unsupported: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -156,6 +161,7 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
     let mut catalogs: Vec<ObjRef> = Vec::new();
     let mut encryption_dicts: Vec<ObjRef> = Vec::new();
     let mut uses_xref_streams = false;
+    let mut unsupported: Option<String> = None;
 
     let mut scanner = Scanner::new(data);
     let mut cursor = 0usize;
@@ -212,7 +218,7 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
                             } else if type_is(dict, "ObjStm")
                                 && let Some(range) = raw.stream.clone()
                             {
-                                index_object_stream(data, h.num, dict, range, &mut entries, &mut catalogs);
+                                index_object_stream(data, h.num, dict, range, &mut entries, &mut catalogs, &mut unsupported);
                             }
                         }
                     }
@@ -257,7 +263,7 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
     {
         trailer.set("Encrypt", Object::Ref(*encrypt));
     }
-    Ok(Repaired { entries, trailer, uses_xref_streams })
+    Ok(Repaired { entries, trailer, uses_xref_streams, unsupported })
 }
 
 /// Does this look like an encryption dictionary (7.6.1, Table 20): the
@@ -279,12 +285,20 @@ fn index_object_stream(
     range: std::ops::Range<usize>,
     entries: &mut HashMap<u32, XrefEntry>,
     catalogs: &mut Vec<ObjRef>,
+    unsupported: &mut Option<String>,
 ) {
     let Some(raw) = data.get(range) else {
         return;
     };
-    let Ok(decoded) = filter::decode_direct(dict, raw) else {
-        return;
+    let decoded = match filter::decode_direct(dict, raw) {
+        Ok(d) => d,
+        Err(Error::Unsupported(m)) => {
+            // The objects inside cannot be found. Remember why, so that a
+            // missing page tree is reported as "unsupported", not "damaged".
+            unsupported.get_or_insert_with(|| format!("{m} in an object stream"));
+            return;
+        }
+        Err(_) => return,
     };
     let Ok(stm) = ObjStm::parse(dict, decoded) else {
         return;

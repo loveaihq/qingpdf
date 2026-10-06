@@ -59,7 +59,7 @@ fn decode_with_limit(dict: &Dict, data: &[u8], resolve: Resolver<'_>, limit: usi
                 input.to_vec()
             }
             other => {
-                return Err(Error::Unsupported(format!("stream filter /{}", String::from_utf8_lossy(other))));
+                return Err(Error::Unsupported(format!("{} filter", String::from_utf8_lossy(other))));
             }
         };
         current = Some(output);

@@ -46,6 +46,11 @@ pub struct Document {
     repair_allowed: Cell<bool>,
     uses_xref_streams: Cell<bool>,
     nesting: Cell<u32>,
+    /// After a rebuild: the reason some object stream could not be opened
+    /// (an unsupported filter). Objects that should be inside it are not in
+    /// the table, so an object missing from the table is "unsupported", not
+    /// "absent".
+    unreadable: RefCell<Option<String>>,
 }
 
 /// One page, with the inheritable attributes of its ancestors copied in.
@@ -78,7 +83,7 @@ impl Page {
     }
 }
 
-fn rectangle(obj: Option<&Object>) -> Option<[f64; 4]> {
+pub(crate) fn rectangle(obj: Option<&Object>) -> Option<[f64; 4]> {
     let [a, b, c, d] = obj?.as_array()? else {
         return None;
     };
@@ -169,6 +174,9 @@ impl Document {
                 doc.repair_allowed.set(true);
                 match checked {
                     Ok(()) => return Ok(doc),
+                    // The table is fine; a filter we cannot decode is in the
+                    // way. Scanning the file again would not change that.
+                    Err(e @ Error::Unsupported(_)) => return Err(e),
                     Err(e) => {
                         data = doc.data;
                         e
@@ -180,14 +188,28 @@ impl Document {
 
         match repair::rebuild(&data) {
             Ok(r) => {
+                let unsupported = r.unsupported;
                 let doc = Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true);
-                doc.validate()?;
-                Ok(doc)
+                *doc.unreadable.borrow_mut() = unsupported.clone();
+                match doc.validate() {
+                    Ok(()) => Ok(doc),
+                    // The page tree is missing because it sits in an object
+                    // stream we cannot open (or the table could not be read
+                    // because of a filter we cannot decode): say so.
+                    Err(e) => match (unsupported, &first_error) {
+                        (Some(m), _) => Err(Error::Unsupported(m)),
+                        (None, Error::Unsupported(m)) => Err(Error::Unsupported(m.clone())),
+                        (None, _) => Err(e),
+                    },
+                }
             }
-            Err(e) => Err(Error::syntax(
-                None,
-                format!("cannot read the cross-reference data ({first_error}) and cannot rebuild it ({e})"),
-            )),
+            Err(e) => match first_error {
+                unsupported @ Error::Unsupported(_) => Err(unsupported),
+                first_error => Err(Error::syntax(
+                    None,
+                    format!("cannot read the cross-reference data ({first_error}) and cannot rebuild it ({e})"),
+                )),
+            },
         }
     }
 
@@ -211,6 +233,7 @@ impl Document {
             repair_allowed: Cell::new(true),
             uses_xref_streams: Cell::new(uses_xref_streams),
             nesting: Cell::new(0),
+            unreadable: RefCell::new(None),
         }
     }
 
@@ -292,7 +315,13 @@ impl Document {
     fn load(&self, r: ObjRef) -> Result<Object> {
         let entry = self.xref.borrow().get(&r.num).copied();
         match entry {
-            None | Some(XrefEntry::Free) => Ok(Object::Null),
+            // Not in the table at all, in a file where an object stream could
+            // not be opened: the object may well be inside that stream.
+            None => match self.unreadable.borrow().as_ref() {
+                Some(why) => Err(Error::Unsupported(why.clone())),
+                None => Ok(Object::Null),
+            },
+            Some(XrefEntry::Free) => Ok(Object::Null),
             Some(XrefEntry::InUse { offset, .. }) => self.load_at(r.num, offset),
             Some(XrefEntry::Compressed { stream_num, index }) => {
                 let stm = self.object_stream(stream_num)?;
@@ -328,6 +357,7 @@ impl Document {
         match repair::rebuild(&self.data) {
             Ok(r) => {
                 *self.xref.borrow_mut() = r.entries;
+                *self.unreadable.borrow_mut() = r.unsupported;
                 self.objstms.borrow_mut().clear();
                 self.uses_xref_streams.set(r.uses_xref_streams);
                 self.repaired.set(true);
@@ -369,7 +399,14 @@ impl Document {
         let Object::Stream(stream) = self.load_at(stream_num, offset)? else {
             return Err(Error::syntax(None, format!("object {stream_num} is not a stream")));
         };
-        let decoded = self.decode_stream(&stream)?;
+        let decoded = match self.decode_stream(&stream) {
+            Ok(d) => d,
+            // Say where the unsupported filter was met.
+            Err(Error::Unsupported(m)) if !self.is_encrypted() => {
+                return Err(Error::Unsupported(format!("{m} in an object stream")));
+            }
+            Err(e) => return Err(e),
+        };
         Ok(Rc::new(ObjStm::parse(&stream.dict, decoded)?))
     }
 
@@ -1412,6 +1449,94 @@ mod tests {
         // Asking again gives the remembered failure, not another long recursion.
         assert!(doc.get(ObjRef::new(7, 0)).is_err());
         assert_eq!(doc.page_count().unwrap(), 0);
+    }
+
+    // --- unsupported filters hiding the structure ---------------------------------------
+
+    /// 1.5-style file whose object stream (holding the catalog, page tree and
+    /// page) is compressed with a filter this layer does not know.
+    fn brotli_objstm_pdf(brotli_xref_stream: bool) -> Vec<u8> {
+        let mut b = PdfBuilder::with_header("%PDF-2.0\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        let header = "1 0 2 40 3 90 ";
+        let o5 = b.stream_obj(
+            5,
+            &format!("/Type /ObjStm /N 3 /First {} /Filter /BrotliDecode", header.len()),
+            b"not brotli, but nobody will look",
+        );
+        let o4 = b.stream_obj(4, "", b"0 0 m 1 1 l S");
+        let x = b.len();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        let rows: Vec<u8> =
+            [row(0, 0, 255), row(2, 5, 0), row(2, 5, 1), row(2, 5, 2), row(1, o4, 0), row(1, o5, 0), row(1, x, 0)]
+                .concat();
+        let (filter, data) = if brotli_xref_stream {
+            ("/Filter /BrotliDecode", b"xref bytes in some other format".to_vec())
+        } else {
+            ("", rows)
+        };
+        b.stream_obj(6, &format!("/Type /XRef /Size 7 /W [1 2 1] /Root 1 0 R {filter}"), &data);
+        b.startxref(x);
+        b.finish()
+    }
+
+    #[test]
+    fn unsupported_filter_in_an_object_stream_is_unsupported_not_damaged() {
+        // The table reads fine; the page tree is inside the unreadable stream.
+        match Document::from_bytes(brotli_objstm_pdf(false)) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("BrotliDecode filter"), "{m}"),
+            Err(e) => panic!("wrong kind of error: {e:?}"),
+            Ok(_) => panic!("should not open"),
+        }
+    }
+
+    #[test]
+    fn unsupported_filter_on_the_xref_stream_and_object_streams_is_unsupported() {
+        // Neither the table nor the objects can be read, so the file is
+        // scanned; the catalog and page tree are still out of reach.
+        match Document::from_bytes(brotli_objstm_pdf(true)) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("BrotliDecode filter"), "{m}"),
+            Err(e) => panic!("wrong kind of error: {e:?}"),
+            Ok(_) => panic!("should not open"),
+        }
+    }
+
+    #[test]
+    fn rebuilt_file_with_plain_catalog_but_unreadable_page_tree_is_unsupported() {
+        // Like the Brotli prototype files: the catalog is an ordinary object,
+        // the page tree is in an object stream with an unknown filter and the
+        // cross-reference stream cannot be read either.
+        let mut b = PdfBuilder::with_header("%PDF-2.0\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.stream_obj(5, "/Type /ObjStm /N 2 /First 8 /Filter /BrotliDecode", b"whatever bytes");
+        let x = b.len();
+        b.stream_obj(6, "/Type /XRef /Size 7 /W [1 2 1] /Root 1 0 R /Filter /BrotliDecode", b"opaque");
+        b.startxref(x);
+        match Document::from_bytes(b.finish()) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("BrotliDecode filter"), "{m}"),
+            other => panic!("{:?}", other.map(|_| "opened")),
+        }
+    }
+
+    #[test]
+    fn object_missing_from_a_rebuilt_table_is_unsupported_when_an_object_stream_was_unreadable() {
+        // Catalog and page tree are plain objects, so the file opens after the
+        // rebuild; a page that lives in the unreadable object stream is not
+        // quietly "null".
+        let mut b = PdfBuilder::with_header("%PDF-2.0\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.stream_obj(5, "/Type /ObjStm /N 1 /First 4 /Filter /BrotliDecode", b"opaque");
+        let x = b.len();
+        b.stream_obj(6, "/Type /XRef /Size 7 /W [1 2 1] /Root 1 0 R /Filter /BrotliDecode", b"opaque");
+        b.startxref(x);
+        let doc = open(b.finish());
+        assert!(doc.was_repaired());
+        assert!(doc.get(ObjRef::new(1, 0)).is_ok());
+        match doc.get(ObjRef::new(3, 0)) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("BrotliDecode filter"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(doc.pages(), Err(Error::Unsupported(_))));
     }
 
     // --- robustness ---------------------------------------------------------------

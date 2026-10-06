@@ -151,6 +151,11 @@ impl Dict {
         self.0.iter_mut().map(|(k, v)| (&*k, v))
     }
 
+    /// The entries in order, by value (for code that rewrites a dictionary).
+    pub fn into_pairs(self) -> Vec<(Name, Object)> {
+        self.0
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
