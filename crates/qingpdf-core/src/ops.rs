@@ -1532,4 +1532,80 @@ mod tests {
             other => panic!("{:?}", other.map(|o| o.warnings)),
         }
     }
+
+    /// A page whose /PieceInfo is an object with an array nested 300 deep.
+    fn page_with_a_very_deep_object() -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] /Resources << >> >>");
+        b.obj(3, "<< /Type /Page /Parent 2 0 R /Contents 5 0 R /PieceInfo 6 0 R >>");
+        b.obj(4, "<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>");
+        b.stream_obj(5, "", b"0 0 m 10 10 l S");
+        b.obj(6, &format!("<< /X {}{} >>", "[".repeat(300), "]".repeat(300)));
+        b.finish_classic(7, "/Root 1 0 R")
+    }
+
+    #[test]
+    fn one_object_nested_too_deeply_is_left_out_with_a_warning_and_nothing_else_is_lost() {
+        let src = open(page_with_a_very_deep_object());
+        let second = open(sample_pdf());
+        let outputs = [
+            copy_all(&src).unwrap(),
+            rotate_pages(&src, &[0], 90).unwrap(),
+            delete_pages(&src, &[1]).unwrap(),
+            extract_pages(&src, &[0]).unwrap(),
+            merge(&[Input { name: "a.pdf", doc: &src }, Input { name: "b.pdf", doc: &second }]).unwrap(),
+            merge(&[Input { name: "b.pdf", doc: &second }, Input { name: "a.pdf", doc: &src }]).unwrap(),
+        ];
+        for out in outputs {
+            assert!(
+                out.warnings.iter().any(|w| w.0.contains("could not be read") && w.0.contains("nested too deeply")),
+                "{:?}",
+                out.warnings
+            );
+            let doc = open(out.data.clone());
+            for page in doc.pages().unwrap() {
+                assert!(!page.dict.contains_key("PieceInfo"));
+            }
+            assert!(contains(&out.data, "0 0 m 10 10 l S"), "the page content is still there");
+        }
+        // It is a damaged object, not a limit: reading it says so.
+        assert!(matches!(src.get(ObjRef::new(6, 0)), Err(Error::TooDeep(_))));
+    }
+
+    #[test]
+    fn references_to_huge_object_numbers_cannot_reach_what_the_program_made_up() {
+        // A kept page names objects 4294967295, 4294967294, ... and 8388608:
+        // numbers no file has. The name tree that a delete writes anew is made of
+        // objects the program numbers from 4294967295 down; none of those may be
+        // what the page's references come to.
+        let mut b = PdfBuilder::new();
+        let tree: String = (0..130).map(|i| format!("(d{i:03}) [{} 0 R /Fit] ", 3 + i % 3)).collect();
+        b.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [{tree}] >> >> >>"));
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 9 9] >>");
+        b.obj(
+            3,
+            "<< /Type /Page /Parent 2 0 R /Foo [4294967295 0 R 4294967294 0 R 4294967293 0 R 8388608 0 R 8388607 0 R] \
+             /Bar 4294967295 0 R >>",
+        );
+        b.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        b.obj(5, "<< /Type /Page /Parent 2 0 R >>");
+        let src = open(b.finish_classic(6, "/Root 1 0 R"));
+        for out in [delete_pages(&src, &[1]).unwrap(), extract_pages(&src, &[0, 2]).unwrap(), copy_all(&src).unwrap()] {
+            let doc = open(out.data);
+            let page = &doc.pages().unwrap()[0];
+            let foo = page.dict.get("Foo").and_then(Object::as_array).unwrap();
+            assert!(foo.iter().all(|o| matches!(o, Object::Null)), "{foo:?}");
+            assert!(!page.dict.contains_key("Bar"));
+        }
+        // And the writer keeps made-up objects out of the file's own namespace:
+        // asking for a reference to an object of the file above the limit gives nothing.
+        let mut builder = Builder::new((1, 4));
+        let pages = HashSet::new();
+        let source = builder.add_source(&src, &pages);
+        let made = builder.define_object(source, Object::Integer(7)).unwrap();
+        assert!(made.num > crate::object::MAX_OBJECT_NUMBER);
+        assert!(builder.import_ref(source, ObjRef::new(made.num - 5, 0)).unwrap().is_none());
+        assert!(builder.import_ref(source, made).unwrap().is_some());
+    }
 }

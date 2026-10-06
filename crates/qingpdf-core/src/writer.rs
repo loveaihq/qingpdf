@@ -21,7 +21,7 @@ use crate::dests::NamedDests;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::lexer::is_delimiter;
-use crate::object::{Dict, Name, ObjRef, Object, PdfString, Stream};
+use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, Stream};
 
 /// A thing the user should know about the result (something was dropped, say).
 /// Never an error: the output is valid.
@@ -310,7 +310,11 @@ struct Source<'a> {
     exclude: Option<Exclusion<'a>>,
     /// Inherited values written once for all the pages that share them.
     shared: HashMap<usize, ObjRef>,
-    /// The next number for an object made up by the caller ([`Builder::define_object`]).
+    /// Objects made up by the caller ([`Builder::define_object`]), by their
+    /// numbers: a table of their own, in the range above what a file can
+    /// have, which no reference read from a file can name.
+    defined: HashMap<u32, Object>,
+    /// The next number for one of them.
     next_defined: u32,
 }
 
@@ -376,6 +380,7 @@ impl<'a> Builder<'a> {
             replace: HashMap::new(),
             exclude: None,
             shared: HashMap::new(),
+            defined: HashMap::new(),
             next_defined: u32::MAX,
         });
         self.sources.len() - 1
@@ -414,13 +419,17 @@ impl<'a> Builder<'a> {
 
     /// An object the caller makes up (a node of a name tree it builds): it is
     /// written as an object of its own. Returns the reference to use for it
-    /// in objects that are imported from `source`; its number is one the file
-    /// cannot have (a cross-reference table stops below 8,388,608).
+    /// in objects that are imported from `source`; its number is above
+    /// [`MAX_OBJECT_NUMBER`], which no object of a file has and no reference
+    /// read from a file (the parser makes those null) can name.
     pub fn define_object(&mut self, source: usize, object: Object) -> Result<ObjRef> {
         let s = self.source_mut(source).ok_or_else(|| Error::Invalid("unknown import source".to_string()))?;
         let num = s.next_defined;
-        s.next_defined = num.checked_sub(1).ok_or_else(|| Error::Limit("too many made-up objects".to_string()))?;
-        s.replace.insert(num, object);
+        if num <= MAX_OBJECT_NUMBER {
+            return Err(Error::Limit("too many made-up objects".to_string()));
+        }
+        s.next_defined = num - 1;
+        s.defined.insert(num, object);
         Ok(ObjRef::new(num, 0))
     }
 
@@ -669,15 +678,26 @@ impl<'a> Builder<'a> {
             if let Some(known) = s.map.get(&r.num) {
                 return Ok(known.map(|n| ObjRef::new(n, 0)));
             }
-            // An annotation of a page that is not in the output.
-            let left_out = s.exclude.is_some_and(|(owners, kept)| {
-                owners.get(&r.num).is_some_and(|pages| !pages.iter().any(|p| kept.contains(p)))
-            });
-            if left_out {
-                s.map.insert(r.num, None);
-                return Ok(None);
+            if r.num > MAX_OBJECT_NUMBER {
+                // Beyond what a file has: an object made up by the caller, or nothing.
+                match s.defined.remove(&r.num) {
+                    Some(made_up) => (s.doc, false, Some(made_up)),
+                    None => {
+                        s.map.insert(r.num, None);
+                        return Ok(None);
+                    }
+                }
+            } else {
+                // An annotation of a page that is not in the output.
+                let left_out = s.exclude.is_some_and(|(owners, kept)| {
+                    owners.get(&r.num).is_some_and(|pages| !pages.iter().any(|p| kept.contains(p)))
+                });
+                if left_out {
+                    s.map.insert(r.num, None);
+                    return Ok(None);
+                }
+                (s.doc, s.pages.contains(&r.num), s.replace.remove(&r.num))
             }
-            (s.doc, s.pages.contains(&r.num), s.replace.remove(&r.num))
         };
         // A page that is not in the output: no need to look at it.
         if is_page {

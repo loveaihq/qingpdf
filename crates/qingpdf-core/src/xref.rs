@@ -71,7 +71,7 @@ pub struct XrefTable {
 
 impl XrefTable {
     /// The highest object number that is kept.
-    pub const MAX_NUM: u32 = (MAX_OBJECTS - 1) as u32;
+    pub const MAX_NUM: u32 = crate::object::MAX_OBJECT_NUMBER;
 
     pub fn new() -> Self {
         XrefTable::default()

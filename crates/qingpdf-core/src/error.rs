@@ -13,8 +13,15 @@ pub enum Error {
     MissingObject { num: u32, generation: u16 },
     /// The file uses something this layer does not support (e.g. encryption).
     Unsupported(String),
-    /// A structural limit was hit: nesting too deep, reference cycle, and so on.
+    /// A limit on what a file may ask for was hit: too much to decode, too many
+    /// pages, a reference cycle, and so on. The file may be fine; it is more
+    /// than we are willing to do with it.
     Limit(String),
+    /// One object nests arrays and dictionaries deeper than the parser goes
+    /// (7.3.6 sets no limit; ours is [`crate::parser::MAX_NESTING`]). A fault
+    /// of that one object, not of the file's size: a copy can leave the object
+    /// out and say so, which it cannot do for a [`Error::Limit`].
+    TooDeep(String),
     /// Invalid input from the caller (bad page range, unknown image format, ...).
     Invalid(String),
 }
@@ -36,6 +43,7 @@ impl fmt::Display for Error {
             Error::MissingObject { num, generation } => write!(f, "object {num} {generation} R not found"),
             Error::Unsupported(m) => write!(f, "not supported yet: {m}"),
             Error::Limit(m) => write!(f, "limit reached: {m}"),
+            Error::TooDeep(m) => write!(f, "nested too deeply: {m}"),
             Error::Invalid(m) => write!(f, "{m}"),
         }
     }

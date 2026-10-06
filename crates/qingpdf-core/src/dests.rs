@@ -5,10 +5,13 @@
 //!
 //! Everything read here is bounded by bytes ([`Spend`]): a name tree whose
 //! leaves share one huge array, or whose keys are one huge string named over
-//! and over, ends in [`Error::Limit`] instead of gigabytes of copies.
+//! and over, ends in [`Error::Limit`] instead of gigabytes of copies. What the
+//! budget stops is amplification (the same big thing copied again and again),
+//! not work in proportion to the file: it grows with the size of the file.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::document::Document;
 use crate::error::{Error, Result};
@@ -21,8 +24,22 @@ pub(crate) const MAX_NAMED_DESTS: usize = 2_000_000;
 /// Deepest name tree followed (7.9.6 trees are a few levels deep).
 const MAX_TREE_DEPTH: usize = 64;
 /// Bytes of names and destinations that may be copied out of one file while
-/// reading and looking up its named destinations. Real files take a few MiB.
-const NAMES_BUDGET: usize = 32 * 1024 * 1024;
+/// reading and looking up its named destinations: at least this much ...
+const NAMES_BUDGET_MIN: usize = 32 * 1024 * 1024;
+/// ... and this many times the size of the file, because a file with two
+/// hundred thousand named destinations (a book made with hyperref) is 18 MB
+/// and needs to hold all of them.
+const NAMES_BUDGET_PER_FILE_BYTE: usize = 4;
+/// A copy of this many bytes or fewer is not paid for when it is made again:
+/// a destination is about a hundred bytes, and looking one up three hundred
+/// thousand times is work in proportion to the file. Bigger copies pay every
+/// time, which is what stops one big thing being copied over and over.
+const FREE_COPY: usize = 512;
+
+/// How many bytes the named destinations of a file of `file_size` bytes may cost.
+fn names_budget(file_size: usize) -> usize {
+    NAMES_BUDGET_MIN.max(file_size.saturating_mul(NAMES_BUDGET_PER_FILE_BYTE))
+}
 /// An explicit destination array has at most six elements (Table 151); longer
 /// is not a destination.
 const MAX_DEST_ARRAY: usize = 16;
@@ -30,44 +47,68 @@ const MAX_DEST_ARRAY: usize = 16;
 /// A name tree leaf holds at most this many entries when a tree is written.
 const LEAF_SIZE: usize = 64;
 
+/// What an entry of the lists costs besides its key and value: the pair and the
+/// key's vector.
+const ENTRY_OVERHEAD: usize = 48;
+
 /// What is left of the bytes one document's named destinations may cost.
 #[derive(Debug)]
-pub(crate) struct Spend(Cell<usize>);
+pub(crate) struct Spend {
+    left: Cell<usize>,
+    total: usize,
+    /// The indirect objects that have been resolved: the first time one is paid
+    /// for in full, as a distinct object; again only if it is bigger than
+    /// [`FREE_COPY`].
+    seen: RefCell<HashSet<u32>>,
+}
 
 impl Spend {
     pub(crate) fn new(total: usize) -> Spend {
-        Spend(Cell::new(total))
+        Spend { left: Cell::new(total), total, seen: RefCell::new(HashSet::new()) }
     }
 
     /// Pay for `bytes` of copying; `Limit` when there is not enough left.
     pub(crate) fn take(&self, bytes: usize) -> Result<()> {
-        match self.0.get().checked_sub(bytes) {
+        match self.left.get().checked_sub(bytes) {
             Some(left) => {
-                self.0.set(left);
+                self.left.set(left);
                 Ok(())
             }
             None => {
-                self.0.set(0);
+                self.left.set(0);
                 Err(Error::Limit(format!(
                     "the named destinations ask for more than {} MiB of copying",
-                    NAMES_BUDGET / (1024 * 1024)
+                    self.total / (1024 * 1024)
                 )))
             }
         }
     }
 
-    /// `doc.resolve(obj)` for a value of the destinations, paid for by its
-    /// size. What cannot be resolved is `None`.
+    /// Pay for a copy that is thrown away again: free up to [`FREE_COPY`] bytes.
+    fn take_copy(&self, bytes: usize) -> Result<()> {
+        self.take(bytes.saturating_sub(FREE_COPY))
+    }
+
+    /// `doc.resolve(obj)` for a value of the destinations. A distinct indirect
+    /// object is paid for once, by its size; a repeated one, and a direct one
+    /// (which is copied each time), only if it is more than [`FREE_COPY`] bytes.
+    /// What cannot be resolved is `None`.
     pub(crate) fn resolved(&self, doc: &Document, obj: &Object) -> Result<Option<Object>> {
-        match doc.resolve(obj) {
-            Ok(o) => {
-                self.take(o.approx_size())?;
-                Ok(Some(o))
-            }
-            Err(_) => Ok(None),
+        let Ok(o) = doc.resolve(obj) else {
+            return Ok(None);
+        };
+        let size = o.approx_size();
+        match obj {
+            Object::Ref(r) if self.seen.borrow_mut().insert(r.num) => self.take(size)?,
+            _ => self.take_copy(size)?,
         }
+        Ok(Some(o))
     }
 }
+
+/// An entry looked up: the explicit destination (`None` when the value is not
+/// one) and the bytes it takes.
+type LookedUp = (Option<Rc<Vec<Object>>>, usize);
 
 /// What the name tree and the old dictionary name, in the order of the file.
 /// The values are as they stand there: an array, a dictionary with a `/D`, or
@@ -79,6 +120,10 @@ pub(crate) struct NamedDests {
     tree_index: HashMap<Vec<u8>, usize>,
     dict_index: HashMap<Vec<u8>, usize>,
     spend: Spend,
+    /// The explicit destinations of the entries already looked up (the tree's
+    /// or the dictionary's, by position), and their sizes: a destination is
+    /// resolved once however many links name it.
+    looked_up: RefCell<HashMap<(bool, usize), LookedUp>>,
 }
 
 impl NamedDests {
@@ -91,7 +136,8 @@ impl NamedDests {
             dict: Vec::new(),
             tree_index: HashMap::new(),
             dict_index: HashMap::new(),
-            spend: Spend::new(NAMES_BUDGET),
+            spend: Spend::new(names_budget(doc.file_size())),
+            looked_up: RefCell::new(HashMap::new()),
         };
         let Ok(catalog) = doc.catalog() else {
             return Ok(out);
@@ -107,7 +153,7 @@ impl NamedDests {
                 if out.dict.len() >= MAX_NAMED_DESTS {
                     break;
                 }
-                out.spend.take(key.as_bytes().len().saturating_add(value.approx_size()))?;
+                out.spend.take(key.as_bytes().len().saturating_add(value.approx_size()).saturating_add(ENTRY_OVERHEAD))?;
                 out.dict.push((key.as_bytes().to_vec(), value.clone()));
             }
         }
@@ -139,13 +185,26 @@ impl NamedDests {
     /// is looked up in the old dictionary first, a string in the tree first;
     /// the other place is tried too, as readers do.
     pub(crate) fn lookup(&self, doc: &Document, key: &[u8], is_name: bool) -> Result<Option<Vec<Object>>> {
-        let from_tree = || self.tree_index.get(key).and_then(|&i| self.tree.get(i));
-        let from_dict = || self.dict_index.get(key).and_then(|&i| self.dict.get(i));
+        let from_tree = || self.tree_index.get(key).and_then(|&i| self.tree.get(i).map(|e| ((true, i), e)));
+        let from_dict = || self.dict_index.get(key).and_then(|&i| self.dict.get(i).map(|e| ((false, i), e)));
         let found = if is_name { from_dict().or_else(from_tree) } else { from_tree().or_else(from_dict) };
-        match found {
-            Some((_, value)) => explicit(doc, value, &self.spend),
-            None => Ok(None),
-        }
+        let Some((at, (_, value))) = found else {
+            return Ok(None);
+        };
+        let cached = self.looked_up.borrow().get(&at).cloned();
+        let (array, size) = match cached {
+            Some(known) => known,
+            None => {
+                let array = explicit(doc, value, &self.spend)?;
+                let size = array.as_ref().map_or(0, |a| a.iter().map(Object::approx_size).sum::<usize>());
+                let entry = (array.map(Rc::new), size);
+                self.looked_up.borrow_mut().insert(at, entry.clone());
+                entry
+            }
+        };
+        // The copy handed out is paid for if it is big.
+        self.spend.take_copy(size)?;
+        Ok(array.map(|a| a.as_ref().clone()))
     }
 }
 
@@ -172,19 +231,21 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8
         if nodes > MAX_TREE_NODES {
             break;
         }
-        let Some(Object::Dict(dict)) = spend.resolved(doc, &node)? else {
+        // Each distinct node and array is read once (above), so reading them
+        // is work in proportion to the file; only what is kept is paid for.
+        let Ok(Object::Dict(dict)) = doc.resolve(&node) else {
             continue;
         };
         if let Some(names) = dict.get("Names")
             && once(names)
-            && let Some(Object::Array(items)) = spend.resolved(doc, names)?
+            && let Ok(Object::Array(items)) = doc.resolve(names)
         {
             for [key, value] in items.as_chunks::<2>().0 {
                 if out.len() >= MAX_NAMED_DESTS {
                     return Ok(out);
                 }
                 if let Some(Object::String(key)) = spend.resolved(doc, key)? {
-                    spend.take(value.approx_size())?;
+                    spend.take(key.bytes.len().saturating_add(value.approx_size()).saturating_add(ENTRY_OVERHEAD))?;
                     out.push((key.bytes, value.clone()));
                 }
             }
@@ -192,9 +253,10 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8
         if depth < MAX_TREE_DEPTH
             && let Some(kids) = dict.get("Kids")
             && once(kids)
-            && let Some(Object::Array(kids)) = spend.resolved(doc, kids)?
+            && let Ok(Object::Array(kids)) = doc.resolve(kids)
         {
             for kid in kids.into_iter().rev() {
+                spend.take(kid.approx_size())?;
                 stack.push((kid, depth + 1));
             }
         }
@@ -437,6 +499,93 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(matches!(NamedDests::load(&doc), Err(Error::Limit(_))));
         assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_budget_grows_with_the_size_of_the_file() {
+        assert_eq!(names_budget(0), 32 * 1024 * 1024);
+        assert_eq!(names_budget(1 << 20), 32 * 1024 * 1024);
+        assert_eq!(names_budget(18 * 1024 * 1024), 72 * 1024 * 1024);
+        assert_eq!(names_budget(usize::MAX), usize::MAX);
+    }
+
+    /// A book made with hyperref: `n` named destinations, each a small array that
+    /// is an object of its own, in leaves of 64 under one root.
+    fn many_small_destinations(n: u32) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        let first_dest = 20u32;
+        let leaves = n.div_ceil(64);
+        let first_leaf = first_dest + n;
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 3 0 R >> >>");
+        b.obj(2, "<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 9 9] >>");
+        let kids: String = (0..leaves).map(|i| format!("{} 0 R ", first_leaf + i)).collect();
+        b.obj(3, &format!("<< /Kids [{kids}] >>"));
+        b.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        for i in 0..n {
+            b.obj(first_dest + i, "[4 0 R /XYZ 72 700 null]");
+        }
+        for leaf in 0..leaves {
+            let (from, to) = (leaf * 64, ((leaf + 1) * 64).min(n));
+            let pairs: String = (from..to).map(|i| format!("(eq.{i:07}) {} 0 R ", first_dest + i)).collect();
+            b.obj(
+                first_leaf + leaf,
+                &format!("<< /Limits [(eq.{from:07}) (eq.{:07})] /Names [{pairs}] >>", to - 1),
+            );
+        }
+        b.finish_classic(first_leaf + leaves, "/Root 1 0 R")
+    }
+
+    #[test]
+    fn two_hundred_thousand_small_named_destinations_are_within_the_budget() {
+        // 200,000 of them were refused at 32 MiB; they are a file of 18 MB.
+        let n = 200_000u32;
+        let doc = open(many_small_destinations(n));
+        let names = NamedDests::load(&doc).unwrap();
+        assert_eq!(names.tree().len(), n as usize);
+        let pages: HashSet<u32> = [4].into_iter().collect();
+        // Every one of them can be resolved for the page it is on (as `Index::build` does).
+        for (_, value) in names.tree() {
+            let array = explicit(&doc, value, names.spend()).unwrap().unwrap();
+            assert_eq!(array_page(&array, &pages), Some(4));
+        }
+    }
+
+    #[test]
+    fn looking_up_the_same_small_destination_again_and_again_costs_nothing() {
+        // 400,000 links to one destination (of about 100 bytes) used to cost the
+        // whole 32 MiB; it is looked up once and copied, which is free when small.
+        let doc = open(many_small_destinations(100));
+        let names = NamedDests::load(&doc).unwrap();
+        for _ in 0..400_000 {
+            let array = names.lookup(&doc, b"eq.0000007", false).unwrap().unwrap();
+            assert_eq!(array.len(), 5);
+        }
+        assert!(names.lookup(&doc, b"nothing", false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_big_destination_looked_up_over_and_over_pays_every_time() {
+        // A destination with a 100,000-byte string in it: free for nobody.
+        let junk = "A".repeat(100_000);
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [(big) 5 0 R] >> >> >>");
+        b.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.obj(5, &format!("[3 0 R /XYZ ({junk})]"));
+        let doc = open(b.finish_classic(6, "/Root 1 0 R"));
+        let names = NamedDests::load(&doc).unwrap();
+        let mut refused_at = None;
+        for i in 0..2000 {
+            match names.lookup(&doc, b"big", false) {
+                Ok(Some(_)) => {}
+                Err(Error::Limit(_)) => {
+                    refused_at = Some(i);
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // 32 MiB of 100 KB copies: about 335 of them.
+        assert!(refused_at.is_some_and(|i| (300..400).contains(&i)), "{refused_at:?}");
     }
 
     #[test]

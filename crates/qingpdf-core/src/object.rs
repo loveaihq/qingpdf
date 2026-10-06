@@ -1,5 +1,10 @@
 //! The PDF object model (ISO 32000-1 7.3).
 
+/// The highest object number a file may use: Annex C, Table C.1 gives 8,388,607
+/// as the most indirect objects. References above it are read as null, so that
+/// no reference taken from a file can name an object made up by a program.
+pub const MAX_OBJECT_NUMBER: u32 = (1 << 23) - 1;
+
 /// An indirect reference `num gen R` (7.3.10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjRef {

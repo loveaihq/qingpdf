@@ -43,6 +43,7 @@ fn kind(e: &Error) -> &'static str {
         Error::MissingObject { .. } => "missing object",
         Error::Unsupported(_) => "unsupported",
         Error::Limit(_) => "limit",
+        Error::TooDeep(_) => "too deep",
         Error::Invalid(_) => "invalid",
     }
 }
@@ -547,6 +548,124 @@ mod hostile {
         });
         assert_quick(took, "reading an xref stream with 8 million entries");
         assert!(matches!(outcome, Ok(1)), "{outcome:?}");
+    }
+
+    /// A book made with hyperref: `pages` pages with `per_page` named
+    /// destinations each (every one a small array that is an object of its own,
+    /// in leaves of 64 under one root) and `links` named links per page.
+    fn hyperref_like(pages: u32, per_page: u32, links: u32) -> Vec<u8> {
+        let page0 = 10u32;
+        let dest0 = page0 + pages;
+        let mut names: Vec<(String, u32, u32)> = Vec::new();
+        let mut num = dest0;
+        for pg in 0..pages {
+            for k in 0..per_page {
+                names.push((format!("eq.{pg}.{k}"), num, pg));
+                num += 1;
+            }
+        }
+        names.sort();
+        let leaf0 = num;
+        let leaves: Vec<&[(String, u32, u32)]> = names.chunks(64).collect();
+        let annot0 = leaf0 + u32::try_from(leaves.len()).unwrap();
+        let mut p = Pdf::new();
+        p.obj(1, "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 3 0 R >> >>");
+        let kids: String = (0..pages).map(|i| format!("{} 0 R ", page0 + i)).collect();
+        p.obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count {pages} /MediaBox [0 0 600 800] /Resources << >> >>"));
+        let leaf_refs: String = (0..leaves.len()).map(|i| format!("{} 0 R ", leaf0 + u32::try_from(i).unwrap())).collect();
+        p.obj(3, &format!("<< /Kids [{leaf_refs}] >>"));
+        for pg in 0..pages {
+            let annots: String = (0..links).map(|j| format!("{} 0 R ", annot0 + pg * links + j)).collect();
+            let body = if links > 0 {
+                format!("<< /Type /Page /Parent 2 0 R /Annots [{annots}] >>")
+            } else {
+                "<< /Type /Page /Parent 2 0 R >>".to_string()
+            };
+            p.obj(page0 + pg, &body);
+        }
+        for (_, n, pg) in &names {
+            p.obj(*n, &format!("[{} 0 R /XYZ 72 700 null]", page0 + pg));
+        }
+        for (i, leaf) in leaves.iter().enumerate() {
+            let pairs: String = leaf.iter().map(|(k, n, _)| format!("({k}) {n} 0 R ")).collect();
+            let (first, last) = (&leaf[0].0, &leaf[leaf.len() - 1].0);
+            p.obj(leaf0 + u32::try_from(i).unwrap(), &format!("<< /Limits [({first}) ({last})] /Names [{pairs}] >>"));
+        }
+        for pg in 0..pages {
+            for j in 0..links {
+                let target = (pg + j + 1) % pages;
+                p.obj(
+                    annot0 + pg * links + j,
+                    &format!("<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Border [0 0 0] /Dest (eq.{target}.{}) >>", j % per_page),
+                );
+            }
+        }
+        p.finish_classic()
+    }
+
+    /// How many entries the name tree of a document has, by walking it.
+    fn entries_in_name_tree(doc: &Document) -> usize {
+        let catalog = doc.catalog().expect("catalog");
+        let names = doc.resolve(catalog.get("Names").expect("names")).expect("names dict");
+        let mut stack = vec![names.as_dict().and_then(|d| d.get("Dests")).expect("dests").clone()];
+        let mut entries = 0;
+        while let Some(node) = stack.pop() {
+            let Object::Dict(d) = doc.resolve(&node).expect("node") else { panic!("not a dictionary") };
+            if let Some(pairs) = d.get("Names") {
+                entries += doc.resolve(pairs).expect("pairs").as_array().map_or(0, |a| a.len() / 2);
+            }
+            if let Some(kids) = d.get("Kids") {
+                stack.extend(doc.resolve(kids).expect("kids").as_array().map_or(Vec::new(), <[Object]>::to_vec));
+            }
+        }
+        entries
+    }
+
+    /// Round 3: a valid file of 18 MB with 200,000 named destinations was
+    /// refused ("the named destinations ask for more than 32 MiB").
+    #[test]
+    fn a_valid_book_with_two_hundred_thousand_named_destinations_can_be_cut_and_split() {
+        let bytes = hyperref_like(2000, 100, 0);
+        assert!(bytes.len() > 15_000_000, "{} bytes", bytes.len());
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let deleted = ops::delete_pages(&doc, &[0]).expect("delete");
+            let split = ops::extract_pages(&doc, &(0..10).collect::<Vec<_>>()).expect("split");
+            let kept_after_delete = entries_in_name_tree(&Document::from_bytes(deleted.data).expect("reopens"));
+            let kept_after_split = entries_in_name_tree(&Document::from_bytes(split.data).expect("reopens"));
+            (kept_after_delete, kept_after_split)
+        });
+        assert_within_four_times(took, "deleting a page of, and splitting, a file with 200,000 named destinations");
+        // The 100 destinations of the deleted page are gone; pages 1 to 10 keep theirs.
+        assert_eq!(outcome, (199_900, 1000));
+    }
+
+    /// Round 3: the later input of a merge whose links all name destinations:
+    /// each is looked up, and a destination looked up again costs nothing.
+    #[test]
+    fn a_merge_input_with_many_named_links_is_resolved_within_the_budget() {
+        let bytes = hyperref_like(300, 10, 200);
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).expect("merge");
+            let copy = Document::from_bytes(merged.data).expect("reopens");
+            let pages = copy.pages().expect("pages");
+            // Every link of the second copy leads to a page of the second copy.
+            let second: std::collections::HashSet<qingpdf_core::ObjRef> = pages[300..].iter().map(|p| p.obj_ref).collect();
+            let mut links = 0usize;
+            for page in &pages[300..] {
+                let annots = copy.resolve(page.dict.get("Annots").expect("annots")).expect("annots");
+                for annot in annots.as_array().expect("array") {
+                    let Object::Dict(a) = copy.resolve(annot).expect("annot") else { panic!() };
+                    let Some(Object::Array(dest)) = a.get("Dest") else { panic!("not resolved: {:?}", a.get("Dest")) };
+                    assert!(matches!(dest.first(), Some(Object::Ref(r)) if second.contains(r)));
+                    links += 1;
+                }
+            }
+            links
+        });
+        assert_within_four_times(took, "merging a file with 60,000 named links");
+        assert_eq!(outcome, 60_000);
     }
 
     /// Round 2, n1: one page of 10 MB listed 300 times. Every listing is written

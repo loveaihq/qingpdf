@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use crate::error::{Error, Result};
 use crate::lexer::{Lexer, Token, find_bytes, is_whitespace, offset_u64};
-use crate::object::{Dict, Name, ObjRef, Object, Stream};
+use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, Stream};
 
 /// Deepest allowed nesting of arrays and dictionaries.
 pub const MAX_NESTING: usize = 256;
@@ -128,6 +128,13 @@ impl<'a> Parser<'a> {
                 if let Ok(num) = u32::try_from(n)
                     && let Some(generation) = self.lex.try_ref_suffix()
                 {
+                    // A file has no object above Annex C's limit, so a reference
+                    // to one is a reference to nothing: null (7.3.10). It must
+                    // not be a reference at all, or it could name an object a
+                    // program made up for itself in that range.
+                    if num > MAX_OBJECT_NUMBER {
+                        return Ok(Object::Null);
+                    }
                     return Ok(Object::Ref(ObjRef::new(num, generation)));
                 }
                 Ok(Object::Integer(n))
@@ -167,7 +174,7 @@ impl<'a> Parser<'a> {
 
     fn check_depth(&self, depth: usize) -> Result<()> {
         if depth >= MAX_NESTING {
-            return Err(Error::Limit(format!("arrays and dictionaries nested more than {MAX_NESTING} levels deep")));
+            return Err(Error::TooDeep(format!("arrays and dictionaries nested more than {MAX_NESTING} levels deep")));
         }
         Ok(())
     }
@@ -406,6 +413,22 @@ mod tests {
     }
 
     #[test]
+    fn references_above_the_object_number_limit_are_null() {
+        // Annex C: 8,388,607 is the most indirect objects a file may have.
+        let obj = parse(b"[8388607 0 R 8388608 0 R 4294967295 0 R 9 0 R]").unwrap();
+        assert_eq!(
+            obj.as_array().unwrap(),
+            [Object::Ref(ObjRef::new(8_388_607, 0)), Object::Null, Object::Null, Object::Ref(ObjRef::new(9, 0))]
+        );
+        // As a dictionary value it is the same as no value (7.3.7).
+        let obj = parse(b"<< /A 4294967290 0 R /B 1 0 R >>").unwrap();
+        let d = obj.as_dict().unwrap();
+        assert!(!d.contains_key("A") && d.contains_key("B"));
+        // A number that is not followed by `g R` is still a number.
+        assert_eq!(parse(b"4294967290").unwrap(), Object::Integer(4_294_967_290));
+    }
+
+    #[test]
     fn numbers_followed_by_numbers_are_not_refs() {
         let obj = parse(b"[1 2 3 4]").unwrap();
         assert_eq!(
@@ -511,16 +534,16 @@ mod tests {
         let too_deep = MAX_NESTING + 1;
         let mut bad = vec![b'['; too_deep];
         bad.extend(std::iter::repeat_n(b']', too_deep));
-        assert!(matches!(parse(&bad), Err(Error::Limit(_))));
+        assert!(matches!(parse(&bad), Err(Error::TooDeep(_))));
 
-        // 1000 deep, arrays, and unterminated: still a Limit error, not a stack overflow.
+        // 1000 deep, arrays, and unterminated: still the same error, not a stack overflow.
         let deep = vec![b'['; 1000];
-        assert!(matches!(parse(&deep), Err(Error::Limit(_))));
+        assert!(matches!(parse(&deep), Err(Error::TooDeep(_))));
         let mut dicts = Vec::new();
         for _ in 0..1000 {
             dicts.extend_from_slice(b"<</A ");
         }
-        assert!(matches!(parse(&dicts), Err(Error::Limit(_))));
+        assert!(matches!(parse(&dicts), Err(Error::TooDeep(_))));
     }
 
     #[test]

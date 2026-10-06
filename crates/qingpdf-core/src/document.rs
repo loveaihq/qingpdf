@@ -277,6 +277,7 @@ fn copy_error(e: &Error) -> Error {
         Error::MissingObject { num, generation } => Error::MissingObject { num: *num, generation: *generation },
         Error::Unsupported(m) => Error::Unsupported(m.clone()),
         Error::Limit(m) => Error::Limit(m.clone()),
+        Error::TooDeep(m) => Error::TooDeep(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
     }
 }
@@ -762,6 +763,11 @@ impl Document {
     pub(crate) fn use_up_the_decoding_budget_for_test(&self) {
         self.budget.charge_for_test(self.budget.remaining());
         self.objstms.borrow_mut().clear();
+    }
+
+    /// How many bytes the file takes (as held in memory, from its header).
+    pub fn file_size(&self) -> usize {
+        self.data.len()
     }
 
     /// Does the trailer have an `/Encrypt` entry (7.5.5)?
@@ -1550,13 +1556,13 @@ mod tests {
     }
 
     #[test]
-    fn deep_nesting_in_an_object_is_a_limit_error() {
+    fn deep_nesting_in_an_object_is_its_own_error() {
         let mut b = PdfBuilder::new();
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
         b.obj(3, &format!("{}{}", "[".repeat(1000), "]".repeat(1000)));
         let doc = open(b.finish_classic(4, "/Root 1 0 R"));
-        assert!(matches!(doc.get(ObjRef::new(3, 0)), Err(Error::Limit(_))));
+        assert!(matches!(doc.get(ObjRef::new(3, 0)), Err(Error::TooDeep(_))));
         // The rest of the document is unaffected.
         assert_eq!(doc.page_count().unwrap(), 0);
     }
