@@ -3,6 +3,7 @@
 mod args;
 mod help;
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,7 @@ use std::process::ExitCode;
 
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
-use qingpdf_core::ops::{self, ImageInput, Input, Output};
+use qingpdf_core::ops::{self, Input, LoadedImage, Output};
 use qingpdf_core::{Document, Error, Warning};
 
 use args::{Parsed, Request, UsageError};
@@ -31,12 +32,12 @@ fn main() -> ExitCode {
         Ok(Parsed::Run(request)) => match run(request) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
-                eprintln!("error: {message}");
+                eprintln!("error: {}", clean(&message));
                 ExitCode::from(1)
             }
         },
         Err(UsageError { message, command }) => {
-            eprintln!("qingpdf: {message}");
+            eprintln!("qingpdf: {}", clean(&message));
             match command {
                 Some(c) => eprintln!("Try 'qingpdf {} --help' for usage.", c.name()),
                 None => eprintln!("Try 'qingpdf --help' for usage."),
@@ -46,9 +47,29 @@ fn main() -> ExitCode {
     }
 }
 
+/// Text for a terminal: control characters (C0, DEL and C1, which include the
+/// escape that starts terminal commands) are written as `\xNN`, except the
+/// line feed. Everything the program prints can contain something taken from a
+/// file (a name, a message about an object), and a file must not be able to
+/// drive the terminal.
+fn clean(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control() && c != '\n') {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c.is_control() && c != '\n' {
+            out.push_str(&format!("\\x{:02x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 /// Print to standard output without panicking if the pipe is closed.
 fn say(text: &str) {
-    let _ = std::io::stdout().write_all(text.as_bytes());
+    let _ = std::io::stdout().write_all(clean(text).as_bytes());
 }
 
 fn run(request: Request) -> Result<(), Failure> {
@@ -96,6 +117,7 @@ fn open_error(path: &Path, e: &Error) -> String {
         Error::Io(io) => format!("cannot read {}: {io}", path.display()),
         Error::Unsupported(m) if m == "encrypted PDF" => encrypted_message(path),
         Error::Unsupported(m) => format!("{}: not supported yet: {m}", path.display()),
+        Error::Limit(_) => format!("{} is not opened: it asks for more than is safe ({e})", path.display()),
         other => format!("{} is not a PDF file, or is too damaged to read ({other})", path.display()),
     }
 }
@@ -154,12 +176,38 @@ fn check_output(output: &Path, inputs: &[PathBuf], force: bool) -> Result<(), Fa
 
 fn print_warnings(warnings: &[Warning]) {
     for w in warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", clean(&w.to_string()));
     }
 }
 
+/// Write `data` as the file `target` all at once: into a new file next to it,
+/// which then takes its place (a rename, which replaces an existing file).
+/// Nothing is ever written into the old file, so an input that is another name
+/// for the same data (a hard link) is left as it was, and a failure part way
+/// leaves no half-written output.
+fn write_replacing(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "out".to_string());
+    for attempt in 0..1000u32 {
+        let temp = dir.join(format!(".{name}.qingpdf-{}-{attempt}.tmp", std::process::id()));
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file.write_all(data).and_then(|()| file.flush());
+        drop(file);
+        let done = written.and_then(|()| fs::rename(&temp, target));
+        if done.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        return done;
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free name for a temporary file"))
+}
+
 fn write_file(output: &Path, data: &[u8]) -> Result<(), Failure> {
-    fs::write(output, data).map_err(|e| format!("cannot write {}: {e}", output.display()))
+    write_replacing(output, data).map_err(|e| format!("cannot write {}: {e}", output.display()))
 }
 
 fn plural(n: usize) -> &'static str {
@@ -201,16 +249,31 @@ fn split_every_command(input: &Path, every: usize, template: &Path, force: bool)
         check_output(name, &[input.to_path_buf()], force)?;
     }
     let mut report: Vec<String> = Vec::new();
-    let warnings = ops::split_every(&doc, every, &mut |n, out| {
+    // The files are written by a second thread while the next one is made; a
+    // short queue keeps at most a few of them in memory.
+    let (to_disk, queue) = std::sync::mpsc::sync_channel::<(PathBuf, Vec<u8>)>(2);
+    let writer = std::thread::spawn(move || -> Result<(), Failure> {
+        for (name, data) in queue {
+            write_replacing(&name, &data).map_err(|e| format!("cannot write {}: {e}", name.display()))?;
+        }
+        Ok(())
+    });
+    let made = ops::split_every(&doc, every, &mut |n, out| {
         let name = n
             .checked_sub(1)
             .and_then(|i| names.get(i))
             .ok_or_else(|| Error::Invalid("more files than expected".to_string()))?;
-        fs::write(name, &out.data).map_err(|e| Error::Invalid(format!("cannot write {}: {e}", name.display())))?;
         report.push(format!("wrote {} ({} page{})\n", name.display(), out.pages, plural(out.pages)));
-        Ok(())
-    })
-    .map_err(|e| op_error(input, &e))?;
+        // A send fails only when the writer has stopped; its error is told below.
+        to_disk
+            .send((name.clone(), out.data))
+            .map_err(|_| Error::Invalid("the output files could not be written".to_string()))
+    });
+    drop(to_disk);
+    let written = writer.join().map_err(|_| "the thread writing the files failed".to_string())?;
+    // If a file could not be written, say why that was, not that the rest were dropped.
+    written?;
+    let warnings = made.map_err(|e| op_error(input, &e))?;
     print_warnings(&warnings);
     for line in report {
         say(&line);
@@ -220,14 +283,15 @@ fn split_every_command(input: &Path, every: usize, template: &Path, force: bool)
 
 fn images_command(inputs: &[PathBuf], mode: PageMode, output: &Path, force: bool) -> Result<(), Failure> {
     check_output(output, inputs, force)?;
-    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(inputs.len());
-    for path in inputs {
-        let data = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        files.push((path.display().to_string(), data));
-    }
-    let images: Vec<ImageInput<'_>> =
-        files.iter().map(|(name, data)| ImageInput { name: name.as_str(), data: data.as_slice() }).collect();
-    let out = ops::images_to_pdf(&images, mode).map_err(|e| match &e {
+    // One image at a time: each file is read when its turn comes and dropped
+    // before the next is read.
+    let mut load = |i: usize| -> Result<LoadedImage<'static>, Error> {
+        let path = inputs.get(i).ok_or_else(|| Error::Invalid("no such image".to_string()))?;
+        let data =
+            fs::read(path).map_err(|e| Error::Invalid(format!("cannot read {}: {e}", path.display())))?;
+        Ok(LoadedImage { name: path.display().to_string(), data: Cow::Owned(data) })
+    };
+    let out = ops::images_to_pdf_with(inputs.len(), &mut load, mode).map_err(|e| match &e {
         Error::Invalid(m) => m.clone(),
         other => format!("cannot make the PDF: {other}"),
     })?;

@@ -5,14 +5,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
-use crate::filter;
+use crate::filter::{self, DecodeBudget, MAX_DECODED_SIZE};
 use crate::lexer::{Lexer, Token, offset_u64, rfind_bytes};
 use crate::object::{Dict, Object};
 use crate::parser::{Parser, PlainHelper, StreamHelper};
 
-/// Most objects we accept in one file. Annex C, Table C.1 gives 8,388,607 as
-/// the architectural limit; a hostile cross-reference stream could otherwise
-/// ask for gigabytes of table.
+/// Most cross-reference rows one file may have, all sections together, and one
+/// more than the highest object number we keep. Annex C, Table C.1 gives
+/// 8,388,607 as the architectural limit on indirect objects; a hostile
+/// cross-reference stream (or a chain of them) could otherwise ask for
+/// gigabytes of table and minutes of work.
 pub const MAX_OBJECTS: usize = 1 << 23;
 
 /// Most objects read from the header of one object stream. Real files hold
@@ -40,10 +42,188 @@ pub enum XrefEntry {
     },
 }
 
+// A table slot holds one entry in 64 bits: the kind in the top byte, and
+//   in use:     generation (16 bits) above the offset (40 bits, a terabyte)
+//   compressed: index in the object stream (24 bits) above its number (32 bits)
+// Free entries need no slot: a bit says "defined as free". A file full of free
+// entries (the usual hostile one) therefore costs a megabit, and nothing a
+// hostile file does makes the table bigger than 64 MiB plus 1 MiB.
+const KIND_SHIFT: u32 = 56;
+const KIND_IN_USE: u64 = 2;
+const KIND_COMPRESSED: u64 = 3;
+const OFFSET_BITS: u32 = 40;
+const OFFSET_MASK: u64 = (1 << OFFSET_BITS) - 1;
+const INDEX_MASK: u64 = (1 << 24) - 1;
+
+/// The cross-reference entries of a file, by object number. Dense: a vector of
+/// 8-byte slots for the entries that are not free, indexed by object number,
+/// and a bit set for the free ones; which is why object numbers above
+/// [`XrefTable::MAX_NUM`] (the limit of Annex C) are not kept.
+#[derive(Debug, Clone, Default)]
+pub struct XrefTable {
+    slots: Vec<u64>,
+    free: Vec<u64>,
+    defined: usize,
+    max: Option<u32>,
+    compressed: bool,
+}
+
+impl XrefTable {
+    /// The highest object number that is kept.
+    pub const MAX_NUM: u32 = (MAX_OBJECTS - 1) as u32;
+
+    pub fn new() -> Self {
+        XrefTable::default()
+    }
+
+    /// An entry that is not free, in a slot. Never 0.
+    fn pack(entry: XrefEntry) -> Option<u64> {
+        match entry {
+            XrefEntry::Free => None,
+            XrefEntry::InUse { offset, generation } => {
+                // An offset past the 40-bit range is past any file we can hold.
+                let offset = offset.min(OFFSET_MASK);
+                Some((KIND_IN_USE << KIND_SHIFT) | (u64::from(generation) << OFFSET_BITS) | offset)
+            }
+            XrefEntry::Compressed { stream_num, index } => {
+                // The index is only a hint; a clamped one just fails to match
+                // and the object is looked up by number.
+                let index = u64::from(index).min(INDEX_MASK);
+                Some((KIND_COMPRESSED << KIND_SHIFT) | (index << 32) | u64::from(stream_num))
+            }
+        }
+    }
+
+    fn unpack(slot: u64) -> Option<XrefEntry> {
+        match slot >> KIND_SHIFT {
+            KIND_IN_USE => Some(XrefEntry::InUse {
+                offset: slot & OFFSET_MASK,
+                generation: u16::try_from((slot >> OFFSET_BITS) & 0xFFFF).unwrap_or(u16::MAX),
+            }),
+            KIND_COMPRESSED => Some(XrefEntry::Compressed {
+                stream_num: u32::try_from(slot & 0xFFFF_FFFF).unwrap_or(u32::MAX),
+                index: u32::try_from((slot >> 32) & INDEX_MASK).unwrap_or(u32::MAX),
+            }),
+            _ => None,
+        }
+    }
+
+    fn slot(&self, num: u32) -> u64 {
+        usize::try_from(num).ok().and_then(|i| self.slots.get(i)).copied().unwrap_or(0)
+    }
+
+    fn is_free(&self, num: u32) -> bool {
+        let (word, bit) = (usize::try_from(num / 64).unwrap_or(usize::MAX), num % 64);
+        self.free.get(word).is_some_and(|w| ((*w >> bit) & 1) == 1)
+    }
+
+    fn set_free(&mut self, num: u32, on: bool) {
+        let (word, bit) = (usize::try_from(num / 64).unwrap_or(usize::MAX), num % 64);
+        if on && word >= self.free.len() {
+            self.free.resize(word + 1, 0);
+        }
+        if let Some(w) = self.free.get_mut(word) {
+            if on {
+                *w |= 1 << bit;
+            } else {
+                *w &= !(1 << bit);
+            }
+        }
+    }
+
+    pub fn get(&self, num: u32) -> Option<XrefEntry> {
+        match XrefTable::unpack(self.slot(num)) {
+            Some(entry) => Some(entry),
+            None if self.is_free(num) => Some(XrefEntry::Free),
+            None => None,
+        }
+    }
+
+    pub fn contains(&self, num: u32) -> bool {
+        self.slot(num) != 0 || self.is_free(num)
+    }
+
+    /// Set the entry of `num`, replacing any earlier one. Returns false (and
+    /// keeps nothing) for an object number beyond [`XrefTable::MAX_NUM`].
+    pub fn insert(&mut self, num: u32, entry: XrefEntry) -> bool {
+        self.put(num, entry, true)
+    }
+
+    /// Set the entry of `num` unless it already has one (the first definition
+    /// wins). Returns false for an object number beyond [`XrefTable::MAX_NUM`].
+    pub fn insert_if_absent(&mut self, num: u32, entry: XrefEntry) -> bool {
+        self.put(num, entry, false)
+    }
+
+    fn put(&mut self, num: u32, entry: XrefEntry, replace: bool) -> bool {
+        if num > XrefTable::MAX_NUM {
+            return false;
+        }
+        let Ok(i) = usize::try_from(num) else {
+            return false;
+        };
+        let was_defined = self.contains(num);
+        if was_defined && !replace {
+            return true;
+        }
+        match XrefTable::pack(entry) {
+            None => {
+                if let Some(slot) = self.slots.get_mut(i) {
+                    *slot = 0;
+                }
+                self.set_free(num, true);
+            }
+            Some(packed) => {
+                if i >= self.slots.len() {
+                    self.slots.resize(i + 1, 0);
+                }
+                if let Some(slot) = self.slots.get_mut(i) {
+                    *slot = packed;
+                }
+                self.set_free(num, false);
+                self.compressed |= matches!(entry, XrefEntry::Compressed { .. });
+            }
+        }
+        if !was_defined {
+            self.defined += 1;
+        }
+        self.max = Some(self.max.map_or(num, |m| m.max(num)));
+        true
+    }
+
+    /// How many object numbers have an entry (free ones included).
+    pub fn len(&self) -> usize {
+        self.defined
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.defined == 0
+    }
+
+    /// The highest object number that has an entry.
+    pub fn max_num(&self) -> Option<u32> {
+        self.max
+    }
+
+    /// Does any entry say "inside an object stream"?
+    pub fn has_compressed(&self) -> bool {
+        self.compressed
+    }
+
+    /// All entries by object number, lowest first.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, XrefEntry)> + '_ {
+        let last = self.max.map_or(0, |m| u64::from(m) + 1);
+        (0..last).filter_map(|n| {
+            let num = u32::try_from(n).ok()?;
+            Some((num, self.get(num)?))
+        })
+    }
+}
+
 /// The merged cross-reference information of a whole file.
 #[derive(Debug)]
 pub struct XrefData {
-    pub entries: HashMap<u32, XrefEntry>,
+    pub entries: XrefTable,
     pub trailer: Dict,
     pub uses_xref_streams: bool,
 }
@@ -76,14 +256,35 @@ pub fn find_startxref(data: &[u8]) -> Result<usize> {
     }
 }
 
+/// The rows still allowed for the whole file (all sections together).
+struct RowBudget(usize);
+
+impl RowBudget {
+    fn take(&mut self) -> Result<()> {
+        match self.0.checked_sub(1) {
+            Some(left) => {
+                self.0 = left;
+                Ok(())
+            }
+            None => Err(Error::Limit(format!("more than {MAX_OBJECTS} cross-reference entries in the file"))),
+        }
+    }
+}
+
 /// Read the whole cross-reference chain of a file: the section `startxref`
 /// points to, then (for each section) its `/XRefStm` and its `/Prev`, newest
 /// first. The first definition of an object number wins, free entries
 /// included, which makes later updates override earlier ones (7.5.6).
 pub fn read_xref(data: &[u8]) -> Result<XrefData> {
+    read_xref_budgeted(data, &DecodeBudget::default())
+}
+
+/// [`read_xref`], charging the decoding of cross-reference streams to `budget`.
+pub fn read_xref_budgeted(data: &[u8], budget: &DecodeBudget) -> Result<XrefData> {
     let start = find_startxref(data)?;
     let helper = PlainHelper::new(data);
-    let mut entries: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut entries = XrefTable::new();
+    let mut rows = RowBudget(MAX_OBJECTS);
     let mut trailer: Option<Dict> = None;
     let mut uses_xref_streams = false;
     let mut seen: HashSet<usize> = HashSet::new();
@@ -94,16 +295,8 @@ pub fn read_xref(data: &[u8]) -> Result<XrefData> {
         if !seen.insert(offset) {
             return Err(Error::Limit(format!("cross-reference sections form a cycle (offset {offset} seen twice)")));
         }
-        let section = read_section(data, offset, &helper)?;
+        let section = read_section(data, offset, &helper, &mut entries, &mut rows, budget)?;
         uses_xref_streams |= section.is_stream || from_xrefstm;
-        for (num, entry) in section.entries {
-            if !entries.contains_key(&num) {
-                if entries.len() >= MAX_OBJECTS {
-                    return Err(Error::Limit(format!("more than {MAX_OBJECTS} cross-reference entries")));
-                }
-                entries.insert(num, entry);
-            }
-        }
         if !from_xrefstm {
             // Stack order: /XRefStm is searched before /Prev (7.5.8.4), so push
             // /Prev first. A stream named by /XRefStm has no chain of its own.
@@ -142,33 +335,40 @@ fn offset_entry(trailer: &Dict, key: &str) -> Option<usize> {
     usize::try_from(n).ok().filter(|&o| o > 0)
 }
 
+/// What is left of a section once its entries are in the table.
 struct Section {
-    entries: Vec<(u32, XrefEntry)>,
     trailer: Dict,
     is_stream: bool,
 }
 
-fn read_section(data: &[u8], offset: usize, helper: &dyn StreamHelper) -> Result<Section> {
+fn read_section(
+    data: &[u8],
+    offset: usize,
+    helper: &dyn StreamHelper,
+    table: &mut XrefTable,
+    rows: &mut RowBudget,
+    budget: &DecodeBudget,
+) -> Result<Section> {
     if offset >= data.len() {
         return Err(Error::syntax(offset_u64(offset), "cross-reference offset is past the end of the file"));
     }
     let mut lex = Lexer::new(data, offset);
     match lex.next_token()? {
-        Some(Token::Keyword(b"xref")) => read_table(data, lex.pos()),
-        Some(Token::Integer(_)) => read_stream_section(data, offset, helper),
+        Some(Token::Keyword(b"xref")) => read_table(data, lex.pos(), table, rows),
+        Some(Token::Integer(_)) => read_stream_section(data, offset, helper, table, rows, budget),
         _ => Err(Error::syntax(offset_u64(offset), "no cross-reference section at this offset")),
     }
 }
 
 /// A classic table (7.5.4) followed by `trailer` and its dictionary (7.5.5).
+/// Entries go straight into `table` (the first definition of a number stays).
 ///
 /// Entries are read as tokens rather than at fixed 20-byte strides, so the
 /// usual damage (19- or 21-byte lines, odd spacing) is accepted. The usual
 /// off-by-one - a first subsection that says it starts at 1 but whose first
 /// entry is the free head `0000000000 65535 f` - is corrected.
-fn read_table(data: &[u8], pos: usize) -> Result<Section> {
+fn read_table(data: &[u8], pos: usize, table: &mut XrefTable, rows: &mut RowBudget) -> Result<Section> {
     let mut lex = Lexer::new(data, pos);
-    let mut entries: Vec<(u32, XrefEntry)> = Vec::new();
     let mut first_subsection = true;
     loop {
         let at = lex.pos();
@@ -182,8 +382,8 @@ fn read_table(data: &[u8], pos: usize) -> Result<Section> {
                 let (Ok(mut start), Ok(count)) = (u64::try_from(start), u64::try_from(count)) else {
                     return Err(Error::syntax(offset_u64(at), "negative cross-reference subsection header"));
                 };
-                let mut raw: Vec<(u64, u64, bool)> = Vec::new(); // offset, generation, in use
-                while (raw.len() as u64) < count {
+                let mut read = 0u64;
+                while read < count {
                     let entry_at = lex.pos();
                     match lex.next_token()? {
                         // The subsection promised more entries than there are.
@@ -208,44 +408,46 @@ fn read_table(data: &[u8], pos: usize) -> Result<Section> {
                                     "negative number in cross-reference entry",
                                 ));
                             };
-                            raw.push((offset, generation, in_use));
-                            if raw.len() > MAX_OBJECTS {
-                                return Err(Error::Limit(format!("more than {MAX_OBJECTS} cross-reference entries")));
+                            if read == 0 && first_subsection && start == 1 && generation == 65535 && !in_use {
+                                start = 0;
                             }
+                            rows.take()?;
+                            let num = start.checked_add(read).and_then(|n| u32::try_from(n).ok());
+                            read += 1;
+                            let Some(num) = num else {
+                                continue;
+                            };
+                            let entry = if in_use && offset > 0 {
+                                XrefEntry::InUse { offset, generation: u16::try_from(generation).unwrap_or(u16::MAX) }
+                            } else {
+                                XrefEntry::Free
+                            };
+                            table.insert_if_absent(num, entry);
                         }
                         _ => return Err(Error::syntax(offset_u64(entry_at), "bad cross-reference entry")),
                     }
                 }
-                if first_subsection && start == 1 && matches!(raw.first(), Some(&(_, 65535, false))) {
-                    start = 0;
-                }
                 first_subsection = false;
-                for (i, (offset, generation, in_use)) in raw.into_iter().enumerate() {
-                    let Some(num) =
-                        u64::try_from(i).ok().and_then(|i| start.checked_add(i)).and_then(|n| u32::try_from(n).ok())
-                    else {
-                        continue;
-                    };
-                    let entry = if in_use && offset > 0 {
-                        XrefEntry::InUse { offset, generation: u16::try_from(generation).unwrap_or(u16::MAX) }
-                    } else {
-                        XrefEntry::Free
-                    };
-                    entries.push((num, entry));
-                }
             }
             _ => return Err(Error::syntax(offset_u64(at), "bad cross-reference table")),
         }
     }
     match Parser::new(data, lex.pos()).parse_object()? {
-        Object::Dict(trailer) => Ok(Section { entries, trailer, is_stream: false }),
+        Object::Dict(trailer) => Ok(Section { trailer, is_stream: false }),
         _ => Err(Error::syntax(offset_u64(lex.pos()), "trailer is not a dictionary")),
     }
 }
 
 /// A cross-reference stream object (7.5.8): its dictionary doubles as the
 /// trailer.
-fn read_stream_section(data: &[u8], offset: usize, helper: &dyn StreamHelper) -> Result<Section> {
+fn read_stream_section(
+    data: &[u8],
+    offset: usize,
+    helper: &dyn StreamHelper,
+    table: &mut XrefTable,
+    rows: &mut RowBudget,
+    budget: &DecodeBudget,
+) -> Result<Section> {
     let raw = Parser::new(data, offset).parse_indirect(helper)?;
     let (Object::Dict(mut dict), Some(range)) = (raw.object, raw.stream) else {
         return Err(Error::syntax(offset_u64(offset), "cross-reference section is not a stream"));
@@ -255,94 +457,117 @@ fn read_stream_section(data: &[u8], offset: usize, helper: &dyn StreamHelper) ->
     {
         return Err(Error::syntax(offset_u64(offset), "stream is not a cross-reference stream"));
     }
+    let layout = XrefLayout::of(&dict, offset)?;
     let bytes = data.get(range).unwrap_or(&[]);
-    let decoded = filter::decode_direct(&dict, bytes)?;
-    let entries = parse_xref_stream_entries(&dict, &decoded, offset)?;
+    // Rows beyond what the file may still have are not worth decoding: cap the
+    // output at that many rows (plus a predictor's tag byte per row) and size
+    // the first buffer for the rows the dictionary declares.
+    let per_row = layout.row_len.saturating_add(1);
+    let limit = rows.0.saturating_mul(per_row).saturating_add(4096).min(MAX_DECODED_SIZE);
+    let declared = usize::try_from(layout.declared).unwrap_or(usize::MAX).min(rows.0);
+    let hint = declared.saturating_mul(per_row);
+    let decoded = filter::decode_with_limit(&dict, bytes, &|o| Ok(o.clone()), limit, hint, budget)?;
+    layout.read_rows(&decoded, table, rows)?;
     strip_stream_only_keys(&mut dict);
-    Ok(Section { entries, trailer: dict, is_stream: true })
+    Ok(Section { trailer: dict, is_stream: true })
 }
 
 fn be_value(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0u64, |acc, &b| (acc << 8) | u64::from(b))
 }
 
-/// The entries in the decoded data of a cross-reference stream (7.5.8.2,
-/// 7.5.8.3). A truncated stream yields the entries that are complete.
-fn parse_xref_stream_entries(dict: &Dict, decoded: &[u8], offset: usize) -> Result<Vec<(u32, XrefEntry)>> {
-    let bad = |what: &str| Error::syntax(offset_u64(offset), format!("cross-reference stream: {what}"));
-    let w = dict.get("W").and_then(Object::as_array).ok_or_else(|| bad("missing /W"))?;
-    let mut widths = [0usize; 3];
-    for (slot, item) in widths.iter_mut().zip(w.iter()) {
-        let n = item.as_int().ok_or_else(|| bad("/W holds a non-integer"))?;
-        *slot = usize::try_from(n).ok().filter(|&n| n <= 8).ok_or_else(|| bad("/W field wider than 8 bytes"))?;
-    }
-    if w.len() < 3 {
-        return Err(bad("/W needs three entries"));
-    }
-    let [w0, w1, w2] = widths;
-    let row_len = w0 + w1 + w2;
-    if row_len == 0 {
-        return Err(bad("/W is all zeros"));
-    }
+/// What the dictionary of a cross-reference stream says about its rows
+/// (7.5.8.2, Table 17).
+struct XrefLayout {
+    widths: [usize; 3],
+    row_len: usize,
+    /// (first object number, count) of each subsection.
+    subsections: Vec<(u64, u64)>,
+    /// Rows the dictionary announces in all.
+    declared: u64,
+}
 
-    // /Index defaults to [0 Size] (Table 17).
-    let mut subsections: Vec<(u64, u64)> = Vec::new();
-    match dict.get("Index") {
-        Some(Object::Array(items)) => {
-            // A stray last element without a partner is ignored.
-            for [a, b] in items.as_chunks::<2>().0 {
-                let (Some(first), Some(count)) = (a.as_int(), b.as_int()) else {
-                    return Err(bad("/Index holds a non-integer"));
-                };
-                let (Ok(first), Ok(count)) = (u64::try_from(first), u64::try_from(count)) else {
-                    return Err(bad("negative number in /Index"));
-                };
-                subsections.push((first, count));
-            }
+impl XrefLayout {
+    fn of(dict: &Dict, offset: usize) -> Result<XrefLayout> {
+        let bad = |what: &str| Error::syntax(offset_u64(offset), format!("cross-reference stream: {what}"));
+        let w = dict.get("W").and_then(Object::as_array).ok_or_else(|| bad("missing /W"))?;
+        let mut widths = [0usize; 3];
+        for (slot, item) in widths.iter_mut().zip(w.iter()) {
+            let n = item.as_int().ok_or_else(|| bad("/W holds a non-integer"))?;
+            *slot = usize::try_from(n).ok().filter(|&n| n <= 8).ok_or_else(|| bad("/W field wider than 8 bytes"))?;
         }
-        _ => {
-            let size = dict.get_int("Size").unwrap_or(0).max(0);
-            subsections.push((0, u64::try_from(size).unwrap_or(0)));
+        if w.len() < 3 {
+            return Err(bad("/W needs three entries"));
         }
-    }
+        let [w0, w1, w2] = widths;
+        let row_len = w0 + w1 + w2;
+        if row_len == 0 {
+            return Err(bad("/W is all zeros"));
+        }
 
-    let mut rows = decoded.chunks_exact(row_len);
-    let mut entries = Vec::new();
-    'sections: for (first, count) in subsections {
-        for k in 0..count {
-            let Some(row) = rows.next() else {
-                break 'sections;
-            };
-            let Some(num) = first.checked_add(k).and_then(|n| u32::try_from(n).ok()) else {
-                continue;
-            };
-            let Some((f0, rest)) = row.split_at_checked(w0) else { continue };
-            let Some((f1, f2)) = rest.split_at_checked(w1) else { continue };
-            // A zero-width type field means type 1 (7.5.8.2).
-            let kind = if w0 == 0 { 1 } else { be_value(f0) };
-            let second = be_value(f1);
-            let third = be_value(f2);
-            let entry = match kind {
-                1 if second > 0 => {
-                    XrefEntry::InUse { offset: second, generation: u16::try_from(third).unwrap_or(u16::MAX) }
+        // /Index defaults to [0 Size] (Table 17).
+        let mut subsections: Vec<(u64, u64)> = Vec::new();
+        match dict.get("Index") {
+            Some(Object::Array(items)) => {
+                // A stray last element without a partner is ignored.
+                for [a, b] in items.as_chunks::<2>().0 {
+                    let (Some(first), Some(count)) = (a.as_int(), b.as_int()) else {
+                        return Err(bad("/Index holds a non-integer"));
+                    };
+                    let (Ok(first), Ok(count)) = (u64::try_from(first), u64::try_from(count)) else {
+                        return Err(bad("negative number in /Index"));
+                    };
+                    subsections.push((first, count));
                 }
-                2 => match u32::try_from(second) {
-                    Ok(stream_num) => {
-                        XrefEntry::Compressed { stream_num, index: u32::try_from(third).unwrap_or(u32::MAX) }
-                    }
-                    Err(_) => XrefEntry::Free,
-                },
-                // Type 0, offset 0, and unknown types all read as the null
-                // object (7.5.8.3).
-                _ => XrefEntry::Free,
-            };
-            entries.push((num, entry));
-            if entries.len() > MAX_OBJECTS {
-                return Err(Error::Limit(format!("more than {MAX_OBJECTS} cross-reference entries")));
+            }
+            _ => {
+                let size = dict.get_int("Size").unwrap_or(0).max(0);
+                subsections.push((0, u64::try_from(size).unwrap_or(0)));
             }
         }
+        let declared = subsections.iter().fold(0u64, |acc, &(_, c)| acc.saturating_add(c));
+        Ok(XrefLayout { widths, row_len, subsections, declared })
     }
-    Ok(entries)
+
+    /// Put the rows of the decoded data (7.5.8.3) into `table`. A truncated
+    /// stream yields the entries that are complete.
+    fn read_rows(&self, decoded: &[u8], table: &mut XrefTable, rows_left: &mut RowBudget) -> Result<()> {
+        let [w0, w1, _] = self.widths;
+        let mut rows = decoded.chunks_exact(self.row_len);
+        'sections: for &(first, count) in &self.subsections {
+            for k in 0..count {
+                let Some(row) = rows.next() else {
+                    break 'sections;
+                };
+                rows_left.take()?;
+                let Some(num) = first.checked_add(k).and_then(|n| u32::try_from(n).ok()) else {
+                    continue;
+                };
+                let Some((f0, rest)) = row.split_at_checked(w0) else { continue };
+                let Some((f1, f2)) = rest.split_at_checked(w1) else { continue };
+                // A zero-width type field means type 1 (7.5.8.2).
+                let kind = if w0 == 0 { 1 } else { be_value(f0) };
+                let second = be_value(f1);
+                let third = be_value(f2);
+                let entry = match kind {
+                    1 if second > 0 => {
+                        XrefEntry::InUse { offset: second, generation: u16::try_from(third).unwrap_or(u16::MAX) }
+                    }
+                    2 => match u32::try_from(second) {
+                        Ok(stream_num) => {
+                            XrefEntry::Compressed { stream_num, index: u32::try_from(third).unwrap_or(u32::MAX) }
+                        }
+                        Err(_) => XrefEntry::Free,
+                    },
+                    // Type 0, offset 0, and unknown types all read as the null
+                    // object (7.5.8.3).
+                    _ => XrefEntry::Free,
+                };
+                table.insert_if_absent(num, entry);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A decoded object stream (7.5.7): the object numbers and where each object
@@ -398,6 +623,11 @@ impl ObjStm {
         self.pairs.is_empty()
     }
 
+    /// About how many bytes this stream holds in memory, for the cache.
+    pub fn weight(&self) -> usize {
+        self.data.len().saturating_add(self.pairs.len().saturating_mul(16)).saturating_add(self.by_num.len().saturating_mul(48))
+    }
+
     /// Object numbers in stream order.
     pub fn object_numbers(&self) -> impl Iterator<Item = u32> + '_ {
         self.pairs.iter().map(|&(n, _)| n)
@@ -432,7 +662,51 @@ mod tests {
     use crate::testutil::*;
 
     fn entry_of(x: &XrefData, num: u32) -> XrefEntry {
-        *x.entries.get(&num).unwrap_or_else(|| panic!("no entry for {num}"))
+        x.entries.get(num).unwrap_or_else(|| panic!("no entry for {num}"))
+    }
+
+    #[test]
+    fn the_table_keeps_free_and_used_entries_and_the_first_definition_wins() {
+        let mut t = XrefTable::new();
+        assert!(t.is_empty() && t.get(5).is_none() && !t.contains(5));
+        assert!(t.insert_if_absent(5, XrefEntry::Free));
+        // A later definition does not displace a free entry ...
+        assert!(t.insert_if_absent(5, XrefEntry::InUse { offset: 99, generation: 1 }));
+        assert_eq!(t.get(5), Some(XrefEntry::Free));
+        // ... unless it is meant to replace (the rebuild: the last one wins).
+        assert!(t.insert(5, XrefEntry::InUse { offset: 99, generation: 1 }));
+        assert_eq!(t.get(5), Some(XrefEntry::InUse { offset: 99, generation: 1 }));
+        assert!(t.insert(5, XrefEntry::Free));
+        assert_eq!(t.get(5), Some(XrefEntry::Free));
+        assert!(t.insert(70, XrefEntry::Compressed { stream_num: 4_000_000_000, index: 70_000_000 }));
+        // The index is clamped (it is only a hint); the rest is exact.
+        assert_eq!(t.get(70), Some(XrefEntry::Compressed { stream_num: 4_000_000_000, index: (1 << 24) - 1 }));
+        assert!(t.insert(3, XrefEntry::InUse { offset: u64::MAX, generation: 65535 }));
+        assert_eq!(t.get(3), Some(XrefEntry::InUse { offset: (1 << 40) - 1, generation: 65535 }));
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.max_num(), Some(70));
+        assert!(t.has_compressed());
+        let all: Vec<u32> = t.iter().map(|(n, _)| n).collect();
+        assert_eq!(all, vec![3, 5, 70]);
+        // Beyond the limit nothing is kept.
+        assert!(!t.insert(XrefTable::MAX_NUM + 1, XrefEntry::Free));
+        assert!(!t.insert(u32::MAX, XrefEntry::Free));
+        assert_eq!(t.len(), 3);
+        assert!(t.insert(XrefTable::MAX_NUM, XrefEntry::Free));
+        assert_eq!(t.get(XrefTable::MAX_NUM), Some(XrefEntry::Free));
+    }
+
+    #[test]
+    fn a_table_of_free_entries_stays_small() {
+        let mut t = XrefTable::new();
+        for n in 0..XrefTable::MAX_NUM {
+            t.insert_if_absent(n, XrefEntry::Free);
+        }
+        t.insert_if_absent(7, XrefEntry::InUse { offset: 10, generation: 0 });
+        assert_eq!(t.get(7), Some(XrefEntry::Free), "the first definition, a free one, stands");
+        assert_eq!(t.len(), XrefTable::MAX_NUM as usize);
+        assert!(t.slots.is_empty(), "free entries take no slot");
+        assert!(t.free.len() * 8 <= 1 << 20);
     }
 
     #[test]
@@ -514,7 +788,7 @@ mod tests {
         b.startxref(xref);
         let x = read_xref(&b.finish()).unwrap();
         assert!(matches!(entry_of(&x, 1), XrefEntry::InUse { .. }));
-        assert!(!x.entries.contains_key(&2));
+        assert!(!x.entries.contains(2));
     }
 
     #[test]
@@ -688,7 +962,7 @@ mod tests {
         assert_eq!(entry_of(&x, 7), XrefEntry::Compressed { stream_num: 20, index: 3 });
         assert_eq!(entry_of(&x, 8), XrefEntry::Free);
         assert!(matches!(entry_of(&x, 9), XrefEntry::InUse { generation: 4, .. }));
-        assert!(!x.entries.contains_key(&0));
+        assert!(!x.entries.contains(0));
     }
 
     #[test]

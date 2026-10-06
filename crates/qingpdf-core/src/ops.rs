@@ -9,12 +9,14 @@
 //! as the base and the pages of the other files added; the other files'
 //! document-level items are not merged and a warning says which were lost.
 
+use std::cell::{Cell, OnceCell};
 use std::collections::HashSet;
 
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::image::{self, Format, PageMode};
 use crate::object::{Dict, Name, ObjRef, Object};
+use crate::prune;
 use crate::writer::{Builder, Warning};
 
 /// A finished file and what to tell the user about it.
@@ -107,6 +109,19 @@ struct Loaded<'a> {
     doc: &'a Document,
     pages: Vec<Page>,
     page_nums: HashSet<u32>,
+    /// What the document-level structures say about the pages; read the first
+    /// time a subset of the pages is cut out, then reused (splitting into many
+    /// files cuts the same structures again and again).
+    index: OnceCell<prune::Index>,
+    /// The size of the file last written from this document: the next one is
+    /// about as big (the pieces of a split), so the buffer is made that big.
+    size_hint: Cell<usize>,
+}
+
+impl Loaded<'_> {
+    fn index(&self) -> &prune::Index {
+        self.index.get_or_init(|| prune::Index::build(self.doc, &self.pages, &self.page_nums))
+    }
 }
 
 fn load(doc: &Document) -> Result<Loaded<'_>> {
@@ -115,7 +130,7 @@ fn load(doc: &Document) -> Result<Loaded<'_>> {
     }
     let pages = doc.pages()?;
     let page_nums = pages.iter().map(|p| p.obj_ref.num).collect();
-    Ok(Loaded { doc, pages, page_nums })
+    Ok(Loaded { doc, pages, page_nums, index: OnceCell::new(), size_hint: Cell::new(0) })
 }
 
 /// Catalog entries that name pages by position or hold page references that
@@ -125,15 +140,38 @@ const THREADS: (&str, &str) = ("Threads", "article threads");
 
 /// Write a new file whose pages are `picks`, in that order, from the
 /// documents in `docs`; the catalog is the first document's.
+///
+/// When pages of the first document are left out, its bookmarks, forms and
+/// named destinations are cut down to the pages that stay ([`prune`]). The
+/// other documents bring only their pages: their named destinations are made
+/// explicit and their structure tree links are dropped, because the things
+/// they point into are not copied.
 fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     let base = docs.first().ok_or_else(|| internal("no documents"))?;
     let version = docs.iter().map(|d| d.doc.version()).max().unwrap_or((1, 4));
-    let mut b = Builder::new(version);
+    // The pages of the first document that stay, by object number.
+    let kept: HashSet<u32> =
+        picks.iter().filter(|p| p.doc == 0).filter_map(|p| base.pages.get(p.page)).map(|p| p.obj_ref.num).collect();
+    let subset = kept.len() < base.page_nums.len();
+
+    let mut b = Builder::with_capacity(version, base.size_hint.get());
     let sources: Vec<usize> = docs.iter().map(|d| b.add_source(d.doc, &d.page_nums)).collect();
     let source_of = |i: usize| sources.get(i).copied().ok_or_else(|| internal("unknown document"));
+    for &later in sources.iter().skip(1) {
+        b.resolve_named_destinations(later);
+        b.drop_structure_links(later);
+    }
 
     let catalog_ref = b.reserve()?;
     let pages_ref = b.reserve()?;
+    let mut warnings = Vec::new();
+    let mut catalog = base.doc.catalog()?;
+    catalog.remove("Pages");
+    if subset {
+        let index = base.index();
+        b.exclude_annotations(source_of(0)?, &index.annot_pages, &kept);
+        index.apply(base.doc, &kept, &mut b, source_of(0)?, &mut catalog, &mut warnings);
+    }
 
     // Give every output page its number first, so that a link on one page to
     // another resolves whatever the order of writing.
@@ -147,29 +185,27 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
 
     for (pick, &new) in picks.iter().zip(&out_pages) {
         let page = docs.get(pick.doc).and_then(|d| d.pages.get(pick.page)).ok_or_else(|| internal("bad page"))?;
-        let mut dict = page.dict.clone();
+        let source = source_of(pick.doc)?;
+        let mut dict: Dict = (*page.dict).clone();
         // Article beads lead to threads at the document level (12.4.3); they
         // would pull the rest of the file back in.
         dict.remove("B");
-        dict.remove("Parent");
         dict.set("Type", Object::from("Page"));
-        // 7.7.3.3 Table 30: /Resources and /MediaBox are required. A page with
-        // none (its own or inherited) gets an empty resource dictionary and
-        // US Letter, which is what every reader assumes for it anyway.
-        if !matches!(dict.get("Resources"), Some(Object::Dict(_) | Object::Ref(_))) {
-            dict.set("Resources", Object::Dict(Dict::new()));
-        }
+        // 7.7.3.3 Table 30: /MediaBox is required. A page with none (its own
+        // or inherited) gets US Letter, which is what every reader assumes
+        // for it anyway.
         if page.media_box().is_none() {
             dict.set("MediaBox", Object::Array([0, 0, 612, 792].into_iter().map(Object::Integer).collect()));
         }
+        let Object::Dict(mut dict) = b.import(source, Object::Dict(dict))? else {
+            return Err(internal("a page did not stay a dictionary"));
+        };
+        inherit(&mut b, source, page, &mut dict)?;
         if pick.rotate_by != 0 {
             // 7.7.3.3: a multiple of 90, so keep it in 0..360 and drop zero.
             let turned = page.rotate().saturating_add(pick.rotate_by).rem_euclid(360);
             dict.set("Rotate", if turned == 0 { Object::Null } else { Object::Integer(turned) });
         }
-        let Object::Dict(mut dict) = b.import(source_of(pick.doc)?, Object::Dict(dict))? else {
-            return Err(internal("a page did not stay a dictionary"));
-        };
         dict.set("Parent", Object::Ref(pages_ref));
         b.put(new, &Object::Dict(dict))?;
     }
@@ -182,20 +218,17 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     b.put(pages_ref, &Object::Dict(tree))?;
 
     // The catalog (7.7.2) is the first file's, with the page tree swapped.
-    let mut warnings = Vec::new();
-    let mut catalog = base.doc.catalog()?;
-    catalog.remove("Pages");
     // Page labels are indexed by page position: right only while every page
     // of the first file still sits where it was. Threads hold references to
     // pages, and a thread with pages missing is not a thread.
     let in_place = picks.iter().enumerate().all(|(i, p)| p.doc != 0 || p.page == i);
-    let mut kept = vec![false; base.pages.len()];
+    let mut seen = vec![false; base.pages.len()];
     for p in picks.iter().filter(|p| p.doc == 0) {
-        if let Some(slot) = kept.get_mut(p.page) {
+        if let Some(slot) = seen.get_mut(p.page) {
             *slot = true;
         }
     }
-    let all_kept = kept.iter().all(|&k| k);
+    let all_kept = seen.iter().all(|&k| k);
     for (condition, (key, what)) in [(in_place, LABELS), (all_kept, THREADS)] {
         if !condition && catalog.remove(key).is_some() {
             warnings.push(Warning(format!("{what} were dropped because the pages no longer line up with them")));
@@ -226,8 +259,56 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     };
 
     let (data, more) = b.finish(catalog_ref, info_ref)?;
+    base.size_hint.set(data.len());
     warnings.extend(more);
     Ok(Output { data, warnings, pages: out_pages.len() })
+}
+
+/// Put what `page` inherits from the page tree (7.7.3.4) onto its output
+/// dictionary `dict` (whose references are already output ones): a page taken
+/// out of its tree must carry it. A direct `/Resources` that many pages share
+/// is written once, as an object of its own, and each page refers to it; the
+/// boxes and the rotation are small and are copied.
+fn inherit(b: &mut Builder<'_>, source: usize, page: &Page, dict: &mut Dict) -> Result<()> {
+    if let Some(shared) = page.inherited("Resources") {
+        match shared.object {
+            Object::Ref(r) => {
+                if let Some(new) = b.import_ref(source, *r)? {
+                    dict.set("Resources", Object::Ref(new));
+                }
+            }
+            Object::Dict(_) => {
+                let new = b.import_shared(source, shared.id, shared.object)?;
+                dict.set("Resources", Object::Ref(new));
+            }
+            _ => {}
+        }
+    }
+    // 7.7.3.3 Table 30: /Resources is required. An empty dictionary is what
+    // every reader assumes for a page that has none.
+    if !matches!(dict.get("Resources"), Some(Object::Dict(_) | Object::Ref(_))) {
+        dict.set("Resources", Object::Dict(Dict::new()));
+    }
+    if !dict.contains_key("MediaBox") && page.media_box().is_some() {
+        copy_inherited(page, dict, "MediaBox");
+    }
+    if !dict.contains_key("CropBox") && page.crop_box().is_some() {
+        copy_inherited(page, dict, "CropBox");
+    }
+    if !dict.contains_key("Rotate") {
+        copy_inherited(page, dict, "Rotate");
+    }
+    Ok(())
+}
+
+/// The value of an inherited box or rotation, references followed, if the
+/// page gets one and it is a plausible one: four numbers, or a number.
+fn copy_inherited(page: &Page, dict: &mut Dict, key: &str) {
+    match page.inherited_resolved(key) {
+        Some(value @ Object::Array(items)) if key != "Rotate" && items.len() == 4 => dict.set(key, value.clone()),
+        Some(value @ (Object::Integer(_) | Object::Real(_))) if key == "Rotate" => dict.set(key, value.clone()),
+        _ => {}
+    }
 }
 
 fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
@@ -284,6 +365,25 @@ pub fn rotate_pages(doc: &Document, pages: &[usize], angle: i64) -> Result<Outpu
     build(&[d], &picks)
 }
 
+/// How much of a document `split_every` keeps parsed while it works.
+const SPLIT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Turns the document's object cache on, and off again when it goes away.
+struct ObjectCacheGuard<'a>(&'a Document);
+
+impl<'a> ObjectCacheGuard<'a> {
+    fn new(doc: &'a Document) -> Self {
+        doc.cache_objects(SPLIT_CACHE_BYTES);
+        ObjectCacheGuard(doc)
+    }
+}
+
+impl Drop for ObjectCacheGuard<'_> {
+    fn drop(&mut self) {
+        self.0.cache_objects(0);
+    }
+}
+
 /// How many files `split_every` makes for `page_count` pages.
 pub fn chunk_count(page_count: usize, every: usize) -> usize {
     if every == 0 { 0 } else { page_count.div_ceil(every) }
@@ -305,6 +405,9 @@ pub fn split_every(
     if count == 0 {
         return Err(Error::Invalid("the document has no pages".to_string()));
     }
+    // Every file takes the shared fonts and resources again: parse each of
+    // those objects once, not once per file.
+    let _cache = ObjectCacheGuard::new(doc);
     let mut warnings: Vec<Warning> = Vec::new();
     for (i, start) in (0..count).step_by(every).enumerate() {
         let end = start.saturating_add(every).min(count);
@@ -415,6 +518,13 @@ pub struct ImageInput<'a> {
     pub data: &'a [u8],
 }
 
+/// An image file as [`images_to_pdf_with`] asks for it: read when it is its
+/// turn, and dropped before the next one is read.
+pub struct LoadedImage<'a> {
+    pub name: String,
+    pub data: std::borrow::Cow<'a, [u8]>,
+}
+
 /// A number for a content stream: short, never an exponent, no negative zero.
 fn content_number(v: f64) -> String {
     let rounded = (v * 100_000.0).round() / 100_000.0;
@@ -425,29 +535,50 @@ fn content_number(v: f64) -> String {
 /// (`DCTDecode`); PNG files are decoded and stored with Flate, transparency as
 /// a soft mask. See [`PageMode`] for the page size.
 pub fn images_to_pdf(images: &[ImageInput<'_>], mode: PageMode) -> Result<Output> {
-    if images.is_empty() {
+    images_to_pdf_with(
+        images.len(),
+        &mut |i| {
+            let img = images.get(i).ok_or_else(|| internal("unknown image"))?;
+            Ok(LoadedImage { name: img.name.to_string(), data: std::borrow::Cow::Borrowed(img.data) })
+        },
+        mode,
+    )
+}
+
+/// [`images_to_pdf`] for `count` images that are fetched one at a time with
+/// `load` (called with 0, 1, ... in order): only the image being worked on is
+/// in memory next to the output.
+pub fn images_to_pdf_with<'a>(
+    count: usize,
+    load: &mut dyn FnMut(usize) -> Result<LoadedImage<'a>>,
+    mode: PageMode,
+) -> Result<Output> {
+    if count == 0 {
         return Err(Error::Invalid("no images given".to_string()));
     }
     // SMask needs PDF 1.4 (11.6.5.2).
     let mut b = Builder::new((1, 4));
     let catalog_ref = b.reserve()?;
     let pages_ref = b.reserve()?;
-    let mut kids = Vec::with_capacity(images.len());
-    for img in images {
+    let mut kids = Vec::with_capacity(count);
+    for index in 0..count {
+        let img = load(index)?;
         let named = |e: Error| match e {
             Error::Invalid(m) => Error::Invalid(format!("{}: {m}", img.name)),
             other => other,
         };
-        let (xobject, placement) = match image::sniff(img.data) {
+        let data: &[u8] = &img.data;
+        let (xobject, placement) = match image::sniff(data) {
             Some(Format::Jpeg) => {
-                let info = image::parse_jpeg(img.data).map_err(named)?;
-                let xobject = image::add_jpeg(&mut b, img.data, &info)?;
+                let info = image::parse_jpeg(data).map_err(named)?;
+                let xobject = image::add_jpeg(&mut b, data, &info)?;
                 (xobject, image::place(info.width, info.height, info.orientation, info.dpi, mode))
             }
             Some(Format::Png) => {
-                let png = image::decode_png(img.data).map_err(named)?;
-                let xobject = image::add_png(&mut b, &png)?;
-                (xobject, image::place(png.width, png.height, 1, png.dpi, mode))
+                let png = image::decode_png(data).map_err(named)?;
+                let (width, height, dpi) = (png.width, png.height, png.dpi);
+                let xobject = image::add_png(&mut b, png)?;
+                (xobject, image::place(width, height, 1, dpi, mode))
             }
             None => {
                 return Err(Error::Invalid(format!("{}: not a JPEG or PNG file", img.name)));
@@ -479,16 +610,16 @@ pub fn images_to_pdf(images: &[ImageInput<'_>], mode: PageMode) -> Result<Output
     }
     let mut tree = Dict::new();
     tree.set("Type", Object::from("Pages"));
-    let count = i64::try_from(kids.len()).unwrap_or(i64::MAX);
+    let kids_len = kids.len();
     tree.set("Kids", Object::Array(kids));
-    tree.set("Count", Object::Integer(count));
+    tree.set("Count", Object::Integer(i64::try_from(kids_len).unwrap_or(i64::MAX)));
     b.put(pages_ref, &Object::Dict(tree))?;
     let mut catalog = Dict::new();
     catalog.set("Type", Object::from("Catalog"));
     catalog.set("Pages", Object::Ref(pages_ref));
     b.put(catalog_ref, &Object::Dict(catalog))?;
     let (data, warnings) = b.finish(catalog_ref, None)?;
-    Ok(Output { data, warnings, pages: images.len() })
+    Ok(Output { data, warnings, pages: kids_len })
 }
 
 #[cfg(test)]
@@ -549,7 +680,7 @@ mod tests {
     }
 
     fn page_dicts(doc: &Document) -> Vec<Dict> {
-        doc.pages().unwrap().into_iter().map(|p| p.dict).collect()
+        doc.pages().unwrap().into_iter().map(|p| (*p.dict).clone()).collect()
     }
 
     // --- page ranges ------------------------------------------------------------
@@ -659,7 +790,8 @@ mod tests {
         assert!(!contains(&out.data, "PAGE-THREE-REMOVED"));
         assert!(!contains(&out.data, "PAGETREE-MARKER"));
         assert!(contains(&out.data, "PAGE-ONE") && contains(&out.data, "PAGE-TWO"));
-        let doc = open(out.data);
+        assert!(!contains(&out.data, "To page 3"));
+        let doc = open(out.data.clone());
         let pages = doc.pages().unwrap();
         assert_eq!(pages.len(), 2);
         // A link to the removed page: the page slot is null; the other link is fine.
@@ -673,13 +805,18 @@ mod tests {
         // The annotation's /P still names the page it is on.
         let a = obj(&doc, annots[0].as_obj_ref().unwrap());
         assert_eq!(a.get("P"), Some(&Object::Ref(pages[0].obj_ref)));
-        // The bookmark and the named destination for the removed page are null too.
+        // The bookmark and the named destination for the removed page are gone;
+        // the other bookmark stays, alone, with its links and count made right.
         let catalog = doc.catalog().unwrap();
-        let named = doc.resolve(catalog.get("Dests").unwrap()).unwrap();
-        assert_eq!(
-            named.as_dict().unwrap().get("Three"),
-            Some(&Object::Array(vec![Object::Null, Object::from("Fit")]))
-        );
+        assert!(!catalog.contains_key("Dests"));
+        let outlines = doc.resolve(catalog.get("Outlines").unwrap()).unwrap();
+        let outlines = outlines.as_dict().unwrap();
+        assert_eq!(outlines.get_int("Count"), Some(1));
+        let first = outlines.get("First").and_then(Object::as_obj_ref).unwrap();
+        assert_eq!(outlines.get("Last").and_then(Object::as_obj_ref), Some(first));
+        let item = obj(&doc, first);
+        assert_eq!(item.get("Dest"), Some(&Object::Array(vec![Object::Ref(pages[1].obj_ref), Object::from("Fit")])));
+        assert!(!item.contains_key("Next") && !item.contains_key("Prev"));
         // Beads were dropped from the page; the thread list went with the page.
         assert!(!catalog.contains_key("Threads"));
         assert!(out.warnings.iter().any(|w| w.0.contains("article threads")), "{:?}", out.warnings);
@@ -1179,5 +1316,148 @@ mod tests {
         };
         assert!(m.contains("bad.png"), "{m}");
         assert!(images_to_pdf(&[], PageMode::A4).is_err());
+    }
+
+    // --- named destinations of later files, structure links, shared resources, /ID ----------
+
+    /// A two-page file with a name tree entry `target` for its page `target_page`
+    /// (1 or 2) and a link on page 1 for each way of naming a destination.
+    fn linked(target_page: u32, with_links: bool, struct_parents: bool) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.obj(
+            1,
+            &format!(
+                "<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [(target) [{} 0 R /Fit]] >> >> \
+                 /Dests << /Old [3 0 R /Fit] >> >>",
+                2 + target_page
+            ),
+        );
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 9 9] >>");
+        let annots = if with_links { "/Annots [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R]" } else { "" };
+        let sp = if struct_parents { "/StructParents 5" } else { "" };
+        b.obj(3, &format!("<< /Type /Page /Parent 2 0 R {annots} {sp} >>"));
+        b.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        let link = |extra: &str| format!("<< /Type /Annot /Subtype /Link /Rect [0 0 1 1] {extra} /StructParent 7 >>");
+        b.obj(5, &link("/Dest (target)"));
+        b.obj(6, &link("/A << /S /GoTo /D (target) >>"));
+        b.obj(7, &link("/Dest /Old"));
+        b.obj(8, &link("/Dest (nothing)"));
+        b.obj(9, &link("/A << /S /GoTo /D (nothing) >>"));
+        b.obj(10, &link("/A << /S /URI /URI (http://example.com) >>"));
+        b.finish_classic(11, "/Root 1 0 R")
+    }
+
+    #[test]
+    fn named_destinations_of_a_later_file_are_resolved_through_its_own_tree() {
+        // Both files call a destination `target`: in the first it is its page
+        // 1, in the second its page 2. The second file's links must go to
+        // the second file's page 2, not to the first file's page 1.
+        let first = open(linked(1, false, false));
+        let second = open(linked(2, true, false));
+        let out = merge(&[Input { name: "a.pdf", doc: &first }, Input { name: "b.pdf", doc: &second }]).unwrap();
+        let doc = open(out.data);
+        let pages = doc.pages().unwrap();
+        assert_eq!(pages.len(), 4);
+        let annots = pages[2].dict.get("Annots").and_then(Object::as_array).unwrap().to_vec();
+        assert_eq!(annots.len(), 6);
+        let annot = |i: usize| obj(&doc, annots[i].as_obj_ref().unwrap());
+        let fit = |page: usize| Object::Array(vec![Object::Ref(pages[page].obj_ref), Object::from("Fit")]);
+        // /Dest given as a string, through the name tree.
+        assert_eq!(annot(0).get("Dest"), Some(&fit(3)));
+        // A go-to action.
+        let action = doc.resolve(annot(1).get("A").unwrap()).unwrap();
+        assert_eq!(action.as_dict().unwrap().get("D"), Some(&fit(3)));
+        // /Dest given as a name, through the old dictionary: page 1 of the second file.
+        assert_eq!(annot(2).get("Dest"), Some(&fit(2)));
+        // A name nobody knows: no destination, and a go-to action with none is gone.
+        assert!(!annot(3).contains_key("Dest"));
+        assert!(!annot(4).contains_key("A"));
+        // Other actions are left alone.
+        let uri = doc.resolve(annot(5).get("A").unwrap()).unwrap();
+        assert!(uri.as_dict().unwrap().contains_key("URI"));
+        // The first file's own name tree is the output's, and still means its page 1.
+        let names = crate::dests::NamedDests::load(&doc);
+        let target = names.lookup(&doc, b"target", false).unwrap();
+        assert_eq!(target.first(), Some(&Object::Ref(pages[0].obj_ref)));
+        // Merging a file with itself: the second copy's links stay in the second copy.
+        let one = open(linked(2, true, false));
+        let out = merge(&[Input { name: "a", doc: &one }, Input { name: "a again", doc: &one }]).unwrap();
+        let doc = open(out.data);
+        let pages = doc.pages().unwrap();
+        let second_annots = pages[2].dict.get("Annots").and_then(Object::as_array).unwrap().to_vec();
+        let a = obj(&doc, second_annots[0].as_obj_ref().unwrap());
+        assert_eq!(a.get("Dest"), Some(&Object::Array(vec![Object::Ref(pages[3].obj_ref), Object::from("Fit")])));
+        // And the first copy's links (through the base's tree) are in the first copy.
+        let first_annots = pages[0].dict.get("Annots").and_then(Object::as_array).unwrap().to_vec();
+        let a = obj(&doc, first_annots[0].as_obj_ref().unwrap());
+        assert!(matches!(a.get("Dest"), Some(Object::String(_))), "the base keeps its own, named, links");
+    }
+
+    #[test]
+    fn structure_links_of_later_files_are_dropped_and_the_bases_are_kept() {
+        let first = open(linked(1, true, true));
+        let second = open(linked(2, true, true));
+        let out = merge(&[Input { name: "a.pdf", doc: &first }, Input { name: "b.pdf", doc: &second }]).unwrap();
+        let doc = open(out.data);
+        let pages = doc.pages().unwrap();
+        assert_eq!(pages[0].dict.get_int("StructParents"), Some(5));
+        assert!(!pages[2].dict.contains_key("StructParents"));
+        let first_annot = obj(&doc, pages[0].dict.get("Annots").and_then(Object::as_array).unwrap()[0].as_obj_ref().unwrap());
+        assert_eq!(first_annot.get_int("StructParent"), Some(7));
+        let second_annot = obj(&doc, pages[2].dict.get("Annots").and_then(Object::as_array).unwrap()[0].as_obj_ref().unwrap());
+        assert!(!second_annot.contains_key("StructParent"));
+    }
+
+    #[test]
+    fn a_resources_dictionary_shared_through_the_page_tree_is_written_once() {
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids: String = (0..50).map(|i| format!("{} 0 R ", 3 + i)).collect();
+        b.obj(
+            2,
+            &format!(
+                "<< /Type /Pages /Kids [{kids}] /Count 50 /MediaBox [0 0 9 9] /CropBox [1 1 8 8] /Rotate 90 \
+                 /Resources << /Marker (SHARED-RESOURCES-MARKER) /Font << /F1 100 0 R >> >> >>"
+            ),
+        );
+        for i in 0..50 {
+            b.obj(3 + i, "<< /Type /Page /Parent 2 0 R >>");
+        }
+        b.obj(100, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let src = open(b.finish_classic(101, "/Root 1 0 R"));
+        for out in [copy_all(&src).unwrap(), rotate_pages(&src, &[0], 90).unwrap(), delete_pages(&src, &[3]).unwrap()] {
+            assert_eq!(out.data.windows(24).filter(|w| *w == b"SHARED-RESOURCES-MARKER)").count(), 1);
+            let doc = open(out.data);
+            let pages = doc.pages().unwrap();
+            let resources: Vec<&Object> = pages.iter().map(|p| p.dict.get("Resources").unwrap()).collect();
+            assert!(matches!(resources[0], Object::Ref(_)));
+            assert!(resources.iter().all(|r| *r == resources[0]), "every page refers to the same object");
+            // The boxes and the rotation are still there, on every page.
+            assert!(pages.iter().all(|p| p.media_box() == Some([0.0, 0.0, 9.0, 9.0]) && p.crop_box() == Some([1.0, 1.0, 8.0, 8.0])));
+            assert_eq!(pages[1].rotate(), 90);
+        }
+    }
+
+    #[test]
+    fn every_output_has_a_file_identifier_that_is_the_same_for_the_same_output() {
+        let src = open(three_pages());
+        let a = copy_all(&src).unwrap();
+        let b = copy_all(&src).unwrap();
+        assert_eq!(a.data, b.data, "the same input gives the same bytes, identifier included");
+        let doc = open(a.data.clone());
+        let Some(Object::Array(id)) = doc.trailer().get("ID") else { panic!("no /ID") };
+        assert_eq!(id.len(), 2);
+        let (Object::String(first), Object::String(second)) = (&id[0], &id[1]) else { panic!() };
+        assert_eq!(first.bytes.len(), 16);
+        assert_eq!(first.bytes, second.bytes, "14.4: both are the same for a new file");
+        // A different output has a different identifier.
+        let other = extract_pages(&src, &[0]).unwrap();
+        let doc2 = open(other.data);
+        let Some(Object::Array(id2)) = doc2.trailer().get("ID") else { panic!() };
+        assert_ne!(id2[0], id[0]);
+        // Images and merged files get one too.
+        let jpeg = tiny_jpeg(4, 4, &[]);
+        let img = images_to_pdf(&[ImageInput { name: "a.jpg", data: &jpeg }], PageMode::A4).unwrap();
+        assert!(open(img.data).trailer().contains_key("ID"));
     }
 }

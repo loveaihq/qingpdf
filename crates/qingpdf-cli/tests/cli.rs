@@ -46,8 +46,9 @@ fn jpegs() -> Vec<PathBuf> {
     v
 }
 
+/// A file of the public corpus; the test fails if it is not there.
 fn corpus(rel: &str) -> PathBuf {
-    common::corpus_root().join("public").join(rel)
+    common::public_file(rel)
 }
 
 /// Make a PDF with one page per fixture JPEG (7 pages) using the tool itself.
@@ -115,6 +116,94 @@ fn wrong_command_lines_exit_with_2() {
         assert!(stdout(&out).is_empty(), "{args:?}");
     }
     assert!(!a.exists());
+}
+
+// --- review findings ------------------------------------------------------------------------
+
+/// Another name for the input's data (a hard link) must not be written into.
+#[test]
+fn an_output_that_is_a_hard_link_of_an_input_leaves_the_input_alone() {
+    let dir = common::fresh_out_dir("cli-hardlink");
+    let input = dir.join("in.pdf");
+    make_seven_page_pdf(&input);
+    let before = std::fs::read(&input).expect("read");
+    let link = dir.join("link.pdf");
+    std::fs::hard_link(&input, &link).expect("this file system cannot make a hard link");
+    // The names differ, so the same-file check lets it through with --force.
+    let out = run([OsStr::new("rotate"), input.as_os_str(), "--angle".as_ref(), "90".as_ref(), "-o".as_ref(), link.as_os_str(), "--force".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(std::fs::read(&input).expect("read"), before, "the input was written into through its hard link");
+    let after = std::fs::read(&link).expect("read");
+    assert_ne!(after, before, "the output is the rotated file");
+    assert_eq!(page_count_of(&link), 7);
+    // Splitting into files named like the link does the same.
+    let template = dir.join("part_%d.pdf");
+    let first = dir.join("part_1.pdf");
+    std::fs::hard_link(&input, &first).expect("hard link");
+    let out = run([OsStr::new("split"), input.as_os_str(), "--every".as_ref(), "3".as_ref(), "-o".as_ref(), template.as_os_str(), "--force".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(std::fs::read(&input).expect("read"), before);
+    assert_eq!(page_count_of(&first), 3);
+    // No temporary file is left behind.
+    let leftovers: Vec<String> = std::fs::read_dir(&dir)
+        .expect("dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A name that cannot be written leaves no half-written file and says why.
+#[test]
+fn a_failing_write_leaves_nothing_behind() {
+    let dir = common::fresh_out_dir("cli-write-fails");
+    let input = dir.join("in.pdf");
+    make_seven_page_pdf(&input);
+    let out = run([OsStr::new("rotate"), input.as_os_str(), "--angle".as_ref(), "90".as_ref(), "-o".as_ref(), dir.join("no such folder").join("o.pdf").as_os_str()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("cannot write"), "{}", stderr(&out));
+}
+
+/// Control characters that come from a file are written out, not sent: the
+/// escape that starts a terminal command is the worst of them.
+#[test]
+fn control_characters_from_a_file_do_not_reach_the_terminal() {
+    let dir = common::fresh_out_dir("cli-escape");
+    // A file with a proper cross-reference table, whose object 4 cannot be read:
+    // it is a keyword with an escape and a bell in it.
+    let bodies: [&[u8]; 4] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 10 10] >>",
+        b"<< /Type /Page /Parent 2 0 R /Foo 4 0 R >>",
+        b"\x1bZZ\x07Q",
+    ];
+    let mut pdf: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for o in &offsets {
+        pdf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    let input = dir.join("esc.pdf");
+    std::fs::write(&input, &pdf).expect("write");
+    let o = dir.join("o.pdf");
+    let out = run([OsStr::new("rotate"), input.as_os_str(), "--angle".as_ref(), "90".as_ref(), "-o".as_ref(), o.as_os_str()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let raw = &out.stderr;
+    assert!(
+        raw.iter().all(|&b| b == b'\n' || (b >= 0x20 && b != 0x7f)),
+        "a control character was printed: {:?}",
+        String::from_utf8_lossy(raw)
+    );
+    assert!(stderr(&out).contains("\\x1bZZ\\x07Q"), "{}", stderr(&out));
 }
 
 // --- the commands ----------------------------------------------------------------------------
@@ -340,10 +429,6 @@ fn errors_give_exit_code_1_and_a_clear_message() {
 #[test]
 fn encrypted_files_are_refused_clearly_but_info_still_reports() {
     let encrypted = corpus("encrypted/encrypted_hello_world_r2.pdf");
-    if !encrypted.exists() {
-        println!("SKIPPED: corpus file not found");
-        return;
-    }
     let dir = common::fresh_out_dir("cli-encrypted");
     let o = dir.join("o.pdf");
     let seven = dir.join("seven.pdf");
@@ -375,10 +460,6 @@ fn encrypted_files_are_refused_clearly_but_info_still_reports() {
 #[test]
 fn info_says_when_a_file_was_repaired() {
     let damaged = corpus("damaged/xref_command_missing.pdf");
-    if !damaged.exists() {
-        println!("SKIPPED: corpus file not found");
-        return;
-    }
     let out = run([OsStr::new("info"), damaged.as_os_str()]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(stdout(&out).contains("Repaired:            yes"), "{}", stdout(&out));
@@ -388,10 +469,6 @@ fn info_says_when_a_file_was_repaired() {
 fn merge_says_what_it_could_not_carry_over() {
     let with_bookmarks = corpus("outline-form-attach/bookmarks.pdf");
     let with_form = corpus("outline-form-attach/multiple_form_types.pdf");
-    if !with_bookmarks.exists() || !with_form.exists() {
-        println!("SKIPPED: corpus files not found");
-        return;
-    }
     let dir = common::fresh_out_dir("cli-merge-warnings");
     let o = dir.join("o.pdf");
     // The second file's form is not carried over: a warning on stderr, exit 0.

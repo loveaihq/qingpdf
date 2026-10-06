@@ -2,17 +2,17 @@
 //! tree.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::error::{Error, Result};
-use crate::filter;
+use crate::filter::{self, DecodeBudget, MAX_DECODED_SIZE, MAX_OBJSTM_DECODED};
 use crate::lexer::find_bytes;
 use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::parser::{EndstreamIndex, Parser, StreamHelper};
-use crate::repair;
-use crate::xref::{self, ObjStm, XrefEntry};
+use crate::repair::{self, Unopened};
+use crate::xref::{self, ObjStm, XrefEntry, XrefTable};
 
 /// Longest chain of `n g R` references `resolve` will follow.
 const MAX_REF_CHAIN: usize = 32;
@@ -21,13 +21,28 @@ const MAX_REF_CHAIN: usize = 32;
 const MAX_NESTED_LOADS: u32 = 8;
 /// Deepest page tree accepted (7.7.3).
 const MAX_PAGE_TREE_DEPTH: usize = 256;
-/// Cap on the total size of inherited attributes copied into pages, so a
-/// hostile tree cannot multiply one huge `/Resources` across many pages.
-const MAX_INHERITED_COPY_WEIGHT: usize = 1 << 26;
+/// Most pages one document may have once shared subtrees and repeated pages
+/// are expanded.
+pub const MAX_PAGES: usize = 1_000_000;
+/// Most page tree entries looked at in all. Repeats are expanded, so a tree
+/// that lists a node ten times at each of ten levels would otherwise be
+/// ten billion visits.
+const MAX_PAGE_TREE_VISITS: usize = 2_000_000;
+/// Cap on the total size of the page dictionaries that are met again (a page
+/// listed several times), so a hostile tree cannot make one huge page count
+/// many times over.
+const MAX_REPEATED_WEIGHT: usize = 1 << 26;
+/// Decoded object streams are kept for reuse up to this many bytes in all;
+/// the oldest are dropped first.
+const OBJSTM_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// The header must start within this many bytes of the beginning of the file.
 const HEADER_WINDOW: usize = 1024;
 /// Page attributes a page inherits from its ancestors (7.7.3.4, Table 30).
 const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
+const RESOURCES: usize = 0;
+const MEDIA_BOX: usize = 1;
+const CROP_BOX: usize = 2;
+const ROTATE: usize = 3;
 
 /// An open PDF file, held completely in memory. Objects are parsed when they
 /// are first asked for.
@@ -35,10 +50,14 @@ pub struct Document {
     data: Vec<u8>,
     header_version: (u8, u8),
     trailer: Dict,
-    xref: RefCell<HashMap<u32, XrefEntry>>,
-    /// Decoded object streams (7.5.7), each decoded once. A stream that failed
-    /// to decode is remembered as failed.
-    objstms: RefCell<HashMap<u32, std::result::Result<Rc<ObjStm>, Error>>>,
+    xref: RefCell<XrefTable>,
+    /// Decoded object streams (7.5.7), each decoded once while it stays in
+    /// the cache. A stream that failed to decode is remembered as failed.
+    objstms: RefCell<ObjStmCache>,
+    /// What is left of the decoding work this document may cause.
+    budget: DecodeBudget,
+    /// Parsed objects kept for reuse, when asked for ([`Document::cache_objects`]).
+    cache: RefCell<ObjectCache>,
     endstreams: EndstreamIndex,
     repaired: Cell<bool>,
     repair_attempted: Cell<bool>,
@@ -46,41 +65,164 @@ pub struct Document {
     repair_allowed: Cell<bool>,
     uses_xref_streams: Cell<bool>,
     nesting: Cell<u32>,
-    /// After a rebuild: the reason some object stream could not be opened
-    /// (an unsupported filter). Objects that should be inside it are not in
-    /// the table, so an object missing from the table is "unsupported", not
-    /// "absent".
-    unreadable: RefCell<Option<String>>,
+    /// After a rebuild: the reason some object stream could not be opened (an
+    /// unsupported filter, or too big). Objects that should be inside it are
+    /// not in the table, so an object missing from the table is "unsupported"
+    /// or "over the limit", not "absent".
+    unreadable: RefCell<Unopened>,
 }
 
-/// One page, with the inheritable attributes of its ancestors copied in.
+/// One inheritable value as written, and with the references in it followed
+/// (for `/MediaBox`, `/CropBox` and `/Rotate`, which may be written
+/// indirectly, also inside the array).
+#[derive(Debug, Clone, PartialEq)]
+struct Attr {
+    raw: Object,
+    resolved: Object,
+}
+
+/// The inheritable attributes in force at some point of the page tree, in the
+/// order of [`INHERITABLE`]. Shared: a page tree node's values are made once
+/// and every page below it points at them, so a big `/Resources` on the root
+/// is not copied into every page.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Inherited([Option<Rc<Attr>>; 4]);
+
+impl Inherited {
+    /// What the kids of a node inherit: its own values over ours.
+    fn with_overrides(&self, own: &[Option<Rc<Attr>>; 4]) -> Inherited {
+        let mut out = self.clone();
+        for (slot, mine) in out.0.iter_mut().zip(own) {
+            if mine.is_some() {
+                slot.clone_from(mine);
+            }
+        }
+        out
+    }
+}
+
+/// What a walk of the page tree may spend.
+#[derive(Debug, Clone, Copy)]
+struct TreeLimits {
+    pages: usize,
+    visits: usize,
+    repeated_weight: usize,
+}
+
+const TREE_LIMITS: TreeLimits =
+    TreeLimits { pages: MAX_PAGES, visits: MAX_PAGE_TREE_VISITS, repeated_weight: MAX_REPEATED_WEIGHT };
+
+/// A page inherited value, with something to tell two of them apart.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedAttr<'a> {
+    /// The value as written in the page tree node it comes from.
+    pub object: &'a Object,
+    /// Same for every page that inherits this very value (an address that
+    /// stays put as long as the pages are alive).
+    pub id: usize,
+}
+
+/// The parts of a page that are looked at often, with the page tree's
+/// inheritance applied and references followed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Boxes {
+    media: Option<[f64; 4]>,
+    crop: Option<[f64; 4]>,
+    rotate: i64,
+}
+
+/// One page.
+///
+/// The page keeps its own dictionary and, apart from that, points at the
+/// values it inherits from the page tree (7.7.3.4): the accessors
+/// [`Page::resources`], [`Page::media_box`], [`Page::crop_box`] and
+/// [`Page::rotate`] give the value in force, the page's own or inherited.
+/// Nothing inherited is copied into the page, so a document in which a
+/// thousand pages inherit one large `/Resources` holds it once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Page {
     pub obj_ref: ObjRef,
-    /// The page dictionary with `/Resources`, `/MediaBox`, `/CropBox` and
-    /// `/Rotate` filled in from the page tree where the page does not have its
-    /// own (7.7.3.4), and without `/Parent`. `/MediaBox`, `/CropBox` and
-    /// `/Rotate` are stored as direct objects.
-    pub dict: Dict,
+    /// The page's own dictionary, without `/Parent`. It has only what the
+    /// page itself says: inheritable entries (`/Resources`, `/MediaBox`,
+    /// `/CropBox`, `/Rotate`) that come from the page tree are not in it.
+    /// Shared between the entries of a page that is listed more than once.
+    pub dict: Rc<Dict>,
+    inherited: Inherited,
+    boxes: Boxes,
 }
 
 impl Page {
+    /// A page that inherits nothing, from its own dictionary alone (references
+    /// in `/MediaBox`, `/CropBox` and `/Rotate` are not followed).
+    pub fn new(obj_ref: ObjRef, dict: Dict) -> Page {
+        let boxes = Boxes {
+            media: rectangle(dict.get("MediaBox")),
+            crop: rectangle(dict.get("CropBox")),
+            rotate: rotation(dict.get("Rotate")),
+        };
+        Page { obj_ref, dict: Rc::new(dict), inherited: Inherited::default(), boxes }
+    }
+
+    /// `/Resources` in force: the page's own, else the nearest ancestor's, as
+    /// written (a dictionary or a reference to one). 7.7.3.4.
+    pub fn resources(&self) -> Option<&Object> {
+        self.dict.get("Resources").or_else(|| self.inherited_slot(RESOURCES).map(|a| &a.raw))
+    }
+
     /// `/MediaBox` as `[llx, lly, urx, ury]`, normalised so that the first
-    /// corner is the lower left (7.9.5).
+    /// corner is the lower left (7.9.5). `None` if there is none or it is not
+    /// four numbers.
     pub fn media_box(&self) -> Option<[f64; 4]> {
-        rectangle(self.dict.get("MediaBox"))
+        self.boxes.media
+    }
+
+    /// `/CropBox`, the same way. 7.7.3.3 Table 30.
+    pub fn crop_box(&self) -> Option<[f64; 4]> {
+        self.boxes.crop
     }
 
     /// `/Rotate` in degrees clockwise: 0, 90, 180 or 270 (7.7.3.3, Table 30).
     pub fn rotate(&self) -> i64 {
-        let raw = match self.dict.get("Rotate") {
-            Some(Object::Integer(i)) => *i,
-            Some(Object::Real(r)) if r.is_finite() => r.round() as i64,
-            _ => 0,
-        };
-        let degrees = raw.rem_euclid(360);
-        degrees - degrees % 90
+        self.boxes.rotate
     }
+
+    fn inherited_slot(&self, index: usize) -> Option<&Rc<Attr>> {
+        self.inherited.0.get(index)?.as_ref()
+    }
+
+    /// The value of an inheritable attribute (`/Resources`, `/MediaBox`,
+    /// `/CropBox`, `/Rotate`) that this page gets from the page tree because
+    /// its own dictionary does not have it, if there is one.
+    pub fn inherited(&self, key: &str) -> Option<SharedAttr<'_>> {
+        if self.dict.contains_key(key) {
+            return None;
+        }
+        let index = INHERITABLE.iter().position(|k| *k == key)?;
+        let attr = self.inherited_slot(index)?;
+        Some(SharedAttr { object: &attr.raw, id: Rc::as_ptr(attr) as usize })
+    }
+
+    /// Like [`Page::inherited`], with the references followed (only
+    /// meaningful for `/MediaBox`, `/CropBox` and `/Rotate`).
+    pub fn inherited_resolved(&self, key: &str) -> Option<&Object> {
+        if self.dict.contains_key(key) {
+            return None;
+        }
+        let index = INHERITABLE.iter().position(|k| *k == key)?;
+        self.inherited_slot(index).map(|a| &a.resolved)
+    }
+}
+
+/// `/Rotate` as 0, 90, 180 or 270: the value modulo 360, rounded down to a
+/// multiple of 90. Missing or not a number: 0. A real is rounded.
+fn rotation(obj: Option<&Object>) -> i64 {
+    let raw = match obj {
+        Some(Object::Integer(i)) => *i,
+        Some(Object::Real(r)) if r.is_finite() => r.round() as i64,
+        _ => 0,
+    };
+    let degrees = raw.rem_euclid(360);
+    degrees - degrees % 90
 }
 
 pub(crate) fn rectangle(obj: Option<&Object>) -> Option<[f64; 4]> {
@@ -126,6 +268,85 @@ fn copy_error(e: &Error) -> Error {
     }
 }
 
+/// Decoded object streams that are kept for reuse: at most
+/// [`OBJSTM_CACHE_BYTES`] of decoded data, the oldest dropped first. A failure
+/// is kept too (it weighs next to nothing), so a broken stream is not decoded
+/// again for every object that lives in it.
+#[derive(Default)]
+struct ObjStmCache {
+    map: HashMap<u32, (std::result::Result<Rc<ObjStm>, Error>, usize)>,
+    order: VecDeque<u32>,
+    bytes: usize,
+}
+
+impl ObjStmCache {
+    fn get(&self, num: u32) -> Option<Result<Rc<ObjStm>>> {
+        self.map.get(&num).map(|(r, _)| match r {
+            Ok(stm) => Ok(Rc::clone(stm)),
+            Err(e) => Err(copy_error(e)),
+        })
+    }
+
+    fn insert(&mut self, num: u32, result: &Result<Rc<ObjStm>>) {
+        let weight = match result {
+            Ok(stm) => stm.weight(),
+            Err(_) => 64,
+        };
+        while self.bytes.saturating_add(weight) > OBJSTM_CACHE_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some((_, w)) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(w);
+            }
+        }
+        let stored = match result {
+            Ok(stm) => Ok(Rc::clone(stm)),
+            Err(e) => Err(copy_error(e)),
+        };
+        if let Some((_, old)) = self.map.insert(num, (stored, weight)) {
+            // Cannot happen (callers look first), but keep the books straight.
+            self.bytes = self.bytes.saturating_sub(old);
+        } else {
+            self.order.push_back(num);
+        }
+        self.bytes = self.bytes.saturating_add(weight);
+    }
+
+    fn clear(&mut self) {
+        *self = ObjStmCache::default();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Parsed objects kept by object number, until `budget` bytes are used.
+#[derive(Default)]
+struct ObjectCache {
+    map: HashMap<u32, Object>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl ObjectCache {
+    fn remember(&mut self, num: u32, object: &Object) {
+        if self.budget == 0 {
+            return;
+        }
+        let size = match object {
+            Object::Stream(s) => s.data.len().saturating_add(dict_weight(&s.dict).saturating_mul(32)),
+            other => weight(other).saturating_mul(32),
+        };
+        if self.bytes.saturating_add(size) <= self.budget {
+            self.bytes += size;
+            self.map.insert(num, object.clone());
+        }
+    }
+}
+
 fn encrypted_error() -> Error {
     Error::Unsupported("encrypted PDF".to_string())
 }
@@ -165,10 +386,13 @@ impl Document {
             data.drain(..p);
         }
         let version = header_version(&data);
+        // One budget for everything the document makes the decoder do, from
+        // the first cross-reference stream on.
+        let budget = DecodeBudget::default();
 
-        let first_error = match xref::read_xref(&data) {
+        let first_error = match xref::read_xref_budgeted(&data, &budget) {
             Ok(x) => {
-                let doc = Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false);
+                let doc = Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false, budget);
                 doc.repair_allowed.set(false);
                 let checked = doc.validate();
                 doc.repair_allowed.set(true);
@@ -179,32 +403,45 @@ impl Document {
                     Err(e @ Error::Unsupported(_)) => return Err(e),
                     Err(e) => {
                         data = doc.data;
-                        e
+                        return Document::open_after_rebuild(data, version, doc.budget, e);
                     }
                 }
             }
             Err(e) => e,
         };
+        Document::open_after_rebuild(data, version, budget, first_error)
+    }
 
-        match repair::rebuild(&data) {
+    /// The cross-reference data could not be used (`first_error` says why):
+    /// scan the file for the objects instead.
+    fn open_after_rebuild(
+        data: Vec<u8>,
+        version: (u8, u8),
+        budget: DecodeBudget,
+        first_error: Error,
+    ) -> Result<Document> {
+        match repair::rebuild_budgeted(&data, &budget) {
             Ok(r) => {
-                let unsupported = r.unsupported;
-                let doc = Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true);
-                *doc.unreadable.borrow_mut() = unsupported.clone();
+                let unopened = r.unopened;
+                let doc = Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true, budget);
+                *doc.unreadable.borrow_mut() = unopened.clone();
                 match doc.validate() {
                     Ok(()) => Ok(doc),
                     // The page tree is missing because it sits in an object
                     // stream we cannot open (or the table could not be read
                     // because of a filter we cannot decode): say so.
-                    Err(e) => match (unsupported, &first_error) {
-                        (Some(m), _) => Err(Error::Unsupported(m)),
-                        (None, Error::Unsupported(m)) => Err(Error::Unsupported(m.clone())),
-                        (None, _) => Err(e),
+                    Err(e) => match (unopened, &first_error) {
+                        (Unopened { unsupported: Some(m), .. }, _) => Err(Error::Unsupported(m)),
+                        (_, Error::Unsupported(m)) => Err(Error::Unsupported(m.clone())),
+                        (Unopened { limit: Some(m), .. }, _) => Err(Error::Limit(m)),
+                        _ => Err(e),
                     },
                 }
             }
             Err(e) => match first_error {
                 unsupported @ Error::Unsupported(_) => Err(unsupported),
+                // A limit is the answer, not "the file is damaged".
+                limit @ Error::Limit(_) => Err(limit),
                 first_error => Err(Error::syntax(
                     None,
                     format!("cannot read the cross-reference data ({first_error}) and cannot rebuild it ({e})"),
@@ -216,24 +453,27 @@ impl Document {
     fn assemble(
         data: Vec<u8>,
         header_version: (u8, u8),
-        entries: HashMap<u32, XrefEntry>,
+        entries: XrefTable,
         trailer: Dict,
         uses_xref_streams: bool,
         repaired: bool,
+        budget: DecodeBudget,
     ) -> Document {
         Document {
             data,
             header_version,
             trailer,
             xref: RefCell::new(entries),
-            objstms: RefCell::new(HashMap::new()),
+            objstms: RefCell::new(ObjStmCache::default()),
+            budget,
+            cache: RefCell::new(ObjectCache::default()),
             endstreams: EndstreamIndex::default(),
             repaired: Cell::new(repaired),
             repair_attempted: Cell::new(repaired),
             repair_allowed: Cell::new(true),
             uses_xref_streams: Cell::new(uses_xref_streams),
             nesting: Cell::new(0),
-            unreadable: RefCell::new(None),
+            unreadable: RefCell::new(Unopened::default()),
         }
     }
 
@@ -304,23 +544,44 @@ impl Document {
     /// compressed object missing from its stream. A reference whose generation
     /// differs from the file's is still honoured.
     pub fn get(&self, r: ObjRef) -> Result<Object> {
-        match self.load(r) {
+        if let Some(hit) = self.cache.borrow().map.get(&r.num) {
+            return Ok(hit.clone());
+        }
+        let loaded = match self.load(r) {
             // The cross-reference entry does not lead to this object: the
             // table is wrong. Rebuild it once and look again.
             Err(Error::MissingObject { .. }) if self.repair_now() => self.load(r),
             other => other,
+        };
+        if let Ok(object) = &loaded {
+            self.cache.borrow_mut().remember(r.num, object);
         }
+        loaded
+    }
+
+    /// Keep the objects that are loaded from now on, up to about `max_bytes`
+    /// of them (those that came first; no later object replaces them), so that
+    /// reading the same ones again costs a copy instead of a parse. Meant for
+    /// a job that goes over the same objects many times, such as writing a
+    /// document out in many pieces. 0 stops it and lets go of what is kept.
+    pub fn cache_objects(&self, max_bytes: usize) {
+        let mut cache = self.cache.borrow_mut();
+        *cache = ObjectCache { budget: max_bytes, ..ObjectCache::default() };
     }
 
     fn load(&self, r: ObjRef) -> Result<Object> {
-        let entry = self.xref.borrow().get(&r.num).copied();
+        let entry = self.xref.borrow().get(r.num);
         match entry {
             // Not in the table at all, in a file where an object stream could
             // not be opened: the object may well be inside that stream.
-            None => match self.unreadable.borrow().as_ref() {
-                Some(why) => Err(Error::Unsupported(why.clone())),
-                None => Ok(Object::Null),
-            },
+            None => {
+                let why = self.unreadable.borrow();
+                match (&why.unsupported, &why.limit) {
+                    (Some(m), _) => Err(Error::Unsupported(m.clone())),
+                    (None, Some(m)) => Err(Error::Limit(m.clone())),
+                    (None, None) => Ok(Object::Null),
+                }
+            }
             Some(XrefEntry::Free) => Ok(Object::Null),
             Some(XrefEntry::InUse { offset, .. }) => self.load_at(r.num, offset),
             Some(XrefEntry::Compressed { stream_num, index }) => {
@@ -354,11 +615,13 @@ impl Document {
             return false;
         }
         self.repair_attempted.set(true);
-        match repair::rebuild(&self.data) {
+        match repair::rebuild_budgeted(&self.data, &self.budget) {
             Ok(r) => {
                 *self.xref.borrow_mut() = r.entries;
-                *self.unreadable.borrow_mut() = r.unsupported;
+                *self.unreadable.borrow_mut() = r.unopened;
                 self.objstms.borrow_mut().clear();
+                let budget = self.cache.borrow().budget;
+                *self.cache.borrow_mut() = ObjectCache { budget, ..ObjectCache::default() };
                 self.uses_xref_streams.set(r.uses_xref_streams);
                 self.repaired.set(true);
                 true
@@ -367,39 +630,28 @@ impl Document {
         }
     }
 
-    /// The decoded object stream `stream_num`, decoding it the first time.
+    /// The decoded object stream `stream_num`, decoding it the first time (and
+    /// again after the cache has let it go).
     fn object_stream(&self, stream_num: u32) -> Result<Rc<ObjStm>> {
-        if let Some(cached) = self.objstms.borrow().get(&stream_num) {
-            return match cached {
-                Ok(stm) => Ok(Rc::clone(stm)),
-                Err(e) => Err(copy_error(e)),
-            };
+        if let Some(cached) = self.objstms.borrow().get(stream_num) {
+            return cached;
         }
         let result = self.read_object_stream(stream_num);
-        let mut cache = self.objstms.borrow_mut();
-        match result {
-            Ok(stm) => {
-                cache.insert(stream_num, Ok(Rc::clone(&stm)));
-                Ok(stm)
-            }
-            Err(e) => {
-                cache.insert(stream_num, Err(copy_error(&e)));
-                Err(e)
-            }
-        }
+        self.objstms.borrow_mut().insert(stream_num, &result);
+        result
     }
 
     fn read_object_stream(&self, stream_num: u32) -> Result<Rc<ObjStm>> {
         let _guard = NestingGuard::enter(&self.nesting)
             .ok_or_else(|| Error::Limit("object streams refer to each other too deeply".to_string()))?;
-        let entry = self.xref.borrow().get(&stream_num).copied();
+        let entry = self.xref.borrow().get(stream_num);
         let Some(XrefEntry::InUse { offset, .. }) = entry else {
             return Err(Error::syntax(None, format!("object stream {stream_num} is not an ordinary object")));
         };
         let Object::Stream(stream) = self.load_at(stream_num, offset)? else {
             return Err(Error::syntax(None, format!("object {stream_num} is not a stream")));
         };
-        let decoded = match self.decode_stream(&stream) {
+        let decoded = match self.decode_stream_limited(&stream, MAX_OBJSTM_DECODED) {
             Ok(d) => d,
             // Say where the unsupported filter was met.
             Err(Error::Unsupported(m)) if !self.is_encrypted() => {
@@ -437,30 +689,33 @@ impl Document {
 
     /// Every object number that is in use, with its generation, in order.
     pub fn object_refs(&self) -> Vec<ObjRef> {
-        let mut refs: Vec<ObjRef> = self
-            .xref
+        self.xref
             .borrow()
             .iter()
-            .filter_map(|(&num, entry)| match entry {
+            .filter_map(|(num, entry)| match entry {
                 XrefEntry::Free => None,
-                XrefEntry::InUse { generation, .. } => Some(ObjRef::new(num, *generation)),
+                XrefEntry::InUse { generation, .. } => Some(ObjRef::new(num, generation)),
                 XrefEntry::Compressed { .. } => Some(ObjRef::new(num, 0)),
             })
-            .collect();
-        refs.sort();
-        refs
+            .collect()
     }
 
     /// Decode the data of a stream through its filters (7.4). Only
     /// `FlateDecode` (with predictors) is supported; any other filter gives
     /// [`Error::Unsupported`], and so does any stream of an encrypted file.
+    /// All the decoding a document does counts against one budget: past it,
+    /// this is [`Error::Limit`].
     pub fn decode_stream(&self, s: &Stream) -> Result<Vec<u8>> {
+        self.decode_stream_limited(s, MAX_DECODED_SIZE)
+    }
+
+    fn decode_stream_limited(&self, s: &Stream, limit: usize) -> Result<Vec<u8>> {
         // Cross-reference streams are never encrypted (7.5.8.2).
         let is_xref_stream = matches!(s.dict.get("Type"), Some(Object::Name(n)) if n == "XRef");
         if self.is_encrypted() && !is_xref_stream {
             return Err(encrypted_error());
         }
-        filter::decode(&s.dict, &s.data, &|o| self.resolve(o))
+        filter::decode_with_limit(&s.dict, &s.data, &|o| self.resolve(o), limit, 0, &self.budget)
     }
 
     /// Does the trailer have an `/Encrypt` entry (7.5.5)?
@@ -480,13 +735,13 @@ impl Document {
 
     /// Does the file hold objects inside object streams (7.5.7)?
     pub fn uses_object_streams(&self) -> bool {
-        self.xref.borrow().values().any(|e| matches!(e, XrefEntry::Compressed { .. }))
+        self.xref.borrow().has_compressed()
     }
 
     /// The number of pages, found by walking the page tree.
     pub fn page_count(&self) -> Result<usize> {
         let mut count = 0usize;
-        self.walk_page_tree(&mut |_, _, _| {
+        self.walk_page_tree(TREE_LIMITS, &mut |_, _, _| {
             count += 1;
             Ok(())
         })?;
@@ -495,40 +750,41 @@ impl Document {
 
     /// All pages in order, each with its inherited attributes (7.7.3.4).
     ///
-    /// A node reachable twice (a cycle, or a shared subtree) is visited once.
-    /// Entries of `/Kids` that are direct objects, missing, or neither a page
-    /// nor a page tree node are skipped.
+    /// A node reachable more than once (a subtree or a page listed under two
+    /// parents, or twice in one `/Kids`) is expanded every time, as the other
+    /// readers do; only a true cycle, a node that is its own ancestor, is cut.
+    /// At most [`MAX_PAGES`] pages and a bounded number of tree entries are
+    /// looked at, so a tree that lists a node many times at every level ends
+    /// in [`Error::Limit`]. Entries of `/Kids` that are direct objects,
+    /// missing, or neither a page nor a page tree node are skipped.
     pub fn pages(&self) -> Result<Vec<Page>> {
+        self.pages_within(TREE_LIMITS)
+    }
+
+    fn pages_within(&self, limits: TreeLimits) -> Result<Vec<Page>> {
         let mut pages = Vec::new();
-        let mut weight_used = 0usize;
-        self.walk_page_tree(&mut |obj_ref, mut dict, inherited| {
-            dict.remove("Parent");
-            for (key, slot) in INHERITABLE.iter().zip(inherited.0.iter()) {
-                if dict.contains_key(key) {
-                    continue;
-                }
-                if let Some(value) = slot {
-                    weight_used = weight_used.saturating_add(weight(value));
-                    if weight_used > MAX_INHERITED_COPY_WEIGHT {
-                        return Err(Error::Limit(
-                            "inherited page attributes are too large to copy into every page".to_string(),
-                        ));
-                    }
-                    dict.set(*key, (**value).clone());
-                }
-            }
-            // The boxes and the rotation are small values: store them directly
-            // so a page can be read without a document at hand.
-            for key in ["MediaBox", "CropBox", "Rotate"] {
-                if let Some(value) = dict.get(key) {
-                    let direct = self.resolve_shallow(value);
-                    dict.set(key, direct);
-                }
-            }
-            pages.push(Page { obj_ref, dict });
+        self.walk_page_tree(limits, &mut |obj_ref, node, inherited| {
+            let boxes = self.page_boxes(&node.dict, inherited);
+            pages.push(Page { obj_ref, dict: Rc::clone(&node.dict), inherited: inherited.clone(), boxes });
             Ok(())
         })?;
         Ok(pages)
+    }
+
+    /// The boxes and the rotation of a page: its own values, else the
+    /// inherited ones, with references followed.
+    fn page_boxes(&self, own: &Dict, inherited: &Inherited) -> Boxes {
+        let value = |key: &str, index: usize| -> Option<Object> {
+            match own.get(key) {
+                Some(v) => Some(self.resolve_shallow(v)),
+                None => inherited.0.get(index)?.as_ref().map(|a| a.resolved.clone()),
+            }
+        };
+        Boxes {
+            media: rectangle(value("MediaBox", MEDIA_BOX).as_ref()),
+            crop: rectangle(value("CropBox", CROP_BOX).as_ref()),
+            rotate: rotation(value("Rotate", ROTATE).as_ref()),
+        }
     }
 
     /// Resolve a reference, and the elements of an array, without failing:
@@ -543,27 +799,72 @@ impl Document {
         }
     }
 
+    /// Load one page tree node, once per walk.
+    fn load_node(&self, r: ObjRef) -> Result<Option<Rc<Node>>> {
+        let mut dict = match self.get(r)? {
+            Object::Dict(d) => d,
+            Object::Stream(s) => s.dict,
+            _ => return Ok(None),
+        };
+        let kind = classify(&dict);
+        dict.remove("Parent");
+        let node = match kind {
+            NodeKind::Skip => return Ok(None),
+            NodeKind::Page => {
+                let weight = dict_weight(&dict);
+                Node { kind, dict: Rc::new(dict), kids: Rc::new(Vec::new()), own: Default::default(), weight, seen: Cell::new(false) }
+            }
+            NodeKind::Pages => {
+                let kids = match dict.remove("Kids") {
+                    Some(kids) => match self.resolve(&kids)? {
+                        Object::Array(items) => items,
+                        _ => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                // Only the inheritable values matter of a page tree node; they
+                // move out of the dictionary into shared cells.
+                let mut own: [Option<Rc<Attr>>; 4] = Default::default();
+                for (slot, key) in own.iter_mut().zip(INHERITABLE) {
+                    if let Some(raw) = dict.remove(key) {
+                        let resolved = if key == "Resources" { raw.clone() } else { self.resolve_shallow(&raw) };
+                        *slot = Some(Rc::new(Attr { raw, resolved }));
+                    }
+                }
+                Node { kind, dict: Rc::new(Dict::new()), kids: Rc::new(kids), own, weight: 0, seen: Cell::new(false) }
+            }
+        };
+        Ok(Some(Rc::new(node)))
+    }
+
     /// Visit every page in order with its own dictionary and the attributes
-    /// inherited from above (7.7.3).
-    fn walk_page_tree(&self, visit: &mut dyn FnMut(ObjRef, Dict, &Inherited) -> Result<()>) -> Result<()> {
+    /// inherited from above (7.7.3). Shared subtrees and repeated pages are
+    /// visited every time; a node that is its own ancestor is skipped.
+    fn walk_page_tree(
+        &self,
+        limits: TreeLimits,
+        visit: &mut dyn FnMut(ObjRef, &Node, &Inherited) -> Result<()>,
+    ) -> Result<()> {
         let catalog = self.catalog()?;
         let Some(Object::Ref(root)) = catalog.get("Pages") else {
             return Err(Error::syntax(None, "the catalog has no /Pages reference"));
         };
         let root = *root;
-        let mut visited: HashSet<ObjRef> = HashSet::new();
+        let mut walk = TreeWalk::new(limits);
         let mut stack: Vec<Frame> = Vec::new();
-        if let Some(frame) = self.enter_node(root, &Inherited::default(), &mut visited, visit)? {
+        if let Some(frame) = self.enter_node(root, &Inherited::default(), &mut walk, visit)? {
             stack.push(frame);
         }
         while let Some(top) = stack.last_mut() {
             let Some(kid) = top.kids.get(top.next) else {
+                walk.on_path.remove(&top.node);
                 stack.pop();
                 continue;
             };
             top.next += 1;
             // /Kids holds indirect references (Table 29); anything else is skipped.
             let Object::Ref(kid) = kid else {
+                walk.count_visit()?;
                 continue;
             };
             let kid = *kid;
@@ -571,43 +872,57 @@ impl Document {
             if stack.len() >= MAX_PAGE_TREE_DEPTH {
                 return Err(Error::Limit(format!("page tree nested more than {MAX_PAGE_TREE_DEPTH} levels deep")));
             }
-            if let Some(frame) = self.enter_node(kid, &inherited, &mut visited, visit)? {
+            if let Some(frame) = self.enter_node(kid, &inherited, &mut walk, visit)? {
                 stack.push(frame);
             }
         }
         Ok(())
     }
 
-    /// Load one page tree node. A page is handed to `visit` and `None` is
+    /// Look at one page tree entry. A page is handed to `visit` and `None` is
     /// returned; a page tree node gives the frame for walking its kids.
     fn enter_node(
         &self,
         r: ObjRef,
         parent: &Inherited,
-        visited: &mut HashSet<ObjRef>,
-        visit: &mut dyn FnMut(ObjRef, Dict, &Inherited) -> Result<()>,
+        walk: &mut TreeWalk,
+        visit: &mut dyn FnMut(ObjRef, &Node, &Inherited) -> Result<()>,
     ) -> Result<Option<Frame>> {
-        if !visited.insert(r) {
-            return Ok(None);
-        }
-        let Some(node) = self.get(r)?.as_dict().cloned() else {
-            return Ok(None);
+        walk.count_visit()?;
+        let node = match walk.nodes.get(&r) {
+            Some(known) => Rc::clone(known),
+            None => {
+                let Some(loaded) = self.load_node(r)? else {
+                    return Ok(None);
+                };
+                walk.nodes.insert(r, Rc::clone(&loaded));
+                loaded
+            }
         };
-        match classify(&node) {
+        match node.kind {
             NodeKind::Skip => Ok(None),
             NodeKind::Page => {
-                visit(r, node, parent)?;
+                walk.pages += 1;
+                if walk.pages > walk.limits.pages {
+                    return Err(Error::Limit(format!("more than {} pages in the page tree", walk.limits.pages)));
+                }
+                // A page met again is counted as its size every time, so one
+                // big page listed a million times cannot be made to count.
+                if node.seen.replace(true) {
+                    walk.repeated_weight = walk.repeated_weight.saturating_add(node.weight);
+                    if walk.repeated_weight > walk.limits.repeated_weight {
+                        return Err(Error::Limit("pages listed over and over in the page tree are too large".to_string()));
+                    }
+                }
+                visit(r, &node, parent)?;
                 Ok(None)
             }
             NodeKind::Pages => {
-                let kids = match node.get("Kids") {
-                    Some(kids) => match self.resolve(kids)? {
-                        Object::Array(items) => items,
-                        _ => Vec::new(),
-                    },
-                    None => Vec::new(),
-                };
-                Ok(Some(Frame { kids, next: 0, inherited: parent.with_overrides(&node) }))
+                // A node already on the way down to here is a cycle.
+                if !walk.on_path.insert(r) {
+                    return Ok(None);
+                }
+                Ok(Some(Frame { node: r, kids: Rc::clone(&node.kids), next: 0, inherited: parent.with_overrides(&node.own) }))
             }
         }
     }
@@ -627,27 +942,55 @@ impl StreamHelper for Document {
     }
 }
 
-/// Inheritable attributes in force at some point of the page tree, in the
-/// order of [`INHERITABLE`]. Shared, so passing them down costs nothing.
-#[derive(Clone, Default)]
-struct Inherited([Option<Rc<Object>>; 4]);
+/// A page tree node, parsed once per walk.
+struct Node {
+    kind: NodeKind,
+    /// Without `/Parent`, and for a page tree node without `/Kids`.
+    dict: Rc<Dict>,
+    kids: Rc<Vec<Object>>,
+    /// The inheritable values this node sets (for a page tree node).
+    own: [Option<Rc<Attr>>; 4],
+    weight: usize,
+    /// Has a page with this node's dictionary been handed out already?
+    seen: Cell<bool>,
+}
 
-impl Inherited {
-    /// What the kids of `node` inherit: this node's own values, over ours.
-    fn with_overrides(&self, node: &Dict) -> Inherited {
-        let mut out = self.clone();
-        for (slot, key) in out.0.iter_mut().zip(INHERITABLE) {
-            if let Some(value) = node.get(key) {
-                *slot = Some(Rc::new(value.clone()));
-            }
+/// What a page tree walk keeps track of.
+struct TreeWalk {
+    limits: TreeLimits,
+    nodes: HashMap<ObjRef, Rc<Node>>,
+    /// The page tree nodes between the root and where the walk is.
+    on_path: HashSet<ObjRef>,
+    visits: usize,
+    pages: usize,
+    repeated_weight: usize,
+}
+
+impl TreeWalk {
+    fn new(limits: TreeLimits) -> TreeWalk {
+        TreeWalk {
+            limits,
+            nodes: HashMap::new(),
+            on_path: HashSet::new(),
+            visits: 0,
+            pages: 0,
+            repeated_weight: 0,
         }
-        out
+    }
+
+    fn count_visit(&mut self) -> Result<()> {
+        self.visits += 1;
+        if self.visits > self.limits.visits {
+            return Err(Error::Limit(format!("more than {} entries in the page tree", self.limits.visits)));
+        }
+        Ok(())
     }
 }
 
 /// A page tree node being walked.
 struct Frame {
-    kids: Vec<Object>,
+    node: ObjRef,
+    kids: Rc<Vec<Object>>,
     next: usize,
     inherited: Inherited,
 }
@@ -677,10 +1020,14 @@ fn classify(node: &Dict) -> NodeKind {
 fn weight(obj: &Object) -> usize {
     match obj {
         Object::Array(items) => items.iter().fold(1usize, |acc, o| acc.saturating_add(weight(o))),
-        Object::Dict(d) => d.iter().fold(1usize, |acc, (_, o)| acc.saturating_add(weight(o))),
+        Object::Dict(d) => dict_weight(d),
         Object::String(s) => 1 + s.bytes.len() / 16,
         _ => 1,
     }
+}
+
+fn dict_weight(d: &Dict) -> usize {
+    d.iter().fold(1usize, |acc, (_, o)| acc.saturating_add(weight(o)))
 }
 
 #[cfg(test)]
@@ -930,14 +1277,14 @@ mod tests {
         // object stream: it is decoded then and never again.
         let doc = open(sample_objstm_pdf());
         assert_eq!(doc.objstms.borrow().len(), 1);
-        let first = Rc::clone(doc.objstms.borrow().values().next().unwrap().as_ref().unwrap());
+        let first = doc.objstms.borrow().get(5).unwrap().unwrap();
         for _ in 0..3 {
             doc.get(ObjRef::new(1, 0)).unwrap();
             doc.get(ObjRef::new(2, 0)).unwrap();
             doc.get(ObjRef::new(3, 0)).unwrap();
         }
         assert_eq!(doc.objstms.borrow().len(), 1);
-        let again = Rc::clone(doc.objstms.borrow().values().next().unwrap().as_ref().unwrap());
+        let again = doc.objstms.borrow().get(5).unwrap().unwrap();
         assert!(Rc::ptr_eq(&first, &again));
     }
 
@@ -1205,36 +1552,39 @@ mod tests {
         let refs: Vec<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
         assert_eq!(refs, vec![5, 6, 7, 8]);
 
-        // Page 5.
+        // Page 5: everything is inherited, and nothing is copied into the page.
         assert_eq!(rect(&pages[0]), Some([0.0, 0.0, 300.0, 300.0]));
         assert_eq!(pages[0].rotate(), 90);
-        assert!(pages[0].dict.get("Resources").unwrap().as_dict().unwrap().contains_key("Font"));
-        assert_eq!(
-            pages[0].dict.get("CropBox"),
-            Some(&Object::Array(vec![
-                Object::Integer(10),
-                Object::Integer(10),
-                Object::Integer(600),
-                Object::Integer(780)
-            ]))
-        );
+        assert!(pages[0].resources().unwrap().as_dict().unwrap().contains_key("Font"));
+        assert_eq!(pages[0].crop_box(), Some([10.0, 10.0, 600.0, 780.0]));
         assert!(!pages[0].dict.contains_key("Parent"));
+        for key in ["Resources", "MediaBox", "CropBox", "Rotate"] {
+            assert!(!pages[0].dict.contains_key(key), "{key} is inherited, not copied");
+            assert!(pages[0].inherited(key).is_some(), "{key}");
+        }
+        // Pages 5 and 6 share the root's /Resources (page 6 has its own) and
+        // the root's /CropBox: the same value, not two copies.
+        assert_eq!(pages[0].inherited("CropBox").unwrap().id, pages[1].inherited("CropBox").unwrap().id);
+        assert!(pages[1].inherited("Resources").is_none());
+        assert_eq!(pages[0].inherited("Resources").unwrap().id, pages[2].inherited("Resources").unwrap().id);
 
-        // Page 6: own values win; /Rotate -90 reads as 270; indirect MediaBox
-        // (with an indirect element) is stored directly.
+        // Page 6: own values win; /Rotate -90 reads as 270; the MediaBox is an
+        // indirect reference (with an indirect element), stored as written but
+        // read through.
         assert_eq!(pages[1].rotate(), 270);
-        assert!(pages[1].dict.get("Resources").unwrap().as_dict().unwrap().contains_key("ProcSet"));
+        assert!(pages[1].resources().unwrap().as_dict().unwrap().contains_key("ProcSet"));
         assert_eq!(rect(&pages[1]), Some([0.0, 0.0, 180.0, 50.5]));
-        assert!(matches!(pages[1].dict.get("MediaBox"), Some(Object::Array(_))));
+        assert!(matches!(pages[1].dict.get("MediaBox"), Some(Object::Ref(_))));
 
         // Page 7: reversed corners are normalised; the dict keeps what was written.
         assert_eq!(rect(&pages[2]), Some([0.0, 0.0, 200.0, 100.0]));
         assert_eq!(pages[2].rotate(), 90);
 
-        // Page 8: indirect Rotate becomes direct, indirect Resources stay as written.
-        assert_eq!(pages[3].dict.get("Rotate"), Some(&Object::Integer(180)));
+        // Page 8: an indirect /Rotate is read through, an indirect /Resources
+        // stays a reference.
+        assert_eq!(pages[3].dict.get("Rotate"), Some(&Object::Ref(ObjRef::new(11, 0))));
         assert_eq!(pages[3].rotate(), 180);
-        assert_eq!(pages[3].dict.get("Resources"), Some(&Object::Ref(ObjRef::new(12, 0))));
+        assert_eq!(pages[3].resources(), Some(&Object::Ref(ObjRef::new(12, 0))));
         // MediaBox comes from the root through node 4.
         assert_eq!(rect(&pages[3]), Some([0.0, 0.0, 612.0, 792.0]));
     }
@@ -1244,7 +1594,7 @@ mod tests {
         let page = |value: Object| {
             let mut dict = Dict::new();
             dict.set("Rotate", value);
-            Page { obj_ref: ObjRef::new(1, 0), dict }
+            Page::new(ObjRef::new(1, 0), dict)
         };
         assert_eq!(page(Object::Integer(0)).rotate(), 0);
         assert_eq!(page(Object::Integer(90)).rotate(), 90);
@@ -1256,7 +1606,7 @@ mod tests {
         assert_eq!(page(Object::Integer(100)).rotate(), 90);
         assert_eq!(page(Object::Integer(i64::MIN)).rotate() % 90, 0);
         assert_eq!(page(Object::from("x")).rotate(), 0);
-        assert_eq!(Page { obj_ref: ObjRef::new(1, 0), dict: Dict::new() }.rotate(), 0);
+        assert_eq!(Page::new(ObjRef::new(1, 0), Dict::new()).rotate(), 0);
     }
 
     #[test]
@@ -1264,7 +1614,7 @@ mod tests {
         let page = |value: Object| {
             let mut dict = Dict::new();
             dict.set("MediaBox", value);
-            Page { obj_ref: ObjRef::new(1, 0), dict }
+            Page::new(ObjRef::new(1, 0), dict)
         };
         let nums = |v: &[f64]| Object::Array(v.iter().map(|&x| Object::Real(x)).collect());
         assert_eq!(page(nums(&[0.0, 0.0, 10.0, 20.0])).media_box(), Some([0.0, 0.0, 10.0, 20.0]));
@@ -1274,12 +1624,14 @@ mod tests {
         assert_eq!(page(nums(&[0.0, 0.0, f64::NAN, 20.0])).media_box(), None);
         assert_eq!(page(Object::Array(vec![Object::from("a"); 4])).media_box(), None);
         assert_eq!(page(Object::Integer(5)).media_box(), None);
-        assert_eq!(Page { obj_ref: ObjRef::new(1, 0), dict: Dict::new() }.media_box(), None);
+        assert_eq!(Page::new(ObjRef::new(1, 0), Dict::new()).media_box(), None);
     }
 
     #[test]
-    fn page_tree_cycles_and_sharing() {
-        // Pages node 2 lists itself and its parent loop; page 3 is listed twice.
+    fn page_tree_cycles_are_cut_and_repeats_are_expanded() {
+        // Pages node 2 lists itself and a node that loops back to it; page 3
+        // is listed twice. Only the loops are cut; the repeated page counts
+        // every time, as in the other readers.
         let mut b = PdfBuilder::new();
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.obj(2, "<< /Type /Pages /Kids [4 0 R 3 0 R 2 0 R 3 0 R 5 0 R] /Count 2 >>");
@@ -1290,14 +1642,35 @@ mod tests {
         b.obj(6, "<< /Type /Page /Parent 4 0 R /MediaBox [0 0 3 3] >>");
         let doc = open(b.finish_classic(7, "/Root 1 0 R"));
         let refs: Vec<u32> = doc.pages().unwrap().iter().map(|p| p.obj_ref.num).collect();
-        assert_eq!(refs, vec![6, 3, 5]);
-        assert_eq!(doc.page_count().unwrap(), 3);
+        assert_eq!(refs, vec![6, 3, 3, 5]);
+        assert_eq!(doc.page_count().unwrap(), 4);
     }
 
     #[test]
-    fn page_tree_billion_laughs_is_cut_off() {
-        // Ten levels, each listing the next level's node ten times: 10^10 pages
-        // if shared nodes were expanded.
+    fn a_shared_subtree_is_expanded_under_each_parent_with_its_own_inheritance() {
+        // Node 4 (one page, no box of its own) hangs under both 3 and 5; the
+        // page gets the box of the parent it is reached through.
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>");
+        b.obj(3, "<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 100 100] /Parent 2 0 R >>");
+        b.obj(4, "<< /Type /Pages /Kids [6 0 R] /Count 1 /Parent 3 0 R >>");
+        b.obj(5, "<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 200 200] /Parent 2 0 R >>");
+        b.obj(6, "<< /Type /Page /Parent 4 0 R >>");
+        let doc = open(b.finish_classic(7, "/Root 1 0 R"));
+        let pages = doc.pages().unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].obj_ref, pages[1].obj_ref);
+        assert_eq!(rect(&pages[0]), Some([0.0, 0.0, 100.0, 100.0]));
+        assert_eq!(rect(&pages[1]), Some([0.0, 0.0, 200.0, 200.0]));
+        // The page dictionary itself is shared, not copied.
+        assert!(Rc::ptr_eq(&pages[0].dict, &pages[1].dict));
+    }
+
+    #[test]
+    fn page_tree_billion_laughs_is_a_limit_error() {
+        // Ten levels, each listing the next level's node ten times: 10^10
+        // pages if shared nodes were expanded.
         let mut b = PdfBuilder::new();
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
         for level in 0..10u32 {
@@ -1306,7 +1679,64 @@ mod tests {
         }
         b.obj(12, "<< /Type /Page /MediaBox [0 0 1 1] >>");
         let doc = open(b.finish_classic(13, "/Root 1 0 R"));
-        assert_eq!(doc.pages().unwrap().len(), 1);
+        // With small limits, so that the test is quick in an unoptimised build.
+        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_weight: 1 << 20 };
+        assert!(matches!(doc.pages_within(small), Err(Error::Limit(m)) if m.contains("5000 pages")));
+        let started = std::time::Instant::now();
+        assert!(matches!(doc.pages(), Err(Error::Limit(_))));
+        assert!(matches!(doc.page_count(), Err(Error::Limit(_))));
+        assert!(started.elapsed().as_secs() < 120, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_tree_of_nothing_listed_over_and_over_is_a_limit_error_too() {
+        // The same, but the leaves are not pages, so no page is ever counted:
+        // the number of entries looked at is what is limited.
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        for level in 0..10u32 {
+            let kids = format!("{} 0 R ", level + 3).repeat(10);
+            b.obj(2 + level, &format!("<< /Type /Pages /Kids [{kids}] /Count 1 >>"));
+        }
+        b.obj(12, "<< /Type /Font >>");
+        let doc = open(b.finish_classic(13, "/Root 1 0 R"));
+        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_weight: 1 << 20 };
+        assert!(matches!(doc.pages_within(small), Err(Error::Limit(m)) if m.contains("20000 entries")));
+    }
+
+    #[test]
+    fn one_big_page_listed_over_and_over_is_a_limit_error() {
+        // The page dictionary is about 3 weight units per name; listed 100
+        // times it adds up past a small allowance.
+        let names: String = (0..200).map(|i| format!("/K{i} 1 ")).collect();
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids = "3 0 R ".repeat(100);
+        b.obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count 100 >>"));
+        b.obj(3, &format!("<< /Type /Page /MediaBox [0 0 1 1] {names} >>"));
+        let doc = open(b.finish_classic(4, "/Root 1 0 R"));
+        let tight = TreeLimits { pages: 1000, visits: 1000, repeated_weight: 5000 };
+        assert!(matches!(doc.pages_within(tight), Err(Error::Limit(m)) if m.contains("over and over")));
+        assert_eq!(doc.pages().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn a_big_resources_dictionary_on_the_root_is_shared_by_every_page() {
+        // 300 pages inherit a /Resources of about a megabyte: it is held once.
+        let names: String = (0..1000).map(|i| format!("/N{i} /{} ", "A".repeat(1000))).collect();
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids: String = (0..300).map(|i| format!("{} 0 R ", 3 + i)).collect();
+        b.obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count 300 /MediaBox [0 0 9 9] /Resources << /X << {names} >> >> >>"));
+        for i in 0..300 {
+            b.obj(3 + i, "<< /Type /Page /Parent 2 0 R >>");
+        }
+        let doc = open(b.finish_classic(303, "/Root 1 0 R"));
+        let pages = doc.pages().unwrap();
+        assert_eq!(pages.len(), 300);
+        let id = pages[0].inherited("Resources").unwrap().id;
+        assert!(pages.iter().all(|p| p.inherited("Resources").unwrap().id == id));
+        assert!(pages.iter().all(|p| p.resources().is_some()));
     }
 
     #[test]
@@ -1344,7 +1774,8 @@ mod tests {
         b.obj(10, "<< /Type /Pages >>"); // no kids at all
         let doc = open(b.finish_classic(11, "/Root 1 0 R"));
         let refs: Vec<u32> = doc.pages().unwrap().iter().map(|p| p.obj_ref.num).collect();
-        assert_eq!(refs, vec![4, 8]);
+        // Page 8 is listed directly and under node 6: both count.
+        assert_eq!(refs, vec![4, 8, 8]);
     }
 
     #[test]
@@ -1578,6 +2009,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn many_object_streams_are_decoded_within_the_cache_and_the_budget() {
+        // Each object stream is a megabyte of padding after one small object.
+        let mut b = PdfBuilder::with_header("%PDF-1.5\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        let n_streams = 4u32;
+        let mut offsets = Vec::new();
+        for k in 0..n_streams {
+            let header = format!("{} 0 ", 10 + k);
+            let mut body = format!("{header}(object {k})").into_bytes();
+            body.resize(1 << 20, b' ');
+            let at = b.flate_stream_obj(100 + k, &format!("/Type /ObjStm /N 1 /First {}", header.len()), &body);
+            offsets.push(at);
+        }
+        let x = b.len();
+        let mut rows: Vec<[u8; 4]> = Vec::new();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        for num in 0..=(100 + n_streams) {
+            rows.push(match num {
+                1 | 2 => row(1, b.offset_of(num), 0),
+                10..=13 => row(2, 100 + (num as usize - 10), 0),
+                100..=103 => row(1, offsets[(num - 100) as usize], 0),
+                _ => row(0, 0, 0),
+            });
+        }
+        rows.push(row(1, x, 0));
+        let packed = png_up_flate(&rows);
+        let size = rows.len();
+        b.stream_obj(
+            104 + 1,
+            &format!("/Type /XRef /Size {size} /W [1 2 1] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>"),
+            &packed,
+        );
+        b.startxref(x);
+        let doc = open(b.finish());
+        for k in 0..n_streams {
+            assert!(matches!(doc.get(ObjRef::new(10 + k, 0)), Ok(Object::String(_))), "{k}");
+        }
+        // They fit in the cache together, so all four are still there.
+        assert_eq!(doc.objstms.borrow().len(), 4);
+        assert!(doc.budget.remaining() < filter::DECODE_BUDGET);
+    }
+
+    #[test]
+    fn decoding_the_same_object_stream_again_and_again_runs_into_the_documents_budget() {
+        // An object stream of 1 MiB decoded, and a budget that has room for five
+        // such decodes: the later gets are refused. (The cache is emptied each time,
+        // so that every get has to decode the stream again.)
+        let mut b = PdfBuilder::with_header("%PDF-1.5\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        let header = "10 0 ";
+        let mut body = format!("{header}(x)").into_bytes();
+        body.resize(1 << 20, b' ');
+        let at = b.flate_stream_obj(100, &format!("/Type /ObjStm /N 1 /First {}", header.len()), &body);
+        let x = b.len();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        let mut rows: Vec<[u8; 4]> = vec![row(0, 0, 0); 102];
+        rows[0] = row(0, 0, 255);
+        rows[1] = row(1, b.offset_of(1), 0);
+        rows[2] = row(1, b.offset_of(2), 0);
+        rows[10] = row(2, 100, 0);
+        rows[100] = row(1, at, 0);
+        rows[101] = row(1, x, 0);
+        let packed = png_up_flate(&rows);
+        b.stream_obj(
+            101,
+            "/Type /XRef /Size 102 /W [1 2 1] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>",
+            &packed,
+        );
+        b.startxref(x);
+        let doc = open(b.finish());
+        doc.budget.charge_for_test(doc.budget.remaining() - 5 * (1 << 20) - 100);
+        let (mut refused, mut read) = (0, 0);
+        for _ in 0..8 {
+            doc.objstms.borrow_mut().clear();
+            match doc.get(ObjRef::new(10, 0)) {
+                Ok(Object::String(_)) => read += 1,
+                Err(Error::Limit(_)) => refused += 1,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(read >= 3 && refused >= 2, "{read} read, {refused} refused");
+    }
+
+    #[test]
+    fn the_object_cache_keeps_what_fits_and_lets_go_on_request() {
+        let doc = open(sample_pdf());
+        // Off by default.
+        doc.get(ObjRef::new(3, 0)).unwrap();
+        assert!(doc.cache.borrow().map.is_empty());
+        doc.cache_objects(100_000);
+        let first = doc.get(ObjRef::new(3, 0)).unwrap();
+        assert!(doc.cache.borrow().map.contains_key(&3));
+        assert_eq!(doc.get(ObjRef::new(3, 0)).unwrap(), first);
+        // A stream is cached with its data.
+        let stream = doc.get(ObjRef::new(4, 0)).unwrap();
+        assert_eq!(doc.get(ObjRef::new(4, 0)).unwrap(), stream);
+        assert!(doc.cache.borrow().bytes > 0);
+        // Stopping lets go of everything.
+        doc.cache_objects(0);
+        assert!(doc.cache.borrow().map.is_empty());
+        doc.get(ObjRef::new(3, 0)).unwrap();
+        assert!(doc.cache.borrow().map.is_empty());
+        // A budget too small for an object keeps nothing of it.
+        doc.cache_objects(10);
+        assert_eq!(doc.get(ObjRef::new(3, 0)).unwrap(), first);
+        assert!(doc.cache.borrow().map.is_empty());
     }
 
     #[test]

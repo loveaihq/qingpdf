@@ -1,6 +1,7 @@
 //! Acceptance 3 (first half), for the commands: whatever `merge`, `split`,
-//! `delete`, `rotate` and `img2pdf` write passes `qpdf --check`. Skipped, with
-//! a note, when qpdf is not installed.
+//! `delete`, `rotate` and `img2pdf` write passes `qpdf --check`, or complains
+//! only about what qpdf also says about the inputs. Skipped, with a note, when
+//! qpdf is not installed.
 // Test code may panic; that is how a test fails.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
@@ -45,51 +46,35 @@ fn usable_corpus() -> Vec<(PathBuf, usize)> {
         .collect()
 }
 
-/// qpdf warnings that come from the inputs or from a documented limit, not from
-/// the writer: damaged stream data and an unsorted name tree are copied from the
-/// input as they are; a merged-in file's form widgets are not reachable from the
-/// base file's /AcroForm because form fields are not merged (the user is warned).
-const EXPLAINED: [&str; 6] = [
-    "error decoding stream data",
-    "stream will be re-processed without filtering",
-    "input stream is complete but output may still be valid",
-    "keys are not sorted",
-    "attempting to repair after error",
-    "widget annotation is not reachable from /AcroForm",
-];
-
 struct Tally {
     pass: usize,
-    /// The input already gives the same kind of trouble.
+    /// qpdf complains, but only about what it says about the inputs too.
     input_quirk: Vec<String>,
-    /// Warnings explained by a documented limit or by damaged input data (merges).
-    explained: Vec<String>,
     failures: Vec<String>,
+}
+
+/// Does `path` have form fields (so that a merge cannot carry them over)?
+fn has_form_fields(path: &Path) -> bool {
+    let Ok(doc) = Document::open(path) else { return false };
+    let Ok(catalog) = doc.catalog() else { return false };
+    let Some(form) = catalog.get("AcroForm").and_then(|f| doc.resolve(f).ok()) else { return false };
+    form.as_dict()
+        .and_then(|d| d.get("Fields"))
+        .and_then(|f| doc.resolve(f).ok())
+        .is_some_and(|f| f.as_array().is_some_and(|a| !a.is_empty()))
 }
 
 impl Tally {
     /// Check `file`, which was made from `inputs`.
     fn check(&mut self, qpdf: &Path, label: &str, file: &Path, inputs: &[&Path]) {
-        let verdict = common::qpdf_check(qpdf, file);
-        if verdict.code == 0 {
-            self.pass += 1;
-            return;
+        // Only a merge leaves form widgets without their fields: the ones of
+        // the later files.
+        let later_forms = inputs.iter().skip(1).any(|p| has_form_fields(p));
+        match common::judge_qpdf_output(qpdf, file, inputs, later_forms) {
+            common::Judgement::Clean => self.pass += 1,
+            common::Judgement::InputQuirk => self.input_quirk.push(label.to_string()),
+            common::Judgement::Fail(why) => self.failures.push(format!("{label}: {why}")),
         }
-        // One input that qpdf already dislikes: whatever it says about the output is an input quirk.
-        if let [input] = inputs
-            && common::qpdf_check(qpdf, input).code != 0
-            && verdict.code == 3
-        {
-            self.input_quirk.push(label.to_string());
-            return;
-        }
-        let problems: Vec<&str> =
-            verdict.text.lines().filter(|l| l.starts_with("WARNING") || l.starts_with("ERROR")).collect();
-        if verdict.code == 3 && !problems.is_empty() && problems.iter().all(|l| EXPLAINED.iter().any(|e| l.contains(e))) {
-            self.explained.push(format!("{label}: {}", problems.first().copied().unwrap_or("")));
-            return;
-        }
-        self.failures.push(format!("{label}: exit {}\n{}", verdict.code, verdict.text));
     }
 }
 
@@ -103,7 +88,7 @@ fn qpdf_accepts_the_output_of_every_command() {
     let dir = common::fresh_out_dir("qpdf-commands");
     let usable = usable_corpus();
     assert!(!usable.is_empty(), "no corpus files to work with");
-    let mut tally = Tally { pass: 0, input_quirk: Vec::new(), explained: Vec::new(), failures: Vec::new() };
+    let mut tally = Tally { pass: 0, input_quirk: Vec::new(), failures: Vec::new() };
     let mut commands_run = 0usize;
 
     // merge: the whole usable corpus in one go, and pairs of neighbours.
@@ -209,14 +194,10 @@ fn qpdf_accepts_the_output_of_every_command() {
 
     println!("\n=== qpdf --check on command outputs: {commands_run} commands ===");
     println!("{:>5}  output files pass", tally.pass);
-    println!("{:>5}  not clean, but the (single) input is not clean either: input quirk", tally.input_quirk.len());
-    println!("{:>5}  merges with warnings explained by damaged input data or by form fields not being merged", tally.explained.len());
+    println!("{:>5}  not clean, but only about what qpdf says about the inputs too: input quirk", tally.input_quirk.len());
     println!("{:>5}  output files FAIL", tally.failures.len());
     for q in &tally.input_quirk {
         println!("  input quirk: {q}");
-    }
-    for e in &tally.explained {
-        println!("  explained: {e}");
     }
     for f in &tally.failures {
         println!("  FAIL: {f}");

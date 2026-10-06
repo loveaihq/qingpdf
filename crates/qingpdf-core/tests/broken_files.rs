@@ -197,10 +197,6 @@ fn variants(data: &[u8], rng: &mut common::XorShift) -> Vec<Variant> {
 #[test]
 fn damaged_files_open_or_fail_cleanly_and_quickly() {
     let files = common::public_files();
-    if files.is_empty() {
-        println!("NOTE: tests/corpus/public is empty; nothing to damage");
-        return;
-    }
     let dump = std::env::var_os("QINGPDF_WRITE_BROKEN").is_some();
     let dump_dir = common::corpus_root().join("broken");
     if dump {
@@ -268,4 +264,284 @@ fn damaged_files_open_or_fail_cleanly_and_quickly() {
     println!("panics: {}, hangs or over 5 s: {}", table.values().filter_map(|m| m.get("PANIC")).sum::<usize>(),
         table.values().filter_map(|m| m.get("HANG")).sum::<usize>());
     assert!(problems.is_empty(), "{} problem(s):\n{}", problems.len(), problems.join("\n"));
+}
+
+// --- hostile files from the review: every one of them within seconds, and either read or a Limit ---------
+//
+// Hard rules 4 and 6: a crafted file must not hang the program or eat gigabytes.
+// The files are made here, so the test needs nothing from outside. The time
+// limits are for the optimised build (`cargo test --release`); an unoptimised
+// build gets ten times as long.
+
+mod hostile {
+    use std::time::{Duration, Instant};
+
+    use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params};
+    use qingpdf_core::{Document, Error, ObjRef, Object, ops};
+
+    fn limit() -> Duration {
+        if cfg!(debug_assertions) { Duration::from_secs(60) } else { Duration::from_secs(5) }
+    }
+
+    /// zlib data for `head` followed by `zeros` zero bytes, made without ever
+    /// holding the uncompressed bytes.
+    fn zlib_head_and_zeros(head: &[u8], zeros: usize) -> Vec<u8> {
+        let flags = create_comp_flags_from_zip_params(1, 1, 0);
+        let mut comp = Box::new(CompressorOxide::new(flags));
+        let mut out: Vec<u8> = Vec::new();
+        let mut scratch = vec![0u8; 1 << 16];
+        let mut feed = |comp: &mut CompressorOxide, mut data: &[u8], flush: TDEFLFlush, out: &mut Vec<u8>| loop {
+            let (status, used, produced) = compress(comp, data, &mut scratch, flush);
+            out.extend_from_slice(&scratch[..produced]);
+            data = &data[used..];
+            if matches!(status, TDEFLStatus::Done) || (data.is_empty() && produced < scratch.len() && flush != TDEFLFlush::Finish) {
+                break;
+            }
+        };
+        feed(&mut comp, head, TDEFLFlush::None, &mut out);
+        let chunk = vec![0u8; 1 << 20];
+        let mut left = zeros;
+        while left > 0 {
+            let n = left.min(chunk.len());
+            feed(&mut comp, &chunk[..n], TDEFLFlush::None, &mut out);
+            left -= n;
+        }
+        feed(&mut comp, &[], TDEFLFlush::Finish, &mut out);
+        out
+    }
+
+    /// Builds a file object by object.
+    struct Pdf {
+        buf: Vec<u8>,
+    }
+
+    impl Pdf {
+        fn new() -> Pdf {
+            Pdf { buf: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec() }
+        }
+
+        fn obj(&mut self, num: u32, body: &str) -> usize {
+            let at = self.buf.len();
+            self.buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+            at
+        }
+
+        fn stream(&mut self, num: u32, dict: &str, data: &[u8]) -> usize {
+            let at = self.buf.len();
+            self.buf.extend_from_slice(format!("{num} 0 obj\n<< {dict} /Length {} >>\nstream\n", data.len()).as_bytes());
+            self.buf.extend_from_slice(data);
+            self.buf.extend_from_slice(b"\nendstream\nendobj\n");
+            at
+        }
+
+        fn finish(mut self, startxref: usize) -> Vec<u8> {
+            self.buf.extend_from_slice(format!("startxref\n{startxref}\n%%EOF\n").as_bytes());
+            self.buf
+        }
+    }
+
+    fn run_within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> (T, Duration) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        let value = rx.recv_timeout(limit() * 3).expect("no answer: the program hangs");
+        (value, started.elapsed())
+    }
+
+    fn assert_quick(took: Duration, what: &str) {
+        assert!(took < limit(), "{what} took {took:?} (limit {:?})", limit());
+    }
+
+    /// For the one test that has to decode a whole gigabyte before the
+    /// document's budget runs out: that takes seconds even when nothing is
+    /// wrong, so it gets four times the time (still a fraction of what the
+    /// unbounded decoding took).
+    fn assert_within_four_times(took: Duration, what: &str) {
+        assert!(took < limit() * 4, "{what} took {took:?} (limit {:?})", limit() * 4);
+    }
+
+    /// Review finding h1: 300 pages that all inherit a /Resources of 10 MB.
+    #[test]
+    fn a_huge_inherited_resources_dictionary_is_shared_not_copied_into_every_page() {
+        let long_name = "A".repeat(10_000);
+        let names: String = (0..1000).map(|_| format!("/{long_name} ")).collect();
+        let pages = 300u32;
+        let mut p = Pdf::new();
+        let mut offsets = vec![0usize; 3 + pages as usize];
+        offsets[1] = p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids: String = (0..pages).map(|i| format!("{} 0 R ", 3 + i)).collect();
+        offsets[2] = p.obj(
+            2,
+            &format!("<< /Type /Pages /Kids [{kids}] /Count {pages} /MediaBox [0 0 100 100] /Resources << /X [{names}] >> >>"),
+        );
+        for i in 0..pages {
+            offsets[3 + i as usize] = p.obj(3 + i, "<< /Type /Page /Parent 2 0 R >>");
+        }
+        let xref = p.buf.len();
+        let mut table = format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len());
+        for o in &offsets[1..] {
+            table.push_str(&format!("{o:010} 00000 n \n"));
+        }
+        table.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\n", offsets.len()));
+        p.buf.extend_from_slice(table.as_bytes());
+        let bytes = p.finish(xref);
+        let input_len = bytes.len();
+
+        let ((rotated, pages_found, count_pages), took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let found = doc.pages().expect("pages").len();
+            let out = ops::rotate_pages(&doc, &(0..300).collect::<Vec<_>>(), 90).expect("rotate");
+            (out.data, found, out.pages)
+        });
+        assert_quick(took, "reading and rotating 300 pages that share 10 MB of resources");
+        assert_eq!((pages_found, count_pages), (300, 300));
+        // The 10 MB is in the output once, not 300 times.
+        assert!(rotated.len() < input_len * 2, "output {} bytes from {input_len}", rotated.len());
+        let doc = Document::from_bytes(rotated).expect("the output opens");
+        assert!(!doc.was_repaired());
+        assert_eq!(doc.page_count().unwrap(), 300);
+    }
+
+    /// Review finding h2 (smaller): object streams that decode to more than the
+    /// limit for one object stream are a Limit, quickly, not gigabytes.
+    #[test]
+    fn object_streams_that_decode_to_more_than_the_limit_are_refused() {
+        // Object stream 100 holds the page tree root and decodes to 70 MiB.
+        let header = "2 0 ";
+        let body = "<< /Type /Pages /Kids [] /Count 0 >>";
+        let packed = zlib_head_and_zeros(format!("{header}{body}").as_bytes(), 70 << 20);
+        let mut p = Pdf::new();
+        let o1 = p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let o100 = p.stream(100, &format!("/Type /ObjStm /N 1 /First {} /Filter /FlateDecode", header.len()), &packed);
+        let x = p.buf.len();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        let mut rows: Vec<[u8; 4]> = vec![row(0, 0, 255), row(1, o1, 0), row(2, 100, 0)];
+        rows.resize(100, row(0, 0, 0));
+        rows.push(row(1, o100, 0));
+        rows.resize(101, row(0, 0, 0));
+        rows.push(row(1, x, 0));
+        let table: Vec<u8> = rows.iter().flatten().copied().collect();
+        p.stream(101, &format!("/Type /XRef /Size {} /W [1 2 1] /Root 1 0 R", rows.len()), &table);
+        let bytes = p.finish(x);
+        let (outcome, took) = run_within(move || Document::from_bytes(bytes).map(|_| ()));
+        assert_quick(took, "opening a file whose page tree is in a 70 MiB object stream");
+        assert!(matches!(outcome, Err(Error::Limit(_))), "{outcome:?}");
+    }
+
+    /// Review finding h2: a file whose object streams are each below the limit but
+    /// that makes the reader decode them again and again runs into the budget
+    /// for a whole document.
+    #[test]
+    fn decoding_the_same_big_object_streams_again_and_again_runs_into_the_document_budget() {
+        // 40 object streams, 40 MiB each when decoded (1.6 GiB in all, more than the
+        // budget), all the same bytes. Object 10+k is said to be in stream 100+k.
+        let n = 40u32;
+        let header = "5 0 ";
+        let packed = zlib_head_and_zeros(format!("{header}(x)").as_bytes(), 40 << 20);
+        let mut p = Pdf::new();
+        let o1 = p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let o2 = p.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        let mut at = Vec::new();
+        for k in 0..n {
+            at.push(p.stream(100 + k, &format!("/Type /ObjStm /N 1 /First {} /Filter /FlateDecode", header.len()), &packed));
+        }
+        let x = p.buf.len();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        let size = 100 + n + 1;
+        let mut rows: Vec<[u8; 4]> = vec![row(0, 0, 0); size as usize];
+        rows[0] = row(0, 0, 255);
+        rows[1] = row(1, o1, 0);
+        rows[2] = row(1, o2, 0);
+        for k in 0..n {
+            rows[(10 + k) as usize] = row(2, 100 + k as usize, 0);
+            rows[(100 + k) as usize] = row(1, at[k as usize], 0);
+        }
+        rows[(100 + n) as usize] = row(1, x, 0);
+        let table: Vec<u8> = rows.iter().flatten().copied().collect();
+        p.stream(100 + n, &format!("/Type /XRef /Size {size} /W [1 2 1] /Root 1 0 R"), &table);
+        let bytes = p.finish(x);
+        let (limited, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let mut limited = 0usize;
+            for round in 0..2 {
+                for k in 0..n {
+                    match doc.get(ObjRef::new(10 + k, 0)) {
+                        Err(Error::Limit(_)) => limited += 1,
+                        Err(e) => panic!("round {round}, stream {k}: {e}"),
+                        Ok(Object::Null | Object::String(_)) => {}
+                        Ok(other) => panic!("{other:?}"),
+                    }
+                }
+            }
+            limited
+        });
+        assert_within_four_times(took, "decoding 40 object streams of 40 MiB twice over");
+        assert!(limited > 0, "the budget for decoding never ran out");
+    }
+
+    /// An xref stream that declares (nearly) as many entries as the limit allows.
+    fn xref_stream_file(sections: usize) -> Vec<u8> {
+        let n = (1usize << 23) - 8;
+        let mut p = Pdf::new();
+        let o1 = p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let o2 = p.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let o3 = p.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] >>");
+        let row = |t: u8, a: usize| {
+            let mut r = vec![t];
+            r.extend_from_slice(&u32::try_from(a).unwrap().to_be_bytes());
+            r.extend_from_slice(&[0, 0]);
+            r
+        };
+        let head: Vec<u8> = [row(0, 0), row(1, o1), row(1, o2), row(1, o3)].concat();
+        // Every row after these is a free entry: 7 zero bytes each.
+        let packed = zlib_head_and_zeros(&head, 7 * (n - 4));
+        let mut prev: Option<usize> = None;
+        for k in 0..sections {
+            let at = p.buf.len();
+            let prev_entry = prev.map_or(String::new(), |q| format!("/Prev {q}"));
+            p.stream(
+                4 + u32::try_from(k).unwrap(),
+                &format!("/Type /XRef /Size {n} /W [1 4 2] /Root 1 0 R {prev_entry} /Filter /FlateDecode"),
+                &packed,
+            );
+            prev = Some(at);
+        }
+        p.finish(prev.unwrap())
+    }
+
+    /// Review finding h4: one xref stream with 8 million entries.
+    #[test]
+    fn an_xref_stream_with_eight_million_entries_is_read_quickly() {
+        let bytes = xref_stream_file(1);
+        assert!(bytes.len() < 1_000_000, "the file is small ({} bytes): that is the point", bytes.len());
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes)?;
+            doc.page_count()
+        });
+        assert_quick(took, "reading an xref stream with 8 million entries");
+        assert!(matches!(outcome, Ok(1)), "{outcome:?}");
+    }
+
+    /// Review finding h4b: six of them chained by /Prev; the cap is for the
+    /// whole document, not per section.
+    #[test]
+    fn six_chained_xref_streams_of_eight_million_entries_stay_within_the_cap_for_the_whole_file() {
+        let bytes = xref_stream_file(6);
+        assert!(bytes.len() < 4_000_000, "{} bytes: still tiny next to what it declares", bytes.len());
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes)?;
+            let repaired = doc.was_repaired();
+            doc.page_count().map(|n| (n, repaired))
+        });
+        assert_quick(took, "reading six chained xref streams of 8 million entries");
+        // Either the limit is reported, or the file is read by scanning it:
+        // the chain beyond the cap is not followed either way.
+        match outcome {
+            Err(Error::Limit(_)) => {}
+            Ok((1, true)) => {}
+            other => panic!("{other:?}"),
+        }
+    }
 }

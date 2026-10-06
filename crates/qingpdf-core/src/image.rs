@@ -1,14 +1,15 @@
 //! Reading just enough of JPEG and PNG files to put them on PDF pages
 //! (images to PDF). JPEG data is embedded as it is, with `DCTDecode`
 //! (ISO 32000-1 7.4.8); only the header is read. PNG is decoded with the
-//! `png` crate and stored with `FlateDecode`, transparency as a soft mask
-//! (11.6.5.2, 8.9.5).
+//! `png` crate, row by row, and stored with `FlateDecode`, transparency as a
+//! soft mask (11.6.5.2, 8.9.5): the rows are compressed as they come, so the
+//! decoded image is never held in memory.
 
 use std::io::Cursor;
 
 use crate::error::{Error, Result};
 use crate::object::{Dict, ObjRef, Object};
-use crate::writer::Builder;
+use crate::writer::{Builder, FlateWriter};
 
 /// A4 in points (595.276 x 841.89, ISO 216 rounded the way PDF tools do).
 pub const A4_WIDTH: f64 = 595.276;
@@ -18,8 +19,15 @@ pub const DEFAULT_DPI: f64 = 96.0;
 /// Page sides Annex C allows are 3 to 14400 units; fitted pages stay inside.
 const MIN_PAGE_SIDE: f64 = 3.0;
 const MAX_PAGE_SIDE: f64 = 14_400.0;
-/// Decoded PNG pixels larger than this are refused instead of exhausting memory.
-const MAX_PNG_BYTES: usize = 512 * 1024 * 1024;
+/// PNG images with more pixels than this (16384 x 16384) are refused: decoding
+/// one takes seconds, and a tiny file can claim any size.
+const MAX_PNG_PIXELS: u64 = 1 << 28;
+/// An interlaced PNG (Adam7) cannot be turned into rows without holding the
+/// whole decoded image; one needing more than this is refused.
+const MAX_INTERLACED_BYTES: usize = 128 * 1024 * 1024;
+/// What the `png` crate itself may allocate besides the image: a few rows and
+/// its decompression buffers.
+const PNG_WORKING_BYTES: usize = 32 * 1024 * 1024;
 
 /// How big the page is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,16 +227,19 @@ fn exif_orientation(tiff: &[u8]) -> Option<u8> {
 
 // --- PNG ----------------------------------------------------------------------
 
-/// A PNG as 8-bit gray or RGB, with its alpha channel split off.
+/// A PNG as 8-bit gray or RGB, with its alpha channel split off, both already
+/// compressed with Flate (zlib), ready to be a stream's data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PngImage {
     pub width: u32,
     pub height: u32,
     /// Gray (one byte per pixel) or RGB (three).
     pub gray: bool,
-    pub pixels: Vec<u8>,
-    /// One byte per pixel; `None` when the image is opaque everywhere.
-    pub alpha: Option<Vec<u8>>,
+    /// The samples, row after row, Flate-compressed.
+    pub pixels_flate: Vec<u8>,
+    /// One byte per pixel, Flate-compressed; `None` when the image is opaque
+    /// everywhere.
+    pub alpha_flate: Option<Vec<u8>>,
     /// Pixels per inch from the `pHYs` chunk, when it has a unit.
     pub dpi: Option<(f64, f64)>,
 }
@@ -237,59 +248,125 @@ fn bad_png(why: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("not a usable PNG file: {why}"))
 }
 
+fn png_too_large() -> Error {
+    Error::Limit("the PNG image is too large".to_string())
+}
+
+/// Takes the decoded rows of a PNG one at a time, splits colour from alpha and
+/// compresses both as it goes.
+struct RowSink {
+    /// Samples per pixel as decoded: 1 gray, 2 gray + alpha, 3 RGB, 4 RGB + alpha.
+    channels: usize,
+    width: usize,
+    colour: FlateWriter,
+    alpha: Option<FlateWriter>,
+    opaque: bool,
+    colour_row: Vec<u8>,
+    alpha_row: Vec<u8>,
+    rows: u64,
+}
+
+impl RowSink {
+    fn new(channels: usize, width: usize) -> RowSink {
+        let has_alpha = channels == 2 || channels == 4;
+        RowSink {
+            channels,
+            width,
+            colour: FlateWriter::new(),
+            alpha: has_alpha.then(FlateWriter::new),
+            opaque: true,
+            colour_row: Vec::new(),
+            alpha_row: Vec::new(),
+            rows: 0,
+        }
+    }
+
+    fn push_row(&mut self, row: &[u8]) -> Result<()> {
+        let wanted = self.width.checked_mul(self.channels).ok_or_else(png_too_large)?;
+        let row = row.get(..wanted).ok_or_else(|| bad_png("a row is shorter than the header says"))?;
+        self.rows += 1;
+        let Some(alpha) = self.alpha.as_mut() else {
+            return self.colour.write(row);
+        };
+        let colour_channels = self.channels - 1;
+        self.colour_row.clear();
+        self.alpha_row.clear();
+        for px in row.chunks_exact(self.channels) {
+            let (colour, a) = px.split_at(colour_channels);
+            self.colour_row.extend_from_slice(colour);
+            let a = a.first().copied().unwrap_or(255);
+            self.opaque &= a == 255;
+            self.alpha_row.push(a);
+        }
+        self.colour.write(&self.colour_row)?;
+        alpha.write(&self.alpha_row)
+    }
+
+    /// The compressed colour and, unless the image is opaque everywhere, alpha.
+    fn finish(self) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let colour = self.colour.finish()?;
+        let alpha = match self.alpha {
+            // Nothing transparent anywhere: no mask needed.
+            Some(_) if self.opaque => None,
+            Some(writer) => Some(writer.finish()?),
+            None => None,
+        };
+        Ok((colour, alpha))
+    }
+}
+
 /// Decode a PNG to 8-bit gray or RGB. Palette images are expanded, 16-bit
-/// samples reduced to 8, `tRNS` transparency turned into alpha.
+/// samples reduced to 8, `tRNS` transparency turned into alpha. The image is
+/// read row by row and compressed as it is read; more than 2^28 pixels, or an
+/// interlaced image needing more than 128 MiB, is a [`Error::Limit`].
 pub fn decode_png(data: &[u8]) -> Result<PngImage> {
     let mut decoder = png::Decoder::new(Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
-    decoder.set_limits(png::Limits { bytes: MAX_PNG_BYTES });
+    decoder.set_limits(png::Limits { bytes: PNG_WORKING_BYTES });
     let mut reader = decoder.read_info().map_err(bad_png)?;
-    let size = reader.output_buffer_size().filter(|&n| n <= MAX_PNG_BYTES);
-    let Some(size) = size else {
-        return Err(Error::Limit("the PNG image is too large".to_string()));
-    };
-    let mut buf = vec![0u8; size];
-    let frame = reader.next_frame(&mut buf).map_err(bad_png)?;
-    if frame.bit_depth != png::BitDepth::Eight {
+    let (width, height) = reader.info().size();
+    if u64::from(width) * u64::from(height) > MAX_PNG_PIXELS {
+        return Err(png_too_large());
+    }
+    let (color_type, bit_depth) = reader.output_color_type();
+    if bit_depth != png::BitDepth::Eight {
         return Err(bad_png("unexpected bit depth after conversion"));
     }
-    let channels = match frame.color_type {
+    let channels = match color_type {
         png::ColorType::Grayscale => 1usize,
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb => 3,
         png::ColorType::Rgba => 4,
         png::ColorType::Indexed => return Err(bad_png("palette was not expanded")),
     };
-    let pixel_count = usize::try_from(frame.width)
-        .ok()
-        .and_then(|w| usize::try_from(frame.height).ok().and_then(|h| w.checked_mul(h)))
-        .ok_or_else(|| Error::Limit("the PNG image is too large".to_string()))?;
-    let used = pixel_count.checked_mul(channels).ok_or_else(|| Error::Limit("the PNG image is too large".to_string()))?;
-    let raw = buf.get(..used).ok_or_else(|| bad_png("the pixel data is shorter than the header says"))?;
-
-    let has_alpha = matches!(frame.color_type, png::ColorType::GrayscaleAlpha | png::ColorType::Rgba);
-    let gray = matches!(frame.color_type, png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha);
-    let (pixels, alpha) = if has_alpha {
-        let color_channels = channels - 1;
-        let mut pixels = Vec::with_capacity(pixel_count.saturating_mul(color_channels));
-        let mut alpha = Vec::with_capacity(pixel_count);
-        for px in raw.chunks_exact(channels) {
-            let (color, a) = px.split_at(color_channels);
-            pixels.extend_from_slice(color);
-            alpha.push(a.first().copied().unwrap_or(255));
+    let gray = matches!(color_type, png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha);
+    let mut sink = RowSink::new(channels, usize::try_from(width).map_err(|_| png_too_large())?);
+    if reader.info().interlaced {
+        // The passes of an interlaced image come in pieces that have to be
+        // put together, so it must be held whole.
+        let line = reader.output_line_size(width).ok_or_else(png_too_large)?;
+        let size = reader.output_buffer_size().filter(|&n| n <= MAX_INTERLACED_BYTES).ok_or_else(|| {
+            Error::Limit(format!("the interlaced PNG image needs more than {MAX_INTERLACED_BYTES} bytes to decode"))
+        })?;
+        let mut buf = vec![0u8; size];
+        reader.next_frame(&mut buf).map_err(bad_png)?;
+        for row in buf.chunks_exact(line.max(1)) {
+            sink.push_row(row)?;
         }
-        // Nothing transparent anywhere: no mask needed.
-        let opaque = alpha.iter().all(|&a| a == 255);
-        (pixels, if opaque { None } else { Some(alpha) })
     } else {
-        (raw.to_vec(), None)
-    };
-
+        while let Some(row) = reader.next_row().map_err(bad_png)? {
+            sink.push_row(row.data())?;
+        }
+    }
+    if sink.rows != u64::from(height) {
+        return Err(bad_png("the pixel data is shorter than the header says"));
+    }
+    let (pixels_flate, alpha_flate) = sink.finish()?;
     let dpi = reader.info().pixel_dims.and_then(|p| match p.unit {
         png::Unit::Meter if p.xppu > 0 && p.yppu > 0 => Some((f64::from(p.xppu) * 0.0254, f64::from(p.yppu) * 0.0254)),
         _ => None,
     });
-    Ok(PngImage { width: frame.width, height: frame.height, gray, pixels, alpha, dpi })
+    Ok(PngImage { width, height, gray, pixels_flate, alpha_flate, dpi })
 }
 
 // --- placing an image on a page ---------------------------------------------------
@@ -394,9 +471,9 @@ pub fn add_jpeg(b: &mut Builder<'_>, data: &[u8], info: &JpegInfo) -> Result<Obj
     b.add(&Object::Stream(crate::object::Stream { dict, data: data.to_vec() }))
 }
 
-/// Add a decoded PNG as an image XObject, Flate-compressed, with its alpha
-/// channel as a soft mask image (`/SMask`).
-pub fn add_png(b: &mut Builder<'_>, png: &PngImage) -> Result<ObjRef> {
+/// Add a decoded PNG as an image XObject, with its alpha channel as a soft
+/// mask image (`/SMask`). Both are already Flate-compressed.
+pub fn add_png(b: &mut Builder<'_>, png: PngImage) -> Result<ObjRef> {
     let size = |space: &str| {
         let mut dict = Dict::new();
         dict.set("Type", Object::from("XObject"));
@@ -408,11 +485,11 @@ pub fn add_png(b: &mut Builder<'_>, png: &PngImage) -> Result<ObjRef> {
         dict
     };
     let mut dict = size(if png.gray { "DeviceGray" } else { "DeviceRGB" });
-    if let Some(alpha) = &png.alpha {
-        let mask = b.add_flate_stream(size("DeviceGray"), alpha)?;
+    if let Some(alpha) = png.alpha_flate {
+        let mask = b.add_precompressed_flate_stream(size("DeviceGray"), alpha)?;
         dict.set("SMask", Object::Ref(mask));
     }
-    b.add_flate_stream(dict, &png.pixels)
+    b.add_precompressed_flate_stream(dict, png.pixels_flate)
 }
 
 #[cfg(test)]
@@ -652,6 +729,11 @@ mod tests {
         assert_eq!((p.page_width, p.page_height), (3.0, 3.0));
     }
 
+    /// What a compressed PNG channel holds.
+    fn inflated(flate: &[u8]) -> Vec<u8> {
+        miniz_oxide::inflate::decompress_to_vec_zlib(flate).unwrap()
+    }
+
     fn make_png(width: u32, height: u32, color: png::ColorType, depth: png::BitDepth, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         {
@@ -669,8 +751,8 @@ mod tests {
         let data = make_png(2, 1, png::ColorType::Rgb, png::BitDepth::Eight, &[1, 2, 3, 4, 5, 6]);
         let img = decode_png(&data).unwrap();
         assert_eq!((img.width, img.height, img.gray), (2, 1, false));
-        assert_eq!(img.pixels, vec![1, 2, 3, 4, 5, 6]);
-        assert_eq!(img.alpha, None);
+        assert_eq!(inflated(&img.pixels_flate), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(img.alpha_flate, None);
         assert_eq!(img.dpi, None);
     }
 
@@ -679,16 +761,16 @@ mod tests {
         let rgba = make_png(2, 1, png::ColorType::Rgba, png::BitDepth::Eight, &[10, 20, 30, 255, 40, 50, 60, 128]);
         let img = decode_png(&rgba).unwrap();
         assert!(!img.gray);
-        assert_eq!(img.pixels, vec![10, 20, 30, 40, 50, 60]);
-        assert_eq!(img.alpha, Some(vec![255, 128]));
+        assert_eq!(inflated(&img.pixels_flate), vec![10, 20, 30, 40, 50, 60]);
+        assert_eq!(img.alpha_flate.as_deref().map(inflated), Some(vec![255, 128]));
         let ga = make_png(2, 1, png::ColorType::GrayscaleAlpha, png::BitDepth::Eight, &[7, 0, 9, 200]);
         let img = decode_png(&ga).unwrap();
         assert!(img.gray);
-        assert_eq!(img.pixels, vec![7, 9]);
-        assert_eq!(img.alpha, Some(vec![0, 200]));
+        assert_eq!(inflated(&img.pixels_flate), vec![7, 9]);
+        assert_eq!(img.alpha_flate.as_deref().map(inflated), Some(vec![0, 200]));
         // Fully opaque alpha is dropped.
         let opaque = make_png(1, 2, png::ColorType::Rgba, png::BitDepth::Eight, &[1, 2, 3, 255, 4, 5, 6, 255]);
-        assert_eq!(decode_png(&opaque).unwrap().alpha, None);
+        assert_eq!(decode_png(&opaque).unwrap().alpha_flate, None);
     }
 
     #[test]
@@ -697,11 +779,11 @@ mod tests {
         let g16 = make_png(2, 1, png::ColorType::Grayscale, png::BitDepth::Sixteen, &[0x12, 0x34, 0xAB, 0xCD]);
         let img = decode_png(&g16).unwrap();
         assert!(img.gray);
-        assert_eq!(img.pixels, vec![0x12, 0xAB]);
+        assert_eq!(inflated(&img.pixels_flate), vec![0x12, 0xAB]);
         // 1-bit gray: 8 pixels in one byte, 0b10100000 -> white black white black ...
         let g1 = make_png(4, 1, png::ColorType::Grayscale, png::BitDepth::One, &[0b1010_0000]);
         let img = decode_png(&g1).unwrap();
-        assert_eq!(img.pixels, vec![255, 0, 255, 0]);
+        assert_eq!(inflated(&img.pixels_flate), vec![255, 0, 255, 0]);
     }
 
     #[test]
@@ -717,8 +799,8 @@ mod tests {
             w.write_image_data(&[0, 1]).unwrap();
         }
         let img = decode_png(&out).unwrap();
-        assert_eq!(img.pixels, vec![255, 0, 0, 0, 255, 0]);
-        assert_eq!(img.alpha, Some(vec![255, 0]));
+        assert_eq!(inflated(&img.pixels_flate), vec![255, 0, 0, 0, 255, 0]);
+        assert_eq!(img.alpha_flate.as_deref().map(inflated), Some(vec![255, 0]));
     }
 
     #[test]
@@ -745,6 +827,89 @@ mod tests {
             w.write_image_data(&[0]).unwrap();
         }
         assert_eq!(decode_png(&out).unwrap().dpi, None);
+    }
+
+    #[test]
+    fn an_interlaced_png_gives_the_same_pixels_as_a_plain_one() {
+        // 9 x 7 RGB, Adam7 interlaced (the encoder cannot make one, so this
+        // file was written by hand); sample i is i * 7 % 251.
+        let interlaced: [u8; 271] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x07, 0x08, 0x02, 0x00, 0x00, 0x01, 0x22, 0xfe, 0xc0,
+            0xa1, 0x00, 0x00, 0x00, 0xd6, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x01, 0xcb, 0x00, 0x34, 0xff,
+            0x00, 0x00, 0x07, 0x0e, 0xa8, 0xaf, 0xb6, 0x00, 0x54, 0x5b, 0x62, 0x00, 0x03, 0x0a, 0x11, 0x57,
+            0x5e, 0x65, 0xab, 0xb2, 0xb9, 0x00, 0x2a, 0x31, 0x38, 0x7e, 0x85, 0x8c, 0x00, 0x2d, 0x34, 0x3b,
+            0x81, 0x88, 0x8f, 0x00, 0x7f, 0x86, 0x8d, 0xa9, 0xb0, 0xb7, 0xd3, 0xda, 0xe1, 0x02, 0x09, 0x10,
+            0x2c, 0x33, 0x3a, 0x00, 0x82, 0x89, 0x90, 0xac, 0xb3, 0xba, 0xd6, 0xdd, 0xe4, 0x05, 0x0c, 0x13,
+            0x2f, 0x36, 0x3d, 0x00, 0x15, 0x1c, 0x23, 0x3f, 0x46, 0x4d, 0x69, 0x70, 0x77, 0x93, 0x9a, 0xa1,
+            0x00, 0x94, 0x9b, 0xa2, 0xbe, 0xc5, 0xcc, 0xe8, 0xef, 0xf6, 0x17, 0x1e, 0x25, 0x00, 0x18, 0x1f,
+            0x26, 0x42, 0x49, 0x50, 0x6c, 0x73, 0x7a, 0x96, 0x9d, 0xa4, 0x00, 0x97, 0x9e, 0xa5, 0xc1, 0xc8,
+            0xcf, 0xeb, 0xf2, 0xf9, 0x1a, 0x21, 0x28, 0x00, 0xbd, 0xc4, 0xcb, 0xd2, 0xd9, 0xe0, 0xe7, 0xee,
+            0xf5, 0x01, 0x08, 0x0f, 0x16, 0x1d, 0x24, 0x2b, 0x32, 0x39, 0x40, 0x47, 0x4e, 0x55, 0x5c, 0x63,
+            0x6a, 0x71, 0x78, 0x00, 0x41, 0x48, 0x4f, 0x56, 0x5d, 0x64, 0x6b, 0x72, 0x79, 0x80, 0x87, 0x8e,
+            0x95, 0x9c, 0xa3, 0xaa, 0xb1, 0xb8, 0xbf, 0xc6, 0xcd, 0xd4, 0xdb, 0xe2, 0xe9, 0xf0, 0xf7, 0x00,
+            0xc0, 0xc7, 0xce, 0xd5, 0xdc, 0xe3, 0xea, 0xf1, 0xf8, 0x04, 0x0b, 0x12, 0x19, 0x20, 0x27, 0x2e,
+            0x35, 0x3c, 0x43, 0x4a, 0x51, 0x58, 0x5f, 0x66, 0x6d, 0x74, 0x7b, 0xbf, 0xdf, 0x58, 0xb4, 0x3e,
+            0x64, 0xd1, 0xb2, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let pixels: Vec<u8> = (0..9 * 7 * 3u32).map(|i| (i * 7 % 251) as u8).collect();
+        let plain = make_png(9, 7, png::ColorType::Rgb, png::BitDepth::Eight, &pixels);
+        let a = decode_png(&plain).unwrap();
+        let b = decode_png(&interlaced).unwrap();
+        assert_eq!(inflated(&a.pixels_flate), pixels);
+        assert_eq!(inflated(&b.pixels_flate), pixels);
+    }
+
+    #[test]
+    fn a_png_that_claims_too_many_pixels_is_refused_without_decoding_it() {
+        // 40000 x 40000 declared, and a few rows of data: refused by size.
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 40_000, 40_000);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            let rows = miniz_oxide::deflate::compress_to_vec_zlib(&[0u8; 100], 6);
+            w.write_chunk(png::chunk::IDAT, &rows).unwrap();
+        }
+        assert!(matches!(decode_png(&out), Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn a_big_flat_png_is_decoded_a_row_at_a_time() {
+        // 2000 x 1500 RGBA, all one transparent colour: 12 MB of pixels that
+        // end up as a few hundred bytes.
+        let (w, h) = (2000u32, 1500u32);
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut writer = enc.write_header().unwrap();
+            let mut stream = writer.stream_writer().unwrap();
+            let row = vec![10u8; w as usize * 4];
+            for _ in 0..h {
+                std::io::Write::write_all(&mut stream, &row).unwrap();
+            }
+            stream.finish().unwrap();
+        }
+        let img = decode_png(&out).unwrap();
+        assert_eq!((img.width, img.height), (w, h));
+        assert!(img.pixels_flate.len() < 200_000);
+        assert_eq!(inflated(&img.pixels_flate).len(), w as usize * h as usize * 3);
+        assert_eq!(inflated(img.alpha_flate.as_ref().unwrap()).len(), w as usize * h as usize);
+    }
+
+    #[test]
+    fn flate_writer_gives_what_the_one_shot_compressor_would_decode_to() {
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        let mut w = FlateWriter::new();
+        for piece in data.chunks(7919) {
+            w.write(piece).unwrap();
+        }
+        assert_eq!(inflated(&w.finish().unwrap()), data);
+        // Nothing at all is a valid, empty zlib stream.
+        assert_eq!(inflated(&FlateWriter::new().finish().unwrap()), Vec::<u8>::new());
     }
 
     #[test]

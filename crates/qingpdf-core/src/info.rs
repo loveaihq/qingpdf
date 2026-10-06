@@ -1,7 +1,7 @@
 //! What `qingpdf info` reports: version, pages and their sizes, the document
 //! information dictionary, and how the file is built.
 
-use crate::document::{Document, Page, rectangle};
+use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::Object;
 
@@ -79,7 +79,7 @@ pub fn describe(doc: &Document) -> Result<Report> {
 /// swapped when the page is rotated a quarter turn.
 fn page_info(page: &Page) -> PageInfo {
     let rotation = page.rotate();
-    let visible = page.media_box().map(|media| match rectangle(page.dict.get("CropBox")) {
+    let visible = page.media_box().map(|media| match page.crop_box() {
         Some(crop) => {
             let clipped = [crop[0].max(media[0]), crop[1].max(media[1]), crop[2].min(media[2]), crop[3].min(media[3])];
             if clipped[2] > clipped[0] && clipped[3] > clipped[1] { clipped } else { media }

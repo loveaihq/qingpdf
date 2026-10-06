@@ -25,6 +25,16 @@ MAX_PAGES = 8
 SCALE = 0.5          # 36 dpi is enough to see a missing glyph or image
 THRESHOLD = 0.5      # mean absolute difference per pixel, 0-255 grey levels
 
+# Differences already investigated (2026-10-06): PDFium is the odd one out.
+KNOWN = {
+    os.path.join("public", "page-tree", "Pages-tree-refs.pdf"):
+        "PDFium trusts /Count and lists a page inside a loop that does not exist; it cannot load it",
+    os.path.join("public", "page-tree", "cropped_no_overlap.pdf"):
+        "CropBox lies outside MediaBox; pypdfium2 refuses to render the original and the copy alike",
+    os.path.join("local", "linearized", "linearized_bug_1055.pdf"):
+        "PDFium does not draw the annotations of this damaged original; MuPDF does, and our copy matches MuPDF",
+}
+
 
 def render(path, pages):
     doc = pdfium.PdfDocument(path)
@@ -35,7 +45,8 @@ def render(path, pages):
 
 
 def main():
-    results = {"same": [], "differs": [], "refused by qingpdf": [], "PDFium cannot open original": []}
+    results = {"same": [], "differs": [], "known PDFium differences": [], "refused by qingpdf": [],
+               "PDFium cannot open original": []}
     with tempfile.TemporaryDirectory() as tmp:
         copy = os.path.join(tmp, "copy.pdf")
         for path in sorted(glob.glob(os.path.join(ROOT, "**", "*.pdf"), recursive=True)):
@@ -51,6 +62,9 @@ def main():
                                  capture_output=True, text=True, encoding="utf-8", errors="replace")
             if run.returncode != 0 or count == 0:
                 results["refused by qingpdf"].append(f"{rel}: {(run.stderr or run.stdout).strip()[:120] or 'no pages'}")
+                continue
+            if rel in KNOWN:
+                results["known PDFium differences"].append(f"{rel}: {KNOWN[rel]}")
                 continue
             pages = list(range(min(count, MAX_PAGES)))
             try:

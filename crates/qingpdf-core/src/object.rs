@@ -138,6 +138,11 @@ impl Dict {
         }
     }
 
+    /// Drop the entries whose value is null (7.3.7: the same as absent).
+    pub fn remove_nulls(&mut self) {
+        self.0.retain(|(_, v)| !matches!(v, Object::Null));
+    }
+
     pub fn remove(&mut self, key: &str) -> Option<Object> {
         let pos = self.0.iter().position(|(k, _)| k == key)?;
         Some(self.0.remove(pos).1)

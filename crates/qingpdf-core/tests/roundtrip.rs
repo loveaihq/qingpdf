@@ -47,10 +47,6 @@ impl Summary {
 #[test]
 fn round_trip_every_corpus_file() {
     let files = common::corpus_files();
-    if files.is_empty() {
-        println!("NOTE: no corpus files found under tests/corpus; nothing to round-trip");
-        return;
-    }
     let mut summary = Summary::default();
     for path in &files {
         let name = common::corpus_name(path);

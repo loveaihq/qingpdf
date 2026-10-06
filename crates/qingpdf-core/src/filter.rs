@@ -2,6 +2,8 @@
 //! the predictors of 7.4.4.4; every other filter is reported as
 //! [`Error::Unsupported`] and the caller keeps the raw bytes.
 
+use std::cell::Cell;
+
 use miniz_oxide::inflate::TINFLStatus;
 use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 
@@ -11,6 +13,50 @@ use crate::object::{Dict, Name, Object};
 /// Largest decoded stream we are willing to build (a guard against
 /// compression bombs).
 pub const MAX_DECODED_SIZE: usize = 256 * 1024 * 1024;
+
+/// Largest an object stream (7.5.7) may decode to. Real ones are a few
+/// hundred kilobytes; the cache holds on to them, so the limit is lower than
+/// the general one.
+pub const MAX_OBJSTM_DECODED: usize = 64 * 1024 * 1024;
+
+/// Total decoded bytes one document may make the decoder produce, however many
+/// streams and however often the same one is decoded again.
+pub const DECODE_BUDGET: u64 = 1024 * 1024 * 1024;
+
+/// What is left of a document's decoding budget. Every Flate step charges the
+/// bytes it produced (also the ones it produced before failing), so a file
+/// full of compression bombs ends in [`Error::Limit`] instead of minutes of
+/// work, however the bombs are reached.
+#[derive(Debug)]
+pub struct DecodeBudget {
+    left: Cell<u64>,
+}
+
+impl Default for DecodeBudget {
+    fn default() -> Self {
+        DecodeBudget::new(DECODE_BUDGET)
+    }
+}
+
+impl DecodeBudget {
+    pub fn new(total: u64) -> Self {
+        DecodeBudget { left: Cell::new(total) }
+    }
+
+    pub fn remaining(&self) -> u64 {
+        self.left.get()
+    }
+
+    fn charge(&self, bytes: usize) {
+        self.left.set(self.left.get().saturating_sub(u64::try_from(bytes).unwrap_or(u64::MAX)));
+    }
+
+    /// Spend `bytes` of the budget, to test what happens when it runs out.
+    #[cfg(test)]
+    pub(crate) fn charge_for_test(&self, bytes: u64) {
+        self.left.set(self.left.get().saturating_sub(bytes));
+    }
+}
 
 /// Upper bounds for predictor parameters; the spec sets none, these only keep
 /// hostile values from overflowing the row arithmetic.
@@ -23,7 +69,7 @@ type Resolver<'a> = &'a dyn Fn(&Object) -> Result<Object>;
 /// `resolve` follows indirect references found in `/Filter` and
 /// `/DecodeParms`.
 pub fn decode(dict: &Dict, data: &[u8], resolve: Resolver<'_>) -> Result<Vec<u8>> {
-    decode_with_limit(dict, data, resolve, MAX_DECODED_SIZE)
+    decode_with_limit(dict, data, resolve, MAX_DECODED_SIZE, 0, &DecodeBudget::default())
 }
 
 /// Like [`decode`] when the dictionary is known to hold only direct objects
@@ -32,7 +78,17 @@ pub fn decode_direct(dict: &Dict, data: &[u8]) -> Result<Vec<u8>> {
     decode(dict, data, &|o| Ok(o.clone()))
 }
 
-fn decode_with_limit(dict: &Dict, data: &[u8], resolve: Resolver<'_>, limit: usize) -> Result<Vec<u8>> {
+/// Decode with a cap on each step's output (`limit`), a guess of the final
+/// size to size the first buffer (`hint`, 0 for none), and a document's
+/// decoding budget to charge the work to.
+pub fn decode_with_limit(
+    dict: &Dict,
+    data: &[u8],
+    resolve: Resolver<'_>,
+    limit: usize,
+    hint: usize,
+    budget: &DecodeBudget,
+) -> Result<Vec<u8>> {
     let filters = filter_names(dict, resolve)?;
     if filters.is_empty() {
         return Ok(data.to_vec());
@@ -44,7 +100,7 @@ fn decode_with_limit(dict: &Dict, data: &[u8], resolve: Resolver<'_>, limit: usi
         let parm = parms.get(i).and_then(|p| p.as_ref());
         let output = match name.as_bytes() {
             b"FlateDecode" => {
-                let inflated = inflate_zlib(input, limit)?;
+                let inflated = inflate_zlib(input, limit, hint, budget)?;
                 apply_predictor(inflated, parm, resolve)?
             }
             // 7.4.10: the Identity crypt filter (the default) leaves data as is.
@@ -113,16 +169,16 @@ fn decode_parms(dict: &Dict, resolve: Resolver<'_>) -> Result<Vec<Option<Dict>>>
 
 /// zlib/deflate decoding (RFC 1950, 1951). Truncated data and a wrong
 /// checksum are tolerated and give what was decoded; corrupt data is an error.
-fn inflate_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+fn inflate_zlib(input: &[u8], limit: usize, hint: usize, budget: &DecodeBudget) -> Result<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    match inflate_once(input, limit) {
+    match inflate_once(input, limit, hint, budget) {
         Err(Error::Syntax { .. }) => {
             // A stray end-of-line before the zlib header is a common defect.
             let trimmed = input.iter().position(|&b| b != b'\r' && b != b'\n').and_then(|p| input.get(p..));
             match trimmed {
-                Some(rest) if rest.len() != input.len() => inflate_once(rest, limit),
+                Some(rest) if rest.len() != input.len() => inflate_once(rest, limit, hint, budget),
                 _ => Err(Error::syntax(None, "corrupt FlateDecode data")),
             }
         }
@@ -130,9 +186,19 @@ fn inflate_zlib(input: &[u8], limit: usize) -> Result<Vec<u8>> {
     }
 }
 
-fn inflate_once(input: &[u8], limit: usize) -> Result<Vec<u8>> {
+fn inflate_once(input: &[u8], limit: usize, hint: usize, budget: &DecodeBudget) -> Result<Vec<u8>> {
     let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-    let mut out = vec![0u8; input.len().saturating_mul(4).max(1024).min(limit.max(1))];
+    // The output may not outgrow the cap, nor what is left of the budget.
+    let left = usize::try_from(budget.remaining()).unwrap_or(usize::MAX);
+    let cap = limit.min(left);
+    if cap == 0 {
+        return Err(Error::Limit("the document asks for more decoding work than is allowed".to_string()));
+    }
+    // Deflate cannot do better than about 1032:1, so a hint far beyond that is
+    // a lie and is not believed.
+    let believable = input.len().saturating_mul(1100).saturating_add(1024);
+    let first = input.len().saturating_mul(4).max(hint.min(believable)).max(1024).min(cap.max(1));
+    let mut out = vec![0u8; first];
     let mut state = Box::<DecompressorOxide>::default();
     let mut in_pos = 0usize;
     let mut out_pos = 0usize;
@@ -143,22 +209,37 @@ fn inflate_once(input: &[u8], limit: usize) -> Result<Vec<u8>> {
         out_pos = out_pos.saturating_add(produced).min(out.len());
         match status {
             TINFLStatus::Done | TINFLStatus::Adler32Mismatch => {
+                budget.charge(out_pos);
                 out.truncate(out_pos);
+                // The buffer was sized for the worst case; the result is
+                // kept around (object streams), so give the slack back.
+                if out.capacity() > out_pos.saturating_add(out_pos / 8).saturating_add(4096) {
+                    out.shrink_to_fit();
+                }
                 return Ok(out);
             }
             TINFLStatus::HasMoreOutput => {
-                if out.len() >= limit {
-                    return Err(Error::Limit(format!("decoded stream larger than {} bytes", limit)));
+                if out.len() >= cap {
+                    budget.charge(out_pos);
+                    return Err(if cap < limit {
+                        Error::Limit("the document asks for more decoding work than is allowed".to_string())
+                    } else {
+                        Error::Limit(format!("decoded stream larger than {limit} bytes"))
+                    });
                 }
-                let new_len = out.len().saturating_mul(2).min(limit);
+                let new_len = out.len().saturating_mul(2).min(cap);
                 out.resize(new_len, 0);
             }
             // Input ended before the end of the compressed data: keep what we have.
             TINFLStatus::FailedCannotMakeProgress | TINFLStatus::NeedsMoreInput => {
+                budget.charge(out_pos);
                 out.truncate(out_pos);
                 return Ok(out);
             }
-            _ => return Err(Error::syntax(None, "corrupt FlateDecode data")),
+            _ => {
+                budget.charge(out_pos);
+                return Err(Error::syntax(None, "corrupt FlateDecode data"));
+            }
         }
     }
 }
@@ -398,13 +479,48 @@ mod tests {
     fn flate_output_limit() {
         let packed = compress_to_vec_zlib(&vec![0u8; 100_000], 6);
         let d = flate_dict(None);
-        let r = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 10_000);
+        let r = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 10_000, 0, &DecodeBudget::default());
         assert!(matches!(r, Err(Error::Limit(_))), "{r:?}");
         // The same data under a big enough limit decodes.
-        let ok = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 100_000).unwrap();
+        let ok = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 100_000, 0, &DecodeBudget::default()).unwrap();
         assert_eq!(ok.len(), 100_000);
-        let ok = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 1 << 20).unwrap();
+        let ok = decode_with_limit(&d, &packed, &|o| Ok(o.clone()), 1 << 20, 0, &DecodeBudget::default()).unwrap();
         assert_eq!(ok.len(), 100_000);
+    }
+
+    #[test]
+    fn the_decoding_budget_is_charged_for_every_step_and_enforced() {
+        let packed = compress_to_vec_zlib(&vec![0u8; 100_000], 6);
+        let d = flate_dict(None);
+        let budget = DecodeBudget::new(250_000);
+        let resolve = |o: &Object| Ok(o.clone());
+        for _ in 0..2 {
+            assert_eq!(decode_with_limit(&d, &packed, &resolve, 1 << 20, 0, &budget).unwrap().len(), 100_000);
+        }
+        assert_eq!(budget.remaining(), 50_000);
+        // The third needs 100,000 and 50,000 are left: refused, and what was
+        // produced before giving up is charged too.
+        let r = decode_with_limit(&d, &packed, &resolve, 1 << 20, 0, &budget);
+        assert!(matches!(&r, Err(Error::Limit(m)) if m.contains("decoding work")), "{r:?}");
+        assert_eq!(budget.remaining(), 0);
+        // With nothing left every decode of anything but nothing is refused at once.
+        assert!(matches!(decode_with_limit(&d, &packed, &resolve, 1 << 20, 0, &budget), Err(Error::Limit(_))));
+        let small = compress_to_vec_zlib(b"x", 6);
+        assert!(matches!(decode_with_limit(&d, &small, &resolve, 1 << 20, 0, &budget), Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn a_size_hint_only_sizes_the_first_buffer() {
+        let packed = compress_to_vec_zlib(&vec![7u8; 100_000], 6);
+        let d = flate_dict(None);
+        let resolve = |o: &Object| Ok(o.clone());
+        let budget = DecodeBudget::default();
+        // Exactly right, too small, and an absurd lie: all give the same data.
+        for hint in [100_000, 10, usize::MAX] {
+            let out = decode_with_limit(&d, &packed, &resolve, 1 << 20, hint, &budget).unwrap();
+            assert_eq!(out.len(), 100_000, "hint {hint}");
+            assert!(out.iter().all(|&b| b == 7));
+        }
     }
 
     #[test]

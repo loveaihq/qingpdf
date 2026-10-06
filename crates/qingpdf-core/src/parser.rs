@@ -147,6 +147,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A value inside an array or a dictionary. A keyword that has no place
+    /// there (a stray token such as `"72AF..."`, which the lexer reads as a
+    /// keyword because a quote is an ordinary character) reads as null and
+    /// parsing goes on. The keywords that begin or end objects (`endobj`,
+    /// `stream`, ...) are not skipped: they mean the container was never
+    /// closed, and are an error as before.
+    fn parse_member(&mut self, depth: usize) -> Result<Object> {
+        let save = self.lex.pos();
+        if let Some(Token::Keyword(k)) = self.lex.next_token()?
+            && !matches!(k, b"true" | b"false" | b"null")
+            && !is_object_boundary(k)
+        {
+            return Ok(Object::Null);
+        }
+        self.lex.set_pos(save);
+        self.parse_value(depth)
+    }
+
     fn check_depth(&self, depth: usize) -> Result<()> {
         if depth >= MAX_NESTING {
             return Err(Error::Limit(format!("arrays and dictionaries nested more than {MAX_NESTING} levels deep")));
@@ -164,7 +182,7 @@ impl<'a> Parser<'a> {
                 Some(Token::ArrayEnd) => return Ok(Object::Array(items)),
                 Some(_) => {
                     self.lex.set_pos(save);
-                    items.push(self.parse_value(depth + 1)?);
+                    items.push(self.parse_member(depth + 1)?);
                 }
             }
         }
@@ -186,7 +204,7 @@ impl<'a> Parser<'a> {
                         return Ok(Object::Dict(Dict::from_pairs(pairs)));
                     }
                     self.lex.set_pos(save);
-                    let value = self.parse_value(depth + 1)?;
+                    let value = self.parse_member(depth + 1)?;
                     pairs.push((key, value));
                 }
                 Some(_) => {
@@ -267,6 +285,12 @@ impl<'a> Parser<'a> {
         };
         Ok(RawObject { obj_ref, object: Object::Dict(dict), stream: Some(data_start..data_end), end })
     }
+}
+
+/// Keywords that start or end something bigger than a value: finding one inside
+/// an array or dictionary means that it was left open.
+fn is_object_boundary(keyword: &[u8]) -> bool {
+    matches!(keyword, b"obj" | b"endobj" | b"stream" | b"endstream" | b"xref" | b"trailer" | b"startxref")
 }
 
 /// The keyword `stream` is followed by CRLF or LF (7.3.8.1). A lone CR and
@@ -430,6 +454,31 @@ mod tests {
         assert!(!d.contains_key("K7"));
         assert_eq!(d.get_int("K8"), Some(99));
         assert_eq!(d.get_int("K49999"), Some(49_999));
+    }
+
+    #[test]
+    fn a_stray_keyword_in_a_value_position_reads_as_null() {
+        // The quote is an ordinary character, so "72AF..." is one keyword.
+        let obj = parse(b"<< /Params << /CheckSum \"72AFCDDEDF554DDA63C0C88E06F1CE18\" >> /Length 3 /B 7 >>").unwrap();
+        let d = obj.as_dict().unwrap();
+        let params = d.get("Params").unwrap().as_dict().unwrap();
+        assert!(params.is_empty());
+        assert_eq!(d.get_int("Length"), Some(3));
+        assert_eq!(d.get_int("B"), Some(7));
+        // In an array it is a null element, and parsing goes on.
+        let obj = parse(b"[1 foo 2 <</K bar>> 3]").unwrap();
+        let items = obj.as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[1], Object::Null);
+        assert_eq!(items[2], Object::Integer(2));
+        assert_eq!(items[3].as_dict().unwrap().len(), 0);
+        assert_eq!(items[4], Object::Integer(3));
+        // But the keywords that end objects mean the container is unclosed.
+        for open in [&b"<< /A 1 /B endobj"[..], b"[1 2 endobj", b"<< /A stream", b"[ trailer", b"<< /A endstream >>", b"[1 xref"] {
+            assert!(parse(open).is_err(), "{}", String::from_utf8_lossy(open));
+        }
+        // At the top level a keyword is still an error.
+        assert!(parse(b"foo").is_err());
     }
 
     #[test]

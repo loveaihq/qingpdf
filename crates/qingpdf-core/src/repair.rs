@@ -8,26 +8,30 @@
 //! objects of this file. Later definitions of an object number win, which is
 //! what a chain of incremental updates means anyway.
 
-use std::collections::HashMap;
-
 use crate::error::{Error, Result};
-use crate::filter;
+use crate::filter::{self, DecodeBudget, MAX_OBJSTM_DECODED};
 use crate::lexer::{find_bytes, is_regular, is_whitespace};
 use crate::object::{Dict, ObjRef, Object};
 use crate::parser::{Parser, PlainHelper};
-use crate::xref::{MAX_OBJECTS, ObjStm, XrefEntry, strip_stream_only_keys};
+use crate::xref::{ObjStm, XrefEntry, XrefTable, strip_stream_only_keys};
+
+/// Why some object stream could not be opened during a rebuild. The objects
+/// inside it are missing from the table, and the message says why: the
+/// stream uses a filter this layer does not decode (for example
+/// `BrotliDecode filter in an object stream`), or it is too big to decode.
+#[derive(Debug, Clone, Default)]
+pub struct Unopened {
+    pub unsupported: Option<String>,
+    pub limit: Option<String>,
+}
 
 /// The result of a rebuild.
 #[derive(Debug)]
 pub struct Repaired {
-    pub entries: HashMap<u32, XrefEntry>,
+    pub entries: XrefTable,
     pub trailer: Dict,
     pub uses_xref_streams: bool,
-    /// Set when an object stream could not be opened because it uses a filter
-    /// this layer does not decode: the objects inside it are missing from
-    /// `entries`, and the message says which filter (for example
-    /// `BrotliDecode filter in an object stream`).
-    pub unsupported: Option<String>,
+    pub unopened: Unopened,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,13 +159,19 @@ fn type_is(dict: &Dict, name: &str) -> bool {
 /// have said. Linear in the size of the file: the work spent on parses that
 /// fail is capped, after which objects are only indexed, not parsed.
 pub fn rebuild(data: &[u8]) -> Result<Repaired> {
+    rebuild_budgeted(data, &DecodeBudget::default())
+}
+
+/// [`rebuild`], charging the decoding of object streams (they are opened to
+/// list what is inside) to `decode_budget`.
+pub fn rebuild_budgeted(data: &[u8], decode_budget: &DecodeBudget) -> Result<Repaired> {
     let helper = PlainHelper::new(data);
-    let mut entries: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut entries = XrefTable::new();
     let mut trailers: Vec<(usize, Dict)> = Vec::new(); // (position in file, dictionary)
     let mut catalogs: Vec<ObjRef> = Vec::new();
     let mut encryption_dicts: Vec<ObjRef> = Vec::new();
     let mut uses_xref_streams = false;
-    let mut unsupported: Option<String> = None;
+    let mut unopened = Unopened::default();
 
     let mut scanner = Scanner::new(data);
     let mut cursor = 0usize;
@@ -169,9 +179,6 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
     let budget = data.len().saturating_mul(2).saturating_add(1 << 20);
 
     loop {
-        if entries.len() > MAX_OBJECTS {
-            return Err(Error::Limit(format!("more than {MAX_OBJECTS} objects in the file")));
-        }
         let header = scanner.next_header(cursor);
         let trailer_at = scanner.next_trailer(cursor);
         match (header, trailer_at) {
@@ -218,7 +225,8 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
                             } else if type_is(dict, "ObjStm")
                                 && let Some(range) = raw.stream.clone()
                             {
-                                index_object_stream(data, h.num, dict, range, &mut entries, &mut catalogs, &mut unsupported);
+                                let sink = ObjStmSink { entries: &mut entries, catalogs: &mut catalogs, unopened: &mut unopened };
+                                index_object_stream(data, h.num, dict, range, sink, decode_budget);
                             }
                         }
                     }
@@ -233,12 +241,12 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
         }
     }
 
-    let Some(max_num) = entries.keys().max().copied() else {
+    let Some(max_num) = entries.max_num() else {
         return Err(Error::syntax(None, "no PDF objects found in the file"));
     };
 
     // The newest trailer whose /Root points at an object we found.
-    let root_ok = |d: &Dict| matches!(d.get("Root"), Some(Object::Ref(r)) if entries.contains_key(&r.num));
+    let root_ok = |d: &Dict| matches!(d.get("Root"), Some(Object::Ref(r)) if entries.contains(r.num));
     let chosen = trailers.iter().rev().find(|(_, d)| root_ok(d)).map(|(_, d)| d.clone());
     let mut trailer = match chosen {
         Some(d) => d,
@@ -263,7 +271,7 @@ pub fn rebuild(data: &[u8]) -> Result<Repaired> {
     {
         trailer.set("Encrypt", Object::Ref(*encrypt));
     }
-    Ok(Repaired { entries, trailer, uses_xref_streams, unsupported })
+    Ok(Repaired { entries, trailer, uses_xref_streams, unopened })
 }
 
 /// Does this look like an encryption dictionary (7.6.1, Table 20): the
@@ -275,6 +283,14 @@ fn is_encryption_dict(dict: &Dict) -> bool {
         && (dict.contains_key("R") || dict.contains_key("V"))
 }
 
+/// What opening an object stream adds to: the table, the catalogs found, and
+/// the record of what could not be opened.
+struct ObjStmSink<'a> {
+    entries: &'a mut XrefTable,
+    catalogs: &'a mut Vec<ObjRef>,
+    unopened: &'a mut Unopened,
+}
+
 /// Record the objects held in an object stream (7.5.7) and note any catalog
 /// among them. The stream is decoded here only to read its header; it is
 /// decoded again, and cached, when an object in it is first needed.
@@ -283,19 +299,25 @@ fn index_object_stream(
     stream_num: u32,
     dict: &Dict,
     range: std::ops::Range<usize>,
-    entries: &mut HashMap<u32, XrefEntry>,
-    catalogs: &mut Vec<ObjRef>,
-    unsupported: &mut Option<String>,
+    sink: ObjStmSink<'_>,
+    budget: &DecodeBudget,
 ) {
+    let ObjStmSink { entries, catalogs, unopened } = sink;
     let Some(raw) = data.get(range) else {
         return;
     };
-    let decoded = match filter::decode_direct(dict, raw) {
+    let decoded = match filter::decode_with_limit(dict, raw, &|o| Ok(o.clone()), MAX_OBJSTM_DECODED, 0, budget) {
         Ok(d) => d,
         Err(Error::Unsupported(m)) => {
             // The objects inside cannot be found. Remember why, so that a
             // missing page tree is reported as "unsupported", not "damaged".
-            unsupported.get_or_insert_with(|| format!("{m} in an object stream"));
+            unopened.unsupported.get_or_insert_with(|| format!("{m} in an object stream"));
+            return;
+        }
+        // Too big to decode (or the document's decoding budget is spent):
+        // say so, so that a page tree inside is reported as a limit hit.
+        Err(Error::Limit(m)) => {
+            unopened.limit.get_or_insert_with(|| format!("{m} (in an object stream)"));
             return;
         }
         Err(_) => return,
@@ -305,9 +327,6 @@ fn index_object_stream(
     };
     let mut budget = stm.data().len().saturating_mul(2).saturating_add(4096);
     for (index, (num, offset)) in stm.offsets().enumerate() {
-        if entries.len() > MAX_OBJECTS {
-            return; // the caller notices and gives up
-        }
         entries.insert(num, XrefEntry::Compressed { stream_num, index: u32::try_from(index).unwrap_or(u32::MAX) });
         // Only dictionaries can be catalogs, and only a bounded amount of
         // parsing is spent on looking.
@@ -335,9 +354,9 @@ mod tests {
     use super::*;
     use crate::testutil::*;
 
-    fn offset_of(entries: &HashMap<u32, XrefEntry>, num: u32) -> usize {
-        match entries.get(&num) {
-            Some(XrefEntry::InUse { offset, .. }) => usize::try_from(*offset).unwrap(),
+    fn offset_of(entries: &XrefTable, num: u32) -> usize {
+        match entries.get(num) {
+            Some(XrefEntry::InUse { offset, .. }) => usize::try_from(offset).unwrap(),
             other => panic!("object {num}: {other:?}"),
         }
     }
@@ -456,9 +475,9 @@ mod tests {
         b.flate_stream_obj(9, &format!("/Type /ObjStm /N 2 /First {}", header.len()), stm.as_bytes());
         b.raw(b"trailer << /Size 10 /Root 5 0 R >>\n");
         let r = rebuild(&b.finish()).unwrap();
-        assert_eq!(r.entries.get(&5), Some(&XrefEntry::Compressed { stream_num: 9, index: 0 }));
-        assert_eq!(r.entries.get(&6), Some(&XrefEntry::Compressed { stream_num: 9, index: 1 }));
-        assert!(matches!(r.entries.get(&9), Some(XrefEntry::InUse { .. })));
+        assert_eq!(r.entries.get(5), Some(XrefEntry::Compressed { stream_num: 9, index: 0 }));
+        assert_eq!(r.entries.get(6), Some(XrefEntry::Compressed { stream_num: 9, index: 1 }));
+        assert!(matches!(r.entries.get(9), Some(XrefEntry::InUse { .. })));
         assert_eq!(r.trailer.get("Root"), Some(&Object::Ref(ObjRef::new(5, 0))));
     }
 
@@ -493,17 +512,17 @@ mod tests {
         b.raw(b"4 0 object (not an object)\n5 0 obj");
         let r = rebuild(&b.finish());
         let r = r.unwrap();
-        assert!(r.entries.contains_key(&1));
-        assert!(r.entries.contains_key(&2));
-        assert!(r.entries.contains_key(&3));
-        assert!(!r.entries.contains_key(&4));
+        assert!(r.entries.contains(1));
+        assert!(r.entries.contains(2));
+        assert!(r.entries.contains(3));
+        assert!(!r.entries.contains(4));
         // `5 0 obj` with nothing after it: unparseable, not indexed.
-        assert!(!r.entries.contains_key(&5));
+        assert!(!r.entries.contains(5));
         // Generation numbers are kept.
         let mut b = PdfBuilder::new();
         b.raw(b"1 0 obj << /Type /Catalog >> endobj\n8 3 obj (g) endobj\n");
         let r = rebuild(&b.finish()).unwrap();
-        assert!(matches!(r.entries.get(&8), Some(XrefEntry::InUse { generation: 3, .. })));
+        assert!(matches!(r.entries.get(8), Some(XrefEntry::InUse { generation: 3, .. })));
     }
 
     #[test]
@@ -519,8 +538,8 @@ mod tests {
         b.obj(1, "<< /Type /Catalog >>");
         b.raw(b"2 0 obj\n<< /Length 500 >>\nstream\nabc");
         let r = rebuild(&b.finish()).unwrap();
-        assert!(r.entries.contains_key(&1));
-        assert!(!r.entries.contains_key(&2));
+        assert!(r.entries.contains(1));
+        assert!(!r.entries.contains(2));
     }
 
     #[test]
@@ -534,7 +553,7 @@ mod tests {
         let start = std::time::Instant::now();
         let r = rebuild(&data).unwrap();
         assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
-        assert!(r.entries.contains_key(&1));
+        assert!(r.entries.contains(1));
         assert_eq!(r.trailer.get("Root"), Some(&Object::Ref(ObjRef::new(1, 0))));
         // Past the parsing budget the headers are still indexed.
         assert!(r.entries.len() > 1000);
@@ -549,7 +568,7 @@ mod tests {
         let start = std::time::Instant::now();
         let r = rebuild(&data).unwrap();
         assert!(start.elapsed().as_secs() < 10, "took {:?}", start.elapsed());
-        assert!(r.entries.contains_key(&1));
+        assert!(r.entries.contains(1));
     }
 
     #[test]

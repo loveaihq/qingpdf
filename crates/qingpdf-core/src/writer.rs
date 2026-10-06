@@ -9,11 +9,15 @@
 //!
 //! The output uses a classic cross-reference table and no object streams.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hasher;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
+use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params};
 
+use crate::dests::NamedDests;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::lexer::is_delimiter;
@@ -43,9 +47,71 @@ const MAX_UNREADABLE_LISTED: usize = 5;
 /// Flate compression level for new streams: a good size for little time.
 const FLATE_LEVEL: u8 = 6;
 
+/// Flate compression (zlib, RFC 1950) of data that arrives in pieces: the
+/// compressed bytes are kept, the input is not, so a stream can be made of
+/// data too big to hold in memory all at once (the rows of a huge image).
+pub(crate) struct FlateWriter {
+    compressor: Box<CompressorOxide>,
+    out: Vec<u8>,
+    scratch: Vec<u8>,
+}
+
+impl FlateWriter {
+    pub(crate) fn new() -> Self {
+        let flags = create_comp_flags_from_zip_params(i32::from(FLATE_LEVEL), 1, 0);
+        FlateWriter { compressor: Box::new(CompressorOxide::new(flags)), out: Vec::new(), scratch: vec![0; 1 << 16] }
+    }
+
+    /// Compress `data` (more of the stream's input).
+    pub(crate) fn write(&mut self, mut data: &[u8]) -> Result<()> {
+        loop {
+            let (status, consumed, produced) = compress(&mut self.compressor, data, &mut self.scratch, TDEFLFlush::None);
+            self.out.extend_from_slice(self.scratch.get(..produced).unwrap_or(&[]));
+            data = data.get(consumed..).unwrap_or(&[]);
+            if !matches!(status, TDEFLStatus::Okay) {
+                return Err(Error::Invalid("internal error: Flate compression failed".to_string()));
+            }
+            if data.is_empty() && produced < self.scratch.len() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// End the stream and give the compressed bytes.
+    pub(crate) fn finish(mut self) -> Result<Vec<u8>> {
+        loop {
+            let (status, _, produced) = compress(&mut self.compressor, &[], &mut self.scratch, TDEFLFlush::Finish);
+            self.out.extend_from_slice(self.scratch.get(..produced).unwrap_or(&[]));
+            match status {
+                TDEFLStatus::Done => return Ok(self.out),
+                TDEFLStatus::Okay => {}
+                _ => return Err(Error::Invalid("internal error: Flate compression failed".to_string())),
+            }
+        }
+    }
+}
+
 // --- object syntax ------------------------------------------------------------
 
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+/// A non-negative integer in decimal, without going through `format!`: a
+/// large file has millions of these.
+fn push_number(out: &mut Vec<u8>, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        if let Some(slot) = digits.get_mut(at) {
+            *slot = b'0' + u8::try_from(n % 10).unwrap_or(0);
+        }
+        n /= 10;
+        if n == 0 || at == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(digits.get(at..).unwrap_or(&[]));
+}
 
 fn push_hex(out: &mut Vec<u8>, b: u8) {
     out.push(*HEX_UPPER.get(usize::from(b >> 4)).unwrap_or(&b'0'));
@@ -130,7 +196,12 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
         Object::Null => out.extend_from_slice(b"null"),
         Object::Bool(true) => out.extend_from_slice(b"true"),
         Object::Bool(false) => out.extend_from_slice(b"false"),
-        Object::Integer(i) => out.extend_from_slice(i.to_string().as_bytes()),
+        Object::Integer(i) => {
+            if *i < 0 {
+                out.push(b'-');
+            }
+            push_number(out, i.unsigned_abs());
+        }
         Object::Real(r) => out.extend_from_slice(format_real(*r)?.as_bytes()),
         Object::String(PdfString { bytes, hex: true }) => write_hex_string(out, bytes),
         Object::String(PdfString { bytes, hex: false }) => write_literal_string(out, bytes),
@@ -149,7 +220,12 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
         Object::Stream(_) => {
             return Err(Error::Invalid("a stream cannot be written as a direct object".to_string()));
         }
-        Object::Ref(r) => out.extend_from_slice(format!("{} {} R", r.num, r.generation).as_bytes()),
+        Object::Ref(r) => {
+            push_number(out, u64::from(r.num));
+            out.push(b' ');
+            push_number(out, u64::from(r.generation));
+            out.extend_from_slice(b" R");
+        }
     }
     Ok(())
 }
@@ -175,7 +251,8 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize) -> 
 /// replaced by the real length of the data as a direct integer, and the data
 /// is written as it is: still encoded, `Filter` and `DecodeParms` untouched.
 fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
-    out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+    push_number(out, u64::from(num));
+    out.extend_from_slice(b" 0 obj\n");
     match obj {
         Object::Stream(Stream { dict, data }) => {
             out.extend_from_slice(b"<<");
@@ -188,10 +265,15 @@ fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
                 out.push(b' ');
                 write_depth(out, value, 1)?;
             }
-            out.extend_from_slice(format!(" /Length {} >>\nstream\n", data.len()).as_bytes());
+            out.extend_from_slice(b" /Length ");
+            push_number(out, u64::try_from(data.len()).unwrap_or(u64::MAX));
+            out.extend_from_slice(b" >>\nstream\n");
             out.extend_from_slice(data);
-            // 7.3.8.1: an end-of-line before `endstream`, not counted in /Length.
-            out.extend_from_slice(b"\nendstream");
+            // 7.3.8.1 says there "should" be an end-of-line before
+            // `endstream`; it would not count in /Length. None is written: it
+            // is a byte per stream for nothing (qpdf writes none either),
+            // /Length is exact, and every reader finds `endstream` by it.
+            out.extend_from_slice(b"endstream");
         }
         other => write_depth(out, other, 0)?,
     }
@@ -200,6 +282,10 @@ fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
 }
 
 // --- the builder --------------------------------------------------------------
+
+/// For an annotation object number, the pages that list it; and the pages that
+/// are kept.
+type Exclusion<'a> = (&'a HashMap<u32, Vec<u32>>, &'a HashSet<u32>);
 
 /// One document objects are imported from.
 struct Source<'a> {
@@ -210,6 +296,19 @@ struct Source<'a> {
     /// Source object number -> number in the output, or `None` when the
     /// reference becomes null (the target is not part of the output).
     map: HashMap<u32, Option<u32>>,
+    /// Turn named destinations into explicit ones through this document's own
+    /// name tree (see [`Builder::resolve_named_destinations`]).
+    resolve_names: bool,
+    names: OnceCell<NamedDests>,
+    /// Leave out the keys that point into a structure tree that is not copied.
+    drop_structure_links: bool,
+    /// Objects whose content is to be taken from here, not from the file.
+    replace: HashMap<u32, Object>,
+    /// Annotations that no kept page lists are not imported: object number ->
+    /// pages that list it, and the pages that are kept.
+    exclude: Option<Exclusion<'a>>,
+    /// Inherited values written once for all the pages that share them.
+    shared: HashMap<usize, ObjRef>,
 }
 
 /// An imported object waiting for its references to be translated.
@@ -235,8 +334,16 @@ impl<'a> Builder<'a> {
     /// Start a file. The header is `%PDF-x.y` and then a comment of four
     /// bytes above 127 (7.5.2), so that tools treat the file as binary.
     pub fn new(version: (u8, u8)) -> Self {
+        Builder::with_capacity(version, 0)
+    }
+
+    /// [`Builder::new`] with room for about `bytes` of output, when a file of
+    /// about that size is expected (the next piece of a split, say): the
+    /// output is not copied over and over as it grows.
+    pub fn with_capacity(version: (u8, u8), bytes: usize) -> Self {
         Builder {
-            buf: Vec::new(),
+            // A hint, not a promise: never more than 64 MiB up front.
+            buf: Vec::with_capacity(bytes.min(64 << 20)),
             offsets: Vec::new(),
             version,
             sources: Vec::new(),
@@ -256,8 +363,58 @@ impl<'a> Builder<'a> {
     /// document may be added again to get a separate copy of everything
     /// (merging a file with itself, say).
     pub fn add_source(&mut self, doc: &'a Document, pages: &'a HashSet<u32>) -> usize {
-        self.sources.push(Source { doc, pages, map: HashMap::new() });
+        self.sources.push(Source {
+            doc,
+            pages,
+            map: HashMap::new(),
+            resolve_names: false,
+            names: OnceCell::new(),
+            drop_structure_links: false,
+            replace: HashMap::new(),
+            exclude: None,
+            shared: HashMap::new(),
+        });
         self.sources.len() - 1
+    }
+
+    fn source_mut(&mut self, source: usize) -> Option<&mut Source<'a>> {
+        self.sources.get_mut(source)
+    }
+
+    /// For a source whose catalog is not copied: a link or go-to action that
+    /// names its destination (12.3.2.3) is given the destination itself, found
+    /// through the source's own `/Names` `/Dests` tree or `/Dests` dictionary,
+    /// so that it cannot end up in somebody else's name tree. A name that
+    /// leads nowhere removes the link's destination, or a go-to action.
+    pub fn resolve_named_destinations(&mut self, source: usize) {
+        if let Some(s) = self.source_mut(source) {
+            s.resolve_names = true;
+        }
+    }
+
+    /// For a source whose structure tree (14.7) is not copied: drop
+    /// `/StructParents`, `/StructParent` and `/SE`, which are indexes into it.
+    pub fn drop_structure_links(&mut self, source: usize) {
+        if let Some(s) = self.source_mut(source) {
+            s.drop_structure_links = true;
+        }
+    }
+
+    /// Take the content of object `num` of `source` from `object` (whose
+    /// references are source references) instead of from the file.
+    pub fn replace(&mut self, source: usize, num: u32, object: Object) {
+        if let Some(s) = self.source_mut(source) {
+            s.replace.insert(num, object);
+        }
+    }
+
+    /// Do not import the annotations of `source` that are listed only by
+    /// pages that are not in `kept`: `owners` says, for an annotation object
+    /// number, which pages list it. References to them become null.
+    pub fn exclude_annotations(&mut self, source: usize, owners: &'a HashMap<u32, Vec<u32>>, kept: &'a HashSet<u32>) {
+        if let Some(s) = self.source_mut(source) {
+            s.exclude = Some((owners, kept));
+        }
     }
 
     /// Take the next object number without writing anything yet. The object
@@ -304,6 +461,12 @@ impl<'a> Builder<'a> {
         self.add(&Object::Stream(Stream { dict, data: packed }))
     }
 
+    /// Add a stream whose `data` is already Flate-compressed.
+    pub fn add_precompressed_flate_stream(&mut self, mut dict: Dict, data: Vec<u8>) -> Result<ObjRef> {
+        dict.set("Filter", Object::from("FlateDecode"));
+        self.add(&Object::Stream(Stream { dict, data }))
+    }
+
     fn write_header(&mut self) {
         self.buf.extend_from_slice(format!("%PDF-{}.{}\n", self.version.0, self.version.1).as_bytes());
         self.buf.extend_from_slice(&[b'%', 0xE2, 0xE3, 0xCF, 0xD3, b'\n']);
@@ -343,6 +506,21 @@ impl<'a> Builder<'a> {
         Ok(new)
     }
 
+    /// Import `obj` of source `source` as an object of its own, once for every
+    /// `id`: what the pages that inherit one direct value share. Returns the
+    /// output object.
+    pub fn import_shared(&mut self, source: usize, id: usize, obj: &Object) -> Result<ObjRef> {
+        if let Some(known) = self.sources.get(source).and_then(|s| s.shared.get(&id)) {
+            return Ok(*known);
+        }
+        let translated = self.import(source, obj.clone())?;
+        let new = self.add(&translated)?;
+        if let Some(s) = self.source_mut(source) {
+            s.shared.insert(id, new);
+        }
+        Ok(new)
+    }
+
     /// Write the imported objects whose references are still untranslated.
     /// Iterative, so a chain of a hundred thousand outline entries is no
     /// problem for the stack.
@@ -362,41 +540,103 @@ impl<'a> Builder<'a> {
                 Some(new) => Object::Ref(new),
                 None => Object::Null,
             },
-            Object::Array(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(self.translate(source, item)?);
+            Object::Array(mut items) => {
+                // In place: no new array for every array of a big file.
+                for item in &mut items {
+                    *item = self.translate(source, std::mem::replace(item, Object::Null))?;
                 }
-                Object::Array(out)
+                Object::Array(items)
             }
-            Object::Dict(d) => Object::Dict(self.translate_dict(source, d)?),
+            Object::Dict(d) => match self.rewrite_dict(source, d) {
+                Some(d) => Object::Dict(self.translate_dict(source, d)?),
+                None => Object::Null,
+            },
             Object::Stream(Stream { mut dict, data }) => {
                 dict.remove("Length");
-                Object::Stream(Stream { dict: self.translate_dict(source, dict)?, data })
+                match self.rewrite_dict(source, dict) {
+                    Some(dict) => Object::Stream(Stream { dict: self.translate_dict(source, dict)?, data }),
+                    None => Object::Null,
+                }
             }
             other => other,
         })
     }
 
-    fn translate_dict(&mut self, source: usize, d: Dict) -> Result<Dict> {
-        let pairs: Vec<(Name, Object)> = d.into_pairs();
-        let mut out = Vec::with_capacity(pairs.len());
-        for (key, value) in pairs {
-            out.push((key, self.translate(source, value)?));
+    /// The dictionary as it is to be imported from `source`, or `None` when
+    /// it is not to be imported at all (see
+    /// [`Builder::resolve_named_destinations`] and
+    /// [`Builder::drop_structure_links`]).
+    fn rewrite_dict(&self, source: usize, mut d: Dict) -> Option<Dict> {
+        let Some(s) = self.sources.get(source) else {
+            return Some(d);
+        };
+        if !s.drop_structure_links && !s.resolve_names {
+            return Some(d);
+        }
+        if s.drop_structure_links {
+            for key in ["StructParents", "StructParent", "SE"] {
+                d.remove(key);
+            }
+        }
+        if s.resolve_names {
+            // A link annotation (12.5.6.5) or an outline item (12.3.3) ...
+            if let Some((key, is_name)) = d.get("Dest").and_then(|v| named_key(s.doc, v)) {
+                match s.names.get_or_init(|| NamedDests::load(s.doc)).lookup(s.doc, &key, is_name) {
+                    Some(array) => d.set("Dest", Object::Array(array)),
+                    None => {
+                        d.remove("Dest");
+                    }
+                }
+            }
+            // ... or a go-to action (12.6.4.2, Table 199).
+            if matches!(d.get("S"), Some(Object::Name(n)) if n == "GoTo")
+                && let Some((key, is_name)) = d.get("D").and_then(|v| named_key(s.doc, v))
+            {
+                let array = s.names.get_or_init(|| NamedDests::load(s.doc)).lookup(s.doc, &key, is_name)?;
+                d.set("D", Object::Array(array));
+            }
+        }
+        Some(d)
+    }
+
+    fn translate_dict(&mut self, source: usize, mut d: Dict) -> Result<Dict> {
+        let mut dropped = false;
+        for (key, slot) in d.iter_mut() {
+            let mut value = self.translate(source, std::mem::replace(slot, Object::Null))?;
+            // A kid that became null (a page or field that is not part of the
+            // output) is not a kid.
+            if key == "Kids"
+                && let Object::Array(items) = &mut value
+            {
+                items.retain(|item| !matches!(item, Object::Null));
+            }
+            dropped |= matches!(value, Object::Null);
+            *slot = value;
         }
         // A reference that became null drops its key (7.3.7).
-        Ok(Dict::from_pairs(out))
+        if dropped {
+            d.remove_nulls();
+        }
+        Ok(d)
     }
 
     /// The output object for source object `r`, importing it if this is the
     /// first time it is met.
     fn map_ref(&mut self, source: usize, r: ObjRef) -> Result<Option<ObjRef>> {
-        let (doc, is_page) = {
-            let s = self.sources.get(source).ok_or_else(|| Error::Invalid("unknown import source".to_string()))?;
+        let (doc, is_page, replaced) = {
+            let s = self.sources.get_mut(source).ok_or_else(|| Error::Invalid("unknown import source".to_string()))?;
             if let Some(known) = s.map.get(&r.num) {
                 return Ok(known.map(|n| ObjRef::new(n, 0)));
             }
-            (s.doc, s.pages.contains(&r.num))
+            // An annotation of a page that is not in the output.
+            let left_out = s.exclude.is_some_and(|(owners, kept)| {
+                owners.get(&r.num).is_some_and(|pages| !pages.iter().any(|p| kept.contains(p)))
+            });
+            if left_out {
+                s.map.insert(r.num, None);
+                return Ok(None);
+            }
+            (s.doc, s.pages.contains(&r.num), s.replace.remove(&r.num))
         };
         // A page that is not in the output: no need to look at it.
         if is_page {
@@ -405,19 +645,22 @@ impl<'a> Builder<'a> {
             }
             return Ok(None);
         }
-        let object = match doc.get(r) {
-            Ok(o) => o,
-            // Not something skipping the object would fix: the whole file is
-            // out of reach (encrypted, unsupported filter, disk trouble).
-            Err(e @ (Error::Unsupported(_) | Error::Io(_))) => return Err(e),
-            // A damaged object: keep going without it and tell the user.
-            Err(e) => {
-                self.unreadable_total = self.unreadable_total.saturating_add(1);
-                if self.unreadable.len() < MAX_UNREADABLE_LISTED {
-                    self.unreadable.push(format!("object {} ({e})", r.num));
+        let object = match replaced {
+            Some(o) => o,
+            None => match doc.get(r) {
+                Ok(o) => o,
+                // Not something skipping the object would fix: the whole file is
+                // out of reach (encrypted, unsupported filter, disk trouble).
+                Err(e @ (Error::Unsupported(_) | Error::Io(_))) => return Err(e),
+                // A damaged object: keep going without it and tell the user.
+                Err(e) => {
+                    self.unreadable_total = self.unreadable_total.saturating_add(1);
+                    if self.unreadable.len() < MAX_UNREADABLE_LISTED {
+                        self.unreadable.push(format!("object {} ({e})", r.num));
+                    }
+                    Object::Null
                 }
-                Object::Null
-            }
+            },
         };
         let keep = !matches!(object, Object::Null) && !is_structural(&object);
         let new = if keep { Some(self.reserve()?) } else { None };
@@ -480,10 +723,39 @@ impl<'a> Builder<'a> {
         if let Some(info) = info {
             table.extend_from_slice(format!(" /Info {} {} R", info.num, info.generation).as_bytes());
         }
+        // 14.4: the file identifier, two equal strings for a new file.
+        let id = file_id(&self.buf);
+        table.extend_from_slice(b" /ID [");
+        write_hex_string(&mut table, &id);
+        table.push(b' ');
+        write_hex_string(&mut table, &id);
+        table.push(b']');
         table.extend_from_slice(format!(" >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
         self.buf.extend_from_slice(&table);
         Ok((self.buf, warning.into_iter().collect()))
     }
+}
+
+/// The file identifier (14.4): 16 bytes made from everything written so far.
+/// Two SipHash runs with different starting words give 128 bits; the same
+/// output always gets the same identifier, and a different one almost surely a
+/// different one.
+fn file_id(body: &[u8]) -> [u8; 16] {
+    let mut first = std::hash::DefaultHasher::new();
+    let mut second = std::hash::DefaultHasher::new();
+    first.write(b"qingpdf-id-1");
+    second.write(b"qingpdf-id-2");
+    for chunk in body.chunks(1 << 16) {
+        first.write(chunk);
+        second.write(chunk);
+    }
+    first.write_usize(body.len());
+    second.write_usize(body.len());
+    let mut id = [0u8; 16];
+    let (a, b) = id.split_at_mut(8);
+    a.copy_from_slice(&first.finish().to_be_bytes());
+    b.copy_from_slice(&second.finish().to_be_bytes());
+    id
 }
 
 /// Objects that are part of a file's structure rather than its content, and
@@ -493,6 +765,25 @@ fn is_structural(obj: &Object) -> bool {
     match obj.as_dict().and_then(|d| d.get_name("Type")) {
         Some(t) => ["Pages", "Page", "Catalog", "XRef", "ObjStm"].iter().any(|k| t == k),
         None => false,
+    }
+}
+
+/// A destination written as a name (old `/Dests` dictionary) or a string
+/// (name tree), directly or through a reference: its bytes, and whether it was
+/// a name object.
+fn named_key(doc: &Document, value: &Object) -> Option<(Vec<u8>, bool)> {
+    let resolved;
+    let value = match value {
+        Object::Ref(_) => {
+            resolved = doc.resolve(value).ok()?;
+            &resolved
+        }
+        other => other,
+    };
+    match value {
+        Object::Name(n) => Some((n.as_bytes().to_vec(), true)),
+        Object::String(s) => Some((s.bytes.clone(), false)),
+        _ => None,
     }
 }
 
@@ -687,7 +978,7 @@ mod tests {
             let off: usize = std::str::from_utf8(&entry[..10]).unwrap().parse().unwrap();
             assert!(bytes[off..].starts_with(format!("{n} 0 obj").as_bytes()));
         }
-        assert!(text.contains("trailer\n<< /Size 3 /Root 1 0 R >>"));
+        assert!(text.contains("trailer\n<< /Size 3 /Root 1 0 R /ID [<"));
         // Our reader opens it.
         let doc = Document::from_bytes(bytes).unwrap();
         assert!(!doc.was_repaired());
