@@ -101,10 +101,10 @@ fn qpdf_accepts_the_output_of_every_command() {
     assert_eq!(code, 0, "merge of everything failed: {err}");
     commands_run += 1;
     tally.check(&qpdf, "merge of all usable corpus files", &big, &all);
-    // Pairs and per-file runs use the files up to 1.5 MB (qpdf is slow on big ones).
+    // Pairs and per-file runs use the files up to 10 MB (qpdf is slow on bigger ones).
     let small: Vec<(PathBuf, usize)> = usable
         .iter()
-        .filter(|(p, _)| std::fs::metadata(p).map(|m| m.len() <= 1_500_000).unwrap_or(false))
+        .filter(|(p, _)| std::fs::metadata(p).map(|m| m.len() <= 10_000_000).unwrap_or(false))
         .cloned()
         .collect();
     for (i, pair) in small.windows(2).enumerate().step_by(4) {

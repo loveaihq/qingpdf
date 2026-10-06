@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dests::{self, NamedDests};
 use crate::document::{Document, Page};
+use crate::error::Result;
 use crate::object::{Dict, ObjRef, Object};
 use crate::writer::{Builder, Warning};
 
@@ -42,6 +43,9 @@ struct Outlines {
     items: Vec<Item>,
     /// The items of the first level, in order.
     top: Vec<usize>,
+    /// Did the tree lead back to the root or to an item already seen? Those
+    /// links are cut; the tree has to be written again for that to show.
+    cycles: bool,
 }
 
 /// A field or widget of the form (12.7.3, 12.5.6.19).
@@ -71,16 +75,20 @@ pub(crate) struct Index {
 }
 
 impl Index {
-    pub(crate) fn build(doc: &Document, pages: &[Page], page_nums: &HashSet<u32>) -> Index {
-        let names = NamedDests::load(doc);
-        let page_of = |entries: &[(Vec<u8>, Object)]| -> Vec<Option<u32>> {
+    /// Read the structures; `Limit` if the named destinations ask for more
+    /// than they may.
+    pub(crate) fn build(doc: &Document, pages: &[Page], page_nums: &HashSet<u32>) -> Result<Index> {
+        let names = NamedDests::load(doc)?;
+        let page_of = |entries: &[(Vec<u8>, Object)]| -> Result<Vec<Option<u32>>> {
             entries
                 .iter()
-                .map(|(_, value)| dests::explicit(doc, value).and_then(|a| dests::array_page(&a, page_nums)))
+                .map(|(_, value)| {
+                    Ok(dests::explicit(doc, value, names.spend())?.and_then(|a| dests::array_page(&a, page_nums)))
+                })
                 .collect()
         };
-        let tree_pages = page_of(names.tree());
-        let dict_pages = page_of(names.dict());
+        let tree_pages = page_of(names.tree())?;
+        let dict_pages = page_of(names.dict())?;
         let catalog = doc.catalog().unwrap_or_default();
 
         // Which page lists which annotation.
@@ -103,9 +111,12 @@ impl Index {
             }
         }
 
-        let outlines = catalog.get("Outlines").and_then(|o| read_outlines(doc, o, &names, page_nums));
+        let outlines = match catalog.get("Outlines") {
+            Some(o) => read_outlines(doc, o, &names, page_nums)?,
+            None => None,
+        };
         let form = catalog.get("AcroForm").and_then(|f| read_form(doc, f, page_nums));
-        Index { annot_pages, names, tree_pages, dict_pages, outlines, form }
+        Ok(Index { annot_pages, names, tree_pages, dict_pages, outlines, form })
     }
 
     /// Cut the catalog and what hangs from it down to the pages `kept`: set
@@ -119,7 +130,7 @@ impl Index {
         source: usize,
         catalog: &mut Dict,
         warnings: &mut Vec<Warning>,
-    ) {
+    ) -> Result<()> {
         // The structure tree cannot follow a page subset (yet); what points
         // into it (parent tree numbers, an outline item's structure element)
         // goes with it.
@@ -137,13 +148,21 @@ impl Index {
                 catalog.set("MarkInfo", if mark.is_empty() { Object::Null } else { Object::Dict(mark) });
             }
         }
-        self.cut_destinations(doc, kept, b, source, catalog);
+        self.cut_destinations(doc, kept, b, source, catalog)?;
         self.cut_outlines(doc, kept, b, source, catalog);
         self.cut_form(doc, kept, b, source, catalog, warnings);
+        Ok(())
     }
 
     /// Named destinations that name a page that is gone.
-    fn cut_destinations(&self, doc: &Document, kept: &HashSet<u32>, b: &mut Builder<'_>, source: usize, catalog: &mut Dict) {
+    fn cut_destinations(
+        &self,
+        doc: &Document,
+        kept: &HashSet<u32>,
+        b: &mut Builder<'_>,
+        source: usize,
+        catalog: &mut Dict,
+    ) -> Result<()> {
         let survive = |pages: &[Option<u32>], entries: &[(Vec<u8>, Object)]| -> Option<Vec<(Vec<u8>, Object)>> {
             let live: Vec<(Vec<u8>, Object)> = entries
                 .iter()
@@ -160,7 +179,9 @@ impl Index {
             if live.is_empty() {
                 names.remove("Dests");
             } else {
-                names.set("Dests", dests::build_name_tree(live));
+                // Every node of the tree is an object of its own (Table 36).
+                let root = dests::build_name_tree(live, &mut |node| b.define_object(source, Object::Dict(node)))?;
+                names.set("Dests", Object::Ref(root));
             }
             let value = if names.is_empty() { Object::Null } else { Object::Dict(names) };
             put_catalog_entry(catalog, "Names", value, b, source);
@@ -170,6 +191,7 @@ impl Index {
             let value = if live.is_empty() { Object::Null } else { Object::Dict(dests::build_dests_dict(live)) };
             put_catalog_entry(catalog, "Dests", value, b, source);
         }
+        Ok(())
     }
 
     /// Bookmarks that lead to a page that is gone.
@@ -201,7 +223,7 @@ impl Index {
                 }
             }
         }
-        if alive.iter().all(|&a| a) {
+        if alive.iter().all(|&a| a) && !outlines.cycles {
             return;
         }
         let live_top: Vec<usize> = outlines.top.iter().copied().filter(|&i| alive.get(i).copied().unwrap_or(false)).collect();
@@ -301,6 +323,14 @@ impl Index {
             }
             if alive.iter().any(|&a| !a) {
                 changed = true;
+                // A dead field is not imported by anything that names it: not
+                // by a parent's /Kids, and not by an action's /Fields either
+                // (12.7.5.2: ResetForm, SubmitForm), which would bring its
+                // value and appearance back.
+                b.exclude_objects(
+                    source,
+                    fields.iter().zip(&alive).filter(|(_, a)| !**a).map(|(f, _)| f.r.num),
+                );
                 // Fields that lost a kid are written with the kids that stay.
                 for (i, f) in fields.iter().enumerate() {
                     let live = alive.get(i).copied().unwrap_or(false);
@@ -385,23 +415,37 @@ fn put_catalog_entry(catalog: &mut Dict, key: &str, value: Object, b: &mut Build
 }
 
 /// The outline tree under the catalog's `/Outlines` (12.3.3), if there is one.
-fn read_outlines(doc: &Document, entry: &Object, names: &NamedDests, pages: &HashSet<u32>) -> Option<Outlines> {
-    let Object::Dict(root) = doc.resolve(entry).ok()? else {
-        return None;
+fn read_outlines(
+    doc: &Document,
+    entry: &Object,
+    names: &NamedDests,
+    pages: &HashSet<u32>,
+) -> Result<Option<Outlines>> {
+    let Some(Object::Dict(root)) = doc.resolve(entry).ok() else {
+        return Ok(None);
     };
     let Some(Object::Ref(first)) = root.get("First") else {
-        return None;
+        return Ok(None);
     };
     let mut items: Vec<Item> = Vec::new();
     let mut top: Vec<usize> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
+    let mut cycles = false;
+    // The root is not an item: a link that leads back to it is a cycle.
+    if let Object::Ref(r) = entry {
+        seen.insert(r.num);
+    }
     // Chains of siblings still to walk: where the chain starts, and whose
     // children it is.
     let mut chains: Vec<(ObjRef, Option<usize>)> = vec![(*first, None)];
     while let Some((start, parent)) = chains.pop() {
         let mut current = Some(start);
         while let Some(r) = current {
-            if items.len() >= MAX_ITEMS || !seen.insert(r.num) {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            if !seen.insert(r.num) {
+                cycles = true;
                 break;
             }
             let Ok(Object::Dict(d)) = doc.get(r) else {
@@ -409,7 +453,8 @@ fn read_outlines(doc: &Document, entry: &Object, names: &NamedDests, pages: &Has
             };
             let index = items.len();
             let open = d.get("Count").and_then(Object::as_int).is_some_and(|c| c > 0);
-            items.push(Item { r, children: Vec::new(), target: dests::item_page(doc, &d, names, pages), open });
+            let target = dests::item_page(doc, &d, names, pages)?;
+            items.push(Item { r, children: Vec::new(), target, open });
             match parent {
                 None => top.push(index),
                 Some(p) => {
@@ -427,7 +472,7 @@ fn read_outlines(doc: &Document, entry: &Object, names: &NamedDests, pages: &Has
             };
         }
     }
-    Some(Outlines { items, top })
+    Ok(Some(Outlines { items, top, cycles }))
 }
 
 /// The field tree under the catalog's `/AcroForm` `/Fields` (12.7.3).
@@ -578,6 +623,143 @@ mod tests {
         assert!(open(out.data).catalog().unwrap().contains_key("AcroForm"));
     }
 
+    /// Every `/Kids` entry of the name tree under `root`, all the way down, is an
+    /// indirect reference.
+    fn assert_all_kids_are_references(doc: &Document, root: &Object) {
+        let mut stack = vec![root.clone()];
+        let mut nodes = 0;
+        while let Some(node) = stack.pop() {
+            nodes += 1;
+            let d = dict_of(doc, &node);
+            if let Some(kids) = d.get("Kids") {
+                let kids = doc.resolve(kids).unwrap();
+                for kid in kids.as_array().unwrap() {
+                    assert!(matches!(kid, Object::Ref(_)), "a kid is not an indirect reference: {kid:?}");
+                    stack.push(kid.clone());
+                }
+            }
+        }
+        assert!(nodes > 1);
+    }
+
+    #[test]
+    fn a_tree_of_many_levels_has_indirect_kids_at_every_level() {
+        // 70,000 destinations need three levels of nodes; delete a third of them.
+        let mut b = PdfBuilder::new();
+        let tree: String = (0..70_000).map(|i| format!("(d{i:05}) [{} 0 R /Fit] ", 3 + i % 3)).collect();
+        b.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [{tree}] >> >> >>"));
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 9 9] >>");
+        for n in 3..=5 {
+            b.obj(n, "<< /Type /Page /Parent 2 0 R >>");
+        }
+        let src = open(b.finish_classic(6, "/Root 1 0 R"));
+        let doc = open(ops::delete_pages(&src, &[1]).unwrap().data);
+        let names = dict_of(&doc, doc.catalog().unwrap().get("Names").unwrap());
+        assert_all_kids_are_references(&doc, names.get("Dests").unwrap());
+        let loaded = NamedDests::load(&doc).unwrap();
+        assert_eq!(loaded.tree().len(), (0..70_000).filter(|i| i % 3 != 1).count());
+    }
+
+    /// Page 2 has a non-terminal field with a value on the parent; page 1 has a
+    /// ResetForm button, and an outline item has a SubmitForm action, both
+    /// naming that field.
+    fn actions_naming_a_field_of_another_page() -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [10 0 R 11 0 R] >> /Outlines 40 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] >>");
+        b.obj(3, "<< /Type /Page /Parent 2 0 R /Annots [20 0 R] >>");
+        b.obj(4, "<< /Type /Page /Parent 2 0 R /Annots [21 0 R] >>");
+        b.obj(10, "<< /T (btn) /FT /Btn /Ff 65536 /Kids [20 0 R] >>");
+        b.obj(20, "<< /Type /Annot /Subtype /Widget /Parent 10 0 R /P 3 0 R /Rect [0 0 9 9] /A << /S /ResetForm /Fields [11 0 R] >> >>");
+        b.obj(11, "<< /T (ssn) /FT /Tx /V (LEAK-PARENT-VALUE) /Kids [21 0 R] >>");
+        b.obj(21, "<< /Type /Annot /Subtype /Widget /Parent 11 0 R /P 4 0 R /Rect [0 0 9 9] /AP << /N 30 0 R >> >>");
+        b.stream_obj(30, "/Type /XObject /Subtype /Form /BBox [0 0 9 9]", b"LEAK-APPEARANCE");
+        b.obj(40, "<< /Type /Outlines /First 41 0 R /Last 41 0 R /Count 1 >>");
+        b.obj(41, "<< /Title (Submit) /Parent 40 0 R /A << /S /SubmitForm /F << /FS /URL /F (http://example.com) >> /Fields [11 0 R] >> >>");
+        b.finish_classic(42, "/Root 1 0 R")
+    }
+
+    #[test]
+    fn a_dead_field_named_by_an_action_does_not_come_back_through_it() {
+        let src = open(actions_naming_a_field_of_another_page());
+        let out = ops::delete_pages(&src, &[1]).unwrap();
+        assert!(!contains(&out.data, "LEAK"), "the form data of the removed page is still in the file");
+        let doc = open(out.data);
+        // The button stays, its action stays, naming no field now.
+        let pages = doc.pages().unwrap();
+        let annots = pages[0].dict.get("Annots").and_then(Object::as_array).unwrap().to_vec();
+        let button = dict_of(&doc, &annots[0]);
+        let action = dict_of(&doc, button.get("A").unwrap());
+        assert_eq!(action.get_name("S").unwrap(), &crate::object::Name::from("ResetForm"));
+        assert_eq!(action.get("Fields"), Some(&Object::Array(vec![])));
+        // The bookmark with the SubmitForm action stays too (it leads nowhere in the file).
+        let outlines = dict_of(&doc, doc.catalog().unwrap().get("Outlines").unwrap());
+        let item = dict_of(&doc, outlines.get("First").unwrap());
+        let submit = dict_of(&doc, item.get("A").unwrap());
+        assert_eq!(submit.get("Fields"), Some(&Object::Array(vec![])));
+        // Keeping page 2 instead keeps the field, and the actions on page 1 are gone.
+        let out = ops::extract_pages(&src, &[1]).unwrap();
+        assert!(contains(&out.data, "LEAK-PARENT-VALUE") && contains(&out.data, "LEAK-APPEARANCE"));
+    }
+
+    #[test]
+    fn outline_links_that_lead_back_to_the_root_or_to_an_item_seen_are_cut() {
+        // A (page 1) has child A1 (page 2) whose /First is the outline root;
+        // C (page 1) has a /First that is A and a /Next that is A again.
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] >>");
+        b.obj(3, "<< /Type /Page /Parent 2 0 R >>");
+        b.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        b.obj(10, "<< /Type /Outlines /First 11 0 R /Last 13 0 R /Count 5 >>");
+        b.obj(11, "<< /Title (A-p1) /Parent 10 0 R /Next 12 0 R /Dest [3 0 R /Fit] /First 14 0 R /Last 14 0 R /Count 1 >>");
+        b.obj(12, "<< /Title (B-p2) /Parent 10 0 R /Prev 11 0 R /Next 13 0 R /Dest [4 0 R /Fit] >>");
+        b.obj(13, "<< /Title (C-p1) /Parent 10 0 R /Prev 12 0 R /Next 11 0 R /Dest [3 0 R /Fit] /First 11 0 R /Count 1 >>");
+        b.obj(14, "<< /Title (A1-p2) /Parent 11 0 R /Next 12 0 R /Dest [4 0 R /Fit] /First 10 0 R >>");
+        let src = open(b.finish_classic(15, "/Root 1 0 R"));
+        let out = ops::delete_pages(&src, &[1]).unwrap();
+        let doc = open(out.data);
+        let root_ref = doc.catalog().unwrap().get("Outlines").and_then(Object::as_obj_ref).unwrap();
+        // Walk the way a reader (qpdf) does: no item may be met twice, and none may lead to the root.
+        let mut seen: HashSet<u32> = HashSet::new();
+        seen.insert(root_ref.num);
+        let mut titles: Vec<String> = Vec::new();
+        let mut stack: Vec<ObjRef> = vec![dict_of(&doc, &Object::Ref(root_ref)).get("First").and_then(Object::as_obj_ref).unwrap()];
+        while let Some(r) = stack.pop() {
+            assert!(seen.insert(r.num), "outline item {} is met twice: a loop", r.num);
+            let d = dict_of(&doc, &Object::Ref(r));
+            let Some(Object::String(t)) = d.get("Title") else { panic!() };
+            titles.push(String::from_utf8(t.bytes.clone()).unwrap());
+            for key in ["Next", "First"] {
+                if let Some(Object::Ref(next)) = d.get(key) {
+                    stack.push(*next);
+                }
+            }
+        }
+        titles.sort();
+        assert_eq!(titles, vec!["A-p1".to_string(), "C-p1".to_string()]);
+        assert_eq!(dict_of(&doc, &Object::Ref(root_ref)).get_int("Count"), Some(2));
+    }
+
+    #[test]
+    fn a_cycle_in_the_outline_is_cut_even_when_no_page_is_left_out() {
+        // Same tree; extracting every page in another order cuts nothing by
+        // page, but a delete that keeps everything that has a bookmark still
+        // walks it, so check the walk itself: the item list has no repeat.
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] >>");
+        b.obj(3, "<< /Type /Page /Parent 2 0 R >>");
+        b.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        b.obj(10, "<< /Type /Outlines /First 11 0 R /Last 11 0 R /Count 1 >>");
+        b.obj(11, "<< /Title (Loop) /Parent 10 0 R /Dest [3 0 R /Fit] /First 10 0 R >>");
+        let src = open(b.finish_classic(12, "/Root 1 0 R"));
+        let doc = Document::from_bytes(ops::delete_pages(&src, &[1]).unwrap().data).unwrap();
+        let root = dict_of(&doc, doc.catalog().unwrap().get("Outlines").unwrap());
+        let item = dict_of(&doc, root.get("First").unwrap());
+        assert!(!item.contains_key("First"), "the link back to the root is cut");
+    }
+
     /// Three pages; bookmarks:
     ///   A -> page 1
     ///   B (closed, no destination of its own)
@@ -703,20 +885,24 @@ mod tests {
         // Keep pages 1 and 3: the entries for page 2 (every third) are gone.
         let out = ops::extract_pages(&src, &[0, 2]).unwrap();
         let doc = open(out.data);
-        let names = NamedDests::load(&doc);
+        let names = NamedDests::load(&doc).unwrap();
         let expected = (0..130).filter(|i| i % 3 != 1).count();
         assert_eq!(names.tree().len(), expected);
         let pages = doc.pages().unwrap();
         let page_nums: HashSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
         for (key, _) in names.tree() {
-            let array = names.lookup(&doc, key, false).unwrap();
+            let array = names.lookup(&doc, key, false).unwrap().unwrap();
             assert!(dests::array_page(&array, &page_nums).is_some(), "{}", String::from_utf8_lossy(key));
         }
-        // The rebuilt tree is a real tree: more than one level.
+        // The rebuilt tree is a real tree: more than one level, every node an
+        // object of its own, and /Kids an array of indirect references (Table 36).
         let catalog = doc.catalog().unwrap();
         let names_dict = dict_of(&doc, catalog.get("Names").unwrap());
-        let root = dict_of(&doc, names_dict.get("Dests").unwrap());
+        let root_entry = names_dict.get("Dests").unwrap();
+        assert!(matches!(root_entry, Object::Ref(_)), "the root is an indirect object");
+        let root = dict_of(&doc, root_entry);
         assert!(root.contains_key("Kids") && !root.contains_key("Limits"));
+        assert_all_kids_are_references(&doc, root_entry);
         // The old dictionary keeps what leads to kept pages, and what leads nowhere known.
         let old = dict_of(&doc, catalog.get("Dests").unwrap());
         assert!(old.contains_key("Old3") && old.contains_key("Odd") && !old.contains_key("Old4"));

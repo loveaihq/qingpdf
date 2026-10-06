@@ -138,6 +138,13 @@ impl Dict {
         }
     }
 
+    /// About how many bytes the dictionary takes (see [`Object::approx_size`]).
+    pub fn approx_size(&self) -> usize {
+        self.0.iter().fold(24usize, |acc, (k, v)| {
+            acc.saturating_add(16).saturating_add(k.as_bytes().len()).saturating_add(v.approx_size())
+        })
+    }
+
     /// Drop the entries whose value is null (7.3.7: the same as absent).
     pub fn remove_nulls(&mut self) {
         self.0.retain(|(_, v)| !matches!(v, Object::Null));
@@ -226,6 +233,20 @@ pub enum Object {
 }
 
 impl Object {
+    /// About how many bytes the object takes in memory: every value counts a
+    /// few words, and names, strings and stream data count their length. Used
+    /// to bound how much a file can make us copy or keep; not exact.
+    pub fn approx_size(&self) -> usize {
+        match self {
+            Object::Null | Object::Bool(_) | Object::Integer(_) | Object::Real(_) | Object::Ref(_) => 16,
+            Object::String(s) => 16usize.saturating_add(s.bytes.len()),
+            Object::Name(n) => 16usize.saturating_add(n.as_bytes().len()),
+            Object::Array(items) => items.iter().fold(24usize, |acc, o| acc.saturating_add(o.approx_size())),
+            Object::Dict(d) => d.approx_size(),
+            Object::Stream(s) => s.dict.approx_size().saturating_add(s.data.len()),
+        }
+    }
+
     pub fn as_dict(&self) -> Option<&Dict> {
         match self {
             Object::Dict(d) => Some(d),

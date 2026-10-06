@@ -313,25 +313,50 @@ mod hostile {
     /// Builds a file object by object.
     struct Pdf {
         buf: Vec<u8>,
+        offsets: std::collections::BTreeMap<u32, usize>,
     }
 
     impl Pdf {
         fn new() -> Pdf {
-            Pdf { buf: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec() }
+            Pdf { buf: b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec(), offsets: std::collections::BTreeMap::new() }
         }
 
         fn obj(&mut self, num: u32, body: &str) -> usize {
+            self.obj_bytes(num, body.as_bytes())
+        }
+
+        fn obj_bytes(&mut self, num: u32, body: &[u8]) -> usize {
             let at = self.buf.len();
-            self.buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+            self.offsets.insert(num, at);
+            self.buf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            self.buf.extend_from_slice(body);
+            self.buf.extend_from_slice(b"\nendobj\n");
             at
         }
 
         fn stream(&mut self, num: u32, dict: &str, data: &[u8]) -> usize {
             let at = self.buf.len();
+            self.offsets.insert(num, at);
             self.buf.extend_from_slice(format!("{num} 0 obj\n<< {dict} /Length {} >>\nstream\n", data.len()).as_bytes());
             self.buf.extend_from_slice(data);
             self.buf.extend_from_slice(b"\nendstream\nendobj\n");
             at
+        }
+
+        /// A classic cross-reference table for the objects written so far.
+        fn finish_classic(mut self) -> Vec<u8> {
+            let size = self.offsets.keys().next_back().map_or(1, |n| n + 1);
+            let at = self.buf.len();
+            let mut table = format!("xref\n0 {size}\n0000000000 65535 f \n");
+            for n in 1..size {
+                match self.offsets.get(&n) {
+                    Some(o) => table.push_str(&format!("{o:010} 00000 n \n")),
+                    None => table.push_str("0000000000 00000 f \n"),
+                }
+            }
+            table.push_str(&format!("trailer\n<< /Size {size} /Root 1 0 R >>\n"));
+            self.buf.extend_from_slice(table.as_bytes());
+            self.finish(at)
         }
 
         fn finish(mut self, startxref: usize) -> Vec<u8> {
@@ -522,6 +547,232 @@ mod hostile {
         });
         assert_quick(took, "reading an xref stream with 8 million entries");
         assert!(matches!(outcome, Ok(1)), "{outcome:?}");
+    }
+
+    /// Round 2, n1: one page of 10 MB listed 300 times. Every listing is written
+    /// out in full, so this must not be expanded.
+    #[test]
+    fn one_big_page_listed_many_times_is_a_limit_error_and_not_gigabytes() {
+        let long_name = "A".repeat(10_000);
+        let names: String = (0..1000).map(|_| format!("/{long_name} ")).collect();
+        let mut p = Pdf::new();
+        p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        p.obj(2, &format!("<< /Type /Pages /Kids [{}] /Count 300 /MediaBox [0 0 100 100] >>", "3 0 R ".repeat(300)));
+        p.obj(3, &format!("<< /Type /Page /Parent 2 0 R /X [{names}] >>"));
+        let bytes = p.finish_classic();
+        assert!(bytes.len() > 10_000_000);
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let counted = doc.page_count();
+            let rotated = ops::rotate_pages(&doc, &[], 0).map(|o| o.data.len());
+            (counted, rotated)
+        });
+        assert_quick(took, "reading a page of 10 MB that is listed 300 times");
+        let (counted, rotated) = outcome;
+        assert!(matches!(counted, Err(Error::Limit(_))), "{counted:?}");
+        assert!(matches!(rotated, Err(Error::Limit(_))), "{rotated:?}");
+    }
+
+    /// Round 2, n7: 12 KB that name one page a million times.
+    #[test]
+    fn a_tiny_file_that_names_one_page_a_million_times_is_a_limit_error() {
+        let fan = 1000;
+        let mut p = Pdf::new();
+        p.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        p.obj(2, &format!("<< /Type /Pages /Kids [{}] /Count {} /MediaBox [0 0 100 100] >>", "4 0 R ".repeat(fan), fan * fan));
+        p.obj(4, &format!("<< /Type /Pages /Kids [{}] /Count {fan} >>", "5 0 R ".repeat(fan)));
+        p.obj(5, "<< /Type /Page /Parent 4 0 R >>");
+        let bytes = p.finish_classic();
+        assert!(bytes.len() < 20_000);
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let counted = doc.page_count();
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            (counted, merged)
+        });
+        assert_quick(took, "a file that names one page a million times");
+        let (counted, merged) = outcome;
+        assert!(matches!(counted, Err(Error::Limit(_))), "{counted:?}");
+        assert!(matches!(merged, Err(Error::Limit(_))), "{merged:?}");
+    }
+
+    /// A name tree whose `leaves` leaves all name one `/Names` array, whose key
+    /// is a string of 1 MiB; and a link that names a destination.
+    fn names_shared_by_many_leaves(leaves: u32) -> Vec<u8> {
+        let mut p = Pdf::new();
+        p.obj(1, "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 10 0 R >> >>");
+        p.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] >>");
+        p.obj(3, "<< /Type /Page /Parent 2 0 R /Annots [6 0 R] >>");
+        p.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        p.obj(6, "<< /Type /Annot /Subtype /Link /Rect [0 0 9 9] /Dest (zzz) >>");
+        p.obj_bytes(8, &[b"(".as_slice(), &vec![b'K'; 1 << 20], b")"].concat());
+        p.obj(9, "[8 0 R [4 0 R /Fit]]");
+        let kids: String = (0..leaves).map(|i| format!("{} 0 R ", 100 + i)).collect();
+        p.obj(10, &format!("<< /Kids [{kids}] >>"));
+        for i in 0..leaves {
+            p.obj(100 + i, "<< /Limits [(a) (z)] /Names 9 0 R >>");
+        }
+        p.finish_classic()
+    }
+
+    /// Round 2, n2: the leaves share one array. It is read once, whether the
+    /// names are cut for a delete or looked up for a merge.
+    #[test]
+    fn leaves_sharing_one_names_array_cost_one_read_of_it() {
+        let bytes = names_shared_by_many_leaves(1500);
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let deleted = ops::delete_pages(&doc, &[1]).map(|o| o.pages);
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            (deleted, merged)
+        });
+        assert_quick(took, "delete and merge of a name tree whose leaves share one array");
+        let (deleted, merged) = outcome;
+        assert!(matches!(deleted, Ok(1)), "{deleted:?}");
+        assert!(matches!(merged, Ok(4)), "{merged:?}");
+    }
+
+    /// Round 2, n2b: one 1 MiB string named as the key of 1500 pairs.
+    #[test]
+    fn one_huge_key_named_as_the_key_of_many_pairs_is_a_limit_error() {
+        let pairs = "8 0 R [4 0 R /Fit] ".repeat(1500);
+        let mut p = Pdf::new();
+        p.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R /Names << /Dests << /Names [{pairs}] >> >> >>"));
+        p.obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 100 100] >>");
+        p.obj(3, "<< /Type /Page /Parent 2 0 R >>");
+        p.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        p.obj_bytes(8, &[b"(".as_slice(), &vec![b'K'; 1 << 20], b")"].concat());
+        let bytes = p.finish_classic();
+        let (outcome, took) = run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            let split = ops::extract_pages(&doc, &[0]).map(|o| o.pages);
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            (split, merged)
+        });
+        assert_quick(took, "a name tree that names one huge key 1500 times");
+        let (split, merged) = outcome;
+        assert!(matches!(split, Err(Error::Limit(_))), "{split:?}");
+        // A merge reads the later files' names only when a link names one: this
+        // file has none, so it merges.
+        assert!(matches!(merged, Ok(4)), "{merged:?}");
+    }
+
+    /// Bookmarks spread over interleaved object streams: bookmark i is in
+    /// stream i mod `streams`, so following the chain asks for a different
+    /// object stream every time. Each stream also holds one unreferenced object
+    /// of `junk` bytes, to make the streams as big as they are in the real
+    /// files that do this (the output stays small).
+    fn interleaved_bookmarks(streams: u32, per: u32, junk: usize) -> Vec<u8> {
+        use miniz_oxide::deflate::compress_to_vec_zlib;
+        let n = streams * per;
+        let first = 10u32;
+        let pad = "x".repeat(90);
+        let mut bodies: Vec<Vec<(u32, String)>> = vec![Vec::new(); streams as usize];
+        for i in 0..n {
+            let num = first + i;
+            let next = if i + 1 < n { format!("/Next {} 0 R ", num + 1) } else { String::new() };
+            let prev = if i > 0 { format!("/Prev {} 0 R ", num - 1) } else { String::new() };
+            bodies[(i % streams) as usize]
+                .push((num, format!("<< /Title (bookmark {i:08} {pad}) /Parent 3 0 R {next}{prev}/Dest [4 0 R /Fit] >>")));
+        }
+        for (s, items) in bodies.iter_mut().enumerate() {
+            let junk_num = first + n + streams + u32::try_from(s).unwrap();
+            items.push((junk_num, format!("({})", " ".repeat(junk))));
+        }
+        let mut p = Pdf::new();
+        p.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 3 0 R >>");
+        p.obj(2, "<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 100 100] >>");
+        p.obj(3, &format!("<< /Type /Outlines /First {first} 0 R /Last {} 0 R /Count {n} >>", first + n - 1));
+        p.obj(4, "<< /Type /Page /Parent 2 0 R >>");
+        let xref_num = first + n + 2 * streams;
+        let mut rows: Vec<[u8; 7]> = vec![[0; 7]; (xref_num + 1) as usize];
+        let row = |t: u8, a: u32, b: u16| {
+            let mut r = [0u8; 7];
+            r[0] = t;
+            r[1..5].copy_from_slice(&a.to_be_bytes());
+            r[5..7].copy_from_slice(&b.to_be_bytes());
+            r
+        };
+        rows[0] = row(0, 0, 0xFFFF);
+        for num in 1..=4u32 {
+            rows[num as usize] = row(1, u32::try_from(p.offsets[&num]).unwrap(), 0);
+        }
+        for (s, items) in bodies.iter().enumerate() {
+            let stream_num = first + n + u32::try_from(s).unwrap();
+            let (mut header, mut data) = (String::new(), String::new());
+            for (k, (num, body)) in items.iter().enumerate() {
+                header.push_str(&format!("{num} {} ", data.len()));
+                data.push_str(body);
+                data.push(' ');
+                rows[*num as usize] = row(2, stream_num, u16::try_from(k).unwrap());
+            }
+            let packed = compress_to_vec_zlib(format!("{header}{data}").as_bytes(), 1);
+            let at = p.stream(
+                stream_num,
+                &format!("/Type /ObjStm /N {} /First {} /Filter /FlateDecode", items.len(), header.len()),
+                &packed,
+            );
+            rows[stream_num as usize] = row(1, u32::try_from(at).unwrap(), 0);
+        }
+        let x = p.buf.len();
+        rows[xref_num as usize] = row(1, u32::try_from(x).unwrap(), 0);
+        let table: Vec<u8> = rows.iter().flatten().copied().collect();
+        let packed = compress_to_vec_zlib(&table, 1);
+        p.stream(
+            xref_num,
+            &format!("/Type /XRef /Size {} /W [1 4 2] /Root 1 0 R /Filter /FlateDecode", rows.len()),
+            &packed,
+        );
+        p.finish(x)
+    }
+
+    /// How many bookmarks the document has, following /First and /Next.
+    fn count_bookmarks(doc: &Document) -> usize {
+        let catalog = doc.catalog().expect("catalog");
+        let Some(root) = catalog.get("Outlines").map(|o| doc.resolve(o).expect("outlines")) else { return 0 };
+        let mut next = root.as_dict().and_then(|d| d.get("First")).cloned();
+        let mut count = 0;
+        while let Some(item) = next {
+            count += 1;
+            next = doc.resolve(&item).expect("item").as_dict().and_then(|d| d.get("Next")).cloned();
+        }
+        count
+    }
+
+    fn rotate_and_count_bookmarks(bytes: Vec<u8>) -> (std::result::Result<usize, Error>, Duration) {
+        run_within(move || {
+            let doc = Document::from_bytes(bytes).expect("opens");
+            match ops::rotate_pages(&doc, &[0], 90) {
+                Ok(out) => {
+                    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+                    let copy = Document::from_bytes(out.data).expect("the copy opens");
+                    Ok(count_bookmarks(&copy))
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    /// Round 2: 50,000 bookmarks in 250 interleaved object streams of 340 KB
+    /// when decoded (85 MB in all). That is more than the cache of 64 MiB the
+    /// first version had, so every bookmark meant decoding a stream again until
+    /// the decoding budget ran out, and the rest of the bookmarks was silently
+    /// dropped as "damaged". It is within the cache of today: every bookmark is kept.
+    #[test]
+    fn bookmarks_in_interleaved_object_streams_that_fit_the_cache_are_all_kept() {
+        let (outcome, took) = rotate_and_count_bookmarks(interleaved_bookmarks(250, 200, 300_000));
+        assert_within_four_times(took, "rotating a file with 50,000 bookmarks in 250 object streams of 340 KB");
+        assert!(matches!(outcome, Ok(50_000)), "{outcome:?}");
+    }
+
+    /// The same with streams of 460 KB (115 MB in all): more than the cache
+    /// holds. Reading it would mean decoding streams again and again, so it
+    /// ends in a limit error, which says so; bookmarks are not lost quietly.
+    #[test]
+    fn bookmarks_in_interleaved_object_streams_beyond_the_cache_are_a_limit_error_not_a_loss() {
+        let (outcome, took) = rotate_and_count_bookmarks(interleaved_bookmarks(250, 200, 440_000));
+        assert_within_four_times(took, "rotating a file whose object streams do not fit the cache");
+        assert!(matches!(outcome, Err(Error::Limit(_))), "{outcome:?}");
     }
 
     /// Review finding h4b: six of them chained by /Prev; the cap is for the

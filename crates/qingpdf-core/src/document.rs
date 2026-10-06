@@ -2,7 +2,7 @@
 //! tree.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -28,13 +28,21 @@ pub const MAX_PAGES: usize = 1_000_000;
 /// that lists a node ten times at each of ten levels would otherwise be
 /// ten billion visits.
 const MAX_PAGE_TREE_VISITS: usize = 2_000_000;
-/// Cap on the total size of the page dictionaries that are met again (a page
-/// listed several times), so a hostile tree cannot make one huge page count
-/// many times over.
-const MAX_REPEATED_WEIGHT: usize = 1 << 26;
-/// Decoded object streams are kept for reuse up to this many bytes in all;
-/// the oldest are dropped first.
-const OBJSTM_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Most times a page may be listed again after its first listing, all pages
+/// together. A tiny file can name one page a million times.
+const MAX_REPEATED_PAGES: usize = 10_000;
+/// Cap on the bytes of the page dictionaries that are met again (a page
+/// listed several times, each listing written out in full), so a hostile tree
+/// cannot make one huge page count many times over.
+const MAX_REPEATED_BYTES: usize = 64 * 1024 * 1024;
+/// Decoded object streams are kept for reuse up to this many bytes in all; the
+/// one used longest ago is dropped first. A file whose objects are spread over
+/// object streams in an order that visits them all again and again (bookmarks
+/// interleaved over 250 streams, say) needs all of them at once, up to this
+/// much; with more than this it ends in a limit error. Larger would make a
+/// document (the cache, the file, and the output being built) cost more than
+/// 200 MB.
+const OBJSTM_CACHE_BYTES: usize = 96 * 1024 * 1024;
 /// The header must start within this many bytes of the beginning of the file.
 const HEADER_WINDOW: usize = 1024;
 /// Page attributes a page inherits from its ancestors (7.7.3.4, Table 30).
@@ -106,11 +114,16 @@ impl Inherited {
 struct TreeLimits {
     pages: usize,
     visits: usize,
-    repeated_weight: usize,
+    repeated_pages: usize,
+    repeated_bytes: usize,
 }
 
-const TREE_LIMITS: TreeLimits =
-    TreeLimits { pages: MAX_PAGES, visits: MAX_PAGE_TREE_VISITS, repeated_weight: MAX_REPEATED_WEIGHT };
+const TREE_LIMITS: TreeLimits = TreeLimits {
+    pages: MAX_PAGES,
+    visits: MAX_PAGE_TREE_VISITS,
+    repeated_pages: MAX_REPEATED_PAGES,
+    repeated_bytes: MAX_REPEATED_BYTES,
+};
 
 /// A page inherited value, with something to tell two of them apart.
 #[derive(Debug, Clone, Copy)]
@@ -272,16 +285,42 @@ fn copy_error(e: &Error) -> Error {
 /// [`OBJSTM_CACHE_BYTES`] of decoded data, the oldest dropped first. A failure
 /// is kept too (it weighs next to nothing), so a broken stream is not decoded
 /// again for every object that lives in it.
-#[derive(Default)]
 struct ObjStmCache {
-    map: HashMap<u32, (std::result::Result<Rc<ObjStm>, Error>, usize)>,
-    order: VecDeque<u32>,
+    map: HashMap<u32, CachedObjStm>,
+    /// Object stream numbers by when they were last used (a counter that goes
+    /// up), the one used longest ago first.
+    recency: BTreeMap<u64, u32>,
+    clock: u64,
     bytes: usize,
+    /// How many bytes it may hold.
+    capacity: usize,
+}
+
+struct CachedObjStm {
+    result: std::result::Result<Rc<ObjStm>, Error>,
+    weight: usize,
+    used: u64,
+}
+
+impl Default for ObjStmCache {
+    fn default() -> Self {
+        ObjStmCache::with_capacity(OBJSTM_CACHE_BYTES)
+    }
 }
 
 impl ObjStmCache {
-    fn get(&self, num: u32) -> Option<Result<Rc<ObjStm>>> {
-        self.map.get(&num).map(|(r, _)| match r {
+    fn with_capacity(capacity: usize) -> ObjStmCache {
+        ObjStmCache { map: HashMap::new(), recency: BTreeMap::new(), clock: 0, bytes: 0, capacity }
+    }
+
+    /// The cached result, which counts as used now.
+    fn get(&mut self, num: u32) -> Option<Result<Rc<ObjStm>>> {
+        let entry = self.map.get_mut(&num)?;
+        self.recency.remove(&entry.used);
+        self.clock += 1;
+        entry.used = self.clock;
+        self.recency.insert(self.clock, num);
+        Some(match &entry.result {
             Ok(stm) => Ok(Rc::clone(stm)),
             Err(e) => Err(copy_error(e)),
         })
@@ -292,29 +331,31 @@ impl ObjStmCache {
             Ok(stm) => stm.weight(),
             Err(_) => 64,
         };
-        while self.bytes.saturating_add(weight) > OBJSTM_CACHE_BYTES {
-            let Some(oldest) = self.order.pop_front() else {
+        // Make room by dropping what was used longest ago.
+        while self.bytes.saturating_add(weight) > self.capacity {
+            let Some((_, oldest)) = self.recency.pop_first() else {
                 break;
             };
-            if let Some((_, w)) = self.map.remove(&oldest) {
-                self.bytes = self.bytes.saturating_sub(w);
+            if let Some(gone) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(gone.weight);
             }
         }
         let stored = match result {
             Ok(stm) => Ok(Rc::clone(stm)),
             Err(e) => Err(copy_error(e)),
         };
-        if let Some((_, old)) = self.map.insert(num, (stored, weight)) {
+        self.clock += 1;
+        if let Some(old) = self.map.insert(num, CachedObjStm { result: stored, weight, used: self.clock }) {
             // Cannot happen (callers look first), but keep the books straight.
-            self.bytes = self.bytes.saturating_sub(old);
-        } else {
-            self.order.push_back(num);
+            self.bytes = self.bytes.saturating_sub(old.weight);
+            self.recency.remove(&old.used);
         }
+        self.recency.insert(self.clock, num);
         self.bytes = self.bytes.saturating_add(weight);
     }
 
     fn clear(&mut self) {
-        *self = ObjStmCache::default();
+        *self = ObjStmCache::with_capacity(self.capacity);
     }
 
     #[cfg(test)]
@@ -336,10 +377,7 @@ impl ObjectCache {
         if self.budget == 0 {
             return;
         }
-        let size = match object {
-            Object::Stream(s) => s.data.len().saturating_add(dict_weight(&s.dict).saturating_mul(32)),
-            other => weight(other).saturating_mul(32),
-        };
+        let size = object.approx_size();
         if self.bytes.saturating_add(size) <= self.budget {
             self.bytes += size;
             self.map.insert(num, object.clone());
@@ -633,7 +671,7 @@ impl Document {
     /// The decoded object stream `stream_num`, decoding it the first time (and
     /// again after the cache has let it go).
     fn object_stream(&self, stream_num: u32) -> Result<Rc<ObjStm>> {
-        if let Some(cached) = self.objstms.borrow().get(stream_num) {
+        if let Some(cached) = self.objstms.borrow_mut().get(stream_num) {
             return cached;
         }
         let result = self.read_object_stream(stream_num);
@@ -716,6 +754,14 @@ impl Document {
             return Err(encrypted_error());
         }
         filter::decode_with_limit(&s.dict, &s.data, &|o| self.resolve(o), limit, 0, &self.budget)
+    }
+
+    /// Spend what is left of the decoding budget and forget the decoded object
+    /// streams, so that the next one needed has to be decoded (and cannot be).
+    #[cfg(test)]
+    pub(crate) fn use_up_the_decoding_budget_for_test(&self) {
+        self.budget.charge_for_test(self.budget.remaining());
+        self.objstms.borrow_mut().clear();
     }
 
     /// Does the trailer have an `/Encrypt` entry (7.5.5)?
@@ -811,8 +857,8 @@ impl Document {
         let node = match kind {
             NodeKind::Skip => return Ok(None),
             NodeKind::Page => {
-                let weight = dict_weight(&dict);
-                Node { kind, dict: Rc::new(dict), kids: Rc::new(Vec::new()), own: Default::default(), weight, seen: Cell::new(false) }
+                let size = dict.approx_size();
+                Node { kind, dict: Rc::new(dict), kids: Rc::new(Vec::new()), own: Default::default(), size, seen: Cell::new(false) }
             }
             NodeKind::Pages => {
                 let kids = match dict.remove("Kids") {
@@ -831,7 +877,7 @@ impl Document {
                         *slot = Some(Rc::new(Attr { raw, resolved }));
                     }
                 }
-                Node { kind, dict: Rc::new(Dict::new()), kids: Rc::new(kids), own, weight: 0, seen: Cell::new(false) }
+                Node { kind, dict: Rc::new(Dict::new()), kids: Rc::new(kids), own, size: 0, seen: Cell::new(false) }
             }
         };
         Ok(Some(Rc::new(node)))
@@ -906,11 +952,19 @@ impl Document {
                 if walk.pages > walk.limits.pages {
                     return Err(Error::Limit(format!("more than {} pages in the page tree", walk.limits.pages)));
                 }
-                // A page met again is counted as its size every time, so one
-                // big page listed a million times cannot be made to count.
+                // A page met again counts against how often and how much (its
+                // bytes, every time): a tiny file cannot name one page a million
+                // times, nor one big page a few hundred times.
                 if node.seen.replace(true) {
-                    walk.repeated_weight = walk.repeated_weight.saturating_add(node.weight);
-                    if walk.repeated_weight > walk.limits.repeated_weight {
+                    walk.repeated_pages += 1;
+                    walk.repeated_bytes = walk.repeated_bytes.saturating_add(node.size);
+                    if walk.repeated_pages > walk.limits.repeated_pages {
+                        return Err(Error::Limit(format!(
+                            "pages are listed again more than {} times in the page tree",
+                            walk.limits.repeated_pages
+                        )));
+                    }
+                    if walk.repeated_bytes > walk.limits.repeated_bytes {
                         return Err(Error::Limit("pages listed over and over in the page tree are too large".to_string()));
                     }
                 }
@@ -950,7 +1004,8 @@ struct Node {
     kids: Rc<Vec<Object>>,
     /// The inheritable values this node sets (for a page tree node).
     own: [Option<Rc<Attr>>; 4],
-    weight: usize,
+    /// About how many bytes the page dictionary takes.
+    size: usize,
     /// Has a page with this node's dictionary been handed out already?
     seen: Cell<bool>,
 }
@@ -963,7 +1018,8 @@ struct TreeWalk {
     on_path: HashSet<ObjRef>,
     visits: usize,
     pages: usize,
-    repeated_weight: usize,
+    repeated_pages: usize,
+    repeated_bytes: usize,
 }
 
 impl TreeWalk {
@@ -974,7 +1030,8 @@ impl TreeWalk {
             on_path: HashSet::new(),
             visits: 0,
             pages: 0,
-            repeated_weight: 0,
+            repeated_pages: 0,
+            repeated_bytes: 0,
         }
     }
 
@@ -1014,20 +1071,6 @@ fn classify(node: &Dict) -> NodeKind {
         _ if ["Contents", "MediaBox", "Resources", "Parent"].iter().any(|k| node.contains_key(k)) => NodeKind::Page,
         _ => NodeKind::Skip,
     }
-}
-
-/// A rough size of an object, to bound how much is copied.
-fn weight(obj: &Object) -> usize {
-    match obj {
-        Object::Array(items) => items.iter().fold(1usize, |acc, o| acc.saturating_add(weight(o))),
-        Object::Dict(d) => dict_weight(d),
-        Object::String(s) => 1 + s.bytes.len() / 16,
-        _ => 1,
-    }
-}
-
-fn dict_weight(d: &Dict) -> usize {
-    d.iter().fold(1usize, |acc, (_, o)| acc.saturating_add(weight(o)))
 }
 
 #[cfg(test)]
@@ -1277,14 +1320,14 @@ mod tests {
         // object stream: it is decoded then and never again.
         let doc = open(sample_objstm_pdf());
         assert_eq!(doc.objstms.borrow().len(), 1);
-        let first = doc.objstms.borrow().get(5).unwrap().unwrap();
+        let first = doc.objstms.borrow_mut().get(5).unwrap().unwrap();
         for _ in 0..3 {
             doc.get(ObjRef::new(1, 0)).unwrap();
             doc.get(ObjRef::new(2, 0)).unwrap();
             doc.get(ObjRef::new(3, 0)).unwrap();
         }
         assert_eq!(doc.objstms.borrow().len(), 1);
-        let again = doc.objstms.borrow().get(5).unwrap().unwrap();
+        let again = doc.objstms.borrow_mut().get(5).unwrap().unwrap();
         assert!(Rc::ptr_eq(&first, &again));
     }
 
@@ -1680,7 +1723,7 @@ mod tests {
         b.obj(12, "<< /Type /Page /MediaBox [0 0 1 1] >>");
         let doc = open(b.finish_classic(13, "/Root 1 0 R"));
         // With small limits, so that the test is quick in an unoptimised build.
-        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_weight: 1 << 20 };
+        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_pages: 1 << 20, repeated_bytes: 1 << 30 };
         assert!(matches!(doc.pages_within(small), Err(Error::Limit(m)) if m.contains("5000 pages")));
         let started = std::time::Instant::now();
         assert!(matches!(doc.pages(), Err(Error::Limit(_))));
@@ -1700,14 +1743,14 @@ mod tests {
         }
         b.obj(12, "<< /Type /Font >>");
         let doc = open(b.finish_classic(13, "/Root 1 0 R"));
-        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_weight: 1 << 20 };
+        let small = TreeLimits { pages: 5000, visits: 20_000, repeated_pages: 1 << 20, repeated_bytes: 1 << 30 };
         assert!(matches!(doc.pages_within(small), Err(Error::Limit(m)) if m.contains("20000 entries")));
     }
 
     #[test]
     fn one_big_page_listed_over_and_over_is_a_limit_error() {
-        // The page dictionary is about 3 weight units per name; listed 100
-        // times it adds up past a small allowance.
+        // A page of a few KB listed 100 times adds up past a small allowance
+        // of bytes; the same page listed 100 times is nothing for the real one.
         let names: String = (0..200).map(|i| format!("/K{i} 1 ")).collect();
         let mut b = PdfBuilder::new();
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -1715,9 +1758,53 @@ mod tests {
         b.obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count 100 >>"));
         b.obj(3, &format!("<< /Type /Page /MediaBox [0 0 1 1] {names} >>"));
         let doc = open(b.finish_classic(4, "/Root 1 0 R"));
-        let tight = TreeLimits { pages: 1000, visits: 1000, repeated_weight: 5000 };
+        let tight = TreeLimits { pages: 1000, visits: 1000, repeated_pages: 1000, repeated_bytes: 50_000 };
         assert!(matches!(doc.pages_within(tight), Err(Error::Limit(m)) if m.contains("over and over")));
+        // How often is limited too.
+        let few = TreeLimits { pages: 1000, visits: 1000, repeated_pages: 10, repeated_bytes: 1 << 30 };
+        assert!(matches!(doc.pages_within(few), Err(Error::Limit(m)) if m.contains("listed again more than 10")));
         assert_eq!(doc.pages().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn names_count_by_their_length_in_what_is_repeated() {
+        // The weight of a page is its bytes: one name of 100,000 characters
+        // is not one unit. 20 listings of it are over a 1 MiB allowance.
+        let big = "A".repeat(100_000);
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let kids = "3 0 R ".repeat(20);
+        b.obj(2, &format!("<< /Type /Pages /Kids [{kids}] /Count 20 >>"));
+        b.obj(3, &format!("<< /Type /Page /MediaBox [0 0 1 1] /X /{big} >>"));
+        let doc = open(b.finish_classic(4, "/Root 1 0 R"));
+        let small = TreeLimits { pages: 1000, visits: 1000, repeated_pages: 1000, repeated_bytes: 1 << 20 };
+        assert!(matches!(doc.pages_within(small), Err(Error::Limit(_))));
+    }
+
+    #[test]
+    fn the_object_stream_cache_drops_the_one_used_longest_ago() {
+        let stream = |n: u32, size: usize| -> Result<Rc<ObjStm>> {
+            let header = format!("{n} 0 ");
+            let mut data = format!("{header}(x)").into_bytes();
+            data.resize(size, b' ');
+            let mut d = Dict::new();
+            d.set("N", Object::Integer(1));
+            d.set("First", Object::Integer(i64::try_from(header.len()).unwrap()));
+            Ok(Rc::new(ObjStm::parse(&d, data).unwrap()))
+        };
+        let one = stream(1, 4000).unwrap().weight();
+        let mut cache = ObjStmCache::with_capacity(one * 2 + one / 2);
+        cache.insert(1, &stream(1, 4000));
+        cache.insert(2, &stream(2, 4000));
+        // 1 is used again, so 2 is the one that goes when 3 needs room.
+        assert!(cache.get(1).is_some());
+        cache.insert(3, &stream(3, 4000));
+        assert!(cache.get(2).is_none(), "the least recently used one is gone");
+        assert!(cache.get(1).is_some() && cache.get(3).is_some());
+        assert_eq!(cache.len(), 2);
+        // A failure is kept too.
+        cache.insert(9, &Err(Error::Limit("x".to_string())));
+        assert!(matches!(cache.get(9), Some(Err(Error::Limit(_)))));
     }
 
     #[test]
@@ -2123,10 +2210,15 @@ mod tests {
     }
 
     #[test]
-    fn weight_counts_nested_content() {
+    fn size_counts_nested_content_and_the_length_of_names_and_strings() {
         let mut d = Dict::new();
         d.set("A", Object::Array(vec![Object::Integer(1); 10]));
         d.set("B", Object::Dict(Dict::new()));
-        assert_eq!(weight(&Object::Dict(d)), 1 + 11 + 1);
+        let small = Object::Dict(d).approx_size();
+        assert!(small > 200 && small < 400, "{small}");
+        let long = Object::Name(crate::object::Name::new(vec![b'x'; 100_000]));
+        assert!(long.approx_size() >= 100_000);
+        let string = Object::String(crate::object::PdfString::literal(vec![0u8; 5000]));
+        assert!(string.approx_size() >= 5000);
     }
 }

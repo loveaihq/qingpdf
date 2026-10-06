@@ -119,8 +119,12 @@ struct Loaded<'a> {
 }
 
 impl Loaded<'_> {
-    fn index(&self) -> &prune::Index {
-        self.index.get_or_init(|| prune::Index::build(self.doc, &self.pages, &self.page_nums))
+    fn index(&self) -> Result<&prune::Index> {
+        if let Some(index) = self.index.get() {
+            return Ok(index);
+        }
+        let built = prune::Index::build(self.doc, &self.pages, &self.page_nums)?;
+        Ok(self.index.get_or_init(|| built))
     }
 }
 
@@ -168,9 +172,9 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     let mut catalog = base.doc.catalog()?;
     catalog.remove("Pages");
     if subset {
-        let index = base.index();
+        let index = base.index()?;
         b.exclude_annotations(source_of(0)?, &index.annot_pages, &kept);
-        index.apply(base.doc, &kept, &mut b, source_of(0)?, &mut catalog, &mut warnings);
+        index.apply(base.doc, &kept, &mut b, source_of(0)?, &mut catalog, &mut warnings)?;
     }
 
     // Give every output page its number first, so that a link on one page to
@@ -477,6 +481,14 @@ fn lost_items(doc: &Document) -> Vec<String> {
     lost
 }
 
+/// Refuse a merge of more than `limit` pages in all.
+fn check_total_pages(total: usize, limit: usize) -> Result<()> {
+    if total > limit {
+        return Err(Error::Limit(format!("the files together have {total} pages, more than the {limit} allowed")));
+    }
+    Ok(())
+}
+
 /// Join the files in order. The first file is the base: its catalog (bookmarks,
 /// forms, names ...) is kept. The pages of the others are appended with their
 /// resources and annotations; their own document-level items are not merged,
@@ -492,6 +504,9 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
         }
         docs.push(load(input.doc)?);
     }
+    // Each file is within the limit for pages; all of them together are too.
+    let total = docs.iter().fold(0usize, |acc, d| acc.saturating_add(d.pages.len()));
+    check_total_pages(total, crate::document::MAX_PAGES)?;
     let mut picks = Vec::new();
     for (i, d) in docs.iter().enumerate() {
         picks.extend(all_picks(i, d.pages.len()));
@@ -1376,8 +1391,8 @@ mod tests {
         let uri = doc.resolve(annot(5).get("A").unwrap()).unwrap();
         assert!(uri.as_dict().unwrap().contains_key("URI"));
         // The first file's own name tree is the output's, and still means its page 1.
-        let names = crate::dests::NamedDests::load(&doc);
-        let target = names.lookup(&doc, b"target", false).unwrap();
+        let names = crate::dests::NamedDests::load(&doc).unwrap();
+        let target = names.lookup(&doc, b"target", false).unwrap().unwrap();
         assert_eq!(target.first(), Some(&Object::Ref(pages[0].obj_ref)));
         // Merging a file with itself: the second copy's links stay in the second copy.
         let one = open(linked(2, true, false));
@@ -1459,5 +1474,62 @@ mod tests {
         let jpeg = tiny_jpeg(4, 4, &[]);
         let img = images_to_pdf(&[ImageInput { name: "a.jpg", data: &jpeg }], PageMode::A4).unwrap();
         assert!(open(img.data).trailer().contains_key("ID"));
+    }
+
+    #[test]
+    fn a_merge_of_more_pages_than_one_document_may_have_is_refused() {
+        assert!(check_total_pages(1000, 1000).is_ok());
+        assert!(matches!(check_total_pages(1001, 1000), Err(Error::Limit(m)) if m.contains("1001")));
+        // The real limit is the one for a document.
+        assert!(check_total_pages(crate::document::MAX_PAGES, crate::document::MAX_PAGES).is_ok());
+        assert!(check_total_pages(2 * crate::document::MAX_PAGES, crate::document::MAX_PAGES).is_err());
+    }
+
+    /// A file whose page 1 refers (through /Foo) to an object that lives in an object stream.
+    fn page_with_an_object_in_an_object_stream() -> Vec<u8> {
+        let mut b = PdfBuilder::with_header("%PDF-1.5\n%\u{e2}\u{e3}\u{cf}\u{d3}\n");
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 9 9] >>");
+        b.obj(3, "<< /Type /Page /Parent 2 0 R /Foo 10 0 R >>");
+        let header = "10 0 ";
+        let at = b.flate_stream_obj(
+            100,
+            &format!("/Type /ObjStm /N 1 /First {}", header.len()),
+            format!("{header}(FROM-THE-OBJECT-STREAM)").as_bytes(),
+        );
+        let x = b.len();
+        let row = |t: u8, a: usize, g: u8| [t, (a >> 8) as u8, a as u8, g];
+        let mut rows: Vec<[u8; 4]> = vec![row(0, 0, 0); 102];
+        rows[0] = row(0, 0, 255);
+        for n in 1..=3u32 {
+            rows[n as usize] = row(1, b.offset_of(n), 0);
+        }
+        rows[10] = row(2, 100, 0);
+        rows[100] = row(1, at, 0);
+        rows[101] = row(1, x, 0);
+        let packed = png_up_flate(&rows);
+        b.stream_obj(
+            101,
+            "/Type /XRef /Size 102 /W [1 2 1] /Root 1 0 R /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4 >>",
+            &packed,
+        );
+        b.startxref(x);
+        b.finish()
+    }
+
+    #[test]
+    fn running_out_of_decoding_budget_is_an_error_not_a_quietly_dropped_object() {
+        let doc = open(page_with_an_object_in_an_object_stream());
+        // With the budget it is all there.
+        let out = copy_all(&doc).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(contains(&out.data, "FROM-THE-OBJECT-STREAM"));
+        // Without it the object cannot be read, and that is not "damaged": the
+        // whole operation says it hit a limit.
+        doc.use_up_the_decoding_budget_for_test();
+        match copy_all(&doc) {
+            Err(Error::Limit(_)) => {}
+            other => panic!("{:?}", other.map(|o| o.warnings)),
+        }
     }
 }

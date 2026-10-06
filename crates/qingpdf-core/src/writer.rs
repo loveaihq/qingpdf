@@ -269,11 +269,10 @@ fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
             push_number(out, u64::try_from(data.len()).unwrap_or(u64::MAX));
             out.extend_from_slice(b" >>\nstream\n");
             out.extend_from_slice(data);
-            // 7.3.8.1 says there "should" be an end-of-line before
-            // `endstream`; it would not count in /Length. None is written: it
-            // is a byte per stream for nothing (qpdf writes none either),
-            // /Length is exact, and every reader finds `endstream` by it.
-            out.extend_from_slice(b"endstream");
+            // 7.3.8.1: an end-of-line before `endstream`, not counted in
+            // /Length. "Should" in the standard, required by PDF/A (ISO 19005
+            // 6.1.7), and a byte per stream.
+            out.extend_from_slice(b"\nendstream");
         }
         other => write_depth(out, other, 0)?,
     }
@@ -299,7 +298,9 @@ struct Source<'a> {
     /// Turn named destinations into explicit ones through this document's own
     /// name tree (see [`Builder::resolve_named_destinations`]).
     resolve_names: bool,
-    names: OnceCell<NamedDests>,
+    /// The file's named destinations, read the first time a link names one;
+    /// or why they could not be (over the budget).
+    names: OnceCell<std::result::Result<NamedDests, String>>,
     /// Leave out the keys that point into a structure tree that is not copied.
     drop_structure_links: bool,
     /// Objects whose content is to be taken from here, not from the file.
@@ -309,6 +310,8 @@ struct Source<'a> {
     exclude: Option<Exclusion<'a>>,
     /// Inherited values written once for all the pages that share them.
     shared: HashMap<usize, ObjRef>,
+    /// The next number for an object made up by the caller ([`Builder::define_object`]).
+    next_defined: u32,
 }
 
 /// An imported object waiting for its references to be translated.
@@ -373,6 +376,7 @@ impl<'a> Builder<'a> {
             replace: HashMap::new(),
             exclude: None,
             shared: HashMap::new(),
+            next_defined: u32::MAX,
         });
         self.sources.len() - 1
     }
@@ -405,6 +409,28 @@ impl<'a> Builder<'a> {
     pub fn replace(&mut self, source: usize, num: u32, object: Object) {
         if let Some(s) = self.source_mut(source) {
             s.replace.insert(num, object);
+        }
+    }
+
+    /// An object the caller makes up (a node of a name tree it builds): it is
+    /// written as an object of its own. Returns the reference to use for it
+    /// in objects that are imported from `source`; its number is one the file
+    /// cannot have (a cross-reference table stops below 8,388,608).
+    pub fn define_object(&mut self, source: usize, object: Object) -> Result<ObjRef> {
+        let s = self.source_mut(source).ok_or_else(|| Error::Invalid("unknown import source".to_string()))?;
+        let num = s.next_defined;
+        s.next_defined = num.checked_sub(1).ok_or_else(|| Error::Limit("too many made-up objects".to_string()))?;
+        s.replace.insert(num, object);
+        Ok(ObjRef::new(num, 0))
+    }
+
+    /// Never import these objects of `source`: references to them become
+    /// null (the dead fields of a form, say).
+    pub fn exclude_objects(&mut self, source: usize, nums: impl IntoIterator<Item = u32>) {
+        if let Some(s) = self.source_mut(source) {
+            for num in nums {
+                s.map.insert(num, None);
+            }
         }
     }
 
@@ -547,13 +573,13 @@ impl<'a> Builder<'a> {
                 }
                 Object::Array(items)
             }
-            Object::Dict(d) => match self.rewrite_dict(source, d) {
+            Object::Dict(d) => match self.rewrite_dict(source, d)? {
                 Some(d) => Object::Dict(self.translate_dict(source, d)?),
                 None => Object::Null,
             },
             Object::Stream(Stream { mut dict, data }) => {
                 dict.remove("Length");
-                match self.rewrite_dict(source, dict) {
+                match self.rewrite_dict(source, dict)? {
                     Some(dict) => Object::Stream(Stream { dict: self.translate_dict(source, dict)?, data }),
                     None => Object::Null,
                 }
@@ -566,12 +592,12 @@ impl<'a> Builder<'a> {
     /// it is not to be imported at all (see
     /// [`Builder::resolve_named_destinations`] and
     /// [`Builder::drop_structure_links`]).
-    fn rewrite_dict(&self, source: usize, mut d: Dict) -> Option<Dict> {
+    fn rewrite_dict(&self, source: usize, mut d: Dict) -> Result<Option<Dict>> {
         let Some(s) = self.sources.get(source) else {
-            return Some(d);
+            return Ok(Some(d));
         };
         if !s.drop_structure_links && !s.resolve_names {
-            return Some(d);
+            return Ok(Some(d));
         }
         if s.drop_structure_links {
             for key in ["StructParents", "StructParent", "SE"] {
@@ -580,23 +606,37 @@ impl<'a> Builder<'a> {
         }
         if s.resolve_names {
             // A link annotation (12.5.6.5) or an outline item (12.3.3) ...
-            if let Some((key, is_name)) = d.get("Dest").and_then(|v| named_key(s.doc, v)) {
-                match s.names.get_or_init(|| NamedDests::load(s.doc)).lookup(s.doc, &key, is_name) {
-                    Some(array) => d.set("Dest", Object::Array(array)),
-                    None => {
-                        d.remove("Dest");
+            if d.contains_key("Dest") {
+                let names = names_of(s)?;
+                let found = match d.get("Dest") {
+                    Some(v) => named_key(s.doc, v, names)?,
+                    None => None,
+                };
+                if let Some((key, is_name)) = found {
+                    match names.lookup(s.doc, &key, is_name)? {
+                        Some(array) => d.set("Dest", Object::Array(array)),
+                        None => {
+                            d.remove("Dest");
+                        }
                     }
                 }
             }
             // ... or a go-to action (12.6.4.2, Table 199).
-            if matches!(d.get("S"), Some(Object::Name(n)) if n == "GoTo")
-                && let Some((key, is_name)) = d.get("D").and_then(|v| named_key(s.doc, v))
-            {
-                let array = s.names.get_or_init(|| NamedDests::load(s.doc)).lookup(s.doc, &key, is_name)?;
-                d.set("D", Object::Array(array));
+            if matches!(d.get("S"), Some(Object::Name(n)) if n == "GoTo") && d.contains_key("D") {
+                let names = names_of(s)?;
+                let found = match d.get("D") {
+                    Some(v) => named_key(s.doc, v, names)?,
+                    None => None,
+                };
+                if let Some((key, is_name)) = found {
+                    match names.lookup(s.doc, &key, is_name)? {
+                        Some(array) => d.set("D", Object::Array(array)),
+                        None => return Ok(None),
+                    }
+                }
             }
         }
-        Some(d)
+        Ok(Some(d))
     }
 
     fn translate_dict(&mut self, source: usize, mut d: Dict) -> Result<Dict> {
@@ -604,8 +644,9 @@ impl<'a> Builder<'a> {
         for (key, slot) in d.iter_mut() {
             let mut value = self.translate(source, std::mem::replace(slot, Object::Null))?;
             // A kid that became null (a page or field that is not part of the
-            // output) is not a kid.
-            if key == "Kids"
+            // output) is not a kid; nor is a field in the /Fields of an action
+            // (12.7.5.2, 12.7.5.3) that became null.
+            if (key == "Kids" || key == "Fields")
                 && let Object::Array(items) = &mut value
             {
                 items.retain(|item| !matches!(item, Object::Null));
@@ -650,8 +691,10 @@ impl<'a> Builder<'a> {
             None => match doc.get(r) {
                 Ok(o) => o,
                 // Not something skipping the object would fix: the whole file is
-                // out of reach (encrypted, unsupported filter, disk trouble).
-                Err(e @ (Error::Unsupported(_) | Error::Io(_))) => return Err(e),
+                // out of reach (encrypted, unsupported filter, disk trouble), or
+                // too much is asked of it (a limit): losing the object quietly
+                // would lose it without anyone knowing it was valid.
+                Err(e @ (Error::Unsupported(_) | Error::Io(_) | Error::Limit(_))) => return Err(e),
                 // A damaged object: keep going without it and tell the user.
                 Err(e) => {
                     self.unreadable_total = self.unreadable_total.saturating_add(1);
@@ -771,19 +814,36 @@ fn is_structural(obj: &Object) -> bool {
 /// A destination written as a name (old `/Dests` dictionary) or a string
 /// (name tree), directly or through a reference: its bytes, and whether it was
 /// a name object.
-fn named_key(doc: &Document, value: &Object) -> Option<(Vec<u8>, bool)> {
+fn named_key(doc: &Document, value: &Object, names: &NamedDests) -> Result<Option<(Vec<u8>, bool)>> {
     let resolved;
     let value = match value {
-        Object::Ref(_) => {
-            resolved = doc.resolve(value).ok()?;
-            &resolved
-        }
+        Object::Ref(_) => match names.spend().resolved(doc, value)? {
+            Some(o) => {
+                resolved = o;
+                &resolved
+            }
+            None => return Ok(None),
+        },
         other => other,
     };
-    match value {
+    Ok(match value {
         Object::Name(n) => Some((n.as_bytes().to_vec(), true)),
         Object::String(s) => Some((s.bytes.clone(), false)),
         _ => None,
+    })
+}
+
+/// The named destinations of a source, read the first time they are needed.
+fn names_of<'s>(s: &'s Source<'_>) -> Result<&'s NamedDests> {
+    let loaded = s.names.get_or_init(|| {
+        NamedDests::load(s.doc).map_err(|e| match e {
+            Error::Limit(m) => m,
+            other => other.to_string(),
+        })
+    });
+    match loaded {
+        Ok(names) => Ok(names),
+        Err(why) => Err(Error::Limit(why.clone())),
     }
 }
 

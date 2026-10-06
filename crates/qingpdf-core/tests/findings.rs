@@ -46,8 +46,38 @@ fn an_attachment_with_a_stray_token_in_its_params_keeps_its_data() {
     assert!(stream.dict.get("Params").and_then(Object::as_dict).is_some_and(|p| !p.contains_key("CheckSum")));
     // It is still there after a copy.
     let out = ops::copy_all(&doc).unwrap();
-    assert!(common::contains(&out.data, b"stream\n345endstream"), "the attachment's bytes are in the copy");
+    assert!(common::contains(&out.data, b"stream\n345\nendstream"), "the attachment's bytes are in the copy");
     assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+/// Round 2: the name tree written after pages are deleted must have indirect
+/// references as /Kids at every level (ISO 32000-1 Table 36), or readers that
+/// follow only references (MuPDF) find no destination at all.
+#[test]
+fn the_name_tree_written_after_deleting_pages_has_only_indirect_kids() {
+    let doc = open("zh/lunwen/lunwen-arxiv-2601.14329-latex.pdf");
+    let out = ops::delete_pages(&doc, &[2, 3, 4]).unwrap();
+    let copy = Document::from_bytes(out.data).unwrap();
+    let catalog = copy.catalog().unwrap();
+    let names = copy.resolve(catalog.get("Names").unwrap()).unwrap();
+    let root = names.as_dict().unwrap().get("Dests").unwrap().clone();
+    assert!(matches!(root, Object::Ref(_)), "the root of the tree is an indirect object");
+    let (mut nodes, mut leaves_entries) = (0usize, 0usize);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        nodes += 1;
+        let Object::Dict(d) = copy.resolve(&node).unwrap() else { panic!("a node is not a dictionary") };
+        if let Some(kids) = d.get("Kids") {
+            for kid in copy.resolve(kids).unwrap().as_array().unwrap() {
+                assert!(matches!(kid, Object::Ref(_)), "a kid that is not an indirect reference: {kid:?}");
+                stack.push(kid.clone());
+            }
+        }
+        if let Some(pairs) = d.get("Names") {
+            leaves_entries += copy.resolve(pairs).unwrap().as_array().unwrap().len() / 2;
+        }
+    }
+    assert!(nodes >= 2 && leaves_entries > 100, "{nodes} nodes, {leaves_entries} entries");
 }
 
 /// Review finding 1: merging a LaTeX paper (links through named destinations)

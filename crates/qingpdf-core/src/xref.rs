@@ -2,6 +2,7 @@
 //! cross-reference streams (7.5.8), the `/Prev` chain of incremental updates
 //! (7.5.6), hybrid files (7.5.8.4) and object streams (7.5.7).
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
@@ -577,7 +578,7 @@ pub struct ObjStm {
     /// (object number, absolute offset into `data`), in stream order.
     pairs: Vec<(u32, usize)>,
     /// First position in `pairs` of each object number.
-    by_num: HashMap<u32, usize>,
+    by_num: OnceCell<HashMap<u32, usize>>,
 }
 
 impl ObjStm {
@@ -595,7 +596,6 @@ impl ObjStm {
         let header = data.get(..first).unwrap_or(&[]);
         let mut lex = Lexer::new(header, 0);
         let mut pairs: Vec<(u32, usize)> = Vec::new();
-        let mut by_num: HashMap<u32, usize> = HashMap::new();
         // Stops at the first malformed or missing pair; `n` may be absurdly large.
         for _ in 0..n.min(MAX_OBJSTM_OBJECTS) {
             let num = lex.next_token().ok().flatten();
@@ -609,10 +609,9 @@ impl ObjStm {
             let Some(abs) = first.checked_add(off).filter(|&a| a < data.len()) else {
                 break;
             };
-            by_num.entry(num).or_insert(pairs.len());
             pairs.push((num, abs));
         }
-        Ok(ObjStm { data, pairs, by_num })
+        Ok(ObjStm { data, pairs, by_num: OnceCell::new() })
     }
 
     pub fn len(&self) -> usize {
@@ -625,7 +624,8 @@ impl ObjStm {
 
     /// About how many bytes this stream holds in memory, for the cache.
     pub fn weight(&self) -> usize {
-        self.data.len().saturating_add(self.pairs.len().saturating_mul(16)).saturating_add(self.by_num.len().saturating_mul(48))
+        // The table by number is made only when an index hint fails to match.
+        self.data.len().saturating_add(self.pairs.len().saturating_mul(16))
     }
 
     /// Object numbers in stream order.
@@ -643,11 +643,23 @@ impl ObjStm {
         self.pairs.iter().copied()
     }
 
+    /// Where each object number first appears in `pairs`, made the first time
+    /// an index hint is wrong (usually it is right, and this is never made).
+    fn by_number(&self) -> &HashMap<u32, usize> {
+        self.by_num.get_or_init(|| {
+            let mut map: HashMap<u32, usize> = HashMap::with_capacity(self.pairs.len());
+            for (i, &(num, _)) in self.pairs.iter().enumerate() {
+                map.entry(num).or_insert(i);
+            }
+            map
+        })
+    }
+
     /// Object number `num`; `index` is the position the cross-reference entry
     /// claims and is only a hint. `None` if the stream does not contain it.
     pub fn get(&self, num: u32, index: u32) -> Result<Option<Object>> {
         let hinted = usize::try_from(index).ok().and_then(|i| self.pairs.get(i)).filter(|&&(n, _)| n == num);
-        let located = hinted.or_else(|| self.by_num.get(&num).and_then(|&i| self.pairs.get(i)));
+        let located = hinted.or_else(|| self.by_number().get(&num).and_then(|&i| self.pairs.get(i)));
         let Some(&(_, offset)) = located else {
             return Ok(None);
         };
