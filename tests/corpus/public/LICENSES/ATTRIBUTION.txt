@@ -1,0 +1,47 @@
+public/ 下的 PDF 文件来自三个上游，全部原样分发（逐字节未改）：
+
+1. Mozilla pdf.js  https://github.com/mozilla/pdf.js  (Apache-2.0, 见 pdfjs-LICENSE-Apache-2.0.txt)
+   固定版本 17bb2442fe53f348ee8e2e0b3e7c1c7d09468cd7
+2. PDFium  https://pdfium.googlesource.com/pdfium  (BSD-3-Clause，LICENSE 文件另附 Apache-2.0 文本，见 pdfium-LICENSE.txt)
+   Copyright 2014 The PDFium Authors
+   固定版本 84f950b4793b26b916db8853791f3475b826fdc7
+3. PDF Association pdf20examples  https://github.com/pdf-association/pdf20examples
+   Copyright PDF Association，CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/)，见 pdf20examples-LICENSE.md
+   固定版本 c20f2c17bfcc4baab7cfe62e70fae64caf14d5fa
+   对应文件：public/pdf20/ 下的 Simple PDF 2.0 file.pdf、pdf20-utf8-test.pdf、PDF 2.0 *.pdf 共 7 个。
+   ShareAlike 只约束改编作品；这些文件原样放在测试集里，不改一个字节。不要把它们改过之后再发布。
+
+每个文件的具体来源和放在 public 的理由见 ../../SOURCES.md。
+
+----------------------------------------------------------------------
+public/zh/ 下载来的中文文件（逐字节原样，未改动；来源和 SHA-256 见 ../../SOURCES-zh.md）
+
+4. arXiv 论文
+   - lunwen-arxiv-2401.01717-word.pdf
+     Yuzhou Yang, Yangming Zhou, Qichao Ying, Zhenxing Qian, Dan Zeng, Liang Liu,
+     "Fact-checking based fake news detection: a review", arXiv:2401.01717v1,
+     https://arxiv.org/abs/2401.01717 — CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)
+   - lunwen-arxiv-2403.14268-word-tc.pdf
+     PeiYing Lee, HauYun Guo, Berlin Chen,
+     "Speech-Aware Neural Diarization with Encoder-Decoder Attractor Guided by Attention Constraints",
+     arXiv:2403.14268v1, https://arxiv.org/abs/2403.14268 — CC BY 4.0
+   - lunwen-arxiv-2601.14329-latex.pdf
+     Huawei Zhao, Xinlei Liu, Xinyao Huang, Guofeng Zhang,
+     "Advances in non-Hermitian dynamics of quadratic bosonic systems", arXiv:2601.14329v2,
+     https://arxiv.org/abs/2601.14329 — CC0 1.0 (https://creativecommons.org/publicdomain/zero/1.0/)
+
+5. 维基文库（Wikisource）导出的 PDF — CC BY-SA 4.0，作者为维基文库贡献者
+   - ebook-wikisource-aq-zhengzhuan.pdf  鲁迅《阿Q正传》，修订 2633268
+     https://zh.wikisource.org/wiki/阿Q正傳
+   - ebook-wikisource-minfadian.pdf  《中华人民共和国民法典》，修订 2590895
+     https://zh.wikisource.org/wiki/中华人民共和国民法典
+   作品本身是公有领域 / 法律文本（著作权法第五条），CC BY-SA 适用于维基文库的编排。
+   原样分发，不要改过之后再发布。
+
+6. 维基共享资源（Wikimedia Commons）上标为公有领域的扫描/重排本
+   - vertical-nlc-hechuan-juan70.pdf  《民國新修合川縣誌》卷七十（1921），
+     https://commons.wikimedia.org/wiki/File:NLC403-311998005256-83304_民國新修合川縣誌_民國10年(1921)_卷七十.pdf
+
+7. 中国国家机关文件（著作权法第五条，不受著作权保护）
+   - gongwen-1954-gazette02-scan.pdf、gongwen-2024-ai-standards-guide.pdf、
+     gongwen-2024-nicheng-work-report.pdf、gongwen-2025-service-mfg-plan.pdf（来源网址见 SOURCES-zh.md）
