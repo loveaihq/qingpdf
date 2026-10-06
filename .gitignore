@@ -1,0 +1,15 @@
+/target/
+
+# The spec is copyrighted: keep it local, never commit it
+docs/spec/*.pdf
+docs/spec/*.txt
+
+# Test files with personal data live outside the repo (QINGPDF_PRIVATE_CORPUS);
+# generated broken files and test outputs are rebuilt on demand
+tests/corpus/private/
+tests/corpus/local/
+tests/corpus/broken/
+tests/out/
+
+# Claude Code worktrees for subagents
+.claude/worktrees/

@@ -1,0 +1,14 @@
+[package]
+name = "qingpdf-cli"
+description = "Command-line interface for qingpdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "qingpdf"
+path = "src/main.rs"
+
+[dependencies]
+qingpdf-core = { path = "../qingpdf-core" }
