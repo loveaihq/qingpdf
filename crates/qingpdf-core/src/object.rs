@@ -74,6 +74,44 @@ impl Dict {
         Dict(Vec::new())
     }
 
+    /// Build a dictionary from entries in file order. The result is the same as
+    /// calling [`Dict::set`] for each pair in turn (later duplicates win, `Null`
+    /// removes the key), but runs in linear time for hostile dictionaries with
+    /// very many keys.
+    pub fn from_pairs(pairs: Vec<(Name, Object)>) -> Dict {
+        if pairs.len() <= 16 {
+            let mut d = Dict::new();
+            for (k, v) in pairs {
+                d.set(k, v);
+            }
+            return d;
+        }
+        let mut slots: Vec<Option<(Name, Object)>> = Vec::with_capacity(pairs.len());
+        let mut index: std::collections::HashMap<Name, usize> = std::collections::HashMap::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let is_null = matches!(v, Object::Null);
+            match index.get(&k).copied() {
+                Some(i) if is_null => {
+                    if let Some(slot) = slots.get_mut(i) {
+                        *slot = None;
+                    }
+                    index.remove(&k);
+                }
+                Some(i) => {
+                    if let Some(Some(entry)) = slots.get_mut(i) {
+                        entry.1 = v;
+                    }
+                }
+                None if is_null => {}
+                None => {
+                    index.insert(k.clone(), slots.len());
+                    slots.push(Some((k, v)));
+                }
+            }
+        }
+        Dict(slots.into_iter().flatten().collect())
+    }
+
     pub fn get(&self, key: &str) -> Option<&Object> {
         self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
