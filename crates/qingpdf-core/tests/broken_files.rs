@@ -45,6 +45,8 @@ fn kind(e: &Error) -> &'static str {
         Error::Limit(_) => "limit",
         Error::TooDeep(_) => "too deep",
         Error::Invalid(_) => "invalid",
+        Error::PasswordRequired => "password required",
+        Error::WrongPassword => "wrong password",
     }
 }
 
@@ -912,6 +914,369 @@ mod hostile {
             Err(Error::Limit(_)) => {}
             Ok((1, true)) => {}
             other => panic!("{other:?}"),
+        }
+    }
+}
+
+// --- encrypted files, damaged and hostile -------------------------------------------------------
+//
+// The same promise for files that are encrypted: whatever is wrong with the
+// encryption dictionary, the ciphertext or the structure, the result is an
+// opened document or a clear error, within seconds, never a panic.
+
+mod encrypted {
+    use std::collections::BTreeMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::time::{Duration, Instant};
+
+    use super::{common, info, variants};
+    use qingpdf_core::{Document, Error, ObjRef, Object, ops};
+
+    fn limit() -> Duration {
+        if cfg!(debug_assertions) { Duration::from_secs(60) } else { Duration::from_secs(5) }
+    }
+
+    /// Open (with `password`), walk and copy; the copy is read again with the
+    /// password. Returns what became of it, or why the file was refused.
+    fn exercise(bytes: Vec<u8>, password: &str) -> Result<&'static str, Error> {
+        let doc = Document::from_bytes_with_password(bytes, password)?;
+        let _ = doc.version();
+        let _ = doc.page_count();
+        let _ = doc.pages();
+        let _ = doc.info();
+        let _ = info::describe(&doc);
+        let _ = doc.encryption();
+        match ops::copy_all(&doc) {
+            Err(_) => Ok("opened, copy refused"),
+            Ok(out) => match Document::from_bytes_with_password(out.data, password) {
+                Ok(copy) if !copy.was_repaired() => {
+                    let _ = copy.pages();
+                    Ok("opened, copied, copy reopens")
+                }
+                Ok(_) => Ok("COPY NEEDED REPAIR"),
+                Err(_) => Ok("COPY DOES NOT REOPEN"),
+            },
+        }
+    }
+
+    /// `exercise` on its own thread, with a time limit and a catch for panics.
+    fn exercise_within(bytes: Vec<u8>, password: &str, what: &str) -> Result<&'static str, Error> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let password = password.to_string();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| exercise(bytes, &password)));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx.recv_timeout(limit() * 3).unwrap_or_else(|_| panic!("{what}: no answer, the program hangs"));
+        assert!(started.elapsed() < limit(), "{what}: took {:?}", started.elapsed());
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                panic!("{what}: PANIC {message}");
+            }
+        }
+    }
+
+    /// Every encrypted file of the public corpus with a password that opens it.
+    fn encrypted_files() -> Vec<(String, Vec<u8>, String)> {
+        let mut files: Vec<(String, Vec<u8>, String)> = common::generated()
+            .into_iter()
+            .map(|r| (common::corpus_name(&r.path), std::fs::read(&r.path).unwrap(), r.user))
+            .collect();
+        for known in common::KNOWN.iter().filter(|k| k.required || common::corpus_root().join(k.rel).is_file()) {
+            let path = common::corpus_root().join(known.rel);
+            files.push((common::corpus_name(&path), std::fs::read(&path).unwrap(), known.user.to_string()));
+        }
+        files
+    }
+
+    /// The damaged-file generator of this file, run over the encrypted files, with
+    /// their passwords.
+    #[test]
+    fn damaged_encrypted_files_open_or_fail_cleanly_and_quickly() {
+        let mut table: BTreeMap<String, usize> = BTreeMap::new();
+        let mut problems: Vec<String> = Vec::new();
+        for (index, (name, original, password)) in encrypted_files().into_iter().enumerate() {
+            let mut rng = common::XorShift::new(0xC0FF_EE00 ^ (index as u64 + 1).wrapping_mul(0x1000_0000_01B3));
+            for variant in variants(&original, &mut rng) {
+                let case = format!("{name} [{} {}]", variant.family, variant.label);
+                let outcome = match exercise_within(variant.data, &password, &case) {
+                    Ok(what) => what.to_string(),
+                    Err(e) => format!("error ({})", super::kind(&e)),
+                };
+                if outcome.starts_with("COPY") {
+                    problems.push(format!("{case}: {outcome}"));
+                }
+                *table.entry(outcome).or_default() += 1;
+            }
+        }
+        println!("\n=== damaged encrypted files ===");
+        for (outcome, n) in &table {
+            println!("{n:>6}  {outcome}");
+        }
+        assert!(problems.is_empty(), "{} problem(s):\n{}", problems.len(), problems.join("\n"));
+        assert!(table.get("opened, copied, copy reopens").copied().unwrap_or(0) > 100, "most variants of the smallest changes should still open");
+    }
+
+    // --- a hand-made encrypted-looking file ---------------------------------------------------
+
+    /// A one-page file whose trailer points at an encryption dictionary made of
+    /// `dict`. Nothing in it is really encrypted.
+    fn file_with_encrypt_dict(dict: &str, trailer_extra: &str) -> Vec<u8> {
+        let objects = [
+            (1u32, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R >>".to_string()),
+            (5, dict.to_string()),
+        ];
+        let mut buf = b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (num, body) in &objects {
+            offsets.insert(*num, buf.len());
+            buf.extend_from_slice(format!("{num} 0 obj\n{body}\nendobj\n").as_bytes());
+        }
+        offsets.insert(4, buf.len());
+        buf.extend_from_slice(b"4 0 obj\n<< /Length 5 >>\nstream\nhello\nendstream\nendobj\n");
+        let xref = buf.len();
+        buf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
+        for n in 1..6u32 {
+            buf.extend_from_slice(format!("{:010} 00000 n \n", offsets[&n]).as_bytes());
+        }
+        buf.extend_from_slice(format!("trailer\n<< /Size 6 /Root 1 0 R /Encrypt 5 0 R /ID [<aa> <bb>] {trailer_extra} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+        buf
+    }
+
+    fn replace_bytes(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let at = bytes.windows(from.len()).position(|w| w == from).expect("the text is in the file");
+        let mut out = bytes[..at].to_vec();
+        out.extend_from_slice(to);
+        out.extend_from_slice(&bytes[at + from.len()..]);
+        out
+    }
+
+    fn standard(extra: &str) -> String {
+        format!("<< /Filter /Standard /V 2 /R 3 /P -4 /O <{}> /U <{}> {extra} >>", "00".repeat(32), "11".repeat(32))
+    }
+
+    #[test]
+    fn a_damaged_encryption_dictionary_is_a_clear_error() {
+        let good = standard("/Length 128");
+        let broken: Vec<(&str, String)> = vec![
+            ("no /Filter", good.replace("/Filter /Standard ", "")),
+            ("no /V", good.replace("/V 2 ", "")),
+            ("no /R", good.replace("/R 3 ", "")),
+            ("no /P", good.replace("/P -4 ", "")),
+            ("no /O", good.replace("/O <", "/Q <")),
+            ("no /U", good.replace("/U <", "/Q <")),
+            ("/O a number", good.replace(&format!("/O <{}>", "00".repeat(32)), "/O 5")),
+            ("/U a name", good.replace(&format!("/U <{}>", "11".repeat(32)), "/U /x")),
+            ("/P a name", good.replace("/P -4", "/P /x")),
+            ("/Length not a multiple of 8", good.replace("/Length 128", "/Length 100")),
+            ("/Length 0", good.replace("/Length 128", "/Length 0")),
+            ("/Length negative", good.replace("/Length 128", "/Length -128")),
+            ("/Length absurd", good.replace("/Length 128", "/Length 999999999999")),
+            ("/Length beyond i64", good.replace("/Length 128", "/Length 99999999999999999999999")),
+            ("/Length a string", good.replace("/Length 128", "/Length (128)")),
+            ("/R 99", good.replace("/R 3", "/R 99")),
+            ("/R negative", good.replace("/R 3", "/R -3")),
+            ("/V 99", good.replace("/V 2", "/V 99")),
+            ("/V 0", good.replace("/V 2", "/V 0")),
+            ("/V 5 with /R 3", good.replace("/V 2", "/V 5")),
+            ("/V 4 without /CF", good.replace("/V 2", "/V 4").replace("/R 3", "/R 4").replace("/Length 128", "/StmF /StdCF")),
+            ("/CF names an unknown method", "<< /Filter /Standard /V 4 /R 4 /P -4 /O (x) /U (y) /CF << /StdCF << /CFM /Weird >> >> /StmF /StdCF /StrF /StdCF >>".to_string()),
+            ("/StmF names nothing", "<< /Filter /Standard /V 4 /R 4 /P -4 /O (x) /U (y) /CF << >> /StmF /Nope >>".to_string()),
+            ("/CF is not a dictionary", "<< /Filter /Standard /V 4 /R 4 /P -4 /O (x) /U (y) /CF 7 /StmF /StdCF >>".to_string()),
+            ("public-key handler", "<< /Filter /Adobe.PubSec /SubFilter /adbe.pkcs7.s5 /V 4 /CF << /DefaultCryptFilter << /CFM /AESV2 /Recipients [(x)] >> >> /StmF /DefaultCryptFilter >>".to_string()),
+            ("another handler", "<< /Filter /Acme /V 1 >>".to_string()),
+            ("not a dictionary", "42".to_string()),
+            ("an array", "[1 2 3]".to_string()),
+            ("null", "null".to_string()),
+            ("empty", "<< >>".to_string()),
+            ("huge /O", format!("<< /Filter /Standard /V 1 /R 2 /P -4 /U (y) /O <{}> >>", "ab".repeat(4_000_000))),
+            ("all entries wrong", "<< /Filter /Standard /V (a) /R [1] /P << >> /O null /U null >>".to_string()),
+        ];
+        let mut refused = 0usize;
+        for (what, dict) in &broken {
+            for password in ["", "secret"] {
+                let result = exercise_within(file_with_encrypt_dict(dict, ""), password, what);
+                match result {
+                    // Refused, which is the usual answer: it must say something.
+                    Err(e) => {
+                        assert!(!e.to_string().is_empty(), "{what}");
+                        refused += 1;
+                    }
+                    // Or opened locked (the dictionary is fine, the password is not).
+                    Ok(_) => assert!(password.is_empty(), "{what}: opened with a wrong password"),
+                }
+            }
+        }
+        assert!(refused >= broken.len(), "only {refused} refusals");
+        // The error says what is wrong.
+        let message = |dict: String| match Document::from_bytes(file_with_encrypt_dict(&dict, "")) {
+            Err(e) => e.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(message(good.replace("/Length 128", "/Length 100")).contains("/Length"));
+        assert!(message(good.replace("/R 3", "/R 99")).contains("/R 99"));
+        assert!(message(good.replace("/V 2", "/V 99")).contains("/V 99"));
+        assert!(message("<< /Filter /Adobe.PubSec /V 4 >>".to_string()).contains("public-key"));
+        assert!(message(good.replace("/O <", "/Q <")).contains("/O"));
+    }
+
+    #[test]
+    fn references_in_the_encrypt_entry_cannot_loop_or_blow_up() {
+        let standard_dict = standard("/Length 128");
+        // /Encrypt 5 0 R, and 5 is a reference to itself, or to a chain that returns.
+        for body in ["5 0 R", "6 0 R"] {
+            let bytes = file_with_encrypt_dict(body, "");
+            let result = exercise_within(bytes, "", "a loop through /Encrypt");
+            assert!(result.is_err(), "{body}");
+        }
+        // A dictionary whose entries point back at itself, many times over.
+        let refs: String = (0..200).map(|i| format!("/K{i} 5 0 R ")).collect();
+        let result = exercise_within(file_with_encrypt_dict(&format!("<< /Filter /Standard /V 4 /R 4 /P -4 /O (x) /U (y) /CF 5 0 R {refs} >>"), ""), "", "self references");
+        assert!(result.is_err());
+        // The entry points at a missing object, or at a stream.
+        let nothing = replace_bytes(&file_with_encrypt_dict(&standard_dict, ""), b"/Encrypt 5 0 R", b"/Encrypt 99 0 R");
+        assert!(exercise_within(nothing, "", "/Encrypt to nothing").is_err());
+        let stream = replace_bytes(&file_with_encrypt_dict(&standard_dict, ""), b"/Encrypt 5 0 R", b"/Encrypt 4 0 R");
+        assert!(exercise_within(stream, "", "/Encrypt to a stream").is_err());
+    }
+
+    // --- damaged ciphertext --------------------------------------------------------------------
+
+    fn generated_bytes(part: &str) -> (Vec<u8>, String) {
+        let row = common::generated().into_iter().find(|r| r.path.to_string_lossy().contains(part)).unwrap();
+        (std::fs::read(&row.path).unwrap(), row.user)
+    }
+
+    /// The bytes of the first hexadecimal string after `key` (inclusive of the
+    /// `<` and `>`), with where it is.
+    fn hex_value_after(bytes: &[u8], key: &[u8]) -> (usize, usize) {
+        let at = bytes.windows(key.len()).position(|w| w == key).expect("the key is in the file");
+        let start = at + bytes[at..].iter().position(|&b| b == b'<').unwrap();
+        let end = start + bytes[start..].iter().position(|&b| b == b'>').unwrap() + 1;
+        (start, end)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The file with the string after `key` replaced by `value`, its table in order.
+    fn with_string(bytes: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+        let (start, end) = hex_value_after(bytes, key);
+        let mut out = bytes[..start].to_vec();
+        out.extend_from_slice(format!("<{}>", hex(value)).as_bytes());
+        out.extend_from_slice(&bytes[end..]);
+        common::with_fresh_xref(&out)
+    }
+
+    fn string_bytes_after(bytes: &[u8], key: &[u8]) -> Vec<u8> {
+        let (start, end) = hex_value_after(bytes, key);
+        let digits = &bytes[start + 1..end - 1];
+        digits.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn damaged_aes_strings_are_errors_for_their_object() {
+        for part in ["pdf20utf8.r4-aes128-empty-modify-none", "pdf20utf8.r6-aes256-user-modify-none"] {
+            let (bytes, password) = generated_bytes(part);
+            let title = string_bytes_after(&bytes, b"/Title");
+            assert!(title.len() >= 32 && title.len().is_multiple_of(16), "{part}");
+            let reads_title = |patched: Vec<u8>| -> Result<(), Error> {
+                let doc = Document::from_bytes_with_password(patched, &password)?;
+                let Some(Object::Ref(info)) = doc.trailer().get("Info").cloned() else { panic!("{part}: no /Info") };
+                doc.get(info).map(|_| ())
+            };
+            assert!(reads_title(bytes.clone()).is_ok(), "{part}: the undamaged file reads");
+            // One byte too few, a vector cut short, no vector at all, one block of garbage after it.
+            let cases: Vec<(&str, Vec<u8>)> = vec![
+                ("not a multiple of 16", title[..title.len() - 1].to_vec()),
+                ("a truncated IV", title[..5].to_vec()),
+                ("an IV and a stray byte", title[..17].to_vec()),
+                ("bad padding", {
+                    let mut t = title.clone();
+                    let last = t.len() - 1;
+                    t[last] = 0;
+                    t
+                }),
+                ("padding too long", {
+                    let mut t = title.clone();
+                    // The block before the last one is XORed into the last plaintext block:
+                    // a change there changes the last byte of plaintext predictably.
+                    let at = t.len() - 17;
+                    t[at] ^= 0x7F;
+                    t
+                }),
+            ];
+            for (what, damaged) in cases {
+                let result = reads_title(with_string(&bytes, b"/Title", &damaged));
+                match result {
+                    Err(Error::Syntax { message, .. }) => assert!(message.contains("object") || message.contains("AES"), "{part} {what}: {message}"),
+                    other => panic!("{part} {what}: expected a syntax error, got {other:?}"),
+                }
+                // Everything else still works: the copy drops the damaged object and says so.
+                let doc = Document::from_bytes_with_password(with_string(&bytes, b"/Title", &damaged), &password).unwrap();
+                let out = ops::copy_all(&doc).expect("a copy of a file with one damaged string");
+                assert!(out.warnings.iter().any(|w| w.0.contains("damaged object")), "{part} {what}: {:?}", out.warnings);
+            }
+            // An empty string, or only a vector, reads as an empty string.
+            for empty in [vec![], title[..16].to_vec()] {
+                assert!(reads_title(with_string(&bytes, b"/Title", &empty)).is_ok(), "{part}: an empty string");
+            }
+        }
+    }
+
+    #[test]
+    fn damaged_streams_are_errors_for_their_object() {
+        for part in ["pdf20utf8.r4-aes128-empty-modify-none", "pdf20utf8.r6-aes256-user-modify-none"] {
+            let (bytes, password) = generated_bytes(part);
+            let doc = Document::from_bytes_with_password(bytes.clone(), &password).unwrap();
+            // The first content stream: cut a byte off its data and say so in /Length.
+            let at = bytes.windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+            let length_at = bytes[..at].windows(8).rposition(|w| w == b"/Length ").unwrap() + 8;
+            let digits = bytes[length_at..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let length: usize = std::str::from_utf8(&bytes[length_at..length_at + digits]).unwrap().parse().unwrap();
+            let mut patched = bytes[..length_at].to_vec();
+            patched.extend_from_slice((length - 1).to_string().as_bytes());
+            patched.extend_from_slice(&bytes[length_at + digits..at + length - 1]);
+            patched.extend_from_slice(&bytes[at + length..]);
+            let patched = common::with_fresh_xref(&patched);
+            let damaged = Document::from_bytes_with_password(patched, &password).unwrap();
+            let header = bytes[..at].windows(7).rposition(|w| w == b" 0 obj
+").unwrap();
+            let first_digit = bytes[..header].iter().rposition(|b| !b.is_ascii_digit()).map_or(0, |p| p + 1);
+            let number: u32 = std::str::from_utf8(&bytes[first_digit..header]).unwrap().parse().unwrap();
+            assert!(doc.get(ObjRef::new(number, 0)).is_ok(), "{part}");
+            assert!(matches!(damaged.get(ObjRef::new(number, 0)), Err(Error::Syntax { .. })), "{part}: object {number}");
+            let out = ops::copy_all(&damaged).expect("a copy of a file with one damaged stream");
+            assert!(out.warnings.iter().any(|w| w.0.contains("damaged object") && w.0.contains(&format!("object {number}"))), "{part}: {:?}", out.warnings);
+        }
+    }
+
+    #[test]
+    fn huge_strings_are_fast() {
+        // Five megabytes of ciphertext in a string: with RC4 they decrypt, with AES
+        // (random bytes: padding that does not fit) it is an error, both at once.
+        for (part, ok) in [("pdf20utf8.r4-128-rc4-v4-user", true), ("pdf20utf8.r4-aes128-empty-modify-none", false)] {
+            let rows = common::generated();
+            let row = rows.iter().find(|r| r.path.to_string_lossy().contains(part)).expect("the generated file");
+            let bytes = std::fs::read(&row.path).unwrap();
+            let big: Vec<u8> = (0..5_000_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+            let patched = with_string(&bytes, b"/Title", &big);
+            let started = Instant::now();
+            let doc = Document::from_bytes_with_password(patched, &row.user).unwrap();
+            let Some(Object::Ref(info)) = doc.trailer().get("Info").cloned() else { panic!("{part}: no /Info") };
+            let result = doc.get(info);
+            assert_eq!(result.is_ok(), ok, "{part}: {:?}", result.map(|_| ()));
+            assert!(started.elapsed() < limit(), "{part}: took {:?}", started.elapsed());
         }
     }
 }

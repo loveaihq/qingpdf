@@ -4,6 +4,7 @@
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::Object;
+use crate::security::Encryption;
 
 /// Points per millimetre's inverse: 1 pt = 1/72 in = 25.4/72 mm.
 const MM_PER_PT: f64 = 25.4 / 72.0;
@@ -31,7 +32,12 @@ impl PageInfo {
 pub struct Report {
     pub version: (u8, u8),
     pub pages: Vec<PageInfo>,
+    /// Why the pages are not listed (the file is locked and its page tree is
+    /// in an encrypted object stream), if that is so.
+    pub pages_unavailable: Option<String>,
     pub encrypted: bool,
+    /// Method, revision, permissions and which password opened the file.
+    pub encryption: Option<Encryption>,
     pub xref_streams: bool,
     pub object_streams: bool,
     pub repaired: bool,
@@ -43,9 +49,15 @@ pub struct Report {
     pub info_unavailable: Option<String>,
 }
 
-/// Gather the report. Fails only if the page tree cannot be read.
+/// Gather the report. Fails only if the page tree cannot be read (for a locked
+/// file that is a note in the report, not a failure: `info` still says how the
+/// file is protected).
 pub fn describe(doc: &Document) -> Result<Report> {
-    let pages = doc.pages()?.iter().map(page_info).collect();
+    let (pages, pages_unavailable) = match doc.pages() {
+        Ok(pages) => (pages.iter().map(page_info).collect(), None),
+        Err(e) if doc.is_locked() => (Vec::new(), Some(e.to_string())),
+        Err(e) => return Err(e),
+    };
     let (info, info_unavailable) = match doc.info() {
         Ok(Some(dict)) => {
             let mut entries = Vec::new();
@@ -66,7 +78,9 @@ pub fn describe(doc: &Document) -> Result<Report> {
     Ok(Report {
         version: doc.version(),
         pages,
+        pages_unavailable,
         encrypted: doc.is_encrypted(),
+        encryption: doc.encryption(),
         xref_streams: doc.uses_xref_streams(),
         object_streams: doc.uses_object_streams(),
         repaired: doc.was_repaired(),
@@ -95,7 +109,7 @@ fn page_info(page: &Page) -> PageInfo {
 
 /// PDFDocEncoding (Annex D.3, Table D.2) above 0x7F and in 0x18-0x1F, as
 /// Unicode. Everything else is the same as Latin-1.
-fn pdf_doc_char(b: u8) -> char {
+pub(crate) fn pdf_doc_char(b: u8) -> char {
     const LOW: [char; 8] = ['\u{2D8}', '\u{2C7}', '\u{2C6}', '\u{2D9}', '\u{2DD}', '\u{2DB}', '\u{2DA}', '\u{2DC}'];
     const HIGH: [char; 31] = [
         '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{192}', '\u{2044}', '\u{2039}',
@@ -271,13 +285,17 @@ mod tests {
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
         b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 20] >>");
-        b.obj(4, "<< /Filter /Standard /V 1 /R 2 /O (x) /U (y) /P -4 >>");
+        b.obj(4, &format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P -4 >>", "00".repeat(32), "11".repeat(32)));
         b.obj(5, "<< /Title (scrambled) >>");
         let doc = Document::from_bytes(b.finish_classic(6, "/Root 1 0 R /Encrypt 4 0 R /Info 5 0 R /ID [<aa> <bb>]")).unwrap();
         let r = describe(&doc).unwrap();
         assert!(r.encrypted);
         assert_eq!(r.pages.len(), 1);
         assert!(r.info.is_empty());
-        assert_eq!(r.info_unavailable.as_deref(), Some("encrypted PDF"));
+        assert!(r.info_unavailable.as_deref().is_some_and(|m| m.contains("needs a password")), "{:?}", r.info_unavailable);
+        let encryption = r.encryption.expect("encryption is described");
+        assert!(encryption.needs_password() && encryption.opened.is_none());
+        assert_eq!((encryption.version, encryption.revision), (1, 2));
+        assert_eq!(encryption.method_name(), "RC4 40-bit");
     }
 }

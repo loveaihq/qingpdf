@@ -8,6 +8,11 @@
 //! selected pages, in order (7.7.3). Merge does the same with the first file
 //! as the base and the pages of the other files added; the other files'
 //! document-level items are not merged and a warning says which were lost.
+//!
+//! What was encrypted stays encrypted: the output has the first file's
+//! encryption dictionary, key, passwords and permissions (as qpdf does), and
+//! every string and stream is encrypted again under its new object number.
+//! Only [`decrypt`] writes a file without it.
 
 use std::cell::{Cell, OnceCell};
 use std::collections::HashSet;
@@ -17,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::image::{self, Format, PageMode};
 use crate::object::{Dict, Name, ObjRef, Object};
 use crate::prune;
+use crate::security::PasswordKind;
 use crate::writer::{Builder, Warning};
 
 /// A finished file and what to tell the user about it.
@@ -32,10 +38,6 @@ pub struct Output {
 pub struct Input<'a> {
     pub name: &'a str,
     pub doc: &'a Document,
-}
-
-fn encrypted() -> Error {
-    Error::Unsupported("encrypted PDF".to_string())
 }
 
 fn internal(what: &str) -> Error {
@@ -129,8 +131,8 @@ impl Loaded<'_> {
 }
 
 fn load(doc: &Document) -> Result<Loaded<'_>> {
-    if doc.is_encrypted() {
-        return Err(encrypted());
+    if doc.is_locked() {
+        return Err(Error::PasswordRequired);
     }
     let pages = doc.pages()?;
     let page_nums = pages.iter().map(|p| p.obj_ref.num).collect();
@@ -143,14 +145,15 @@ const LABELS: (&str, &str) = ("PageLabels", "page labels");
 const THREADS: (&str, &str) = ("Threads", "article threads");
 
 /// Write a new file whose pages are `picks`, in that order, from the
-/// documents in `docs`; the catalog is the first document's.
+/// documents in `docs`; the catalog is the first document's. `encrypt` keeps the first document's
+/// encryption (when it has any); without it the output is written in the clear.
 ///
 /// When pages of the first document are left out, its bookmarks, forms and
 /// named destinations are cut down to the pages that stay ([`prune`]). The
 /// other documents bring only their pages: their named destinations are made
 /// explicit and their structure tree links are dropped, because the things
 /// they point into are not copied.
-fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
+fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
     let base = docs.first().ok_or_else(|| internal("no documents"))?;
     let version = docs.iter().map(|d| d.doc.version()).max().unwrap_or((1, 4));
     // The pages of the first document that stay, by object number.
@@ -161,6 +164,9 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     let mut b = Builder::with_capacity(version, base.size_hint.get());
     let sources: Vec<usize> = docs.iter().map(|d| b.add_source(d.doc, &d.page_nums)).collect();
     let source_of = |i: usize| sources.get(i).copied().ok_or_else(|| internal("unknown document"));
+    if encrypt {
+        b.keep_encryption_of(source_of(0)?);
+    }
     for &later in sources.iter().skip(1) {
         b.resolve_named_destinations(later);
         b.drop_structure_links(later);
@@ -171,6 +177,10 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick]) -> Result<Output> {
     let mut warnings = Vec::new();
     let mut catalog = base.doc.catalog()?;
     catalog.remove("Pages");
+    // `/EncryptMetadata false` leaves this stream, and only this one, unencrypted.
+    if let Some(Object::Ref(metadata)) = catalog.get("Metadata") {
+        b.mark_root_metadata(source_of(0)?, metadata.num);
+    }
     if subset {
         let index = base.index()?;
         b.exclude_annotations(source_of(0)?, &index.annot_pages, &kept);
@@ -325,7 +335,7 @@ fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
 pub fn copy_all(doc: &Document) -> Result<Output> {
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks)
+    build(&[d], &picks, true)
 }
 
 /// A new file with just the pages `pages` (0-based indices, as returned by
@@ -336,7 +346,7 @@ pub fn extract_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     }
     let d = load(doc)?;
     let picks: Vec<Pick> = pages.iter().map(|&page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-    build(&[d], &picks)
+    build(&[d], &picks, true)
 }
 
 /// A new file without the pages `pages` (0-based indices).
@@ -347,7 +357,7 @@ pub fn delete_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     if picks.is_empty() {
         return Err(Error::Invalid("that would delete every page".to_string()));
     }
-    build(&[d], &picks)
+    build(&[d], &picks, true)
 }
 
 /// A new file in which the pages `pages` (0-based indices) are turned by
@@ -366,7 +376,7 @@ pub fn rotate_pages(doc: &Document, pages: &[usize], angle: i64) -> Result<Outpu
             p
         })
         .collect();
-    build(&[d], &picks)
+    build(&[d], &picks, true)
 }
 
 /// How much of a document `split_every` keeps parsed while it works.
@@ -416,7 +426,7 @@ pub fn split_every(
     for (i, start) in (0..count).step_by(every).enumerate() {
         let end = start.saturating_add(every).min(count);
         let picks: Vec<Pick> = (start..end).map(|page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-        let out = build(&loaded, &picks)?;
+        let out = build(&loaded, &picks, true)?;
         for w in &out.warnings {
             if !warnings.contains(w) {
                 warnings.push(w.clone());
@@ -499,8 +509,8 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
     }
     let mut docs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        if input.doc.is_encrypted() {
-            return Err(Error::Unsupported(format!("encrypted PDF ({})", input.name)));
+        if input.doc.is_locked() {
+            return Err(Error::Invalid(format!("{}: the file is encrypted and needs a password", input.name)));
         }
         docs.push(load(input.doc)?);
     }
@@ -511,7 +521,19 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
     for (i, d) in docs.iter().enumerate() {
         picks.extend(all_picks(i, d.pages.len()));
     }
-    let mut out = build(&docs, &picks)?;
+    let mut out = build(&docs, &picks, true)?;
+    // The first file's encryption is the output's (qpdf does the same). If it
+    // has none, the output has none, and the encrypted files that came after
+    // it lose theirs.
+    let first_is_encrypted = inputs.first().is_some_and(|i| i.doc.is_encrypted());
+    if !first_is_encrypted {
+        for input in inputs.iter().skip(1).filter(|i| i.doc.is_encrypted()) {
+            out.warnings.push(Warning(format!(
+                "{}: its encryption was not carried over; the output is not encrypted because the first file is not",
+                input.name
+            )));
+        }
+    }
     for input in inputs.iter().skip(1) {
         let lost = lost_items(input.doc);
         if !lost.is_empty() {
@@ -523,6 +545,41 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
         }
     }
     Ok(out)
+}
+
+// --- decrypt ----------------------------------------------------------------------------
+
+/// A copy of the document without its encryption. Stricter than qpdf: only for
+/// a file that was opened with the owner password, or whose permissions allow
+/// everything; anything else would be taking the author's restrictions off a
+/// file the user holds only with limited rights. `password` is the one the
+/// user gave, if any (the empty password is always counted too): whether it is
+/// the owner's is looked at here. The file must be encrypted and open
+/// ([`Error::PasswordRequired`] otherwise).
+pub fn decrypt(doc: &Document, password: &str) -> Result<Output> {
+    let Some(encryption) = doc.encryption() else {
+        return Err(Error::Invalid("the file is not encrypted".to_string()));
+    };
+    if doc.is_locked() {
+        return Err(Error::PasswordRequired);
+    }
+    // The owner is whoever has the owner password: it opened the file, or it
+    // is what was given, or it is the empty one (an owner with no password).
+    let owner = encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
+        || doc.security().is_some_and(|s| {
+            (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password("")
+        });
+    if !owner && !encryption.permissions.allows_everything() {
+        let denied: Vec<&str> =
+            encryption.permissions.list().iter().filter(|(_, allowed)| !allowed).map(|(what, _)| *what).collect();
+        return Err(Error::Invalid(format!(
+            "the encryption is not removed: the file was opened with the user password and its author did not allow: {}. Give the owner password with --password to remove it",
+            denied.join(", ")
+        )));
+    }
+    let d = load(doc)?;
+    let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
+    build(&[d], &picks, false)
 }
 
 // --- images to PDF ---------------------------------------------------------------------
@@ -1004,21 +1061,22 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_input_is_unsupported() {
+    fn locked_input_needs_a_password() {
         let mut b = PdfBuilder::new();
         b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
         b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 5 5] >>");
-        b.obj(4, "<< /Filter /Standard /V 1 /R 2 /O (x) /U (y) /P -4 >>");
+        b.obj(4, &format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P -4 >>", "00".repeat(32), "11".repeat(32)));
         let doc = open(b.finish_classic(5, "/Root 1 0 R /Encrypt 4 0 R /ID [<aa> <bb>]"));
-        assert!(matches!(copy_all(&doc), Err(Error::Unsupported(m)) if m == "encrypted PDF"));
-        assert!(matches!(extract_pages(&doc, &[0]), Err(Error::Unsupported(_))));
-        assert!(matches!(delete_pages(&doc, &[]), Err(Error::Unsupported(_))));
-        assert!(matches!(rotate_pages(&doc, &[0], 90), Err(Error::Unsupported(_))));
-        assert!(matches!(split_every(&doc, 1, &mut |_, _| Ok(())), Err(Error::Unsupported(_))));
+        assert!(matches!(copy_all(&doc), Err(Error::PasswordRequired)));
+        assert!(matches!(extract_pages(&doc, &[0]), Err(Error::PasswordRequired)));
+        assert!(matches!(delete_pages(&doc, &[]), Err(Error::PasswordRequired)));
+        assert!(matches!(rotate_pages(&doc, &[0], 90), Err(Error::PasswordRequired)));
+        assert!(matches!(split_every(&doc, 1, &mut |_, _| Ok(())), Err(Error::PasswordRequired)));
+        assert!(matches!(decrypt(&doc, ""), Err(Error::PasswordRequired)));
         let plain = open(three_pages());
         let r = merge(&[Input { name: "plain", doc: &plain }, Input { name: "locked.pdf", doc: &doc }]);
-        assert!(matches!(r, Err(Error::Unsupported(m)) if m.contains("locked.pdf")));
+        assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("locked.pdf") && m.contains("needs a password")));
     }
 
     #[test]

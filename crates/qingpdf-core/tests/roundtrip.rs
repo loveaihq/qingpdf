@@ -50,11 +50,12 @@ fn round_trip_every_corpus_file() {
     let mut summary = Summary::default();
     for path in &files {
         let name = common::corpus_name(path);
+        let password = common::password_for(path);
         let Ok(bytes) = std::fs::read(path) else {
             summary.add("FAIL unreadable file", &name, "");
             continue;
         };
-        let doc = match Document::from_bytes(bytes) {
+        let doc = match Document::from_bytes_with_password(bytes, &password) {
             Ok(d) => d,
             Err(Error::Unsupported(why)) => {
                 // The Brotli prototype file must be reported as unsupported, naming the filter.
@@ -69,10 +70,10 @@ fn round_trip_every_corpus_file() {
                 continue;
             }
         };
-        if doc.is_encrypted() {
+        if doc.is_locked() {
             match ops::copy_all(&doc) {
-                Err(Error::Unsupported(m)) if m == "encrypted PDF" => summary.add("encrypted (Unsupported, as expected)", &name, ""),
-                other => summary.add("FAIL encrypted file did not give Unsupported", &name, format!("{:?}", other.map(|o| o.pages))),
+                Err(Error::PasswordRequired) => summary.add("encrypted, password unknown (PasswordRequired, as expected)", &name, ""),
+                other => summary.add("FAIL locked file did not give PasswordRequired", &name, format!("{:?}", other.map(|o| o.pages))),
             }
             continue;
         }
@@ -94,7 +95,7 @@ fn round_trip_every_corpus_file() {
                 continue;
             }
         };
-        let copy = match Document::from_bytes(out.data.clone()) {
+        let copy = match Document::from_bytes_with_password(out.data.clone(), &password) {
             Ok(c) => c,
             Err(e) => {
                 summary.add("FAIL output does not reopen", &name, e.to_string());

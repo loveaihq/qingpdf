@@ -2,9 +2,9 @@
 
 A small, fast, offline PDF tool with its own engine, written in Rust. *Qīng* (轻) means "light".
 
-Most PDF tools today are hundreds of megabytes. qingpdf is one 0.8 MB executable that needs nothing installed, never goes online, and is built to do Chinese PDFs right.
+Most PDF tools today are hundreds of megabytes. qingpdf is one 0.9 MB executable that needs nothing installed, never goes online, and is built to do Chinese PDFs right.
 
-**Status: early (layer 1 of 5).** What works today is the file-structure layer: reading, repairing and rewriting PDFs, and the page operations below. There is no viewer, text extraction, conversion or editing yet; see [the plan](PLAN.md). Encrypted PDFs are not supported yet (next on the list).
+**Status: early (layer 1 of 5).** What works today is the file-structure layer: reading, repairing and rewriting PDFs, and the page operations below. There is no viewer, text extraction, conversion or editing yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
 
 ## What it does now
 
@@ -16,7 +16,10 @@ qingpdf split a.pdf --every 10 -o part_%d.pdf       cut into files of 10 pages
 qingpdf delete a.pdf --pages 2,4-6 -o out.pdf       remove pages
 qingpdf rotate a.pdf --pages 1-3 --angle 90 -o out.pdf
 qingpdf img2pdf 1.jpg 2.png -o out.pdf              one image per page (JPEG kept as-is, EXIF orientation honoured)
+qingpdf decrypt a.pdf -o plain.pdf --password P     write an unencrypted copy (owner password, or a file that allows everything)
 ```
+
+Every command that reads a PDF takes `--password <password>` for encrypted files (the empty password is always tried first); the results are encrypted the way the input was, with the same passwords and permissions. `info` shows how a file is protected and what its author allows.
 
 Outputs are never written over an input, and an existing file is only replaced with `--force`. Run `qingpdf <command> --help` for details.
 
@@ -24,7 +27,7 @@ Outputs are never written over an input, and an existing file is only replaced w
 
 Every release is measured against these; a feature that breaks one is not added.
 
-1. Windows download ≤ 20 MB (today: 0.8 MB).
+1. Windows download ≤ 20 MB (today: 0.9 MB).
 2. First page of a 100-page PDF on screen in ≤ 1 s (today `info` on 1000 pages: ~50 ms).
 3. Page turns ≤ 100 ms.
 4. ≤ 200 MB memory for a 100-page document.
@@ -58,4 +61,4 @@ MIT OR Apache-2.0, at your option. Test files keep their own licences; see [test
 
 ## 中文简介
 
-qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在完成了五层里的第 1 层（文件结构）：能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件。阅读界面、提取文字、转换和编辑在后面几层，加密文件马上就做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
+qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在完成了五层里的第 1 层（文件结构）：能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件。阅读界面、提取文字、转换和编辑在后面几层，加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。

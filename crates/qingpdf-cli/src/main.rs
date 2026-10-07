@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
+use qingpdf_core::security::{Method, PasswordKind};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
 use qingpdf_core::{Document, Error, Warning};
 
@@ -74,25 +75,27 @@ fn say(text: &str) {
 
 fn run(request: Request) -> Result<(), Failure> {
     match request {
-        Request::Info { input } => info_command(&input),
-        Request::Merge { inputs, output, force } => merge_command(&inputs, &output, force),
-        Request::SplitPages { input, pages, output, force } => {
-            let doc = open_plain(&input)?;
+        Request::Info { input, password } => info_command(&input, &password),
+        Request::Merge { inputs, output, force, password } => merge_command(&inputs, &output, force, &password),
+        Request::SplitPages { input, pages, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
             let wanted = page_list(&doc, &input, &pages)?;
             check_output(&output, std::slice::from_ref(&input), force)?;
             let out = ops::extract_pages(&doc, &wanted).map_err(|e| op_error(&input, &e))?;
             finish(&output, &out)
         }
-        Request::SplitEvery { input, every, output, force } => split_every_command(&input, every, &output, force),
-        Request::Delete { input, pages, output, force } => {
-            let doc = open_plain(&input)?;
+        Request::SplitEvery { input, every, output, force, password } => {
+            split_every_command(&input, every, &output, force, &password)
+        }
+        Request::Delete { input, pages, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
             let gone = page_list(&doc, &input, &pages)?;
             check_output(&output, std::slice::from_ref(&input), force)?;
             let out = ops::delete_pages(&doc, &gone).map_err(|e| op_error(&input, &e))?;
             finish(&output, &out)
         }
-        Request::Rotate { input, pages, angle, output, force } => {
-            let doc = open_plain(&input)?;
+        Request::Rotate { input, pages, angle, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
             let turn = match pages {
                 Some(list) => page_list(&doc, &input, &list)?,
                 None => (0..doc.page_count().map_err(|e| op_error(&input, &e))?).collect(),
@@ -101,23 +104,43 @@ fn run(request: Request) -> Result<(), Failure> {
             let out = ops::rotate_pages(&doc, &turn, angle).map_err(|e| op_error(&input, &e))?;
             finish(&output, &out)
         }
+        Request::Decrypt { input, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
+            check_output(&output, std::slice::from_ref(&input), force)?;
+            if !doc.is_encrypted() {
+                return Err(format!("{} is not encrypted; there is nothing to decrypt", input.display()));
+            }
+            let out = ops::decrypt(&doc, &password).map_err(|e| op_error(&input, &e))?;
+            finish(&output, &out)
+        }
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
     }
 }
 
 // --- reading and writing files -------------------------------------------------------
 
-fn encrypted_message(path: &Path) -> String {
-    format!("{} is encrypted. Encrypted PDF files are not supported yet.", path.display())
+fn needs_password_message(path: &Path) -> String {
+    format!("{} needs a password; give it with --password", path.display())
+}
+
+fn wrong_password_message(path: &Path) -> String {
+    format!("wrong password for {}", path.display())
 }
 
 /// Say why a file could not be opened, for people.
 fn open_error(path: &Path, e: &Error) -> String {
     match e {
         Error::Io(io) => format!("cannot read {}: {io}", path.display()),
-        Error::Unsupported(m) if m == "encrypted PDF" => encrypted_message(path),
-        Error::Unsupported(m) => format!("{}: not supported yet: {m}", path.display()),
+        Error::PasswordRequired => needs_password_message(path),
+        Error::WrongPassword => wrong_password_message(path),
+        Error::Unsupported(m) => format!("{}: not supported: {m}", path.display()),
         Error::Limit(_) => format!("{} is not opened: it asks for more than is safe ({e})", path.display()),
+        // The file is a PDF; what is wrong is how it says it is encrypted.
+        Error::Syntax { message, .. }
+            if message.starts_with("encryption dictionary") || message.starts_with("cannot read the encryption dictionary") =>
+        {
+            format!("{} cannot be opened: its encryption is damaged ({message})", path.display())
+        }
         other => format!("{} is not a PDF file, or is too damaged to read ({other})", path.display()),
     }
 }
@@ -125,22 +148,27 @@ fn open_error(path: &Path, e: &Error) -> String {
 /// Say why an operation on an open file failed.
 fn op_error(path: &Path, e: &Error) -> String {
     match e {
-        Error::Unsupported(m) if m.starts_with("encrypted PDF") => encrypted_message(path),
+        Error::PasswordRequired => needs_password_message(path),
+        Error::WrongPassword => wrong_password_message(path),
         Error::Unsupported(m) => format!("{}: not supported yet: {m}", path.display()),
         Error::Invalid(m) => m.clone(),
         other => format!("{}: {other}", path.display()),
     }
 }
 
-fn open_pdf(path: &Path) -> Result<Document, Failure> {
-    Document::open(path).map_err(|e| open_error(path, &e))
+/// Open a file. If it needs a password, the empty one is tried first and then
+/// `password`; one that does not work is an error, and a file that needs one
+/// and was given none is returned locked (only `info` can say something about
+/// it then).
+fn open_pdf(path: &Path, password: &str) -> Result<Document, Failure> {
+    Document::open_with_password(path, password).map_err(|e| open_error(path, &e))
 }
 
-/// Open a file and refuse it if it is encrypted.
-fn open_plain(path: &Path) -> Result<Document, Failure> {
-    let doc = open_pdf(path)?;
-    if doc.is_encrypted() {
-        return Err(encrypted_message(path));
+/// Open a file and refuse it if it is still locked: operations need to read it.
+fn open_unlocked(path: &Path, password: &str) -> Result<Document, Failure> {
+    let doc = open_pdf(path, password)?;
+    if doc.is_locked() {
+        return Err(needs_password_message(path));
     }
     Ok(doc)
 }
@@ -224,8 +252,8 @@ fn finish(output: &Path, out: &Output) -> Result<(), Failure> {
 
 // --- commands ------------------------------------------------------------------------------
 
-fn merge_command(inputs: &[PathBuf], output: &Path, force: bool) -> Result<(), Failure> {
-    let docs: Vec<Document> = inputs.iter().map(|p| open_plain(p)).collect::<Result<_, _>>()?;
+fn merge_command(inputs: &[PathBuf], output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let docs: Vec<Document> = inputs.iter().map(|p| open_unlocked(p, password)).collect::<Result<_, _>>()?;
     let names: Vec<String> = inputs.iter().map(|p| p.display().to_string()).collect();
     check_output(output, inputs, force)?;
     let merge_inputs: Vec<Input<'_>> =
@@ -237,8 +265,8 @@ fn merge_command(inputs: &[PathBuf], output: &Path, force: bool) -> Result<(), F
     finish(output, &out)
 }
 
-fn split_every_command(input: &Path, every: usize, template: &Path, force: bool) -> Result<(), Failure> {
-    let doc = open_plain(input)?;
+fn split_every_command(input: &Path, every: usize, template: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
     let count = doc.page_count().map_err(|e| op_error(input, &e))?;
     let template = template.to_str().ok_or("the output name is not valid text")?;
     // Work out and check every name before writing any file.
@@ -300,8 +328,8 @@ fn images_command(inputs: &[PathBuf], mode: PageMode, output: &Path, force: bool
 
 // --- info ---------------------------------------------------------------------------------------
 
-fn info_command(input: &Path) -> Result<(), Failure> {
-    let doc = open_pdf(input)?;
+fn info_command(input: &Path, password: &str) -> Result<(), Failure> {
+    let doc = open_pdf(input, password)?;
     let report = info::describe(&doc).map_err(|e| op_error(input, &e))?;
     say(&render_info(input, &report));
     Ok(())
@@ -321,8 +349,14 @@ fn render_info(path: &Path, r: &Report) -> String {
     let mut s = String::new();
     s.push_str(&format!("File:                {}\n", path.display()));
     s.push_str(&format!("PDF version:         {}.{}\n", r.version.0, r.version.1));
-    s.push_str(&format!("Pages:               {}\n", r.pages.len()));
+    match &r.pages_unavailable {
+        Some(why) => s.push_str(&format!("Pages:               (not available: {why})\n")),
+        None => s.push_str(&format!("Pages:               {}\n", r.pages.len())),
+    }
     s.push_str(&format!("Encrypted:           {}\n", yes_no(r.encrypted)));
+    if let Some(e) = &r.encryption {
+        render_encryption(&mut s, e);
+    }
     s.push_str(&format!("Cross-ref streams:   {}\n", yes_no(r.xref_streams)));
     s.push_str(&format!("Object streams:      {}\n", yes_no(r.object_streams)));
     s.push_str(&format!(
@@ -352,6 +386,35 @@ fn render_info(path: &Path, r: &Report) -> String {
         s.push_str(&format!("  {:>width$}: {size}{rotation}\n", i + 1));
     }
     s
+}
+
+/// The lines about how the file is encrypted: the method, whether a password
+/// is needed and which one opened it, and what the author allows.
+fn render_encryption(s: &mut String, e: &qingpdf_core::security::Encryption) {
+    let metadata = if e.encrypt_metadata { "" } else { ", metadata not encrypted" };
+    s.push_str(&format!("Encryption:          {} (V{}, R{}{metadata})\n", e.method_name(), e.version, e.revision));
+    let method_note = if e.stream_method == Method::None && e.string_method == Method::None {
+        " (nothing is actually encrypted)"
+    } else {
+        ""
+    };
+    let password = match e.opened {
+        None => "needed (none was given; use --password)".to_string(),
+        Some(a) => {
+            let which = match (a.kind, a.empty) {
+                (PasswordKind::User, true) => "the empty user password",
+                (PasswordKind::Owner, true) => "the empty password, which is also the owner password",
+                (PasswordKind::User, false) => "the user password",
+                (PasswordKind::Owner, false) => "the owner password",
+            };
+            if a.empty { format!("not needed (opened with {which})") } else { format!("needed (opened with {which})") }
+        }
+    };
+    s.push_str(&format!("Password to open:    {password}{method_note}\n"));
+    for (i, (what, allowed)) in e.permissions.list().iter().enumerate() {
+        let label = if i == 0 { "Permissions:        " } else { "                    " };
+        s.push_str(&format!("{label} {what}: {}\n", yes_no(*allowed)));
+    }
 }
 
 #[cfg(test)]

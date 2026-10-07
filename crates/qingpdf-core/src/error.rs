@@ -11,7 +11,8 @@ pub enum Error {
     Syntax { offset: Option<u64>, message: String },
     /// A referenced object does not exist or could not be loaded.
     MissingObject { num: u32, generation: u16 },
-    /// The file uses something this layer does not support (e.g. encryption).
+    /// The file uses something not supported (a filter we cannot decode, public-key
+    /// encryption, ...).
     Unsupported(String),
     /// A limit on what a file may ask for was hit: too much to decode, too many
     /// pages, a reference cycle, and so on. The file may be fine; it is more
@@ -24,6 +25,11 @@ pub enum Error {
     TooDeep(String),
     /// Invalid input from the caller (bad page range, unknown image format, ...).
     Invalid(String),
+    /// The file is encrypted, the empty password does not open it, and no
+    /// other password was given: it needs one.
+    PasswordRequired,
+    /// A password was given and neither it nor the empty one opens the file.
+    WrongPassword,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -45,6 +51,8 @@ impl fmt::Display for Error {
             Error::Limit(m) => write!(f, "limit reached: {m}"),
             Error::TooDeep(m) => write!(f, "nested too deeply: {m}"),
             Error::Invalid(m) => write!(f, "{m}"),
+            Error::PasswordRequired => f.write_str("the file is encrypted and needs a password"),
+            Error::WrongPassword => f.write_str("wrong password"),
         }
     }
 }

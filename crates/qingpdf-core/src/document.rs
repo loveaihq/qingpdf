@@ -12,6 +12,7 @@ use crate::lexer::find_bytes;
 use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::parser::{EndstreamIndex, Parser, StreamHelper};
 use crate::repair::{self, Unopened};
+use crate::security::{Encryption, Security};
 use crate::xref::{self, ObjStm, XrefEntry, XrefTable};
 
 /// Longest chain of `n g R` references `resolve` will follow.
@@ -43,6 +44,10 @@ const MAX_REPEATED_BYTES: usize = 64 * 1024 * 1024;
 /// document (the cache, the file, and the output being built) cost more than
 /// 200 MB.
 const OBJSTM_CACHE_BYTES: usize = 96 * 1024 * 1024;
+/// How many references the `/Encrypt` dictionary may lead through, and how
+/// big the dictionary may be once they are followed.
+const MAX_ENCRYPT_REFS: usize = 64;
+const MAX_ENCRYPT_BYTES: usize = 1 << 20;
 /// The header must start within this many bytes of the beginning of the file.
 const HEADER_WINDOW: usize = 1024;
 /// Page attributes a page inherits from its ancestors (7.7.3.4, Table 30).
@@ -78,6 +83,9 @@ pub struct Document {
     /// not in the table, so an object missing from the table is "unsupported"
     /// or "over the limit", not "absent".
     unreadable: RefCell<Unopened>,
+    /// The encryption (7.6) of the file, if it has any: set when the file is
+    /// opened and never changed after. Locked until a password has opened it.
+    security: Option<Security>,
 }
 
 /// One inheritable value as written, and with the references in it followed
@@ -279,6 +287,8 @@ fn copy_error(e: &Error) -> Error {
         Error::Limit(m) => Error::Limit(m.clone()),
         Error::TooDeep(m) => Error::TooDeep(m.clone()),
         Error::Invalid(m) => Error::Invalid(m.clone()),
+        Error::PasswordRequired => Error::PasswordRequired,
+        Error::WrongPassword => Error::WrongPassword,
     }
 }
 
@@ -386,10 +396,6 @@ impl ObjectCache {
     }
 }
 
-fn encrypted_error() -> Error {
-    Error::Unsupported("encrypted PDF".to_string())
-}
-
 /// `1.7` as `(1, 7)`.
 fn parse_version(bytes: &[u8]) -> Option<(u8, u8)> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -407,17 +413,37 @@ fn header_version(data: &[u8]) -> (u8, u8) {
 }
 
 impl Document {
-    /// Read a file. The whole file is loaded into memory.
+    /// Read a file. The whole file is loaded into memory. An encrypted file
+    /// is opened with the empty password if that works; if it does not, the
+    /// document is [locked](Document::is_locked).
     pub fn open(path: impl AsRef<Path>) -> Result<Document> {
+        Document::open_with_password(path, "")
+    }
+
+    /// [`Document::open`] with a password to try after the empty one, as the
+    /// user password and as the owner password. A password that does not work
+    /// is [`Error::WrongPassword`].
+    pub fn open_with_password(path: impl AsRef<Path>, password: &str) -> Result<Document> {
         let data = std::fs::read(path)?;
-        Document::from_bytes(data)
+        Document::from_bytes_with_password(data, password)
     }
 
     /// Open a PDF held in memory. Reads the cross-reference data and the trailer
     /// only; objects are parsed when requested. If the cross-reference data is
     /// missing or wrong the file is scanned and the table rebuilt
     /// ([`Document::was_repaired`]).
-    pub fn from_bytes(mut data: Vec<u8>) -> Result<Document> {
+    pub fn from_bytes(data: Vec<u8>) -> Result<Document> {
+        Document::from_bytes_with_password(data, "")
+    }
+
+    /// [`Document::from_bytes`] for a file that may need `password`. The empty
+    /// password is tried first (many files are encrypted only to restrict what
+    /// may be done with them), then `password`, each as the user and as the
+    /// owner password. With no password given and none needed the file opens
+    /// normally; if one is needed the document is locked (its structure can
+    /// be read, but not its strings and streams); a given password that does
+    /// not work is an error.
+    pub fn from_bytes_with_password(mut data: Vec<u8>, password: &str) -> Result<Document> {
         // 7.5.2: the header is at the start of the file. Junk before it is
         // tolerated; offsets are then counted from the header.
         let window = data.get(..HEADER_WINDOW.min(data.len())).unwrap_or(&[]);
@@ -431,24 +457,26 @@ impl Document {
 
         let first_error = match xref::read_xref_budgeted(&data, &budget) {
             Ok(x) => {
-                let doc = Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false, budget);
+                let mut doc =
+                    Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false, budget);
                 doc.repair_allowed.set(false);
-                let checked = doc.validate();
+                let checked = doc.init_security(password).and_then(|()| doc.validate());
                 doc.repair_allowed.set(true);
                 match checked {
                     Ok(()) => return Ok(doc),
                     // The table is fine; a filter we cannot decode is in the
-                    // way. Scanning the file again would not change that.
-                    Err(e @ Error::Unsupported(_)) => return Err(e),
+                    // way, or the password is wrong. Scanning the file again
+                    // would not change that.
+                    Err(e @ (Error::Unsupported(_) | Error::PasswordRequired | Error::WrongPassword)) => return Err(e),
                     Err(e) => {
                         data = doc.data;
-                        return Document::open_after_rebuild(data, version, doc.budget, e);
+                        return Document::open_after_rebuild(data, version, doc.budget, e, password);
                     }
                 }
             }
             Err(e) => e,
         };
-        Document::open_after_rebuild(data, version, budget, first_error)
+        Document::open_after_rebuild(data, version, budget, first_error, password)
     }
 
     /// The cross-reference data could not be used (`first_error` says why):
@@ -458,14 +486,24 @@ impl Document {
         version: (u8, u8),
         budget: DecodeBudget,
         first_error: Error,
+        password: &str,
     ) -> Result<Document> {
-        match repair::rebuild_budgeted(&data, &budget) {
+        match repair::rebuild_budgeted(&data, &budget, None) {
             Ok(r) => {
                 let unopened = r.unopened;
-                let doc = Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true, budget);
+                let mut doc =
+                    Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true, budget);
                 *doc.unreadable.borrow_mut() = unopened.clone();
-                match doc.validate() {
+                let checked = doc.init_security(password).and_then(|()| {
+                    doc.index_encrypted_object_streams();
+                    doc.validate()
+                });
+                match checked {
                     Ok(()) => Ok(doc),
+                    Err(e @ (Error::PasswordRequired | Error::WrongPassword)) => Err(e),
+                    // Not for the page tree to explain: the encryption itself
+                    // cannot be read.
+                    Err(e @ Error::Unsupported(_)) if doc.is_encrypted() => Err(e),
                     // The page tree is missing because it sits in an object
                     // stream we cannot open (or the table could not be read
                     // because of a filter we cannot decode): say so.
@@ -513,14 +551,127 @@ impl Document {
             uses_xref_streams: Cell::new(uses_xref_streams),
             nesting: Cell::new(0),
             unreadable: RefCell::new(Unopened::default()),
+            security: None,
+        }
+    }
+
+    /// Read the encryption dictionary, if the trailer names one, and try the
+    /// empty password and then `password`. Unlocked, every object read from
+    /// now on is decrypted; locked (no password worked and none was given) the
+    /// objects are read as they are. A given password that does not work is
+    /// [`Error::WrongPassword`].
+    fn init_security(&mut self, password: &str) -> Result<()> {
+        let Some(entry) = self.trailer.get("Encrypt").cloned() else {
+            return Ok(());
+        };
+        // The dictionary is never encrypted, so it is read before there is a key.
+        let unreadable = |e: Error| match e {
+            Error::Syntax { .. } | Error::MissingObject { .. } | Error::Limit(_) => {
+                Error::syntax(None, format!("cannot read the encryption dictionary ({e})"))
+            }
+            other => other,
+        };
+        let encrypt_num = entry.as_obj_ref().map(|r| r.num);
+        let resolved = self.resolve(&entry).map_err(unreadable)?;
+        if !matches!(resolved, Object::Dict(_)) {
+            return Err(Error::syntax(None, "the /Encrypt entry does not lead to a dictionary"));
+        }
+        let mut refs_left = MAX_ENCRYPT_REFS;
+        let dict = match self.inline_references(resolved, &mut refs_left, 0).map_err(unreadable)? {
+            Object::Dict(d) if d.approx_size() <= MAX_ENCRYPT_BYTES => d,
+            Object::Dict(_) => return Err(Error::syntax(None, "the encryption dictionary is absurdly large")),
+            _ => return Err(Error::syntax(None, "the /Encrypt entry does not lead to a dictionary")),
+        };
+        let mut security = Security::from_dict(dict, self.first_file_id(), encrypt_num)?;
+        if !security.authenticate(password) {
+            self.security = Some(security);
+            return if password.is_empty() { Ok(()) } else { Err(Error::WrongPassword) };
+        }
+        // `/EncryptMetadata false` leaves the catalog's metadata stream in the
+        // clear; which stream that is, is found out with the key in place.
+        self.security = Some(security.clone());
+        self.forget_loaded_objects();
+        if !security.encrypt_metadata() {
+            let metadata = match self.catalog().ok().and_then(|c| c.get("Metadata").cloned()) {
+                Some(Object::Ref(r)) => Some(r.num),
+                _ => None,
+            };
+            security.set_root_metadata(metadata);
+            self.security = Some(security);
+            self.forget_loaded_objects();
+        }
+        Ok(())
+    }
+
+    /// Objects and object streams read before the key was known (or with a
+    /// different state of it) are not to be reused.
+    fn forget_loaded_objects(&self) {
+        self.objstms.borrow_mut().clear();
+        let budget = self.cache.borrow().budget;
+        *self.cache.borrow_mut() = ObjectCache { budget, ..ObjectCache::default() };
+    }
+
+    /// The first element of the trailer's `/ID` (14.4), which the key depends
+    /// on for revisions 2 to 4; empty if there is none.
+    fn first_file_id(&self) -> Vec<u8> {
+        let id = self.trailer.get("ID").and_then(|o| self.resolve(o).ok());
+        match id {
+            Some(Object::Array(items)) => match items.first() {
+                Some(Object::String(s)) => s.bytes.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// `obj` with every reference replaced by what it leads to, at most
+    /// `refs_left` of them in all and eight deep (the encryption dictionary may
+    /// keep its `/CF` or its strings in objects of their own, 7.6.1 asks for
+    /// direct objects but files exist).
+    fn inline_references(&self, obj: Object, refs_left: &mut usize, depth: usize) -> Result<Object> {
+        Ok(match obj {
+            Object::Ref(_) => {
+                if *refs_left == 0 || depth >= 8 {
+                    return Err(Error::Limit("the encryption dictionary refers to too many objects".to_string()));
+                }
+                *refs_left -= 1;
+                let target = self.resolve(&obj)?;
+                self.inline_references(target, refs_left, depth + 1)?
+            }
+            Object::Array(items) => Object::Array(
+                items.into_iter().map(|i| self.inline_references(i, refs_left, depth)).collect::<Result<Vec<_>>>()?,
+            ),
+            Object::Dict(d) => {
+                let mut out = Dict::new();
+                for (key, value) in d.into_pairs() {
+                    out.set(key, self.inline_references(value, refs_left, depth)?);
+                }
+                Object::Dict(out)
+            }
+            // A stream cannot be a value in a dictionary.
+            Object::Stream(_) => Object::Null,
+            other => other,
+        })
+    }
+
+    /// After the file was scanned for its objects without the key: scan again
+    /// with it, so that the objects inside encrypted object streams are found.
+    fn index_encrypted_object_streams(&self) {
+        let Some(security) = self.security.as_ref().filter(|s| s.is_unlocked()) else {
+            return;
+        };
+        if let Ok(again) = repair::rebuild_budgeted(&self.data, &self.budget, Some(security)) {
+            *self.xref.borrow_mut() = again.entries;
+            *self.unreadable.borrow_mut() = again.unopened;
+            self.uses_xref_streams.set(again.uses_xref_streams);
         }
     }
 
     /// Is the file usable: a catalog dictionary, and a page tree root that is
-    /// really there if the catalog names one. Encrypted files cannot be checked
-    /// (their object streams cannot be read) and are accepted.
+    /// really there if the catalog names one. A locked file cannot be checked
+    /// (its object streams cannot be read) and is accepted.
     fn validate(&self) -> Result<()> {
-        if self.is_encrypted() {
+        if self.is_locked() {
             return Ok(());
         }
         let catalog = self.catalog()?;
@@ -564,13 +715,14 @@ impl Document {
     }
 
     /// The document information dictionary (14.3.3), if there is one. Its
-    /// strings are encrypted in an encrypted file, which is not supported.
+    /// strings are encrypted in an encrypted file: [`Error::PasswordRequired`]
+    /// while the file is locked.
     pub fn info(&self) -> Result<Option<Dict>> {
         let Some(entry) = self.trailer.get("Info") else {
             return Ok(None);
         };
-        if self.is_encrypted() {
-            return Err(encrypted_error());
+        if self.is_locked() {
+            return Err(Error::PasswordRequired);
         }
         match self.resolve(entry)? {
             Object::Dict(d) => Ok(Some(d)),
@@ -644,7 +796,14 @@ impl Document {
             return Err(missing());
         }
         let raw = parser.parse_body(header, self)?;
-        Ok(raw.into_object(&self.data))
+        let mut object = raw.into_object(&self.data);
+        // Strings and stream data are encrypted in the file (7.6.2); everything
+        // above this point sees them decrypted. The generation is the file's
+        // own, which the key depends on.
+        if let Some(security) = &self.security {
+            security.decrypt_object(header, &mut object)?;
+        }
+        Ok(object)
     }
 
     /// Rebuild the cross-reference table by scanning, once per document.
@@ -654,7 +813,7 @@ impl Document {
             return false;
         }
         self.repair_attempted.set(true);
-        match repair::rebuild_budgeted(&self.data, &self.budget) {
+        match repair::rebuild_budgeted(&self.data, &self.budget, self.security.as_ref().filter(|s| s.is_unlocked())) {
             Ok(r) => {
                 *self.xref.borrow_mut() = r.entries;
                 *self.unreadable.borrow_mut() = r.unopened;
@@ -683,6 +842,9 @@ impl Document {
     fn read_object_stream(&self, stream_num: u32) -> Result<Rc<ObjStm>> {
         let _guard = NestingGuard::enter(&self.nesting)
             .ok_or_else(|| Error::Limit("object streams refer to each other too deeply".to_string()))?;
+        if self.is_locked() {
+            return Err(Error::PasswordRequired);
+        }
         let entry = self.xref.borrow().get(stream_num);
         let Some(XrefEntry::InUse { offset, .. }) = entry else {
             return Err(Error::syntax(None, format!("object stream {stream_num} is not an ordinary object")));
@@ -693,7 +855,7 @@ impl Document {
         let decoded = match self.decode_stream_limited(&stream, MAX_OBJSTM_DECODED) {
             Ok(d) => d,
             // Say where the unsupported filter was met.
-            Err(Error::Unsupported(m)) if !self.is_encrypted() => {
+            Err(Error::Unsupported(m)) => {
                 return Err(Error::Unsupported(format!("{m} in an object stream")));
             }
             Err(e) => return Err(e),
@@ -741,9 +903,10 @@ impl Document {
 
     /// Decode the data of a stream through its filters (7.4). Only
     /// `FlateDecode` (with predictors) is supported; any other filter gives
-    /// [`Error::Unsupported`], and so does any stream of an encrypted file.
-    /// All the decoding a document does counts against one budget: past it,
-    /// this is [`Error::Limit`].
+    /// [`Error::Unsupported`]. The data of a stream read from an encrypted file
+    /// is already decrypted ([`Document::get`]); a stream of a locked file is
+    /// [`Error::PasswordRequired`]. All the decoding a document does counts
+    /// against one budget: past it, this is [`Error::Limit`].
     pub fn decode_stream(&self, s: &Stream) -> Result<Vec<u8>> {
         self.decode_stream_limited(s, MAX_DECODED_SIZE)
     }
@@ -751,8 +914,8 @@ impl Document {
     fn decode_stream_limited(&self, s: &Stream, limit: usize) -> Result<Vec<u8>> {
         // Cross-reference streams are never encrypted (7.5.8.2).
         let is_xref_stream = matches!(s.dict.get("Type"), Some(Object::Name(n)) if n == "XRef");
-        if self.is_encrypted() && !is_xref_stream {
-            return Err(encrypted_error());
+        if self.is_locked() && !is_xref_stream {
+            return Err(Error::PasswordRequired);
         }
         filter::decode_with_limit(&s.dict, &s.data, &|o| self.resolve(o), limit, 0, &self.budget)
     }
@@ -773,6 +936,24 @@ impl Document {
     /// Does the trailer have an `/Encrypt` entry (7.5.5)?
     pub fn is_encrypted(&self) -> bool {
         self.trailer.contains_key("Encrypt")
+    }
+
+    /// Is the file encrypted and not yet open: neither the empty password nor
+    /// the one given opened it? Only its structure can be read; strings and
+    /// streams are not decrypted, and nothing can be written from it.
+    pub fn is_locked(&self) -> bool {
+        self.security.as_ref().is_some_and(|s| !s.is_unlocked())
+    }
+
+    /// The file's encryption: method, revision, permissions, which password
+    /// opened it. `None` for a file that is not encrypted.
+    pub fn encryption(&self) -> Option<Encryption> {
+        self.security.as_ref().map(Security::describe)
+    }
+
+    /// The security state, for the writer and the tests.
+    pub fn security(&self) -> Option<&Security> {
+        self.security.as_ref()
     }
 
     /// Was the cross-reference table rebuilt by scanning the file?
@@ -1911,19 +2092,29 @@ mod tests {
         b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
         b.obj(3, "<< /Type /Page /MediaBox [0 0 1 1] /Contents 4 0 R >>");
         b.stream_obj(4, "", b"encrypted bytes");
-        b.obj(5, "<< /Filter /Standard /V 1 /R 2 /O (x) /U (y) /P -4 >>");
+        b.obj(5, &format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P -4 >>", "00".repeat(32), "11".repeat(32)));
         b.obj(6, "<< /Title (scrambled) >>");
         let doc = open(b.finish_classic(7, "/Root 1 0 R /Encrypt 5 0 R /Info 6 0 R /ID [<aa> <bb>]"));
         assert!(doc.is_encrypted());
+        assert!(doc.is_locked());
         assert!(!doc.was_repaired());
-        // Structure is readable; anything needing decryption is Unsupported.
+        // Structure is readable; anything needing decryption needs the password.
         assert_eq!(doc.page_count().unwrap(), 1);
         let Object::Stream(s) = doc.get(ObjRef::new(4, 0)).unwrap() else { panic!() };
-        match doc.decode_stream(&s) {
-            Err(Error::Unsupported(m)) => assert_eq!(m, "encrypted PDF"),
-            other => panic!("{other:?}"),
-        }
-        assert!(matches!(doc.info(), Err(Error::Unsupported(_))));
+        assert!(matches!(doc.decode_stream(&s), Err(Error::PasswordRequired)));
+        assert!(matches!(doc.info(), Err(Error::PasswordRequired)));
+        // A password that is wrong is refused when it is given.
+        let again = Document::from_bytes_with_password(
+            {
+                let mut b = PdfBuilder::new();
+                b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+                b.obj(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+                b.obj(3, &format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P -4 >>", "00".repeat(32), "11".repeat(32)));
+                b.finish_classic(4, "/Root 1 0 R /Encrypt 3 0 R /ID [<aa> <bb>]")
+            },
+            "not the password",
+        );
+        assert!(matches!(again, Err(Error::WrongPassword)));
     }
 
     #[test]
@@ -1931,15 +2122,15 @@ mod tests {
         // The catalog lives in an (encrypted, so unreadable) object stream.
         let mut b = PdfBuilder::new();
         let o5 = b.stream_obj(5, "/Type /ObjStm /N 1 /First 4", b"\x01\x02\x03\x04garbage");
-        let o6 = b.obj(6, "<< /Filter /Standard >>");
+        let o6 = b.obj(6, &format!("<< /Filter /Standard /V 1 /R 2 /O <{}> /U <{}> /P -4 >>", "00".repeat(32), "11".repeat(32)));
         let x = b.len();
         let row = |t: u8, a: usize| [t, (a >> 8) as u8, a as u8, 0];
         let rows: Vec<u8> = [row(2, 5), row(1, o5), row(1, o6), row(1, x)].concat();
         b.stream_obj(7, "/Type /XRef /Size 8 /W [1 2 1] /Index [1 1 5 3] /Root 1 0 R /Encrypt 6 0 R", &rows);
         b.startxref(x);
         let doc = open(b.finish());
-        assert!(doc.is_encrypted());
-        assert!(matches!(doc.page_count(), Err(Error::Unsupported(_))));
+        assert!(doc.is_encrypted() && doc.is_locked());
+        assert!(matches!(doc.page_count(), Err(Error::PasswordRequired)));
     }
 
     #[test]

@@ -16,7 +16,7 @@
 | `incremental` | 增量更新（多个 %%EOF） | 3 | 0.01 MB | 4 | 1.22 MB |
 | `linearized` | 线性化 | 0 | 0.00 MB | 5 | 0.05 MB |
 | `damaged` | 损坏/畸形 | 18 | 0.03 MB | 5 | 0.61 MB |
-| `encrypted` | 加密（只测检测） | 7 | 0.01 MB | 6 | 0.28 MB |
+| `encrypted` | 加密（检测、解密；另有 `qpdf-generated/` 30 个自己生成的，见下） | 7 | 0.01 MB | 6 | 0.28 MB |
 | `large` | 大页数 / 大文件 | 0 | 0.00 MB | 3 | 10.75 MB |
 | `cjk` | 中日韩（CJK） | 8 | 0.02 MB | 17 | 2.32 MB |
 | `pdf20` | PDF 2.0 | 9 | 0.05 MB | 2 | 1.27 MB |
@@ -25,6 +25,7 @@
 | `outline-form-attach` | 带书签/表单/附件（合并时要提示丢失） | 4 | 0.01 MB | 0 | 0.00 MB |
 | **合计** | | **65** | **0.18 MB** | **57** | **19.57 MB** |
 
+- 第 1.5 层又加了 `public/encrypted/qpdf-generated/` 的 30 个自己生成的加密文件（0.11 MB），上表的个数和合计没有算它们（中文组的文件也没有算，见 SOURCES-zh.md）。
 - 总共 122 个文件。public 0.18 MB（上限 50 MB），local 19.57 MB（上限 200 MB）。最大的单个文件是 issue3188.pdf（local/，7.75 MB），没有超过 30 MB 的。
 - **页数最多的是 `freeculture.pdf`，352 页**（`local/large/`）。扫完全部候选，≥300 页的只有这一个（≥100 页的也只有它）。
 - 来源分布：public 里 pdf.js 16 个、PDFium 42 个、pdf20examples 7 个；local 里 pdf.js 51 个、PDFium 6 个。
@@ -111,7 +112,7 @@
 | `trailer_unterminated.pdf` | [PDFium@84f950b](https://pdfium.googlesource.com/pdfium/+/84f950b4793b26b916db8853791f3475b826fdc7/testing/resources/trailer_unterminated.pdf) | PDFium 用自己的 `.in` 文本模板生成（BSD-3-Clause）；同目录有 trailer_unterminated.in | v1.7；1页；经典xref；损坏:mupdf需重建xref,pypdf严格模式失败；**trailer 字典没闭合** |
 | `xref_command_missing.pdf` | [pdf.js@17bb244](https://github.com/mozilla/pdf.js/blob/17bb2442fe53f348ee8e2e0b3e7c1c7d09468cd7/test/pdfs/xref_command_missing.pdf) | pdf.js 贡献者手写的合成测试文件，内容是自编标记文字（Apache-2.0；按提交记录和内容推断）；添加者 Jonas Jenwald 2015-10-01（192907e0d） | v1.7；1页；无可用xref；损坏:startxref偏移错,mupdf需重建xref,pypdf严格模式失败；**缺 xref 关键字** |
 
-#### `public/encrypted/` — 加密（只测检测）（7 个）
+#### `public/encrypted/` — 加密（7 个，打开密码见下）
 
 | 文件 | 来源（固定到提交） | 许可 / 放这里的原因 | 特征 |
 |---|---|---|---|
@@ -122,6 +123,21 @@
 | `encrypted_hello_world_r3_bad_okey.pdf` | [PDFium@84f950b](https://pdfium.googlesource.com/pdfium/+/84f950b4793b26b916db8853791f3475b826fdc7/testing/resources/encrypted_hello_world_r3_bad_okey.pdf) | PDFium 提交者手写的最小测试文件，无第三方内容（BSD-3-Clause；按提交记录和内容推断）；添加者 Lei Zhang 2019-12-18（d690c3d32） | v1.7；经典xref；加密 V2/R3 RC4；**V2/R3，/O 值被改坏** |
 | `encrypted_hello_world_r5.pdf` | [PDFium@84f950b](https://pdfium.googlesource.com/pdfium/+/84f950b4793b26b916db8853791f3475b826fdc7/testing/resources/encrypted_hello_world_r5.pdf) | PDFium 提交者手写的最小测试文件，无第三方内容（BSD-3-Clause；按提交记录和内容推断）；添加者 Lei Zhang 2019-01-14（b76e45126） | v1.7；页数:需密码才能读；经典xref；加密 V5/R5 AESV3；**V5/R5 AES-256（Adobe 扩展）** |
 | `encrypted_hello_world_r6.pdf` | [PDFium@84f950b](https://pdfium.googlesource.com/pdfium/+/84f950b4793b26b916db8853791f3475b826fdc7/testing/resources/encrypted_hello_world_r6.pdf) | PDFium 提交者手写的最小测试文件，无第三方内容（BSD-3-Clause；按提交记录和内容推断）；添加者 Lei Zhang 2019-01-14（b76e45126） | v1.7；页数:需密码才能读；经典xref；加密 V5/R6 AESV3；**V5/R6 AES-256（PDF 2.0）** |
+
+打开密码（第 1.5 层查到的；`crates/qingpdf-core/tests/common/mod.rs` 里的 `KNOWN` 是同一张表）：
+
+| 文件 | 用户密码 | 所有者密码 | 出处 |
+|---|---|---|---|
+| `encrypted_hello_world_r2.pdf`、`_r3.pdf`、`_r5.pdf`、`_r6.pdf` | `hôtel` | `âge` | PDFium 的 `cpdf_security_handler_embeddertest.cpp`（R2、R3 的文件用 Latin-1 写，R5、R6 用 UTF-8；两种我们都能开） |
+| `encrypted_hello_world_r2_bad_okey.pdf`、`_r3_bad_okey.pdf` | 没有能开的 | 没有能开的 | `/O` 被改坏了，PDFium 用它们测"不崩溃"；qpdf 和我们都说密码不对 |
+| `bug_644.pdf` | `a` | `b` | 用 qpdf 猜出来的（R5，xref 坏了，要先修复） |
+| `local/` 的 `bug900822.pdf`、`empty_protected.pdf`、`issue17215.pdf`、`issue19484_1.pdf` | 空密码 | 不知道 | pdf.js 清单里没写密码；`issue19484_1.pdf` 是 V4 加 5 字节 RC4 密钥，只有 pdf.js 和我们能开，qpdf、MuPDF、PDFium 开不了 |
+| `local/issue3371.pdf` | 不知道 | `ELXRTQWS` | pdf.js 的清单 |
+| `local/pr6531_1.pdf` | `asdfasdf` | `asdfasdf` | pdf.js 的清单；用户和所有者是同一个密码 |
+
+#### `public/encrypted/qpdf-generated/` — 自己生成的加密文件（30 个）
+
+我们自己做的，用 qpdf 12.4.2 把 `public/` 里的小文件加密得到（来源写在 `manifest.tsv` 的第 5 列）：许可证同来源文件（都是 `public/` 里的，可以再分发）。`generate.py` 是生成脚本，`manifest.tsv` 是清单（文件名、用户密码、所有者密码、另外能打开它的密码、来源、用途），测试读这张清单。覆盖：RC4 40 位（R2）、RC4 128 位（R3，和 V4 的 `/CF` RC4）、AES-128（R4）、AES-256（R5、R6），有无用户密码，几种权限（`--print=none`、`--modify=none`、`--extract=n`、`--assemble=n`、全部禁止），中文密码（R6 的用户和所有者密码；R4 的 UTF-8 字节），超过 32 字节的密码，全角写法的密码（`ＡＢＣ１２３` 对应 `ABC123`，靠轻量 SASLprep 打开），`--cleartext-metadata`（`/EncryptMetadata false`），所有者密码也为空，带签名字典、表单、嵌入文件的文件，带对象流和交叉引用流的文件。这些密码是为测试编的。`python generate.py` 重新生成（每次的 `/ID` 和密钥不同，文件内容会变，清单不变）。
 
 #### `public/cjk/` — 中日韩（CJK）（8 个）
 
@@ -230,7 +246,7 @@
 | `scan-bad.pdf` | [pdf.js@17bb244](https://github.com/mozilla/pdf.js/blob/17bb2442fe53f348ee8e2e0b3e7c1c7d09468cd7/test/pdfs/scan-bad.pdf) | pdf.js 仓库里的文件，来源/许可不明（多半来自 bug 报告或第三方文档） | v1.3；1页；经典xref；损坏:缺%%EOF(截断),尾部截断,mupdf需重建xref；**截断：没有 startxref 和 %%EOF** |
 | `text_font.pdf` | [PDFium@84f950b](https://pdfium.googlesource.com/pdfium/+/84f950b4793b26b916db8853791f3475b826fdc7/testing/resources/text_font.pdf) | PDFium 仓库里非 `.in` 生成的文件，由 Acrobat/Word 等工具产生，来源不明；添加者 Miklos Vajna 2018-08-01（53d4f0a45） | v1.5；1页；经典xref；损坏:xref偏移错；Producer:LibreOfficeDev 6.2；**LibreOffice 生成；xref 偏移错** |
 
-#### `local/encrypted/` — 加密（只测检测）（6 个）
+#### `local/encrypted/` — 加密（6 个，打开密码见下）
 
 | 文件 | 来源（固定到提交） | 许可 / 放这里的原因 | 特征 |
 |---|---|---|---|
@@ -311,7 +327,7 @@
 - **线性化**：public 里没有线性化的纯净样本（只有 `public/xref-stream-objstm/bug_757705.pdf` 恰好也是线性化）；其余线性化文件都是 Acrobat 等工具产物，只能放 local。
 - **xref 流 / 对象流 / 混合 xref**：public 里 xref 流/对象流只有 1 个（`bug_757705.pdf`）；混合 xref 在 public 里**没有真正可用的**，`bug_1324503.pdf` 的 `/XRefStm` 是 -1，是个坏文件。真实工具产物（Word、Acrobat、pdfTeX 等）的混合/xref 流文件全在 local。
 - **增量更新**：public 只有 2~3 个 `%%EOF` 的签名类文件和 PDF 2.0 的增量示例；local 有 `comments.pdf`（12 个 `%%EOF`）。缺“反复编辑、有被删除对象、`/Prev` 链很长”的公开样本。
-- **加密**：public 的 6 个 `encrypted_hello_world_*` 能测检测，但不知道打开密码；V4（AESV2）、V5/R6 的真实文档只在 local。缺 `/EncryptMetadata false`、`/Identity` 加密过滤器的样本。
+- **加密**：打开密码都查到了（上面的表）；V4（AESV2）、V5/R6 的真实文档仍然只在 local。`qpdf-generated/` 补上了各种方式、权限、中文密码、`/EncryptMetadata false`；`/Identity` 加密过滤器和流自己的 `/Crypt` 过滤器 qpdf 生成不出来，测试里改生成文件的字节来做。缺别的软件（Acrobat、Word、WPS）生成的 V4/R6 文件的公开样本。
 - **大文件**：最大 7.75 MB（`issue3188.pdf`）。缺 >30 MB 的文件和 >10 万对象的文件，压力测试得自己造。
 - **书签/表单/附件**：`public/outline-form-attach/` 只放了 4 个很小的文件，够测“合并时提示丢失了什么”，但没有带真实多级书签的大文件。
 

@@ -7,7 +7,7 @@
 #[path = "../../qingpdf-core/tests/common/mod.rs"]
 mod common;
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -426,8 +426,15 @@ fn errors_give_exit_code_1_and_a_clear_message() {
     assert!(!o.exists());
 }
 
+/// One of the generated encrypted files, by part of its name.
+fn generated(part: &str) -> common::Encrypted {
+    common::generated().into_iter().find(|r| r.path.to_string_lossy().contains(part)).expect("a generated file")
+}
+
 #[test]
-fn encrypted_files_are_refused_clearly_but_info_still_reports() {
+fn encrypted_files_need_their_password_and_say_so() {
+    // PDFium's file: user password "hôtel" (the accent is why this goes through
+    // the command line as text).
     let encrypted = corpus("encrypted/encrypted_hello_world_r2.pdf");
     let dir = common::fresh_out_dir("cli-encrypted");
     let o = dir.join("o.pdf");
@@ -440,21 +447,173 @@ fn encrypted_files_are_refused_clearly_but_info_still_reports() {
         vec!["delete".as_ref(), encrypted.as_os_str(), "--pages".as_ref(), "1".as_ref(), "-o".as_ref(), o.as_os_str()],
         vec!["rotate".as_ref(), encrypted.as_os_str(), "--angle".as_ref(), "90".as_ref(), "-o".as_ref(), o.as_os_str()],
         vec!["split".as_ref(), encrypted.as_os_str(), "--every".as_ref(), "1".as_ref(), "-o".as_ref(), template.as_os_str()],
+        vec!["decrypt".as_ref(), encrypted.as_os_str(), "-o".as_ref(), o.as_os_str()],
     ];
-    for args in attempts {
-        let out = run(&args);
+    for args in &attempts {
+        // No password: "needs a password", with the file's name, exit 1, nothing written.
+        let out = run(args);
         assert_eq!(code(&out), 1, "{args:?}");
         let message = stderr(&out);
-        assert!(message.contains("is encrypted") && message.contains("not supported yet"), "{message}");
-        assert!(message.contains("encrypted_hello_world_r2.pdf"), "{message}");
+        assert!(message.contains("needs a password") && message.contains("encrypted_hello_world_r2.pdf"), "{message}");
+        // A wrong password: "wrong password", and the password is not repeated.
+        let mut wrong: Vec<&OsStr> = args.clone();
+        wrong.extend([OsStr::new("--password"), OsStr::new("hunter2-not-it")]);
+        let out = run(&wrong);
+        assert_eq!(code(&out), 1, "{args:?}");
+        let message = stderr(&out);
+        assert!(message.contains("wrong password") && message.contains("encrypted_hello_world_r2.pdf"), "{message}");
+        assert!(!message.contains("hunter2") && !stdout(&out).contains("hunter2"), "the password was printed: {message}");
     }
     assert!(!o.exists());
-    // info works: structure is readable.
+    // info works without the password: the structure is readable, the rest is said to be locked.
     let out = run([OsStr::new("info"), encrypted.as_os_str()]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let text = stdout(&out);
     assert!(text.contains("Encrypted:           yes"), "{text}");
     assert!(text.contains("Pages:               1"), "{text}");
+    assert!(text.contains("Encryption:          RC4 40-bit (V1, R2)"), "{text}");
+    assert!(text.contains("Password to open:    needed (none was given; use --password)"), "{text}");
+    assert!(text.contains("print: no") && text.contains("fill in form fields: no"), "{text}");
+    // With the password everything works and the result is still encrypted the same way.
+    let with_password = |extra: &[&str]| -> Vec<OsString> {
+        let mut v: Vec<OsString> = Vec::new();
+        v.extend(extra.iter().map(OsString::from));
+        v.extend([OsString::from("--password"), OsString::from("hôtel")]);
+        v
+    };
+    let out = run(with_password(&["split", encrypted.to_str().unwrap(), "--pages", "1", "-o", o.to_str().unwrap()]));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&run([OsStr::new("info"), o.as_os_str(), "--password".as_ref(), "hôtel".as_ref()]));
+    assert!(text.contains("Encryption:          RC4 40-bit (V1, R2)") && text.contains("opened with the user password"), "{text}");
+    let out = run(with_password(&["merge", seven.to_str().unwrap(), encrypted.to_str().unwrap(), "-o", o.to_str().unwrap(), "--force"]));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stderr(&out).contains("encryption was not carried over"), "the first file is not encrypted: {}", stderr(&out));
+    assert!(stdout(&run([OsStr::new("info"), o.as_os_str()])).contains("Pages:               8"));
+}
+
+#[test]
+fn the_password_works_for_chinese_and_every_command() {
+    let chinese = generated("vertical.r6-aes256-user-chinese");
+    let dir = common::fresh_out_dir("cli-encrypted-chinese");
+    let outputs = [
+        ("split", vec!["--pages", "1"]),
+        ("delete", vec!["--pages", "1"]),
+        ("rotate", vec!["--angle", "90"]),
+    ];
+    let qpdf = common::find_qpdf();
+    for (i, (command, extra)) in outputs.iter().enumerate() {
+        let o = dir.join(format!("{command}.pdf"));
+        let mut args: Vec<OsString> = vec![OsString::from(*command), chinese.path.clone().into_os_string()];
+        args.extend(extra.iter().map(OsString::from));
+        // Deleting the only page of a one-page file is refused; the others work.
+        args.extend([OsString::from("-o"), o.clone().into_os_string(), OsString::from("--password"), OsString::from(&chinese.user)]);
+        let out = run(&args);
+        if *command == "delete" {
+            let pages = encrypted_page_count(&chinese.path, &chinese.user);
+            if pages == 1 {
+                assert_eq!(code(&out), 1);
+                continue;
+            }
+        }
+        assert_eq!(code(&out), 0, "{command}: {}", stderr(&out));
+        let shown = stdout(&run([OsStr::new("info"), o.as_os_str(), OsStr::new("--password"), OsStr::new(&chinese.user)]));
+        assert!(shown.contains("AES-256 (V5, R6)") && shown.contains("opened with the user password"), "{shown}");
+        if let Some(qpdf) = &qpdf {
+            let verdict = common::qpdf_check_pw(qpdf, &o, &chinese.user);
+            assert!(verdict.code == 0 || verdict.code == 3, "{command} {i}: {}", verdict.text);
+            let theirs = common::qpdf_encryption(qpdf, &o, &chinese.user).expect("qpdf opens it with the same password");
+            let original = common::qpdf_encryption(qpdf, &chinese.path, &chinese.user).unwrap();
+            assert_eq!((theirs.revision, theirs.permissions, &theirs.key), (original.revision, original.permissions, &original.key));
+        }
+    }
+    // The owner password (Chinese too) opens it as the owner.
+    let shown = stdout(&run([
+        OsStr::new("info"),
+        chinese.path.as_os_str(),
+        OsStr::new("--password"),
+        OsStr::new(&chinese.owner),
+    ]));
+    assert!(shown.contains("opened with the owner password"), "{shown}");
+}
+
+/// The page count of an encrypted file, through the library.
+fn encrypted_page_count(path: &Path, password: &str) -> usize {
+    qingpdf_core::Document::open_with_password(path, password).unwrap().page_count().unwrap()
+}
+
+#[test]
+fn decrypt_writes_a_plain_copy_only_for_the_owner_or_when_everything_is_allowed() {
+    let dir = common::fresh_out_dir("cli-decrypt");
+    // Everything is allowed (only the user password is set): the user password is enough.
+    let open_file = generated("bookmarks.r4-aes128-user-assemble-n");
+    // ... but this one does not allow assembling.
+    let o = dir.join("plain.pdf");
+    let out = run([
+        OsStr::new("decrypt"),
+        open_file.path.as_os_str(),
+        OsStr::new("-o"),
+        o.as_os_str(),
+        OsStr::new("--password"),
+        OsStr::new(&open_file.user),
+    ]);
+    assert_eq!(code(&out), 1);
+    let message = stderr(&out);
+    assert!(message.contains("owner password") && message.contains("assemble"), "{message}");
+    assert!(!o.exists());
+    // The owner password does it.
+    let out = run([
+        OsStr::new("decrypt"),
+        open_file.path.as_os_str(),
+        OsStr::new("-o"),
+        o.as_os_str(),
+        OsStr::new("--password"),
+        OsStr::new(&open_file.owner),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).starts_with("wrote "), "{}", stdout(&out));
+    let text = stdout(&run([OsStr::new("info"), o.as_os_str()]));
+    assert!(text.contains("Encrypted:           no") && text.contains("Pages:               2"), "{text}");
+    if let Some(qpdf) = common::find_qpdf() {
+        assert_eq!(common::qpdf_check(&qpdf, &o).code, 0);
+    }
+    // A file whose permissions allow everything: the user password is enough.
+    let everything = generated("r2-40-user");
+    let o2 = dir.join("plain2.pdf");
+    let out = run([
+        OsStr::new("decrypt"),
+        everything.path.as_os_str(),
+        OsStr::new("-o"),
+        o2.as_os_str(),
+        OsStr::new("--password"),
+        OsStr::new(&everything.user),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    // The output is not overwritten without --force, and not an input.
+    let out = run([OsStr::new("decrypt"), everything.path.as_os_str(), OsStr::new("-o"), o2.as_os_str(), OsStr::new("--password"), OsStr::new(&everything.user)]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("already exists"), "{}", stderr(&out));
+    let out = run([OsStr::new("decrypt"), o2.as_os_str(), OsStr::new("-o"), dir.join("again.pdf").as_os_str()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("not encrypted"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_password_on_an_unencrypted_file_does_no_harm() {
+    let dir = common::fresh_out_dir("cli-password-unneeded");
+    let plain = corpus("xref-classic/hello_world_2_pages.pdf");
+    let o = dir.join("o.pdf");
+    let out = run([
+        OsStr::new("split"),
+        plain.as_os_str(),
+        OsStr::new("--pages"),
+        OsStr::new("1"),
+        OsStr::new("-o"),
+        o.as_os_str(),
+        OsStr::new("--password"),
+        OsStr::new("not needed"),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&run([OsStr::new("info"), o.as_os_str()])).contains("Encrypted:           no"));
 }
 
 #[test]

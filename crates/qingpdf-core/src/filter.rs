@@ -103,17 +103,11 @@ pub fn decode_with_limit(
                 let inflated = inflate_zlib(input, limit, hint, budget)?;
                 apply_predictor(inflated, parm, resolve)?
             }
-            // 7.4.10: the Identity crypt filter (the default) leaves data as is.
-            b"Crypt" => {
-                let identity = match parm.and_then(|p| p.get("Name")) {
-                    None => true,
-                    Some(obj) => matches!(resolve(obj)?, Object::Name(n) if n == "Identity"),
-                };
-                if !identity {
-                    return Err(Error::Unsupported("Crypt filter".to_string()));
-                }
-                input.to_vec()
-            }
+            // 7.4.10: a Crypt filter says how the stream is encrypted, which
+            // is undone when the stream is read from an encrypted file (the
+            // Identity filter, the default, means it was not encrypted). What
+            // is left to decode here is the same either way.
+            b"Crypt" => input.to_vec(),
             other => {
                 return Err(Error::Unsupported(format!("{} filter", String::from_utf8_lossy(other))));
             }
@@ -546,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn crypt_identity_is_a_no_op() {
+    fn crypt_filters_are_a_no_op_here() {
         let d = dict(vec![("Filter", Object::from("Crypt"))]);
         assert_eq!(decode_direct(&d, b"abc").unwrap(), b"abc");
         let d = dict(vec![
@@ -558,7 +552,8 @@ mod tests {
             ("Filter", Object::from("Crypt")),
             ("DecodeParms", Object::Dict(dict(vec![("Name", Object::from("StdCF"))]))),
         ]);
-        assert!(matches!(decode_direct(&d, b"abc"), Err(Error::Unsupported(_))));
+        // The document decrypted the stream when it read it.
+        assert_eq!(decode_direct(&d, b"abc").unwrap(), b"abc");
     }
 
     #[test]

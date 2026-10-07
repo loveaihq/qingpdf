@@ -13,12 +13,20 @@ pub enum Command {
     Split,
     Delete,
     Rotate,
+    Decrypt,
     Img2pdf,
 }
 
 impl Command {
-    pub const ALL: [Command; 6] =
-        [Command::Info, Command::Merge, Command::Split, Command::Delete, Command::Rotate, Command::Img2pdf];
+    pub const ALL: [Command; 7] = [
+        Command::Info,
+        Command::Merge,
+        Command::Split,
+        Command::Delete,
+        Command::Rotate,
+        Command::Decrypt,
+        Command::Img2pdf,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -27,6 +35,7 @@ impl Command {
             Command::Split => "split",
             Command::Delete => "delete",
             Command::Rotate => "rotate",
+            Command::Decrypt => "decrypt",
             Command::Img2pdf => "img2pdf",
         }
     }
@@ -39,12 +48,13 @@ impl Command {
 /// What the user asked for, checked for completeness.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    Info { input: PathBuf },
-    Merge { inputs: Vec<PathBuf>, output: PathBuf, force: bool },
-    SplitPages { input: PathBuf, pages: String, output: PathBuf, force: bool },
-    SplitEvery { input: PathBuf, every: usize, output: PathBuf, force: bool },
-    Delete { input: PathBuf, pages: String, output: PathBuf, force: bool },
-    Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool },
+    Info { input: PathBuf, password: String },
+    Merge { inputs: Vec<PathBuf>, output: PathBuf, force: bool, password: String },
+    SplitPages { input: PathBuf, pages: String, output: PathBuf, force: bool, password: String },
+    SplitEvery { input: PathBuf, every: usize, output: PathBuf, force: bool, password: String },
+    Delete { input: PathBuf, pages: String, output: PathBuf, force: bool, password: String },
+    Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool, password: String },
+    Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
 }
 
@@ -77,16 +87,20 @@ struct Allowed {
     every: bool,
     angle: bool,
     page: bool,
+    /// `--password`: every command that reads a PDF file.
+    password: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
-    let none = Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false };
+    let none =
+        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, password: false };
     match c {
-        Command::Info => none,
-        Command::Merge => Allowed { output: true, force: true, ..none },
-        Command::Split => Allowed { output: true, force: true, pages: true, every: true, ..none },
-        Command::Delete => Allowed { output: true, force: true, pages: true, ..none },
-        Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, ..none },
+        Command::Info => Allowed { password: true, ..none },
+        Command::Merge => Allowed { output: true, force: true, password: true, ..none },
+        Command::Split => Allowed { output: true, force: true, pages: true, every: true, password: true, ..none },
+        Command::Delete => Allowed { output: true, force: true, pages: true, password: true, ..none },
+        Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
+        Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
     }
 }
@@ -101,6 +115,7 @@ struct Collected {
     every: Option<String>,
     angle: Option<String>,
     page: Option<String>,
+    password: Option<String>,
 }
 
 fn text(value: OsString, option: &str, command: Command) -> Result<String, UsageError> {
@@ -162,6 +177,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--every" if ok.every => {}
             "--angle" if ok.angle => {}
             "--page" if ok.page => {}
+            "--password" if ok.password => {}
             "--force" if ok.force => {
                 if inline.is_some() {
                     return Err(usage(c, "--force does not take a value"));
@@ -169,7 +185,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 got.force = true;
                 continue;
             }
-            _ => return Err(usage(c, format!("unknown option '{name}' for '{}'", command.name()))),
+            _ => {
+                // Show the option, never what was given with it: that may be a password.
+                let shown = name.split('=').next().unwrap_or("");
+                return Err(usage(c, format!("unknown option '{shown}' for '{}'", command.name())));
+            }
         }
         let value = match inline {
             Some(v) => OsString::from(v),
@@ -197,6 +217,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                     return Err(slot_taken("--angle"));
                 }
             }
+            "--password" => {
+                if got.password.replace(text(value, "--password", command)?).is_some() {
+                    return Err(slot_taken("--password"));
+                }
+            }
             _ => {
                 if got.page.replace(text(value, "--page", command)?).is_some() {
                     return Err(slot_taken("--page"));
@@ -209,7 +234,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, pages, every, angle, page } = got;
+    let Collected { mut inputs, output, force, pages, every, angle, page, password } = got;
+    let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
             1 => Ok(inputs.remove(0)),
@@ -219,12 +245,12 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     };
     let need_output = |output: Option<PathBuf>| output.ok_or_else(|| usage(c, "-o <output file> is required"));
     match command {
-        Command::Info => Ok(Request::Info { input: one_input(&mut inputs)? }),
+        Command::Info => Ok(Request::Info { input: one_input(&mut inputs)?, password }),
         Command::Merge => {
             if inputs.len() < 2 {
                 return Err(usage(c, "merge needs at least two input files"));
             }
-            Ok(Request::Merge { inputs, output: need_output(output)?, force })
+            Ok(Request::Merge { inputs, output: need_output(output)?, force, password })
         }
         Command::Split => {
             let input = one_input(&mut inputs)?;
@@ -232,7 +258,7 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
             match (pages, every) {
                 (Some(_), Some(_)) => Err(usage(c, "use either --pages or --every, not both")),
                 (None, None) => Err(usage(c, "split needs --pages <list> or --every <N>")),
-                (Some(pages), None) => Ok(Request::SplitPages { input, pages, output, force }),
+                (Some(pages), None) => Ok(Request::SplitPages { input, pages, output, force, password }),
                 (None, Some(n)) => {
                     let every = n
                         .parse::<usize>()
@@ -242,7 +268,7 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                     if !output.to_str().is_some_and(|o| o.contains("%d")) {
                         return Err(usage(c, "with --every the output name must contain %d (for example out_%d.pdf)"));
                     }
-                    Ok(Request::SplitEvery { input, every, output, force })
+                    Ok(Request::SplitEvery { input, every, output, force, password })
                 }
             }
         }
@@ -250,7 +276,7 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
             let input = one_input(&mut inputs)?;
             let output = need_output(output)?;
             let pages = pages.ok_or_else(|| usage(c, "delete needs --pages <list>"))?;
-            Ok(Request::Delete { input, pages, output, force })
+            Ok(Request::Delete { input, pages, output, force, password })
         }
         Command::Rotate => {
             let input = one_input(&mut inputs)?;
@@ -261,7 +287,11 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 .ok()
                 .filter(|a| a % 90 == 0)
                 .ok_or_else(|| usage(c, format!("--angle must be a multiple of 90 (such as 90, 180, 270 or -90), not '{angle}'")))?;
-            Ok(Request::Rotate { input, pages, angle, output, force })
+            Ok(Request::Rotate { input, pages, angle, output, force, password })
+        }
+        Command::Decrypt => {
+            let input = one_input(&mut inputs)?;
+            Ok(Request::Decrypt { input, output: need_output(output)?, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {
@@ -316,26 +346,60 @@ mod tests {
 
     #[test]
     fn every_command_in_its_documented_form() {
-        assert_eq!(run(&["info", "a.pdf"]), Request::Info { input: "a.pdf".into() });
+        assert_eq!(run(&["info", "a.pdf"]), Request::Info { input: "a.pdf".into(), password: String::new() });
         assert_eq!(
             run(&["merge", "a.pdf", "b.pdf", "c.pdf", "-o", "out.pdf"]),
-            Request::Merge { inputs: vec!["a.pdf".into(), "b.pdf".into(), "c.pdf".into()], output: "out.pdf".into(), force: false }
+            Request::Merge {
+                inputs: vec!["a.pdf".into(), "b.pdf".into(), "c.pdf".into()],
+                output: "out.pdf".into(),
+                force: false,
+                password: String::new()
+            }
         );
         assert_eq!(
             run(&["split", "a.pdf", "--pages", "1-3,5", "-o", "out.pdf"]),
-            Request::SplitPages { input: "a.pdf".into(), pages: "1-3,5".into(), output: "out.pdf".into(), force: false }
+            Request::SplitPages {
+                input: "a.pdf".into(),
+                pages: "1-3,5".into(),
+                output: "out.pdf".into(),
+                force: false,
+                password: String::new()
+            }
         );
         assert_eq!(
             run(&["split", "a.pdf", "--every", "10", "-o", "out_%d.pdf", "--force"]),
-            Request::SplitEvery { input: "a.pdf".into(), every: 10, output: "out_%d.pdf".into(), force: true }
+            Request::SplitEvery {
+                input: "a.pdf".into(),
+                every: 10,
+                output: "out_%d.pdf".into(),
+                force: true,
+                password: String::new()
+            }
         );
         assert_eq!(
             run(&["delete", "a.pdf", "--pages", "2,4-6", "-o", "out.pdf"]),
-            Request::Delete { input: "a.pdf".into(), pages: "2,4-6".into(), output: "out.pdf".into(), force: false }
+            Request::Delete {
+                input: "a.pdf".into(),
+                pages: "2,4-6".into(),
+                output: "out.pdf".into(),
+                force: false,
+                password: String::new()
+            }
         );
         assert_eq!(
             run(&["rotate", "a.pdf", "--pages", "1-3", "--angle", "90", "-o", "out.pdf"]),
-            Request::Rotate { input: "a.pdf".into(), pages: Some("1-3".into()), angle: 90, output: "out.pdf".into(), force: false }
+            Request::Rotate {
+                input: "a.pdf".into(),
+                pages: Some("1-3".into()),
+                angle: 90,
+                output: "out.pdf".into(),
+                force: false,
+                password: String::new()
+            }
+        );
+        assert_eq!(
+            run(&["decrypt", "a.pdf", "-o", "out.pdf", "--password", "s3cret"]),
+            Request::Decrypt { input: "a.pdf".into(), output: "out.pdf".into(), force: false, password: "s3cret".into() }
         );
         assert_eq!(
             run(&["img2pdf", "1.jpg", "2.png", "-o", "out.pdf"]),
@@ -348,19 +412,67 @@ mod tests {
     fn options_may_be_anywhere_and_take_equals() {
         assert_eq!(
             run(&["rotate", "--angle=-90", "a.pdf", "--output=o.pdf"]),
-            Request::Rotate { input: "a.pdf".into(), pages: None, angle: -90, output: "o.pdf".into(), force: false }
+            Request::Rotate {
+                input: "a.pdf".into(),
+                pages: None,
+                angle: -90,
+                output: "o.pdf".into(),
+                force: false,
+                password: String::new()
+            }
         );
         assert_eq!(
             run(&["delete", "--pages", "1", "-o", "o.pdf", "a.pdf"]),
-            Request::Delete { input: "a.pdf".into(), pages: "1".into(), output: "o.pdf".into(), force: false }
+            Request::Delete {
+                input: "a.pdf".into(),
+                pages: "1".into(),
+                output: "o.pdf".into(),
+                force: false,
+                password: String::new()
+            }
         );
         // A value that starts with '-' is still the value.
         assert!(matches!(run(&["rotate", "a.pdf", "--angle", "-90", "-o", "o.pdf"]), Request::Rotate { angle: -90, .. }));
         // `--` ends the options; `-` alone is a file name.
         assert_eq!(
             run(&["info", "--", "-weird.pdf"]),
-            Request::Info { input: "-weird.pdf".into() }
+            Request::Info { input: "-weird.pdf".into(), password: String::new() }
         );
+    }
+
+    #[test]
+    fn the_password_is_an_option_of_every_command_that_reads_a_pdf() {
+        for args in [
+            &["info", "a.pdf", "--password", "pw"][..],
+            &["merge", "a.pdf", "b.pdf", "-o", "o.pdf", "--password=pw"],
+            &["split", "a.pdf", "--pages", "1", "-o", "o.pdf", "--password", "pw"],
+            &["split", "a.pdf", "--every", "1", "-o", "o_%d.pdf", "--password", "pw"],
+            &["delete", "a.pdf", "--pages", "1", "-o", "o.pdf", "--password", "pw"],
+            &["rotate", "a.pdf", "--angle", "90", "-o", "o.pdf", "--password", "pw"],
+            &["decrypt", "a.pdf", "-o", "o.pdf", "--password", "pw"],
+        ] {
+            match run(args) {
+                Request::Info { password, .. }
+                | Request::Merge { password, .. }
+                | Request::SplitPages { password, .. }
+                | Request::SplitEvery { password, .. }
+                | Request::Delete { password, .. }
+                | Request::Rotate { password, .. }
+                | Request::Decrypt { password, .. } => assert_eq!(password, "pw", "{args:?}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // An empty password is allowed (it is what is tried first anyway); images have none.
+        assert!(matches!(run(&["info", "a.pdf", "--password", ""]), Request::Info { password, .. } if password.is_empty()));
+        assert!(fails(&["img2pdf", "a.png", "-o", "o.pdf", "--password", "x"]).contains("unknown option '--password'"));
+        assert!(fails(&["info", "a.pdf", "--password"]).contains("needs a value"));
+        assert!(fails(&["info", "a.pdf", "--password", "a", "--password", "b"]).contains("more than once"));
+        assert!(fails(&["decrypt", "a.pdf"]).contains("-o"));
+        // What is wrong with the command line is shown, a password given with it is not.
+        let message = fails(&["info", "a.pdf", "-p=topsecret"]);
+        assert!(!message.contains("topsecret"), "{message}");
+        let message = fails(&["info", "a.pdf", "--passwrd=topsecret"]);
+        assert!(message.contains("--passwrd") && !message.contains("topsecret"), "{message}");
     }
 
     #[test]

@@ -8,6 +8,10 @@
 //! caller imports ends up in the file.
 //!
 //! The output uses a classic cross-reference table and no object streams.
+//!
+//! A file that was encrypted can be written encrypted again ([`Builder::keep_encryption_of`]):
+//! the same encryption dictionary and key, every string and stream encrypted
+//! afresh under the number it gets in the new file (7.6.2).
 
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -22,6 +26,7 @@ use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::lexer::is_delimiter;
 use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, Stream};
+use crate::security::{ObjectCrypt, OutputCrypt};
 
 /// A thing the user should know about the result (something was dropped, say).
 /// Never an error: the output is valid.
@@ -185,10 +190,12 @@ pub fn format_real(v: f64) -> Result<String> {
 /// must be an indirect object), so one here is an error. Dictionary entries
 /// whose value is null are left out (7.3.7: same as absent).
 pub fn write_object(out: &mut Vec<u8>, obj: &Object) -> Result<()> {
-    write_depth(out, obj, 0)
+    write_depth(out, obj, 0, None)
 }
 
-fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
+/// `enc`, when given, encrypts the strings (always written in hexadecimal then:
+/// the bytes are random, and a literal string would be four times as long).
+fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize, enc: Option<&ObjectCrypt<'_>>) -> Result<()> {
     if depth > MAX_WRITE_DEPTH {
         return Err(Error::Limit("objects nested too deeply to write".to_string()));
     }
@@ -203,6 +210,13 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
             push_number(out, i.unsigned_abs());
         }
         Object::Real(r) => out.extend_from_slice(format_real(*r)?.as_bytes()),
+        Object::String(PdfString { bytes, .. }) if enc.is_some_and(ObjectCrypt::encrypts_strings) => {
+            let encrypted = match enc {
+                Some(e) => e.encrypt_string(bytes)?,
+                None => bytes.clone(),
+            };
+            write_hex_string(out, &encrypted);
+        }
         Object::String(PdfString { bytes, hex: true }) => write_hex_string(out, bytes),
         Object::String(PdfString { bytes, hex: false }) => write_literal_string(out, bytes),
         Object::Name(n) => write_name(out, n),
@@ -212,11 +226,11 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
                 if i > 0 {
                     out.push(b' ');
                 }
-                write_depth(out, item, depth + 1)?;
+                write_depth(out, item, depth + 1, enc)?;
             }
             out.push(b']');
         }
-        Object::Dict(d) => write_dict(out, d, None, depth)?,
+        Object::Dict(d) => write_dict(out, d, None, depth, enc)?,
         Object::Stream(_) => {
             return Err(Error::Invalid("a stream cannot be written as a direct object".to_string()));
         }
@@ -232,8 +246,10 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize) -> Result<()> {
 
 /// `<< /Key value ... >>`, skipping null values and, when `skip` is given, the
 /// entry with that key.
-fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize) -> Result<()> {
+fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize, enc: Option<&ObjectCrypt<'_>>) -> Result<()> {
     out.extend_from_slice(b"<<");
+    // The contents of a signature are not encrypted (they are the signature).
+    let signature = matches!(d.get("ByteRange"), Some(Object::Array(_)));
     for (key, value) in d.iter() {
         if matches!(value, Object::Null) || skip.is_some_and(|s| key == s) {
             continue;
@@ -241,7 +257,8 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize) -> 
         out.push(b' ');
         write_name(out, key);
         out.push(b' ');
-        write_depth(out, value, depth + 1)?;
+        let enc = if signature && key == "Contents" { None } else { enc };
+        write_depth(out, value, depth + 1, enc)?;
     }
     out.extend_from_slice(b" >>");
     Ok(())
@@ -250,7 +267,7 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize) -> 
 /// `n 0 obj ... endobj` (7.3.10). For a stream (7.3.8) the `/Length` entry is
 /// replaced by the real length of the data as a direct integer, and the data
 /// is written as it is: still encoded, `Filter` and `DecodeParms` untouched.
-fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
+fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object, enc: Option<&ObjectCrypt<'_>>) -> Result<()> {
     push_number(out, u64::from(num));
     out.extend_from_slice(b" 0 obj\n");
     match obj {
@@ -263,18 +280,31 @@ fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
                 out.push(b' ');
                 write_name(out, key);
                 out.push(b' ');
-                write_depth(out, value, 1)?;
+                write_depth(out, value, 1, enc)?;
             }
+            // An encrypted stream is longer than its data (7.6.2: the AES
+            // vector and padding), and /Length says how long it is in the file.
+            let plan = match enc {
+                Some(e) => e.stream_plan(dict)?,
+                None => None,
+            };
+            let length = match &plan {
+                Some(plan) => ObjectCrypt::encrypted_len(plan, data.len()),
+                None => data.len(),
+            };
             out.extend_from_slice(b" /Length ");
-            push_number(out, u64::try_from(data.len()).unwrap_or(u64::MAX));
+            push_number(out, u64::try_from(length).unwrap_or(u64::MAX));
             out.extend_from_slice(b" >>\nstream\n");
-            out.extend_from_slice(data);
+            match (&plan, enc) {
+                (Some(plan), Some(e)) => e.encrypt_stream(plan, data, out)?,
+                _ => out.extend_from_slice(data),
+            }
             // 7.3.8.1: an end-of-line before `endstream`, not counted in
             // /Length. "Should" in the standard, required by PDF/A (ISO 19005
             // 6.1.7), and a byte per stream.
             out.extend_from_slice(b"\nendstream");
         }
-        other => write_depth(out, other, 0)?,
+        other => write_depth(out, other, 0, enc)?,
     }
     out.extend_from_slice(b"\nendobj\n");
     Ok(())
@@ -335,6 +365,14 @@ pub struct Builder<'a> {
     pending: Vec<Pending>,
     unreadable: Vec<String>,
     unreadable_total: usize,
+    /// Encrypt what is written ([`Builder::keep_encryption_of`]), and the
+    /// source whose encryption that is.
+    crypt: Option<OutputCrypt>,
+    crypt_source: Option<usize>,
+    /// The metadata stream of the catalog, as (source, object number), and
+    /// its number in the output once it is imported.
+    root_metadata: Option<(usize, u32)>,
+    root_metadata_out: Option<u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -357,7 +395,30 @@ impl<'a> Builder<'a> {
             pending: Vec::new(),
             unreadable: Vec::new(),
             unreadable_total: 0,
+            crypt: None,
+            crypt_source: None,
+            root_metadata: None,
+            root_metadata_out: None,
         }
+    }
+
+    /// Write the file encrypted the way `source` was: the same encryption
+    /// dictionary and key (so the same passwords and permissions), with every
+    /// string and stream encrypted again under its new object number. Nothing
+    /// happens if the source is not encrypted. Streams that come from other
+    /// sources are encrypted too, whatever their own encryption was.
+    pub fn keep_encryption_of(&mut self, source: usize) {
+        let crypt = self.sources.get(source).and_then(|s| s.doc.security()).and_then(OutputCrypt::new);
+        if crypt.is_some() {
+            self.crypt = crypt;
+            self.crypt_source = Some(source);
+        }
+    }
+
+    /// Say that object `num` of `source` is the catalog's metadata stream,
+    /// which an encryption that leaves metadata in the clear does not encrypt.
+    pub fn mark_root_metadata(&mut self, source: usize, num: u32) {
+        self.root_metadata = Some((source, num));
     }
 
     /// The PDF version the header will say.
@@ -478,7 +539,8 @@ impl<'a> Builder<'a> {
             return Err(Error::Invalid(format!("object {} written twice", r.num)));
         }
         *slot = Some(u64::try_from(self.buf.len()).unwrap_or(u64::MAX));
-        write_indirect(&mut self.buf, r.num, obj)
+        let enc = self.crypt.as_ref().map(|c| c.object(r.num, self.root_metadata_out == Some(r.num)));
+        write_indirect(&mut self.buf, r.num, obj, enc.as_ref())
     }
 
     /// Reserve a number and write `obj` under it.
@@ -588,6 +650,11 @@ impl<'a> Builder<'a> {
             },
             Object::Stream(Stream { mut dict, data }) => {
                 dict.remove("Length");
+                // Its data was decrypted when it was read. Only the source whose
+                // encryption is kept uses the crypt filters of that encryption.
+                if self.crypt_source != Some(source) {
+                    strip_crypt_filter(&mut dict);
+                }
                 match self.rewrite_dict(source, dict)? {
                     Some(dict) => Object::Stream(Stream { dict: self.translate_dict(source, dict)?, data }),
                     None => Object::Null,
@@ -727,6 +794,11 @@ impl<'a> Builder<'a> {
         };
         let keep = !matches!(object, Object::Null) && !is_structural(&object);
         let new = if keep { Some(self.reserve()?) } else { None };
+        if let Some(new) = new
+            && self.root_metadata == Some((source, r.num))
+        {
+            self.root_metadata_out = Some(new.num);
+        }
         if let Some(s) = self.sources.get_mut(source) {
             s.map.insert(r.num, new.map(|n| n.num));
         }
@@ -768,6 +840,19 @@ impl<'a> Builder<'a> {
                 self.put(ObjRef::new(num, 0), &Object::Null)?;
             }
         }
+        // The encryption dictionary is an object of its own, and never encrypted.
+        let encrypt_ref = match self.crypt.as_ref().map(|c| c.encrypt_dict().clone()) {
+            Some(dict) => {
+                let r = self.reserve()?;
+                let slot = usize::try_from(r.num).ok().and_then(|n| n.checked_sub(1)).and_then(|i| self.offsets.get_mut(i));
+                if let Some(slot) = slot {
+                    *slot = Some(u64::try_from(self.buf.len()).unwrap_or(u64::MAX));
+                }
+                write_indirect(&mut self.buf, r.num, &Object::Dict(dict), None)?;
+                Some(r)
+            }
+            None => None,
+        };
         let xref_at = u64::try_from(self.buf.len()).unwrap_or(u64::MAX);
         let size = self.offsets.len() + 1;
         // 7.5.4: one 20-byte entry per object, the free-list head first.
@@ -786,10 +871,18 @@ impl<'a> Builder<'a> {
         if let Some(info) = info {
             table.extend_from_slice(format!(" /Info {} {} R", info.num, info.generation).as_bytes());
         }
-        // 14.4: the file identifier, two equal strings for a new file.
+        if let Some(r) = encrypt_ref {
+            table.extend_from_slice(format!(" /Encrypt {} {} R", r.num, r.generation).as_bytes());
+        }
+        // 14.4: the file identifier, two equal strings for a new file. An
+        // encrypted file keeps the first one: the key of revisions 2 to 4
+        // depends on it (7.6.3.3 step e).
         let id = file_id(&self.buf);
         table.extend_from_slice(b" /ID [");
-        write_hex_string(&mut table, &id);
+        match &self.crypt {
+            Some(c) => write_hex_string(&mut table, c.id0()),
+            None => write_hex_string(&mut table, &id),
+        }
         table.push(b' ');
         write_hex_string(&mut table, &id);
         table.push(b']');
@@ -819,6 +912,44 @@ fn file_id(body: &[u8]) -> [u8; 16] {
     a.copy_from_slice(&first.finish().to_be_bytes());
     b.copy_from_slice(&second.finish().to_be_bytes());
     id
+}
+
+/// Take the `/Crypt` entries out of a stream's `/Filter` (and the matching
+/// `/DecodeParms`): the data has been decrypted, and the file it goes to has
+/// no crypt filter of that name (7.4.10). Only direct entries are looked at.
+fn strip_crypt_filter(dict: &mut Dict) {
+    let is_crypt = |o: &Object| matches!(o, Object::Name(n) if n == "Crypt");
+    match dict.get("Filter") {
+        Some(f) if is_crypt(f) => {
+            dict.remove("Filter");
+            dict.remove("DecodeParms");
+        }
+        Some(Object::Array(items)) if items.iter().any(is_crypt) => {
+            let keep: Vec<bool> = items.iter().map(|o| !is_crypt(o)).collect();
+            let filtered = |list: &[Object]| -> Vec<Object> {
+                list.iter().zip(&keep).filter(|(_, k)| **k).map(|(o, _)| o.clone()).collect()
+            };
+            let remaining = filtered(items);
+            let parms = match dict.get("DecodeParms") {
+                Some(Object::Array(p)) => Some(filtered(p)),
+                _ => None,
+            };
+            if remaining.is_empty() {
+                dict.remove("Filter");
+                dict.remove("DecodeParms");
+                return;
+            }
+            dict.set("Filter", Object::Array(remaining));
+            match parms {
+                Some(p) => dict.set("DecodeParms", Object::Array(p)),
+                // One dictionary for all of them: it is the Crypt filter's.
+                None => {
+                    dict.remove("DecodeParms");
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Objects that are part of a file's structure rather than its content, and

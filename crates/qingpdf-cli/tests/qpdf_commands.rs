@@ -204,3 +204,63 @@ fn qpdf_accepts_the_output_of_every_command() {
     }
     assert!(tally.failures.is_empty(), "{} output file(s) fail qpdf --check", tally.failures.len());
 }
+
+/// The same for encrypted input: every command, run with the password, writes a
+/// file that qpdf accepts and that is encrypted the way the input was (the same
+/// revision, permissions and key); `decrypt` with the owner password writes one
+/// that is not encrypted at all.
+#[test]
+fn qpdf_accepts_the_output_of_every_command_on_encrypted_files() {
+    let Some(qpdf) = common::find_qpdf() else {
+        println!("SKIPPED: qpdf was not found (not on PATH, not in C:\\Program Files\\qpdf*\\bin)");
+        return;
+    };
+    let dir = common::fresh_out_dir("qpdf-commands-encrypted");
+    let mut outputs = 0usize;
+    for (i, row) in common::generated().iter().enumerate() {
+        let label = common::corpus_name(&row.path);
+        let pages = Document::open_with_password(&row.path, &row.user).unwrap().page_count().unwrap();
+        let input = row.path.as_path();
+        let with = |words: &[&str], files: &[&Path]| -> Vec<OsString> {
+            let mut a = args(words, files);
+            a.extend([OsString::from("--password"), OsString::from(&row.user)]);
+            a
+        };
+        let out = |name: &str| dir.join(format!("{i}-{name}.pdf"));
+        let mut jobs: Vec<(&str, Vec<OsString>, PathBuf)> = vec![
+            ("split", with(&["split", "@", "--pages", "1", "-o", "@"], &[input, &out("split")]), out("split")),
+            ("rotate", with(&["rotate", "@", "--angle", "90", "-o", "@"], &[input, &out("rotate")]), out("rotate")),
+            ("merge", with(&["merge", "@", "@", "-o", "@"], &[input, input, &out("merge")]), out("merge")),
+        ];
+        if pages >= 2 {
+            jobs.push(("delete", with(&["delete", "@", "--pages", "1", "-o", "@"], &[input, &out("delete")]), out("delete")));
+        }
+        for (what, command, output) in jobs {
+            let (code, err) = qingpdf(&command);
+            assert_eq!(code, 0, "{label}: {what}: {err}");
+            let tag = format!("{label}: {what}");
+            common::qpdf_accepts(&qpdf, &output, &row.user, &[(input, &row.user)], &tag);
+            let (before, after) =
+                (common::qpdf_encryption(&qpdf, input, &row.user).unwrap(), common::qpdf_encryption(&qpdf, &output, &row.user));
+            let after = after.unwrap_or_else(|| panic!("{tag}: qpdf does not open the output with the password"));
+            assert_eq!((after.revision, after.permissions, &after.key, &after.methods), (before.revision, before.permissions, &before.key, &before.methods), "{tag}");
+            outputs += 1;
+        }
+        // Cut into files of one page: the first piece (the template is the name of the files).
+        let template = dir.join(format!("{i}-every-%d.pdf"));
+        let (code, err) = qingpdf(&with(&["split", "@", "--every", "1", "-o", "@"], &[input, &template]));
+        assert_eq!(code, 0, "{label}: split --every: {err}");
+        let first = dir.join(format!("{i}-every-1.pdf"));
+        common::qpdf_accepts(&qpdf, &first, &row.user, &[(input, &row.user)], &format!("{label}: split --every"));
+        assert_eq!(common::qpdf_encryption(&qpdf, &first, &row.user).unwrap().key, common::qpdf_encryption(&qpdf, input, &row.user).unwrap().key);
+        // The owner takes the encryption off.
+        let plain = out("decrypt");
+        let (code, err) = qingpdf(&args(&["decrypt", "@", "-o", "@", "--password", &row.owner], &[input, &plain]));
+        assert_eq!(code, 0, "{label}: decrypt: {err}");
+        common::qpdf_accepts(&qpdf, &plain, "", &[(input, &row.user)], &format!("{label}: decrypt"));
+        assert!(common::qpdf_encryption(&qpdf, &plain, "").is_none(), "{label}: qpdf still sees encryption in the decrypted copy");
+        outputs += 2;
+    }
+    println!("{outputs} outputs of the commands on encrypted files are accepted by qpdf and keep their encryption");
+    assert!(outputs > 100);
+}

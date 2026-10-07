@@ -13,6 +13,7 @@ use crate::filter::{self, DecodeBudget, MAX_OBJSTM_DECODED};
 use crate::lexer::{find_bytes, is_regular, is_whitespace};
 use crate::object::{Dict, ObjRef, Object};
 use crate::parser::{Parser, PlainHelper};
+use crate::security::Security;
 use crate::xref::{ObjStm, XrefEntry, XrefTable, strip_stream_only_keys};
 
 /// Why some object stream could not be opened during a rebuild. The objects
@@ -159,12 +160,14 @@ fn type_is(dict: &Dict, name: &str) -> bool {
 /// have said. Linear in the size of the file: the work spent on parses that
 /// fail is capped, after which objects are only indexed, not parsed.
 pub fn rebuild(data: &[u8]) -> Result<Repaired> {
-    rebuild_budgeted(data, &DecodeBudget::default())
+    rebuild_budgeted(data, &DecodeBudget::default(), None)
 }
 
 /// [`rebuild`], charging the decoding of object streams (they are opened to
-/// list what is inside) to `decode_budget`.
-pub fn rebuild_budgeted(data: &[u8], decode_budget: &DecodeBudget) -> Result<Repaired> {
+/// list what is inside) to `decode_budget`. For an encrypted file the object
+/// streams are encrypted: with `security` (its key known) they are decrypted
+/// first, without it they cannot be read and what is inside them is not found.
+pub fn rebuild_budgeted(data: &[u8], decode_budget: &DecodeBudget, security: Option<&Security>) -> Result<Repaired> {
     let helper = PlainHelper::new(data);
     let mut entries = XrefTable::new();
     let mut trailers: Vec<(usize, Dict)> = Vec::new(); // (position in file, dictionary)
@@ -226,7 +229,8 @@ pub fn rebuild_budgeted(data: &[u8], decode_budget: &DecodeBudget) -> Result<Rep
                                 && let Some(range) = raw.stream.clone()
                             {
                                 let sink = ObjStmSink { entries: &mut entries, catalogs: &mut catalogs, unopened: &mut unopened };
-                                index_object_stream(data, h.num, dict, range, sink, decode_budget);
+                                let whose = ObjRef::new(h.num, h.generation);
+                                index_object_stream(data, whose, dict, range, sink, decode_budget, security);
                             }
                         }
                     }
@@ -296,15 +300,28 @@ struct ObjStmSink<'a> {
 /// decoded again, and cached, when an object in it is first needed.
 fn index_object_stream(
     data: &[u8],
-    stream_num: u32,
+    stream: ObjRef,
     dict: &Dict,
     range: std::ops::Range<usize>,
     sink: ObjStmSink<'_>,
     budget: &DecodeBudget,
+    security: Option<&Security>,
 ) {
     let ObjStmSink { entries, catalogs, unopened } = sink;
+    let stream_num = stream.num;
     let Some(raw) = data.get(range) else {
         return;
+    };
+    let decrypted;
+    let raw = match security {
+        Some(security) => match security.decrypt_stream_data(stream, dict, raw.to_vec()) {
+            Ok(plain) => {
+                decrypted = plain;
+                decrypted.as_slice()
+            }
+            Err(_) => return,
+        },
+        None => raw,
     };
     let decoded = match filter::decode_with_limit(dict, raw, &|o| Ok(o.clone()), MAX_OBJSTM_DECODED, 0, budget) {
         Ok(d) => d,

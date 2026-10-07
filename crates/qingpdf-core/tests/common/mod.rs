@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -141,6 +142,112 @@ pub fn qpdf_check(qpdf: &Path, file: &Path) -> QpdfVerdict {
     QpdfVerdict { code: out.status.code().unwrap_or(-1), text }
 }
 
+/// A file holding `password` as UTF-8 bytes, for qpdf's `--password-file`
+/// (command line arguments cannot carry every password the same way on every
+/// system). Lives in the system's temporary folder.
+pub fn password_file(password: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("qingpdf-test-password-{}-{n}.txt", std::process::id()));
+    std::fs::write(&path, password.as_bytes()).expect("cannot write a password file");
+    path
+}
+
+/// Run qpdf with the password `password` (taken from a file) and `args`.
+pub fn qpdf_with_password(qpdf: &Path, password: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let file = password_file(password);
+    let mut arg = std::ffi::OsString::from("--password-file=");
+    arg.push(file.as_os_str());
+    let out = Command::new(qpdf).arg(arg).args(args).output().expect("cannot run qpdf");
+    let _ = std::fs::remove_file(&file);
+    out
+}
+
+/// [`qpdf_check`] of a file that needs `password`.
+pub fn qpdf_check_pw(qpdf: &Path, file: &Path, password: &str) -> QpdfVerdict {
+    let out = qpdf_with_password(qpdf, password, &["--check".as_ref(), file.as_os_str()]);
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    QpdfVerdict { code: out.status.code().unwrap_or(-1), text }
+}
+
+/// What `qpdf --show-encryption --show-encryption-key` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QpdfEncryption {
+    pub revision: i64,
+    pub permissions: i64,
+    /// Lower case hex.
+    pub key: String,
+    pub user_matched: bool,
+    pub owner_matched: bool,
+    /// The "stream/string/file encryption method" lines, such as `AESv3`.
+    pub methods: Vec<String>,
+}
+
+/// `None` if qpdf does not accept the password (or the file is not encrypted).
+pub fn qpdf_encryption(qpdf: &Path, file: &Path, password: &str) -> Option<QpdfEncryption> {
+    let out = qpdf_with_password(
+        qpdf,
+        password,
+        &["--show-encryption".as_ref(), "--show-encryption-key".as_ref(), file.as_os_str()],
+    );
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.contains("Incorrect password") || text.contains("invalid password") {
+        return None;
+    }
+    let value = |prefix: &str| text.lines().find_map(|l| l.strip_prefix(prefix)).map(|v| v.trim().to_string());
+    Some(QpdfEncryption {
+        revision: value("R = ")?.parse().ok()?,
+        permissions: value("P = ")?.parse().ok()?,
+        key: value("Encryption key = ").unwrap_or_default().to_lowercase(),
+        user_matched: text.contains("Supplied password is user password"),
+        owner_matched: text.contains("Supplied password is owner password"),
+        methods: text
+            .lines()
+            .filter(|l| l.contains("encryption method:"))
+            .map(|l| l.rsplit(':').next().unwrap_or("").trim().to_string())
+            .collect(),
+    })
+}
+
+/// Make a copy of `file` in which qpdf has removed the encryption, as a QDF
+/// file: streams as they are (so that every byte can be compared), every
+/// object marked with the number it had in `file` (`%% Original object ID`).
+pub fn qpdf_decrypt(qpdf: &Path, file: &Path, password: &str, out: &Path) -> bool {
+    let run = qpdf_with_password(
+        qpdf,
+        password,
+        &[
+            "--qdf".as_ref(),
+            "--stream-data=preserve".as_ref(),
+            "--normalize-content=n".as_ref(),
+            "--object-streams=disable".as_ref(),
+            file.as_os_str(),
+            out.as_os_str(),
+        ],
+    );
+    // 0 is fine, 3 is "warnings only".
+    matches!(run.status.code(), Some(0 | 3)) && out.is_file()
+}
+
+/// In a QDF file: the number each object has there, by the number it had in
+/// the file it was made from (the `%% Original object ID: N G` comments).
+pub fn qdf_original_numbers(bytes: &[u8]) -> std::collections::HashMap<u32, u32> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut map = std::collections::HashMap::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line.strip_prefix("%% Original object ID: ") else { continue };
+        let original = rest.split_whitespace().next().and_then(|n| n.parse::<u32>().ok());
+        let new = lines.next().and_then(|l| l.split_whitespace().next()).and_then(|n| n.parse::<u32>().ok());
+        if let (Some(original), Some(new)) = (original, new) {
+            map.insert(original, new);
+        }
+    }
+    map
+}
+
 /// [`qpdf_check`] of an input, remembered: the same input is judged again for
 /// every output made from it, and qpdf is slow on big files.
 fn qpdf_check_input(qpdf: &Path, file: &Path) -> QpdfVerdict {
@@ -258,4 +365,154 @@ impl XorShift {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % (n.max(1) as u64)) as usize
     }
+}
+
+// --- the encrypted files and their passwords --------------------------------------------
+
+/// One generated file, from `manifest.tsv`.
+#[derive(Debug, Clone)]
+pub struct Encrypted {
+    pub path: PathBuf,
+    pub user: String,
+    pub owner: String,
+    /// Other passwords that open it as the user (the full-width form of a
+    /// password, which becomes the plain one by the light SASLprep).
+    pub alternatives: Vec<String>,
+}
+
+pub fn generated_dir() -> PathBuf {
+    corpus_root().join("public").join("encrypted").join("qpdf-generated")
+}
+
+pub fn generated() -> Vec<Encrypted> {
+    let text = std::fs::read_to_string(generated_dir().join("manifest.tsv")).expect("manifest.tsv of the generated files");
+    let rows: Vec<Encrypted> = text
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            Encrypted {
+                path: generated_dir().join(cols[0]),
+                user: cols[1].to_string(),
+                owner: cols[2].to_string(),
+                alternatives: cols[3].split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
+            }
+        })
+        .collect();
+    assert!(rows.len() >= 20, "the generated set is missing: {} rows", rows.len());
+    for row in &rows {
+        assert!(row.path.is_file(), "{} is missing", row.path.display());
+    }
+    rows
+}
+
+/// The files that were not made for this project, with the passwords of the
+/// user and, if known, of the owner. `required`: in the public corpus (must be
+/// there); the others are local.
+pub struct Known {
+    pub rel: &'static str,
+    pub user: &'static str,
+    pub owner: Option<&'static str>,
+    pub required: bool,
+}
+
+/// Where the passwords come from: PDFium's tests (the `encrypted_hello_world`
+/// files: user "hôtel", owner "âge", written in Latin-1 for revisions 2 and 3
+/// and UTF-8 for 5 and 6), pdf.js's manifest (`ELXRTQWS`, `asdfasdf`), and
+/// qpdf, which found `a` and `b` for `bug_644.pdf` among the first guesses.
+pub const KNOWN: &[Known] = &[
+    Known { rel: "public/encrypted/bug_644.pdf", user: "a", owner: Some("b"), required: true },
+    Known { rel: "public/encrypted/encrypted_hello_world_r2.pdf", user: "hôtel", owner: Some("âge"), required: true },
+    Known { rel: "public/encrypted/encrypted_hello_world_r3.pdf", user: "hôtel", owner: Some("âge"), required: true },
+    Known { rel: "public/encrypted/encrypted_hello_world_r5.pdf", user: "hôtel", owner: Some("âge"), required: true },
+    Known { rel: "public/encrypted/encrypted_hello_world_r6.pdf", user: "hôtel", owner: Some("âge"), required: true },
+    Known { rel: "local/encrypted/bug900822.pdf", user: "", owner: None, required: false },
+    Known { rel: "local/encrypted/empty_protected.pdf", user: "", owner: None, required: false },
+    Known { rel: "local/encrypted/issue17215.pdf", user: "", owner: None, required: false },
+    // V4 with a 5-byte RC4 key; qpdf wants 128 bits for every V4 file and cannot open it.
+    Known { rel: "local/encrypted/issue19484_1.pdf", user: "", owner: None, required: false },
+    Known { rel: "local/encrypted/issue3371.pdf", user: "ELXRTQWS", owner: None, required: false },
+    Known { rel: "local/encrypted/pr6531_1.pdf", user: "asdfasdf", owner: Some("asdfasdf"), required: false },
+];
+
+/// A classic file whose objects have moved: the cross-reference table written
+/// again from where the `n 0 obj` lines are now. (A file with a wrong table is
+/// repaired by every reader, and qpdf does not decrypt everything it reads while
+/// it repairs, so the edited files must be in order.)
+pub fn with_fresh_xref(bytes: &[u8]) -> Vec<u8> {
+    let find = |needle: &[u8], from: usize| {
+        bytes.get(from..).and_then(|b| b.windows(needle.len()).position(|w| w == needle)).map(|p| p + from)
+    };
+    let xref_at = (0..bytes.len()).rev().find(|&i| bytes[i..].starts_with(b"\nxref\n")).expect("an xref table") + 1;
+    let trailer_at = find(b"trailer", xref_at).expect("a trailer");
+    let startxref_at = find(b"startxref", trailer_at).expect("startxref");
+    let mut offsets: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    let mut i = 0;
+    while i < xref_at {
+        // A line `N 0 obj` at the start of a line.
+        if (i == 0 || bytes[i - 1] == b'\n') && bytes[i].is_ascii_digit() {
+            let line_end = bytes[i..].iter().position(|&b| b == b'\n').map_or(xref_at, |p| i + p);
+            let line = &bytes[i..line_end];
+            if line.ends_with(b" 0 obj") {
+                let number = std::str::from_utf8(&line[..line.len() - 6]).ok().and_then(|t| t.parse::<u32>().ok());
+                if let Some(n) = number {
+                    offsets.insert(n, i);
+                }
+            }
+        }
+        i += 1;
+    }
+    let size = offsets.keys().max().map_or(1, |m| m + 1);
+    let mut out = bytes[..xref_at].to_vec();
+    let new_xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for n in 1..size {
+        match offsets.get(&n) {
+            Some(at) => out.extend_from_slice(format!("{at:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 00000 f \n"),
+        }
+    }
+    out.extend_from_slice(&bytes[trailer_at..startxref_at]);
+    out.extend_from_slice(format!("startxref\n{new_xref}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// The password that opens `path` if it is one of the encrypted files whose
+/// passwords are known; the empty password otherwise.
+pub fn password_for(path: &Path) -> String {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let wanted = canonical(path);
+    if let Some(known) = KNOWN.iter().find(|k| canonical(&corpus_root().join(k.rel)) == wanted) {
+        return known.user.to_string();
+    }
+    if (path.starts_with(generated_dir()) || wanted.starts_with(canonical(&generated_dir())))
+        && let Some(row) = generated().into_iter().find(|r| canonical(&r.path) == wanted)
+    {
+        return row.user;
+    }
+    String::new()
+}
+
+/// qpdf accepts `output` (opened with `out_password`), or complains only about
+/// what it complains about in the inputs too.
+pub fn qpdf_accepts(qpdf: &Path, output: &Path, out_password: &str, inputs: &[(&Path, &str)], what: &str) {
+    let verdict = qpdf_check_pw(qpdf, output, out_password);
+    if verdict.code == 0 {
+        return;
+    }
+    let seen: Vec<QpdfVerdict> = inputs.iter().map(|(p, pw)| qpdf_check_pw(qpdf, p, pw)).collect();
+    if verdict.code == 2 && seen.iter().any(|v| v.code == 2) {
+        return;
+    }
+    assert_eq!(verdict.code, 3, "{what}: qpdf --check says:\n{}", verdict.text);
+    let known: HashSet<String> =
+        seen.iter().zip(inputs).flat_map(|(v, (p, _))| qpdf_complaints(&v.text, p)).collect();
+    // A merge does not carry over the form fields of the files after the first (the
+    // user is warned, decisions.md): their widgets are on the pages, not in /AcroForm.
+    let merging = what.contains("merge") || what.starts_with("enc-");
+    let new: Vec<String> = qpdf_complaints(&verdict.text, output)
+        .into_iter()
+        .filter(|c| !known.contains(c) && !(merging && c.contains("widget annotation is not reachable from /acroform")))
+        .collect();
+    assert!(new.is_empty(), "{what}: qpdf complains about what the inputs do not give: {new:?}\n{}", verdict.text);
 }

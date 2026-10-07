@@ -2,6 +2,7 @@
 //!
 //! Spec references in comments point to ISO 32000-1:2008 unless noted.
 
+mod cipher;
 mod dests;
 pub mod document;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod ops;
 pub mod parser;
 mod prune;
 pub mod repair;
+pub mod security;
 pub mod writer;
 pub mod xref;
 
