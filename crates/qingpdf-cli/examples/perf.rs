@@ -9,7 +9,13 @@
 //! <= 2 s, release `qingpdf.exe` <= 3 MB. For encrypted files (layer 1.5):
 //! opening one costs at most 5 ms more than opening the same file unencrypted,
 //! AES decryption runs at 1 GB/s or better, and `qingpdf.exe` is at most
-//! 200 KB bigger than the 833,024 bytes it was before encryption.
+//! 200 KB bigger than the 833,024 bytes it was before encryption. For text
+//! extraction (layer 2): all the text of the 468-page e-book
+//! `local/zh/ebook/ebook-wikisource-yijikao-468p.pdf` in 1 s or less (without
+//! that file, the largest text file of the public corpus, with the time
+//! scaled by its page count), and `qingpdf.exe` at most 1 MB bigger than the
+//! 994,816 bytes it was before the text tables. Memory (target 200 MB) is
+//! measured from outside: `python measure.py -- qingpdf.exe text <file> -o <out>`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -82,6 +88,42 @@ fn average(n: u32, mut f: impl FnMut()) -> Duration {
 
 /// Encrypted files: the cost of opening them, and how fast AES decrypts.
 /// Returns whether the targets were met.
+/// Layer 2: the time of `qingpdf text` on the longest text file we have.
+fn text_case(program: &Path) -> Result<bool, String> {
+    let corpus = root().join("tests").join("corpus");
+    let book = corpus.join("local").join("zh").join("ebook").join("ebook-wikisource-yijikao-468p.pdf");
+    let (file, pages, note) = if book.is_file() {
+        let pages = Document::open(&book).and_then(|d| d.page_count()).map_err(|e| e.to_string())?;
+        (book, pages, "")
+    } else {
+        // The public file with the most pages that has a text layer (a scan gives no text).
+        let mut all = Vec::new();
+        pdfs_below(&corpus.join("public"), &mut all);
+        let mut best: Option<(PathBuf, usize)> = None;
+        for path in all {
+            let Ok(doc) = Document::open(&path) else { continue };
+            if doc.is_encrypted() {
+                continue;
+            }
+            let Ok(count) = doc.page_count() else { continue };
+            let has_text = doc.pages().ok().and_then(|p| p.first().and_then(|first| qingpdf_core::text::TextExtractor::new(&doc).page_text(first).ok())).is_some_and(|t| !t.is_empty());
+            if has_text && best.as_ref().is_none_or(|(_, n)| count > *n) {
+                best = Some((path, count));
+            }
+        }
+        let (path, count) = best.ok_or("no file with a text layer")?;
+        (path, count, " (the 468-page e-book is not here; the largest public text file instead)")
+    };
+    let out = root().join("tests").join("out").join("perf").join("text.txt");
+    std::fs::create_dir_all(out.parent().ok_or("no folder")?).map_err(|e| e.to_string())?;
+    let (fastest, median) = time_runs(program, &["text".as_ref(), file.as_os_str(), "-o".as_ref(), out.as_os_str(), "--force".as_ref()])?;
+    let limit = (pages as f64 / 468.0).clamp(0.05, 1.0);
+    let ok = median.as_secs_f64() <= limit;
+    println!("\ntext, {} ({pages} pages){note}:", file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    println!("  all pages to a file:      fastest {fastest:.3?}, median of {RUNS} {median:.3?}  (target <= {limit:.2} s)  {}", verdict(ok));
+    Ok(ok)
+}
+
 fn encrypted() -> Result<bool, String> {
     let public = root().join("tests").join("corpus").join("public");
     let dir = public.join("encrypted").join("qpdf-generated");
@@ -286,13 +328,20 @@ fn main() -> Result<(), String> {
     let bytes = std::fs::metadata(&program).map_err(|e| e.to_string())?.len();
     let size_ok = bytes <= 3 * 1024 * 1024;
     println!("qingpdf.exe size:           {bytes} bytes = {:.2} MB  (target <= 3 MB)  {}", bytes as f64 / 1_048_576.0, verdict(size_ok));
-    // Layer 1.5: at most 200 KB more than the 833,024 bytes before encryption.
+    // Layer 1.5: at most 200 KB more than the 833,024 bytes before encryption. The program now also holds
+    // the text tables, so the growth is taken from the size recorded when layer 1.5 was finished.
     const BEFORE_ENCRYPTION: u64 = 833_024;
-    let grown = bytes.saturating_sub(BEFORE_ENCRYPTION);
+    const BEFORE_TEXT: u64 = 994_816;
+    let grown = BEFORE_TEXT.saturating_sub(BEFORE_ENCRYPTION);
     let growth_ok = grown <= 200 * 1000;
-    println!("  grown by encryption:      {grown} bytes ({:.0} KB)  (target <= 200 KB)  {}", grown as f64 / 1000.0, verdict(growth_ok));
+    println!("  grown by encryption:      {grown} bytes ({:.0} KB)  (target <= 200 KB; the size recorded at layer 1.5)  {}", grown as f64 / 1000.0, verdict(growth_ok));
+    // Layer 2: at most 1 MB more than the 994,816 bytes before the text tables.
+    let text_grown = bytes.saturating_sub(BEFORE_TEXT);
+    let text_growth_ok = text_grown <= 1_000_000;
+    println!("  grown by text extraction: {text_grown} bytes ({:.0} KB)  (target <= 1 MB)  {}", text_grown as f64 / 1000.0, verdict(text_growth_ok));
 
     let encrypted_ok = encrypted()?;
+    let text_ok = text_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && encrypted_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && encrypted_ok && text_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

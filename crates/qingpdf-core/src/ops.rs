@@ -618,7 +618,7 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
 /// opened it, or `password` (the one that was given) is the owner's, or the empty
 /// password is (an owner with no password)? The hash that decides that costs
 /// something for revisions 5 and 6, so callers ask only when it matters.
-fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str) -> bool {
+pub(crate) fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str) -> bool {
     encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
         || doc.security().is_some_and(|s| (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password(""))
 }

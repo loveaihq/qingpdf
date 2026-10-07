@@ -2,7 +2,7 @@
 //! makes truncated copies, copies with a wrong `startxref`, copies with the
 //! cross-reference data scrambled, and copies with random bytes changed. Each
 //! one must either open or give an error, within 5 seconds, without a panic;
-//! the ones that open are also walked (pages, info) and copied, and what the
+//! the ones that open are also walked (pages, text of the first pages, info) and copied, and what the
 //! copy writes must open again.
 //!
 //! Set `QINGPDF_WRITE_BROKEN=1` to also write the generated files to
@@ -56,7 +56,13 @@ fn exercise(bytes: Vec<u8>) -> Outcome {
         Ok(doc) => {
             let _ = doc.version();
             let _ = doc.page_count();
-            let _ = doc.pages();
+            // Layer 2: the text of the first pages (content streams, fonts, CMaps of a damaged file).
+            if let Ok(pages) = doc.pages() {
+                let mut extractor = qingpdf_core::text::TextExtractor::new(&doc);
+                for page in pages.iter().take(10) {
+                    let _ = extractor.page_text(page);
+                }
+            }
             let _ = doc.info();
             let _ = info::describe(&doc);
             match ops::copy_all(&doc) {

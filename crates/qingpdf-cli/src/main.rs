@@ -13,7 +13,7 @@ use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
 use qingpdf_core::security::{Method, PasswordKind};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
-use qingpdf_core::{Document, Error, Warning};
+use qingpdf_core::{Document, Error, Warning, text};
 
 use args::{Parsed, Request, UsageError};
 
@@ -112,6 +112,9 @@ fn run(request: Request) -> Result<(), Failure> {
             }
             let out = ops::decrypt(&doc, &password).map_err(|e| op_error(&input, &e))?;
             finish(&output, &out)
+        }
+        Request::Text { input, pages, output, force, password } => {
+            text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
         }
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
     }
@@ -251,6 +254,61 @@ fn finish(output: &Path, out: &Output) -> Result<(), Failure> {
 }
 
 // --- commands ------------------------------------------------------------------------------
+
+/// Screen text: like [`clean`], but the form feed that separates pages stays.
+fn say_text(text: &str) {
+    let mut out = String::with_capacity(text.len());
+    for piece in text.split_inclusive('\u{c}') {
+        match piece.strip_suffix('\u{c}') {
+            Some(body) => {
+                out.push_str(&clean(body));
+                out.push('\u{c}');
+            }
+            None => out.push_str(&clean(piece)),
+        }
+    }
+    let _ = std::io::stdout().write_all(out.as_bytes());
+}
+
+fn text_command(
+    input: &Path,
+    pages: Option<&str>,
+    output: Option<&Path>,
+    force: bool,
+    password: &str,
+) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    text::check_extraction_allowed(&doc, password).map_err(|e| op_error(input, &e))?;
+    let wanted: Vec<usize> = match pages {
+        Some(list) => page_list(&doc, input, list)?,
+        None => (0..doc.page_count().map_err(|e| op_error(input, &e))?).collect(),
+    };
+    if let Some(out) = output {
+        check_output(out, std::slice::from_ref(&input.to_path_buf()), force)?;
+    }
+    let all = doc.pages().map_err(|e| op_error(input, &e))?;
+    let mut extractor = text::TextExtractor::new(&doc);
+    let mut result = String::new();
+    for (k, &index) in wanted.iter().enumerate() {
+        let Some(page) = all.get(index) else { continue };
+        if k > 0 {
+            result.push('\u{c}');
+        }
+        let page_text = extractor.page_text(page).map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
+        result.push_str(&page_text);
+    }
+    for w in extractor.take_warnings() {
+        eprintln!("warning: {}", clean(&w));
+    }
+    match output {
+        Some(out) => {
+            write_file(out, result.as_bytes())?;
+            say(&format!("wrote {} ({} page{})\n", out.display(), wanted.len(), plural(wanted.len())));
+        }
+        None => say_text(&result),
+    }
+    Ok(())
+}
 
 fn merge_command(inputs: &[PathBuf], output: &Path, force: bool, password: &str) -> Result<(), Failure> {
     let docs: Vec<Document> = inputs.iter().map(|p| open_unlocked(p, password)).collect::<Result<_, _>>()?;

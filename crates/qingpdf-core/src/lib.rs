@@ -16,6 +16,7 @@ pub mod parser;
 mod prune;
 pub mod repair;
 pub mod security;
+pub mod text;
 pub mod writer;
 pub mod xref;
 

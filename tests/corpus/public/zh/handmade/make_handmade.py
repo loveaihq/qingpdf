@@ -47,11 +47,13 @@ def stream(dict_body, data):
     return head.encode("ascii") + data + b"\nendstream"
 
 
-def tounicode_cmap(chars):
+def tounicode_cmap(chars, overrides=None):
     """ToUnicode CMap for codes that equal their own Unicode value.
     Runs of 3+ consecutive code points become bfrange, the rest bfchar,
-    so both forms are exercised."""
-    cps = sorted(set(ord(c) for c in chars))
+    so both forms are exercised. `overrides` maps a character to the text its
+    code must give instead (one or more characters): written as bfchar."""
+    overrides = overrides or {}
+    cps = sorted(set(ord(c) for c in chars if c not in overrides))
     runs, cur = [], [cps[0]]
     for cp in cps[1:]:
         if cp == cur[-1] + 1:
@@ -60,7 +62,8 @@ def tounicode_cmap(chars):
             runs.append(cur)
             cur = [cp]
     runs.append(cur)
-    bfchar, bfrange = [], []
+    bfchar = ["<%04X> <%s>" % (ord(c), v.encode("utf-16-be").hex().upper()) for c, v in sorted(overrides.items())]
+    bfrange = []
     for r in runs:
         if len(r) >= 3:
             bfrange.append("<%04X> <%04X> <%04X>" % (r[0], r[-1], r[0]))
@@ -177,6 +180,17 @@ def main():
           make_pdf(horizontal_content(TRAD_LINES), "MSung-Light", "MSung-Light",
                    "UniCNS-UCS2-H", "CNS1", 3),
           TRAD_LINES)
+    # 6. ToUnicode that DISAGREES with the predefined CMap (9.10.2: ToUnicode wins).
+    #    The codes are UniGB-UCS2 Unicode values, so a reader that took the predefined
+    #    CMap (or the Adobe-GB1 table) would give the original character. Three
+    #    characters are remapped, one of them to two characters (a ligature-like value).
+    overrides = {"床": "牀", "明": "朙", "汉": "漢字"}
+    differs_expected = ["".join(overrides.get(c, c) for c in line) for line in SIMP_LINES]
+    write("zh-gb1-h-tounicode-differs",
+          make_pdf(horizontal_content(SIMP_LINES), "STSong-Light", "STSong-Light",
+                   "UniGB-UCS2-H", "GB1", 2,
+                   tounicode=tounicode_cmap("".join(SIMP_LINES), overrides)),
+          differs_expected)
     # 5. (extra) same as 1, but the Type0 BaseFont follows the ISO 32000-1 Table 121 convention
     #    "<CIDFont BaseFont>-<CMap name>", which is what most real producers write
     write("zh-gb1-h-basefont-suffix",

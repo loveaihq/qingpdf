@@ -15,6 +15,7 @@ Commands:
   delete    Remove pages
   rotate    Turn pages by a multiple of 90 degrees
   decrypt   Write a copy of an encrypted PDF without the encryption
+  text      Extract the text of a PDF, in reading order
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
 
 Options:
@@ -150,6 +151,29 @@ Options:
   --force               Overwrite the output file if it exists
 ";
 
+const TEXT: &str = "\
+Usage:
+  qingpdf text <file.pdf> [--pages <list>] [-o <output.txt>] [--force] [--password <password>]
+
+Print the text of the PDF in reading order, as UTF-8, one line per text line.
+Pages are separated by a form feed (the \\f character, as pdftotext does). With -o
+the text goes to a file instead of the screen.
+
+Chinese (and Japanese, Korean) text is read whether the fonts are embedded or
+not, with or without a ToUnicode table; vertical text comes out one column per
+line, right to left. Hidden text (the text layer of a scan) is included. A page
+without a text layer gives nothing: scans are not recognized.
+
+An encrypted file whose author did not allow copying or extracting text is
+refused when it was opened with the user password; give the owner password.
+
+Options:
+  --pages <list>        The pages to read (default: all)
+  -o, --output <file>   Write the text to this file
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 const IMG2PDF: &str = "\
 Usage:
   qingpdf img2pdf <1.jpg> <2.png> [...] -o <output.pdf> [--page a4|fit] [--force]
@@ -178,6 +202,7 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Delete) => format!("{DELETE}{PAGE_LIST}"),
         Some(Command::Rotate) => format!("{ROTATE}{PAGE_LIST}"),
         Some(Command::Decrypt) => DECRYPT.to_string(),
+        Some(Command::Text) => format!("{TEXT}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),
     }
 }

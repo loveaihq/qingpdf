@@ -77,10 +77,10 @@ fn help_and_version() {
     let out = run(["--help"]);
     assert_eq!(code(&out), 0);
     let text = stdout(&out);
-    for word in ["info", "merge", "split", "delete", "rotate", "img2pdf", "--force"] {
+    for word in ["info", "merge", "split", "delete", "rotate", "text", "img2pdf", "--force"] {
         assert!(text.contains(word), "main help should mention {word}");
     }
-    for command in ["info", "merge", "split", "delete", "rotate", "img2pdf"] {
+    for command in ["info", "merge", "split", "delete", "rotate", "text", "img2pdf"] {
         let out = run([command, "--help"]);
         assert_eq!(code(&out), 0, "{command}");
         assert!(stdout(&out).contains(&format!("qingpdf {command}")), "{command}");
@@ -731,4 +731,85 @@ fn img2pdf_page_modes_and_png() {
     // A bad mode is a usage error.
     let out = run([OsStr::new("img2pdf"), png_path.as_os_str(), "--page".as_ref(), "letter".as_ref(), "-o".as_ref(), dir.join("x.pdf").as_os_str()]);
     assert_eq!(code(&out), 2);
+}
+
+#[test]
+fn text_prints_or_writes_the_text_of_the_chosen_pages() {
+    let dir = common::fresh_out_dir("cli-text");
+    let handmade = common::corpus_root().join("public").join("zh").join("handmade");
+    let expected = std::fs::read_to_string(handmade.join("zh-gb1-h-tounicode-differs.expected.txt")).expect("expected text");
+    let pdf = handmade.join("zh-gb1-h-tounicode-differs.pdf");
+
+    // to the screen: UTF-8, exactly the expected lines
+    let out = run([OsStr::new("text"), pdf.as_os_str()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(stdout(&out), expected);
+
+    // to a file; the file is never overwritten without --force
+    let target = dir.join("out.txt");
+    let out = run([OsStr::new("text"), pdf.as_os_str(), "-o".as_ref(), target.as_os_str()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("wrote") && stdout(&out).contains("(1 page)"), "{}", stdout(&out));
+    assert_eq!(std::fs::read(&target).expect("written"), expected.as_bytes());
+    let out = run([OsStr::new("text"), pdf.as_os_str(), "-o".as_ref(), target.as_os_str()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    let out = run([OsStr::new("text"), pdf.as_os_str(), "-o".as_ref(), target.as_os_str(), "--force".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // pages are separated by a form feed; --pages picks and orders them
+    let two = corpus("xref-classic/hello_world_2_pages.pdf");
+    let out = run([OsStr::new("text"), two.as_os_str()]);
+    assert_eq!(stdout(&out), "Hello, world!\nGoodbye, world!\n\u{c}Hello, world!\nGoodbye, world!\n");
+    let out = run([OsStr::new("text"), two.as_os_str(), "--pages".as_ref(), "2".as_ref()]);
+    assert_eq!(stdout(&out), "Hello, world!\nGoodbye, world!\n");
+    let out = run([OsStr::new("text"), two.as_os_str(), "--pages".as_ref(), "3".as_ref()]);
+    assert_eq!(code(&out), 1, "a page that does not exist is an error");
+
+    // usage errors, and the help
+    assert_eq!(code(&run([OsStr::new("text"), two.as_os_str(), "--force".as_ref()])), 2);
+    assert_eq!(code(&run(["text"])), 2);
+    assert_eq!(code(&run([OsStr::new("text"), two.as_os_str(), "--angle".as_ref(), "90".as_ref()])), 2);
+    let help = stdout(&run(["text", "--help"]));
+    assert!(help.contains("qingpdf text") && help.contains("--pages") && help.contains("owner password"), "{help}");
+    assert!(stdout(&run(["--help"])).contains("text"));
+}
+
+#[test]
+fn text_obeys_the_copy_permission_and_the_password() {
+    let dir = common::generated_dir();
+    // copying not allowed, empty user password: refused, and the message says what to do
+    let restricted = dir.join("two.r2-40-empty-modify-extract-none.pdf");
+    let out = run([OsStr::new("text"), restricted.as_os_str()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("owner password") && stderr(&out).contains("--password"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty());
+    // the owner password gives the text
+    let out = run([OsStr::new("text"), restricted.as_os_str(), "--password".as_ref(), "owner".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("Hello, world!"), "{}", stdout(&out));
+    // a file that needs its password
+    let locked = dir.join("bookmarks.r2-40-user.pdf");
+    let out = run([OsStr::new("text"), locked.as_os_str()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("needs a password"), "{}", stderr(&out));
+    let out = run([OsStr::new("text"), locked.as_os_str(), "--password".as_ref(), "user".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = run([OsStr::new("text"), locked.as_os_str(), "--password".as_ref(), "wrong".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("wrong password"), "{}", stderr(&out));
+}
+
+#[test]
+fn text_reports_what_it_skipped_and_never_prints_escape_sequences() {
+    // a content stream in a filter we do not read: a warning on stderr, no text, success
+    let out = run([OsStr::new("text"), corpus("xref-classic/asciihexdecode.pdf").as_os_str()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stderr(&out).starts_with("warning:") && stderr(&out).contains("skipped"), "{}", stderr(&out));
+    // text taken from files never carries control characters to the terminal
+    for rel in ["cjk/90ms_rksj_h_sample.pdf", "pdf20/pdf20-utf8-test.pdf", "outline-form-attach/bookmarks.pdf"] {
+        let out = run([OsStr::new("text"), corpus(rel).as_os_str()]);
+        assert_eq!(code(&out), 0, "{rel}: {}", stderr(&out));
+        assert!(!stdout(&out).chars().any(|c| c.is_control() && c != '\n' && c != '\u{c}'), "{rel}");
+    }
 }

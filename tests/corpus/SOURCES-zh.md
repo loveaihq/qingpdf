@@ -52,6 +52,7 @@
 | `public/zh/handmade/zh-gb1-h-tounicode.pdf` | 1 | 2543 字节 | 同第 1 个，另带 /ToUnicode（bfchar + bfrange 两种写法都用到） |
 | `public/zh/handmade/zh-cns1-h-noembed.pdf` | 1 | 1353 字节 | 繁体：/BaseFont /MSung-Light，/Encoding /UniCNS-UCS2-H，Ordering (CNS1) 补充号 3 |
 | `public/zh/handmade/zh-gb1-h-basefont-suffix.pdf` | 1 | 1367 字节 | 额外加的：同第 1 个，但 Type0 的 /BaseFont 按 ISO 32000-1 表 121 的惯例写成 STSong-Light-UniGB-UCS2-H（多数真实生成器这样写） |
+| `public/zh/handmade/zh-gb1-h-tounicode-differs.pdf` | 1 | 2.6 KB | **2026-10-07 第 2 层加的第 6 个**（上面和概览里的个数、大小仍按 5 个算）：同第 3 个，但 ToUnicode 故意和预定义 CMap 不一致（床→牀、明→朙、汉→漢字，后一个是两个字符），证明 ToUnicode 优先；`.expected.txt` 是 ToUnicode 的结果 |
 
 **对 ISO 32000-1 的取舍**（`docs/decisions.md` 可以引用）：
 

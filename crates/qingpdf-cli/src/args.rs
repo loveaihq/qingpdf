@@ -14,17 +14,19 @@ pub enum Command {
     Delete,
     Rotate,
     Decrypt,
+    Text,
     Img2pdf,
 }
 
 impl Command {
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 8] = [
         Command::Info,
         Command::Merge,
         Command::Split,
         Command::Delete,
         Command::Rotate,
         Command::Decrypt,
+        Command::Text,
         Command::Img2pdf,
     ];
 
@@ -36,6 +38,7 @@ impl Command {
             Command::Delete => "delete",
             Command::Rotate => "rotate",
             Command::Decrypt => "decrypt",
+            Command::Text => "text",
             Command::Img2pdf => "img2pdf",
         }
     }
@@ -55,6 +58,7 @@ pub enum Request {
     Delete { input: PathBuf, pages: String, output: PathBuf, force: bool, password: String },
     Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool, password: String },
     Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
+    Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
 }
 
@@ -101,6 +105,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Delete => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
         Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
+        Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
     }
 }
@@ -292,6 +297,13 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
         Command::Decrypt => {
             let input = one_input(&mut inputs)?;
             Ok(Request::Decrypt { input, output: need_output(output)?, force, password })
+        }
+        Command::Text => {
+            let input = one_input(&mut inputs)?;
+            if force && output.is_none() {
+                return Err(usage(c, "--force only goes with -o <output file>"));
+            }
+            Ok(Request::Text { input, pages, output, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {
