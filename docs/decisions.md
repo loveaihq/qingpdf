@@ -25,7 +25,7 @@
 
 ### 读取端：过滤器
 
-- **第 1 层只解 `FlateDecode`。其他过滤器返回 `Error::Unsupported`，原始字节留在 `Stream` 里。** `Crypt` 过滤器如果没有参数或者 `/Name` 是 `Identity`（7.4.10 的默认值），当作什么都不做；其他名字返回 `Unsupported`。`Filter` 数组里 Flate 可以出现多次；只要数组里有别的过滤器，整个解码返回 `Unsupported`（不返回解了一半的数据）。`/Filter` 和 `/DecodeParms` 允许是间接引用，解码时通过文档解析。
+- **第 1 层只解 `FlateDecode`（第 2 层补丁起还有 ASCIIHex、ASCII85、LZW、RunLength，见「第 2 层补丁」）。其他过滤器返回 `Error::Unsupported`，原始字节留在 `Stream` 里。** `Crypt` 过滤器如果没有参数或者 `/Name` 是 `Identity`（7.4.10 的默认值），当作什么都不做；其他名字返回 `Unsupported`。`Filter` 数组里 Flate 可以出现多次；只要数组里有别的过滤器，整个解码返回 `Unsupported`（不返回解了一半的数据）。`/Filter` 和 `/DecodeParms` 允许是间接引用，解码时通过文档解析。
 - **Flate 数据被截断、或者末尾的 Adler-32 校验和不对，都照样返回已经解出来的部分；压缩数据本身坏了才报错。** 规范没说。许多真实文件末尾缺校验和或者被截断，拒绝它们就读不了；而压缩数据坏了是真正的损坏，继续猜只会得到乱码。数据开头多出的 CR/LF（流起点判断错一两个字节的常见症状）也容忍：第一次解不开时，去掉开头的换行再试一次。
 - **解码后的数据最大 256 MiB，超过返回 `Error::Limit`。** 防压缩炸弹。规范没有规定。
 - **每个文档的所有 Flate 解码合计最多产出 1 GiB，超过返回 `Error::Limit`。** 从读第一个交叉引用流算起，包括修复时为了列出对象而打开的对象流，也包括同一个对象流被缓存丢掉后再解的那一次。每一步解码的输出都受"这一步的上限"和"剩余预算"里较小的那个限制；失败时已经产出的字节也记在账上，所以一个全是压缩炸弹的文件不论怎么被碰到都会在几秒内以 Limit 结束（评审里的例子：2 MB 的文件有 8 个各解开 255 MiB 的对象流，以前 5 秒、4.3 GB 内存）。规范没有规定。
@@ -243,7 +243,7 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 
 - **支持的操作符：** `q Q cm`、`BT`（重置文字矩阵）、`Tc Tw Tz TL Tf Ts`、`Td TD Tm T*`、`Tj TJ ' "`、`Do`（表单 XObject），其余全部忽略；`Tr` 不看，隐藏文字（`3 Tr`，扫描件的 OCR 层）照样提取；内嵌图片（`BI … ID … EI`）跳过：`ID` 后的二进制数据里找前后是空白、后面 16 个字节都像文本的 `EI`；内容流里的 `<<…>>`（标记内容的属性表）按字节跳过。操作数的数字按宽松规则读（几个符号算一个，第二个小数点或字母结束），写不成数字的当操作符。
 - **预算和上限（超了是 `Error::Limit`，页的文字不返回；CLI 报"page N: limit reached…"退出码 1）：** 每页操作符 5,000,000 个（表单里的也算，同一个表单画多少次算多少次），每页字符 1,000,000 个（真实的页最多几万个；再多也会因为 80 字节一个字符吃掉上百 MB 内存），一页的内容流解码后合计 256 MiB，表单嵌套 32 层（更深的跳过并警告）；表单自己包含自己（栈上有同一个对象）跳过那一次并警告；表单解码后的内容缓存最多 64 MiB（超了不缓存，照样执行）；`q` 嵌套最多 256 层（更深的 `q` 忽略）；一个 CMap 最多 6,000,000 个词、600,000 个条目，`/UseCMap` 链最多 8 层、环（同一个流对象再次出现）切断并警告；`/W`、`/W2` 各最多 2,000,000 项；每个字体的字符缓存最多 20 万项。所有解码走文档的解码预算（`decode_stream`），预算用完是 `Error::Limit`。
-- **出错的处理：** 内容流解不开（例如 `LZWDecode`，第 1 层的过滤器模块只会 Flate）、字体或 CMap 写坏、字体对象读不了：跳过那一部分，给警告（每种至多 50 条，同样的只给一次），其余照常提取。截断的内容流（停在字符串或字典中间）保留之前的部分。加密文件锁着（没给密码）是 `Error::PasswordRequired`。**注意：** 内容流里用 ASCIIHex、ASCII85、LZW、RunLength 过滤器的老文件现在提取不出文字（`xref-classic/asciihexdecode.pdf`）；给第 1 层的过滤器模块补上这四个就行，没在这一层做。
+- **出错的处理：** 内容流解不开（过滤器模块不会的，例如 `DCTDecode`，或者压缩数据本身坏了）、字体或 CMap 写坏、字体对象读不了：跳过那一部分，给警告（每种至多 50 条，同样的只给一次），其余照常提取。截断的内容流（停在字符串或字典中间）保留之前的部分。加密文件锁着（没给密码）是 `Error::PasswordRequired`。**注意：** 内容流里用 ASCIIHex、ASCII85、LZW、RunLength 过滤器的老文件现在提取不出文字（`xref-classic/asciihexdecode.pdf`）；给第 1 层的过滤器模块补上这四个就行，没在这一层做。
 - **权限：** `text::check_extraction_allowed`：加密、权限位 5（复制或提取）没开、又不是用所有者密码打开的（用 `ops::has_owner_rights` 判断，和 `decrypt` 同一套），拒绝，提示需要所有者密码和 `--password`；`/Perms` 和 `/P` 对不上时按"什么都不许"处理（第 1.5 层的规矩）。"为辅助功能提取"（位 10）不单独放行，任务单只提了位 5。
 
 ### 速度和大小（本机，release，2026-10-07）
@@ -258,3 +258,24 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **和别人对照（`tests/tools/text_compare.py`，用法见脚本开头）：** 每个文件和 PyMuPDF（`page.get_text()`）、Git 带的 `pdftotext` 逐页比去掉空白后的字符（`ordered`：difflib 的比例；`bag`：不管顺序，只比字符的多少）。**中文组（`public/zh` 加 `local/zh`，28 个文件，其中 5 个是没有文字层的扫描件，两边都是空，按相同算）对 PyMuPDF 最低 99.65%（`lunwen-arxiv-2601.14329-latex.pdf`：我们多出 177 个字符，是图里的坐标轴文字，PyMuPDF 没有给，应该是被图的裁剪路径裁掉了，我们不跟踪裁剪路径），平均 99.96%，全部 ≥ 98%。** 其次：`founder-fly` 99.81%（PyMuPDF 多出 28 个标点，是一个没有 ToUnicode 的字体，它按字形号猜，我们留空并警告）、`cnki-ttkn` 99.84%（字符完全一致，只有几行顺序不同）、`aq-zhengzhuan` 99.87%、`wuhan-gazette` 99.87%、468 页的 99.94%、民法典 99.98%。对 pdftotext 低很多是因为它读不了没内嵌字体的 CID 字体（手写文件 0%）、不认竖排的顺序、Type3 电子书里它不换康熙部首（`bag` 都在 99% 以上）。全部语料（141 个文件）里和 PyMuPDF 差得多的：PyMuPDF 读不出来的（`SimFang-variant`、`XiaoBiaoSong`：我们和 pdftotext 都有字）、页面文字在批注里的（`issue20504`、`bug1811510`、`multiple_form_types`、`issue17492`）、希伯来文顺序（`issue11656`）、内置编码的 CFF 字体（`TAMReview`）、PyMuPDF 数不出页的页面树（`no_page_count`）、过滤器（`asciihexdecode`）。
 - **坏文件：** 内容流截断、操作数乱、字体字典缺项、Type0 没有后代字体、CMap 写坏（ToUnicode 和嵌入的 Encoding 各一个，含 `/UseCMap` 指向自己）、表单 XObject 互相引用成环、套了 40 层、超操作符和字符上限，都在 `text/mod.rs` 的单元测试里（为了测上限，测试时上限是 20,000 个操作符、5,000 个字符）；`broken_files.rs` 对每个公开语料文件生成的 1500 多个损坏变体，除了原来的检查，现在还提取前 10 页的文字，要求没有 panic、5 秒内有结果。`tests/text.rs` 另外读整个语料库（公开和本地，每个文件最多 60 页）：结果只能是文字或明确的错误，文字里没有控制字符，每个文件 20 秒内。
 - **权限和命令：** `tests/text.rs` 用 qpdf 生成的加密文件测"不许复制就拒绝、所有者密码放行、用户密码但允许复制就读"；`crates/qingpdf-cli/tests/cli.rs` 测打印、`-o`、`--force`、`--pages`、`\f`、用法错误、权限和密码的提示、警告、屏幕上没有控制字符。
+
+### 第 2 层补丁：补全过滤器，读字体程序自带的编码
+
+过滤器（`filter.rs` 调用 `codecs.rs`）：
+
+- **ASCIIHexDecode（7.4.2）、ASCII85Decode（7.4.3）、RunLengthDecode（7.4.5）、LZWDecode（7.4.4）都解；LZW 之后也做和 Flate 一样的预测器。** 链（`[/ASCII85Decode /FlateDecode]`）按顺序逐个解。
+- **规范说"别的字符都是错误"，我们照做：** ASCIIHex 和 ASCII85 里出现规定之外的字符、`z` 出现在一组中间、一组的值大于 2^32 - 1、最后一组只剩一个字符，都是 `Error::Syntax`。规范没说、但很常见的情况放行：ASCII85 没有 `~>` 结尾（数据到头就算结束），开头带 Adobe 的 `<~`（`~` 在数据里只能是结束标记，所以 `<~` 开头没有歧义）；ASCIIHex 缺 `>` 同样放行，奇数个数字补 0（规范明文规定）。
+- **RunLength 和 LZW 数据在结束标记前被截断：返回已经解出来的部分，不报错**（和 Flate 对截断的处理一致）。LZW 的码不合法（第一个码不是字面值、码超出字典）是错误。`/EarlyChange` 取 0 或 1，默认 1，其他非零值按 1。字典满 4096 项后不再加项，也不强制要求出现清除码。
+- **会放大的过滤器（Flate、LZW、RunLength）共用同一套预算：** 输出不超过单个流的上限，也不超过文档剩余的解码预算；解出多少算多少（出错前解出的也算），预算用完是 `Error::Limit`。ASCIIHex 和 ASCII85 不放大，也照样算。放大倍数上限：RunLength 128 倍，LZW 约 4096 倍，都被同一个上限卡住。
+- **没做：** 内联图片的缩写名（`AHx`、`A85`、`LZW`、`RL`、`Fl`）；内容流扫描器本来就跳过内联图片。
+
+字体程序自带的编码（`text/fontprog.rs`，在 `text/font.rs` 里接上）：
+
+- **顺序（9.10.2 加 9.6.6.1）：** `/ToUnicode` → `/Differences` 给的名字 → 字体程序自带的编码 → 原来的基础编码表。只有在简单字体没有 `/BaseEncoding`（没有 `/Encoding`，或 `/Encoding` 字典里没有 `/BaseEncoding`）、不是 Symbol 和 ZapfDingbats、描述符里有字体文件时才读字体程序。
+- **非符号字体带 `/Encoding` 字典但没有 `/BaseEncoding`：** 9.6.6.1 说基础是 StandardEncoding，我们改用字体程序自带的编码。理由：画出字形的正是这个程序，Acrobat 和 pdf.js 也这样；程序里的编码如果就是 Standard，结果相同。
+- **字体程序里有这个字形、但查不出 Unicode（名字是 `g152` 这样的，或 TrueType 里没有 Unicode 子表也没有字形名）：不覆盖原来的基础编码表，仍用原来的猜法。** 起初这样的码直接变成"没有字符"，tracemonkey.pdf（Calibri 子集，ToUnicode 只覆盖一部分码）因此丢了 1371 个字符；改成现在的做法后和补丁之前完全一样。
+- **Type1（`/FontFile`）：** 只读明文部分（到 `eexec` 为止；没有 `eexec` 就读全部，不依赖 `/Length1`，因为不少文件写错）。认 `/Encoding StandardEncoding def` 和 `dup <码> /<名字> put` 数组（码可以是 `8#101` 这样的进制写法，`dup 66/B put` 不加空格也行），遇到第一个 `def` 结束，最多读 8000 个记号。别的预定义编码（`ISOLatin1Encoding`）不认，算读失败。
+- **CFF（`/FontFile3`，`/Type1C`，或 OpenType 里的 `CFF ` 表）：** 头、Name / Top DICT / String INDEX、Top DICT 里的 charset、Encoding、CharStrings；编码格式 0、1 和补充编码，字符集格式 0、1、2，预定义的 Standard 编码和 ISOAdobe 字符集；字形名走 391 个标准字符串加 String INDEX，再走 AGL。**不认：** 预定义的 Expert 编码、Expert 和 ExpertSubset 字符集（表在 CFF 规范里，本地没有原文，不凭记忆写；这种字体几乎只在小型大写字母之类的专业字体里出现），以及 CID 键控的 CFF（简单字体里不会有）；这几种都算读失败。391 个标准字符串来自 CFF 规范附录 A（技术说明 #5176，本地没有原文，按公开资料写出）；单元测试用已有的 Standard 编码表（来自 PDF 规范）核对了其中 1 到 149 号。
+- **TrueType（`/FontFile2`），只读符号字体（Flags 第 3 位）：** 9.6.6.4：(3,0) 子表取码本身、或加 0xF000、0xF100、0xF200 之后的码，没有就用 (1,0)；子表格式 0、4、6、12。码到字形之后，字形到 Unicode 先用反过来的 Unicode 子表（(3,10)，(3,1)，(0,*)；同一个字形有多个码时取最小的），没有再用 `post` 2.0 版的字形名（258 个 Macintosh 标准字形名内嵌，来自 OpenType 规范；单元测试核对了第 3 到 225 号和 ASCII、Mac Roman 表一致）。非符号 TrueType 字体不动：它按 `/Encoding` 的名字走原来的表。
+- **上限：** cmap 反查最多访问 262144 个码，cmap 最多看 64 个子表，sfnt 表目录最多看 256 项，所有取数都是带范围检查的 `get`；format 4 和 12 按码查找用二分，不遍历。程序读失败：字体照原来的编码表出字，给一条警告（"the built-in encoding of the font program was not read (原因)"）；程序有效但什么也没映射出来，不给警告。
+- **效果（本地语料）：** 143 个文件里只有 5 个文件的字体会走到这条路（没有 ToUnicode、没有 BaseEncoding、有字体文件）：tracemonkey.pdf 和它的副本 comments.pdf（TeX 字体，`/Differences` 已经写全，结果不变）、issue11279.pdf（结果不变）、TAMReview.pdf 和 font_ascent_descent.pdf。后两个的字形名是 `g152`、`G12` 这样的（子集化时改的名字），字体程序里的名字也一样，整个文件里没有任何 Unicode 信息，读了字体程序也得不到字：这是文件本身没有信息，不是我们漏读。PyMuPDF 对这些字输出的是字符码本身（控制字符），所以字符数比我们多、相似度低，但那些字符不是文字。合成的字体程序（Type1、CFF、OpenType CFF、TrueType）在 `text/fontprog.rs` 的测试里一一验证；另外临时拿语料里 6 个真实字体程序（CFF、TrueType、Type1）跑过，确认读得对，脚本没有留下。

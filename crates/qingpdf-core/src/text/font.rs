@@ -18,6 +18,7 @@ use crate::object::{Dict, ObjRef, Object};
 
 use super::cmap::{self, CMap, MAX_USECMAP_DEPTH, ToUni, Uni};
 use super::data::{self, Ordering};
+use super::fontprog::{self, Kind};
 
 /// Distinct warnings kept for one run; more are counted and dropped.
 const MAX_WARNINGS: usize = 50;
@@ -122,6 +123,30 @@ fn strip_subset_prefix(name: &str) -> &str {
     }
 }
 
+/// The built-in encoding of the font program of a simple font (9.6.6): `/FontFile` (Type 1),
+/// `/FontFile3` (CFF), and `/FontFile2` (TrueType) when the font is symbolic (9.6.6.4; a
+/// non-symbolic one is read through the names of its encoding). A program that cannot be read
+/// leaves the font with the encoding it would have had, and one warning.
+fn load_builtin_encoding(doc: &Document, descriptor: &Dict, flags: i64, name: &str, warnings: &mut Warnings) -> Option<fontprog::Table> {
+    let (kind, key) = if descriptor.get("FontFile").is_some() {
+        (Kind::Type1, "FontFile")
+    } else if descriptor.get("FontFile3").is_some() {
+        (Kind::Cff, "FontFile3")
+    } else if descriptor.get("FontFile2").is_some() && flags & 4 != 0 {
+        (Kind::TrueType, "FontFile2")
+    } else {
+        return None;
+    };
+    let program = stream_data(doc, descriptor.get(key), "font program", warnings)?;
+    match fontprog::builtin_encoding(kind, &program) {
+        Ok(table) => Some(table),
+        Err(why) => {
+            warnings.add(format!("font {name}: the built-in encoding of the font program was not read ({why})"));
+            None
+        }
+    }
+}
+
 /// Decode a stream object's data, or say why not.
 fn stream_data(doc: &Document, obj: Option<&Object>, what: &str, warnings: &mut Warnings) -> Option<Vec<u8>> {
     let Object::Stream(s) = resolved(doc, obj)? else { return None };
@@ -211,8 +236,14 @@ impl Font {
                 }
             }
         }
+        // 9.6.6.1, 9.6.6.2: without a /BaseEncoding the base is the font program's own encoding.
+        let builtin = match (&descriptor, base_name.is_none() && !symbolic_name && !zapf_name) {
+            (Some(d), true) => load_builtin_encoding(doc, d, flags, &name, warnings),
+            _ => None,
+        };
         // Per code: the font's ToUnicode first, then the name /Differences gave it, then the
-        // base encoding. (The name is only looked up when ToUnicode does not know the code.)
+        // font program's own encoding, then the base encoding. (Each is only looked up when the
+        // ones before it do not know the code.)
         let uni: Vec<Uni> = (0..256usize)
             .map(|code| {
                 if let Some(tu) = &to_uni {
@@ -222,13 +253,14 @@ impl Font {
                     }
                 }
                 if let Some(Some(name)) = renamed.get(code) {
-                    let glyph = String::from_utf8_lossy(name);
-                    let cps = data::glyph_name_to_unicode(&glyph);
-                    return match cps.as_slice() {
-                        [] => Uni::None,
-                        [one] => Uni::cp(*one),
-                        many => Uni::from_str(&many.iter().filter_map(|&c| char::from_u32(c)).collect::<String>()),
-                    };
+                    return fontprog::uni_of_glyph_name(&String::from_utf8_lossy(name));
+                }
+                // A glyph the program has but cannot give a character (a name that is no Unicode
+                // name, say) leaves the code to the base encoding, as before.
+                if let Some(Some(u)) = builtin.as_ref().and_then(|b| b.get(code))
+                    && !u.is_none()
+                {
+                    return u.clone();
                 }
                 match table.get(code) {
                     Some(&cp) if cp != 0 => Uni::cp(u32::from(cp)),

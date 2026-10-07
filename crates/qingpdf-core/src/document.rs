@@ -1844,7 +1844,7 @@ mod tests {
         b.obj(4, "[/FlateDecode]");
         let packed = miniz_oxide::deflate::compress_to_vec_zlib(&[2, 1, 2, 3, 2, 1, 1, 1], 6);
         b.stream_obj(5, "/Filter 4 0 R /DecodeParms << /Predictor 12 /Columns 3 >>", &packed);
-        b.stream_obj(6, "/Filter /LZWDecode", b"xx");
+        b.stream_obj(6, "/Filter /DCTDecode", b"xx");
         let doc = open(b.finish_classic(7, "/Root 1 0 R"));
         let Object::Stream(s) = doc.get(ObjRef::new(3, 0)).unwrap() else { panic!() };
         assert_eq!(doc.decode_stream(&s).unwrap(), b"hello flate");

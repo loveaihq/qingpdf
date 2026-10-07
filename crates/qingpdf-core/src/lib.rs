@@ -3,6 +3,7 @@
 //! Spec references in comments point to ISO 32000-1:2008 unless noted.
 
 mod cipher;
+mod codecs;
 mod dests;
 pub mod document;
 pub mod error;

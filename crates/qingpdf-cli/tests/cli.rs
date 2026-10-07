@@ -802,8 +802,47 @@ fn text_obeys_the_copy_permission_and_the_password() {
 
 #[test]
 fn text_reports_what_it_skipped_and_never_prints_escape_sequences() {
-    // a content stream in a filter we do not read: a warning on stderr, no text, success
-    let out = run([OsStr::new("text"), corpus("xref-classic/asciihexdecode.pdf").as_os_str()]);
+    // a content stream in a filter we do not read (DCTDecode): a warning on stderr, no text, success
+    let dir = common::fresh_out_dir("cli-text-unreadable");
+    let pdf = dir.join("dct-content.pdf");
+    let mut file = b"%PDF-1.4
+".to_vec();
+    let mut offsets = Vec::new();
+    let bodies: [&[u8]; 4] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        b"<< /Length 2 /Filter /DCTDecode >>
+stream
+xx
+endstream",
+    ];
+    for (i, body) in bodies.iter().enumerate() {
+        offsets.push(file.len());
+        file.extend_from_slice(format!("{} 0 obj
+", i + 1).as_bytes());
+        file.extend_from_slice(body);
+        file.extend_from_slice(b"
+endobj
+");
+    }
+    let xref = file.len();
+    file.extend_from_slice(b"xref
+0 5
+0000000000 65535 f 
+");
+    for off in &offsets {
+        file.extend_from_slice(format!("{off:010} 00000 n 
+").as_bytes());
+    }
+    file.extend_from_slice(format!("trailer
+<< /Size 5 /Root 1 0 R >>
+startxref
+{xref}
+%%EOF
+").as_bytes());
+    std::fs::write(&pdf, file).expect("write the test file");
+    let out = run([OsStr::new("text"), pdf.as_os_str()]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(stderr(&out).starts_with("warning:") && stderr(&out).contains("skipped"), "{}", stderr(&out));
     // text taken from files never carries control characters to the terminal

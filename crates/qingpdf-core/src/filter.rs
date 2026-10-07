@@ -1,5 +1,6 @@
-//! Stream filters (ISO 32000-1 7.4). Layer 1 decodes `FlateDecode` only, with
-//! the predictors of 7.4.4.4; every other filter is reported as
+//! Stream filters (ISO 32000-1 7.4). Decoded here: `FlateDecode` and
+//! `LZWDecode` (both with the predictors of 7.4.4.4), `ASCIIHexDecode`,
+//! `ASCII85Decode` and `RunLengthDecode`; every other filter is reported as
 //! [`Error::Unsupported`] and the caller keeps the raw bytes.
 
 use std::cell::Cell;
@@ -7,6 +8,7 @@ use std::cell::Cell;
 use miniz_oxide::inflate::TINFLStatus;
 use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
 
+use crate::codecs::{self, Fail};
 use crate::error::{Error, Result};
 use crate::object::{Dict, Name, Object};
 
@@ -109,6 +111,18 @@ pub fn decode_with_limit(
                 let inflated = inflate_zlib(input, limit, hint, budget)?;
                 apply_predictor(inflated, parm, resolve)?
             }
+            b"ASCIIHexDecode" => run_codec(limit, budget, |out, cap| codecs::ascii_hex(input, out, cap))?,
+            b"ASCII85Decode" => run_codec(limit, budget, |out, cap| codecs::ascii85(input, out, cap))?,
+            b"RunLengthDecode" => run_codec(limit, budget, |out, cap| codecs::run_length(input, out, cap))?,
+            b"LZWDecode" => {
+                // 7.4.4.2: /EarlyChange 0 or 1, default 1.
+                let early = match parm {
+                    Some(p) => int_param(p, "EarlyChange", 1, resolve)? != 0,
+                    None => true,
+                };
+                let decoded = run_codec(limit, budget, |out, cap| codecs::lzw(input, early, out, cap))?;
+                apply_predictor(decoded, parm, resolve)?
+            }
             // 7.4.10: a Crypt filter says how the stream is encrypted, which
             // is undone when the stream is read from an encrypted file (the
             // Identity filter, the default, means it was not encrypted). What
@@ -121,6 +135,26 @@ pub fn decode_with_limit(
         current = Some(output);
     }
     Ok(current.unwrap_or_default())
+}
+
+/// Run one of the simple decoders of [`codecs`]: its output may not outgrow the
+/// cap `limit` nor what is left of the budget, and what it produced is charged
+/// to the budget also when it fails.
+fn run_codec(limit: usize, budget: &DecodeBudget, decode: impl FnOnce(&mut Vec<u8>, usize) -> std::result::Result<(), Fail>) -> Result<Vec<u8>> {
+    let left = usize::try_from(budget.remaining()).unwrap_or(usize::MAX);
+    let cap = limit.min(left);
+    if cap == 0 {
+        return Err(Error::Limit("the document asks for more decoding work than is allowed".to_string()));
+    }
+    let mut out = Vec::new();
+    let result = decode(&mut out, cap);
+    budget.charge(out.len());
+    match result {
+        Ok(()) => Ok(out),
+        Err(Fail::Corrupt(why)) => Err(Error::syntax(None, why)),
+        Err(Fail::Over) if cap < limit => Err(Error::Limit("the document asks for more decoding work than is allowed".to_string())),
+        Err(Fail::Over) => Err(Error::Limit(format!("decoded stream larger than {limit} bytes"))),
+    }
 }
 
 /// The `/Filter` entry as a list of names (7.3.8.2, Table 5).
@@ -526,11 +560,7 @@ mod tests {
     #[test]
     fn other_filters_are_unsupported() {
         for name in [
-            "ASCIIHexDecode",
-            "ASCII85Decode",
-            "LZWDecode",
             "DCTDecode",
-            "RunLengthDecode",
             "CCITTFaxDecode",
             "JBIG2Decode",
             "JPXDecode",
@@ -543,6 +573,66 @@ mod tests {
         let d = dict(vec![("Filter", Object::Array(vec![Object::from("FlateDecode"), Object::from("DCTDecode")]))]);
         let packed = compress_to_vec_zlib(b"jpeg bytes", 6);
         assert!(matches!(decode_direct(&d, &packed), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn ascii_filters_and_chains() {
+        let plain = b"hello hello hello, hello world";
+        // ASCII85 then Flate, and ASCIIHex then Flate (vectors made with Python's zlib and base64).
+        let a85: &[u8] = b"GhU>3c,n(/a?YhJ:el:b;,.GuX@!@A~>";
+        let hex: &[u8] = b"78DACB48CDC9C957C840903A504E797E514E0A00AC430B25>";
+        for (name, data) in [("ASCII85Decode", a85), ("ASCIIHexDecode", hex)] {
+            let d = dict(vec![("Filter", Object::Array(vec![Object::from(name), Object::from("FlateDecode")]))]);
+            assert_eq!(decode_direct(&d, data).unwrap(), plain, "{name}");
+        }
+        let d = dict(vec![("Filter", Object::from("ASCII85Decode"))]);
+        assert_eq!(decode_direct(&d, b"87cUR~>").unwrap(), b"Hell");
+        assert!(matches!(decode_direct(&d, b"87cUR~>"), Err(Error::Syntax { .. })));
+        let d = dict(vec![("Filter", Object::from("RunLengthDecode"))]);
+        assert_eq!(decode_direct(&d, &[1, b'a', b'b', 253, b'z', 128]).unwrap(), b"abzzzz");
+    }
+
+    #[test]
+    fn lzw_filter_with_early_change_and_predictor() {
+        // 7.4.4.2's example: 45 45 45 45 45 65 45 45 45 66.
+        let encoded = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+        let d = dict(vec![("Filter", Object::from("LZWDecode"))]);
+        assert_eq!(decode_direct(&d, &encoded).unwrap(), [45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
+        let early0 = Object::Dict(dict(vec![("EarlyChange", Object::Integer(0))]));
+        let d = dict(vec![("Filter", Object::from("LZWDecode")), ("DecodeParms", early0)]);
+        assert_eq!(decode_direct(&d, &encoded).unwrap(), [45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
+        // The TIFF predictor (running sums) works on LZW output as on Flate output.
+        let tiff = Object::Dict(dict(vec![
+            ("Predictor", Object::Integer(2)),
+            ("Columns", Object::Integer(10)),
+            ("EarlyChange", Object::Integer(1)),
+        ]));
+        let d = dict(vec![("Filter", Object::from("LZWDecode")), ("DecodeParms", tiff)]);
+        assert_eq!(decode_direct(&d, &encoded).unwrap(), [45, 90, 135, 180, 225, 34, 79, 124, 169, 235]);
+        // Garbage is an error, not a panic.
+        assert!(matches!(decode_direct(&d, &[0xFF, 0xFF, 0xFF]), Err(Error::Syntax { .. })));
+    }
+
+    #[test]
+    fn amplifying_filters_are_charged_and_capped() {
+        // RunLengthDecode: 100 repeats of 128 bytes.
+        let bomb: Vec<u8> = (0..100).flat_map(|_| [129u8, 0]).collect();
+        let d = dict(vec![("Filter", Object::from("RunLengthDecode"))]);
+        let budget = DecodeBudget::new(100_000);
+        let out = decode_with_limit(&d, &bomb, &|o| Ok(o.clone()), usize::MAX, 0, &budget).unwrap();
+        assert_eq!(out.len(), 12_800);
+        assert_eq!(budget.remaining(), 100_000 - 12_800);
+        // Over the budget: an error, and the bytes produced before it was noticed are spent.
+        let budget = DecodeBudget::new(5_000);
+        let err = decode_with_limit(&d, &bomb, &|o| Ok(o.clone()), usize::MAX, 0, &budget).unwrap_err();
+        assert!(matches!(err, Error::Limit(_)));
+        assert!(budget.remaining() < 5_000);
+        // Over the per-stream cap.
+        let err = decode_with_limit(&d, &bomb, &|o| Ok(o.clone()), 1000, 0, &DecodeBudget::default()).unwrap_err();
+        assert!(matches!(err, Error::Limit(m) if m.contains("larger than")));
+        // An exhausted budget refuses outright.
+        let spent = DecodeBudget::new(0);
+        assert!(matches!(decode_with_limit(&d, &bomb, &|o| Ok(o.clone()), usize::MAX, 0, &spent), Err(Error::Limit(_))));
     }
 
     #[test]

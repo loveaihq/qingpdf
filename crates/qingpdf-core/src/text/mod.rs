@@ -16,6 +16,7 @@ mod cmap;
 mod data;
 mod encodings;
 mod font;
+mod fontprog;
 mod interp;
 mod layout;
 mod scan;
