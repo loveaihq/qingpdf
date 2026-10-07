@@ -188,15 +188,18 @@ pub fn aes_decrypt_vec(key: &[u8], data: Vec<u8>) -> Result<Vec<u8>, CipherError
         32 => cbc_decrypt_vec(&Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?, data)?,
         _ => return Err(CipherError::Key),
     };
-    // PKCS#7 (7.6.2): the last byte says how many bytes of padding there are, 1
-    // to 16. qpdf and pdf.js strip that many when the byte is in that range,
-    // without looking at the others, and keep every byte when it is not (a writer
-    // that did not pad, or damaged data): so do we, because qpdf, MuPDF and
-    // PDFium show such files as they were meant and refusing the object would
-    // lose it.
+    // PKCS#7 (7.6.2): the last byte p says how many bytes of padding there are, 1
+    // to 16, and all of them are p. qpdf (Pl_AES_PDF) and pdf.js strip the padding
+    // only when all p bytes are p, and keep every byte otherwise (a writer that did
+    // not pad, whose last byte happens to be small, or damaged data): so do we,
+    // because refusing the object would lose it and stripping a text's last bytes
+    // would cut it.
     let pad = usize::from(plain.last().copied().unwrap_or(0));
-    if (1..=16).contains(&pad) {
-        plain.truncate(plain.len().saturating_sub(pad));
+    if (1..=16).contains(&pad)
+        && let Some(start) = plain.len().checked_sub(pad)
+        && plain.get(start..).is_some_and(|tail| tail.iter().all(|&b| usize::from(b) == pad))
+    {
+        plain.truncate(start);
     }
     Ok(plain)
 }
@@ -487,11 +490,19 @@ mod tests {
         let mut zero = vec![b'a'; 31];
         zero.push(0);
         assert_eq!(aes_decrypt(&key, &encrypt_raw(&zero)).unwrap(), zero);
-        // A last byte of 5 whose four neighbours are not 5: five bytes are stripped,
-        // as qpdf does (it does not look at the others).
+        // A last byte of 5 whose four neighbours are not 5 is not padding: every byte
+        // stays (qpdf and pdf.js strip only when all five are 5).
         let mut five = vec![b'a'; 31];
         five.push(5);
-        assert_eq!(aes_decrypt(&key, &encrypt_raw(&five)).unwrap(), vec![b'a'; 27]);
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&five)).unwrap(), five);
+        // A last byte of 10 (a newline) in unpadded text: kept.
+        let mut newline = vec![b'a'; 31];
+        newline.push(b'\n');
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&newline)).unwrap(), newline);
+        // Five bytes of 5: padding.
+        let mut padded = vec![b'a'; 27];
+        padded.extend([5u8; 5]);
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&padded)).unwrap(), vec![b'a'; 27]);
         // Valid padding still works, a whole block of it too.
         let mut sixteen = vec![b'b'; 16];
         sixteen.extend([16u8; 16]);

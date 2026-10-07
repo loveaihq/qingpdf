@@ -715,7 +715,7 @@ impl Document {
 
     /// After the file was scanned for its objects without the key: scan again
     /// with it, so that the objects inside encrypted object streams are found.
-    fn index_encrypted_object_streams(&self) {
+    fn index_encrypted_object_streams(&mut self) {
         let Some(security) = self.security.as_ref().filter(|s| s.is_unlocked()) else {
             return;
         };
@@ -723,6 +723,11 @@ impl Document {
             *self.xref.borrow_mut() = again.entries;
             *self.unreadable.borrow_mut() = again.unopened;
             self.uses_xref_streams.set(again.uses_xref_streams);
+            // The first scan believed any /Root of a trailer with /Encrypt, because the
+            // catalog could be in an object stream it could not open. Now it can: the
+            // trailer is chosen again with the usual check, falling back to the catalog
+            // that was found.
+            self.trailer = again.trailer;
         }
     }
 

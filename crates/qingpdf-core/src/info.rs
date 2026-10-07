@@ -47,6 +47,9 @@ pub struct Report {
     /// Why the information dictionary is not shown (it is encrypted, or
     /// cannot be read), if that is so.
     pub info_unavailable: Option<String>,
+    /// What was met while reading the above that the person should know: strings
+    /// of an encrypted file that were not encrypted and were kept as they are.
+    pub warning: Option<String>,
 }
 
 /// Gather the report. Fails only if the page tree cannot be read (for a locked
@@ -86,6 +89,7 @@ pub fn describe(doc: &Document) -> Result<Report> {
         repaired: doc.was_repaired(),
         info,
         info_unavailable,
+        warning: doc.decryption_warning(),
     })
 }
 

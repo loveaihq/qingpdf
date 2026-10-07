@@ -240,6 +240,9 @@ pub struct Security {
     /// Does `/Perms` agree with `/P` (revisions 5 and 6; see
     /// [`Encryption::perms_valid`])? Set when a password is accepted.
     perms_valid: bool,
+    /// Whether the empty password would not have opened the file, worked out the
+    /// first time `describe` is asked and kept (it can cost a hash).
+    password_needed: std::cell::Cell<Option<bool>>,
 }
 
 /// What the check value `/Perms` says once the file key decrypts it.
@@ -451,6 +454,7 @@ impl Security {
             encrypt_num,
             root_metadata: None,
             perms_valid: true,
+            password_needed: std::cell::Cell::new(None),
         })
     }
 
@@ -486,6 +490,24 @@ impl Security {
     pub fn perms_valid(&self) -> bool {
         self.perms_valid
     }
+
+    /// Is this the same encryption as `other`: the same file key and the same
+    /// encryption dictionary (a file and the parts that were split from it)?
+    /// Both must be open. Then what one file may be written under, the other may.
+    pub fn same_protection(&self, other: &Security) -> bool {
+        let (Some(a), Some(b)) = (&self.key, &other.key) else { return false };
+        a == b
+            && self.params.dict == other.params.dict
+            && self.params.id0 == other.params.id0
+            && self.params.v == other.params.v
+            && self.params.r == other.params.r
+            && self.params.p == other.params.p
+            && self.params.o == other.params.o
+            && self.params.u == other.params.u
+            && self.params.oe == other.params.oe
+            && self.params.ue == other.params.ue
+            && self.params.perms == other.params.perms
+    }
     /// The file key, if a password has been accepted. Tests compare it with
     /// the one qpdf shows.
     pub fn file_key(&self) -> Option<&[u8]> {
@@ -503,10 +525,17 @@ impl Security {
         // Whether the empty password would have opened the file is only worked out
         // here (for `info` and the commands that look at the permissions): when a
         // password was given, the empty one was not tried.
-        let password_needed = match self.auth {
-            None => true,
-            Some(a) if a.empty => false,
-            Some(_) => self.try_text("", self.first_order()).is_none(),
+        let password_needed = match self.password_needed.get() {
+            Some(known) => known,
+            None => {
+                let worked_out = match self.auth {
+                    None => true,
+                    Some(a) if a.empty => false,
+                    Some(_) => self.try_text("", self.first_order()).is_none(),
+                };
+                self.password_needed.set(Some(worked_out));
+                worked_out
+            }
         };
         Encryption {
             version: p.v,
@@ -543,6 +572,7 @@ impl Security {
     /// first; with a password given that spends a hash on a password nobody
     /// meant, so for a given password it is tried last.)
     pub(crate) fn authenticate(&mut self, password: &str) -> bool {
+        self.password_needed.set(None);
         let mut found = None;
         if !password.is_empty() {
             found = self.try_text(password, Order::UserThenOwner).map(|(key, kind)| (key, Auth { kind, empty: false }));
@@ -758,7 +788,8 @@ impl Security {
         let Some(block) = p.perms.as_deref().and_then(|perms| cipher::aes256_decrypt_block(key, perms).ok()) else {
             return PermsState::Garbage;
         };
-        if block.get(9..12) != Some(b"adb".as_slice()) {
+        // The marker, and the four bytes after `/P` that are all ones.
+        if block.get(9..12) != Some(b"adb".as_slice()) || block.get(4..8) != Some([0xFF_u8; 4].as_slice()) {
             return PermsState::Garbage;
         }
         if block.get(..4) == Some(p.p.to_le_bytes().as_slice()) { PermsState::Valid } else { PermsState::Disagrees }

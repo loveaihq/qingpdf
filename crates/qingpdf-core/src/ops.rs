@@ -292,6 +292,7 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
         }
         if let Some(encryption) = d.doc.encryption()
             && !encryption.perms_valid
+            && encryption.opened.is_none_or(|a| a.kind != PasswordKind::Owner)
         {
             warnings.push(say(
                 "its permission check value (/Perms) does not agree with its permission flags (/P), which someone may have edited; opened with the user password it is taken to allow nothing"
@@ -538,7 +539,14 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
         }
         // The output has the first file's encryption, so only the first file can
         // keep what restricts it: for any other the restriction would be lost.
-        if i > 0 && restricts(input.doc, input.password) {
+        // The exception: a file with the very protection of the first one (the parts that
+        // were split from the same file, or the file itself), whose output keeps it.
+        let same_as_first = inputs
+            .first()
+            .and_then(|f| f.doc.security())
+            .zip(input.doc.security())
+            .is_some_and(|(first, this)| first.same_protection(this));
+        if i > 0 && !same_as_first && restricts(input.doc, input.password) {
             return Err(Error::Invalid(format!(
                 "{} restricts what can be done with it; put it first so its protection carries over, or give its owner password",
                 input.name

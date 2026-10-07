@@ -512,19 +512,14 @@ fn every_operation_keeps_the_encryption_and_qpdf_agrees() {
             let rest = ops::delete_pages(&doc, &[0]).unwrap();
             outputs.push(("delete".into(), rest.data, pages - 1, false));
         }
-        // A file that restricts what may be done with it cannot follow itself in a merge.
+        // A file may follow itself in a merge, restricted or not: the output has the very protection
+        // of both (a restricted file behind a different one is refused, and tested on its own).
         let twice = ops::merge(&[
             Input { name: "a.pdf", doc: &doc, password: &row.user },
             Input { name: "b.pdf", doc: &doc, password: &row.user },
-        ]);
-        if restricts(&doc, &row.user) {
-            match twice {
-                Err(Error::Invalid(m)) => assert!(m.contains("b.pdf restricts what can be done with it; put it first"), "{label}: {m}"),
-                other => panic!("{label}: the second copy restricts the file, but got {:?}", other.map(|o| o.pages)),
-            }
-        } else {
-            outputs.push(("merge with itself".into(), twice.unwrap().data, pages * 2, true));
-        }
+        ])
+        .unwrap();
+        outputs.push(("merge with itself".into(), twice.data, pages * 2, true));
         let mut every = Vec::new();
         ops::split_every(&doc, 1, &mut |n, out| {
             every.push((n, out.data));
@@ -1134,4 +1129,135 @@ fn metadata_left_in_the_clear_is_read_like_qpdf() {
             compare_with_qpdf(qpdf, &written, &row.user, &again, &out_dir, &tag);
         }
     }
+}
+
+
+// --- round two of the review -----------------------------------------------------------------
+
+/// Unpadded data whose last byte is small (a newline; a 5 with no 5s beside it) is not cut:
+/// qpdf and pdf.js take the padding off only when every one of its bytes says how long it is.
+#[test]
+fn unpadded_data_ending_in_a_small_byte_is_not_cut() {
+    for kind in ["aes-r4", "aes-r6"] {
+        let name = format!("nopadnl-{kind}.pdf");
+        let doc = fixture_doc(&name, "");
+        let contents = page_contents(&doc);
+        assert_eq!(contents.len(), 1, "{name}");
+        assert!(contents[0].ends_with(b"(LAST LINE) Tj ET\n"), "{name}: {:?}", String::from_utf8_lossy(&contents[0]));
+        assert_eq!(string_at(&doc, 8, &["A"]), b"Hello world, 15\x05".to_vec(), "{name}");
+        if let Some(qpdf) = common::find_qpdf() {
+            let out_dir = common::fresh_out_dir(&format!("encryption-nopadnl-{kind}"));
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("encrypted_fixtures").join(&name);
+            let theirs = qpdf_content_of(&qpdf, &path, "", &out_dir, "nopadnl");
+            assert!(theirs.streams.contains(&contents[0]), "{name}: qpdf reads the stream differently");
+        }
+    }
+}
+
+/// An encrypted file whose trailer says /Root 99 (no such object) is read through the catalog that
+/// the scan finds, once the key opens the object streams; the first scan, without the key, must not
+/// make the trailer's /Root stick.
+#[test]
+fn a_bad_root_in_the_trailer_of_an_encrypted_file_is_not_believed() {
+    for name in [
+        "badroot-aes-r4",
+        "badroot-rc4-r3",
+        "badroot-aes-r6",
+        "badroot2-aes-r4",
+        "badroot2-rc4-r3",
+        "badroot2-aes-r6",
+        "badroot-intact-aes-r4",
+    ] {
+        let file = format!("{name}.pdf");
+        let doc = fixture_doc(&file, "");
+        assert_eq!(doc.page_count().unwrap(), 1, "{file}");
+        assert!(doc.catalog().is_ok(), "{file}");
+        let out = ops::copy_all(&doc).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let again = Document::from_bytes_with_password(out.data, "").unwrap();
+        assert_eq!(again.page_count().unwrap(), 1, "{file}");
+    }
+}
+
+/// The parts that were split from one restricted file have its very protection, so they merge again
+/// (and a file merges with itself); a different restricted file behind them is still refused.
+#[test]
+fn parts_of_one_restricted_file_can_be_merged_again() {
+    let rows = generated();
+    let find = |part: &str| rows.iter().find(|r| r.path.to_string_lossy().contains(part)).unwrap().clone();
+    let row = find("rects.r3-128-rc4-empty-extract-n");
+    let other_row = find("bookmarks.r4-aes128-user-assemble-n");
+    let doc = open(&row.path, &row.user);
+    assert!(restricts(&doc, &row.user), "the file must be a restricted one for this to mean anything");
+    let part = |page: usize| {
+        let out = ops::extract_pages(&doc, &[page]).unwrap();
+        Document::from_bytes_with_password(out.data, &row.user).unwrap()
+    };
+    let (p1, p2) = (part(0), part(1));
+    let merged = ops::merge(&[
+        Input { name: "p1.pdf", doc: &p1, password: &row.user },
+        Input { name: "p2.pdf", doc: &p2, password: &row.user },
+    ])
+    .expect("two parts of one restricted file");
+    assert_eq!(merged.pages, 2);
+    let again = Document::from_bytes_with_password(merged.data, &row.user).unwrap();
+    assert_eq!(again.encryption().unwrap().permissions, doc.encryption().unwrap().permissions);
+    ops::merge(&[
+        Input { name: "a.pdf", doc: &doc, password: &row.user },
+        Input { name: "a again.pdf", doc: &doc, password: &row.user },
+    ])
+    .expect("a restricted file with itself");
+    let other = open(&other_row.path, &other_row.user);
+    let refused = ops::merge(&[
+        Input { name: "p1.pdf", doc: &p1, password: &row.user },
+        Input { name: "other.pdf", doc: &other, password: &other_row.user },
+    ]);
+    assert!(
+        matches!(&refused, Err(Error::Invalid(m)) if m.contains("other.pdf restricts what can be done with it")),
+        "{:?}",
+        refused.map(|o| o.pages)
+    );
+}
+
+/// A /Perms block that has its marker but not the four 0xFF bytes after /P is not a /Perms block (and
+/// so, opened with the user password, the flags are not vouched for); one that has them is.
+#[test]
+fn a_perms_block_needs_its_ones_as_well_as_its_marker() {
+    use aes::Aes256;
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    let rows = generated();
+    let row = rows.iter().find(|r| r.path.to_string_lossy().contains("two.r6-aes256-user-everything-denied")).unwrap().clone();
+    let original = std::fs::read(&row.path).unwrap();
+    let key = open(&row.path, &row.user).security().unwrap().file_key().unwrap().to_vec();
+    let with_perms = |ones: [u8; 4]| -> Document {
+        let mut block = [0u8; 16];
+        block[..4].copy_from_slice(&(-3392i32).to_le_bytes());
+        block[4..8].copy_from_slice(&ones);
+        block[8] = b'T';
+        block[9..12].copy_from_slice(b"adb");
+        let mut array = aes::cipher::Array::from(block);
+        Aes256::new_from_slice(&key).unwrap().encrypt_block(&mut array);
+        let hex: String = array.iter().map(|b| format!("{b:02x}")).collect();
+        let mut bytes = original.clone();
+        let at = bytes.windows(8).position(|w| w == b"/Perms <").expect("a hex /Perms") + 8;
+        bytes[at..at + 32].copy_from_slice(hex.as_bytes());
+        Document::from_bytes_with_password(bytes, &row.user).unwrap()
+    };
+    assert!(with_perms([0xFF; 4]).encryption().unwrap().perms_valid);
+    assert!(!with_perms([0; 4]).encryption().unwrap().perms_valid);
+}
+
+/// Whether the empty password would have opened the file costs a hash for revision 6; asking for the
+/// description again and again (one output part after another) does not pay it each time.
+#[test]
+fn describing_the_encryption_again_is_cheap() {
+    let rows = generated();
+    let row = rows.iter().find(|r| r.path.to_string_lossy().contains("pdf20utf8.r6-aes256-user-modify-none")).unwrap().clone();
+    let doc = open(&row.path, &row.user);
+    let first = doc.encryption().unwrap();
+    assert!(first.needs_password());
+    let started = std::time::Instant::now();
+    for _ in 0..300 {
+        assert!(doc.encryption().unwrap().needs_password());
+    }
+    assert!(started.elapsed() < std::time::Duration::from_millis(60), "300 descriptions took {:?}", started.elapsed());
 }

@@ -363,6 +363,9 @@ fn render_info(path: &Path, r: &Report) -> String {
         "Repaired:            {}\n",
         if r.repaired { "yes (the cross-reference table was damaged and was rebuilt by scanning the file)" } else { "no" }
     ));
+    if let Some(warning) = &r.warning {
+        s.push_str(&format!("Warning:             {warning}\n"));
+    }
     s.push_str("\nDocument info:\n");
     if let Some(why) = &r.info_unavailable {
         s.push_str(&format!("  (not available: {why})\n"));
@@ -422,7 +425,7 @@ fn render_encryption(s: &mut String, e: &qingpdf_core::security::Encryption) {
         let label = if i == 0 { "Permissions:        " } else { "                    " };
         s.push_str(&format!("{label} {what}: {}\n", yes_no(*allowed)));
     }
-    if !e.perms_valid {
+    if !e.perms_valid && e.opened.is_none_or(|a| a.kind != PasswordKind::Owner) {
         s.push_str(
             "                     (the permission flags /P do not agree with the check value /Perms that only the file key can read: someone may have edited them, so nothing is allowed when the file is opened with the user password)\n",
         );
