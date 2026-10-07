@@ -485,10 +485,70 @@ fn encrypted_files_need_their_password_and_say_so() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     let text = stdout(&run([OsStr::new("info"), o.as_os_str(), "--password".as_ref(), "hôtel".as_ref()]));
     assert!(text.contains("Encryption:          RC4 40-bit (V1, R2)") && text.contains("opened with the user password"), "{text}");
+    // The file allows nothing (it is restricted): it may be the first of a merge, whose output then
+    // carries its encryption, but not a later one, where the protection would be lost.
     let out = run(with_password(&["merge", seven.to_str().unwrap(), encrypted.to_str().unwrap(), "-o", o.to_str().unwrap(), "--force"]));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let message = stderr(&out);
+    assert!(
+        message.contains("encrypted_hello_world_r2.pdf restricts what can be done with it; put it first so its protection carries over, or give its owner password"),
+        "{message}"
+    );
+    assert!(!message.contains("hôtel"), "{message}");
+    let out = run(with_password(&["merge", encrypted.to_str().unwrap(), seven.to_str().unwrap(), "-o", o.to_str().unwrap(), "--force"]));
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(stderr(&out).contains("encryption was not carried over"), "the first file is not encrypted: {}", stderr(&out));
+    let text = stdout(&run([OsStr::new("info"), o.as_os_str(), "--password".as_ref(), "hôtel".as_ref()]));
+    assert!(text.contains("Pages:               8") && text.contains("Encryption:          RC4 40-bit (V1, R2)"), "{text}");
+    // Given the owner password ("âge"), it may come second: the output is not encrypted (the first file is
+    // not), and says that and that a password was needed.
+    let out = run([
+        OsStr::new("merge"),
+        seven.as_os_str(),
+        encrypted.as_os_str(),
+        OsStr::new("-o"),
+        o.as_os_str(),
+        OsStr::new("--force"),
+        OsStr::new("--password"),
+        OsStr::new("âge"),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let message = stderr(&out);
+    assert!(message.contains("encryption was not carried over"), "{message}");
+    assert!(message.contains("it needed a password to open, and the merged file opens without one"), "{message}");
     assert!(stdout(&run([OsStr::new("info"), o.as_os_str()])).contains("Pages:               8"));
+}
+
+/// A file whose only encrypted part is the attachments says so, and a file whose permission flags were
+/// edited says that.
+#[test]
+fn info_describes_attachments_only_encryption_and_edited_permissions() {
+    let fixtures = common::workspace_root().join("crates").join("qingpdf-core").join("tests").join("encrypted_fixtures");
+    let out = run([OsStr::new("info"), fixtures.join("eff-user.pdf").as_os_str(), OsStr::new("--password"), OsStr::new("u")]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Encryption:          attachments only (AES-128) (V4, R4)"), "{text}");
+    assert!(!text.contains("nothing is actually encrypted"), "{text}");
+    // Edit /P of a revision 6 file: five bytes, the same length.
+    let original = generated("two.r6-aes256-user-everything-denied");
+    let mut bytes = std::fs::read(&original.path).unwrap();
+    let at = bytes.windows(8).position(|w| w == b"/P -3392").expect("the flags");
+    bytes[at + 3..at + 8].copy_from_slice(b"-0004");
+    let dir = common::fresh_out_dir("cli-perms");
+    let edited = dir.join("edited.pdf");
+    std::fs::write(&edited, &bytes).unwrap();
+    let out = run([OsStr::new("info"), edited.as_os_str(), OsStr::new("--password"), OsStr::new(&original.user)]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("do not agree with the check value /Perms"), "{text}");
+    assert!(text.contains("print: no") && !text.contains("print: yes"), "{text}");
+    // decrypt refuses with the user password, and the message says why; the owner's password does it.
+    let plain = dir.join("plain.pdf");
+    let out = run([OsStr::new("decrypt"), edited.as_os_str(), OsStr::new("-o"), plain.as_os_str(), OsStr::new("--password"), OsStr::new(&original.user)]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("/Perms") && stderr(&out).contains("owner password"), "{}", stderr(&out));
+    assert!(!plain.exists());
+    let out = run([OsStr::new("decrypt"), edited.as_os_str(), OsStr::new("-o"), plain.as_os_str(), OsStr::new("--password"), OsStr::new(&original.owner)]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
 }
 
 #[test]

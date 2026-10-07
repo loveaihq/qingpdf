@@ -16,7 +16,7 @@
 | `incremental` | 增量更新（多个 %%EOF） | 3 | 0.01 MB | 4 | 1.22 MB |
 | `linearized` | 线性化 | 0 | 0.00 MB | 5 | 0.05 MB |
 | `damaged` | 损坏/畸形 | 18 | 0.03 MB | 5 | 0.61 MB |
-| `encrypted` | 加密（检测、解密；另有 `qpdf-generated/` 30 个自己生成的，见下） | 7 | 0.01 MB | 6 | 0.28 MB |
+| `encrypted` | 加密（检测、解密；另有 `qpdf-generated/` 31 个自己生成的，见下） | 7 | 0.01 MB | 6 | 0.28 MB |
 | `large` | 大页数 / 大文件 | 0 | 0.00 MB | 3 | 10.75 MB |
 | `cjk` | 中日韩（CJK） | 8 | 0.02 MB | 17 | 2.32 MB |
 | `pdf20` | PDF 2.0 | 9 | 0.05 MB | 2 | 1.27 MB |
@@ -25,7 +25,7 @@
 | `outline-form-attach` | 带书签/表单/附件（合并时要提示丢失） | 4 | 0.01 MB | 0 | 0.00 MB |
 | **合计** | | **65** | **0.18 MB** | **57** | **19.57 MB** |
 
-- 第 1.5 层又加了 `public/encrypted/qpdf-generated/` 的 30 个自己生成的加密文件（0.11 MB），上表的个数和合计没有算它们（中文组的文件也没有算，见 SOURCES-zh.md）。
+- 第 1.5 层又加了 `public/encrypted/qpdf-generated/` 的 31 个自己生成的加密文件（0.12 MB），上表的个数和合计没有算它们（中文组的文件也没有算，见 SOURCES-zh.md）。
 - 总共 122 个文件。public 0.18 MB（上限 50 MB），local 19.57 MB（上限 200 MB）。最大的单个文件是 issue3188.pdf（local/，7.75 MB），没有超过 30 MB 的。
 - **页数最多的是 `freeculture.pdf`，352 页**（`local/large/`）。扫完全部候选，≥300 页的只有这一个（≥100 页的也只有它）。
 - 来源分布：public 里 pdf.js 16 个、PDFium 42 个、pdf20examples 7 个；local 里 pdf.js 51 个、PDFium 6 个。
@@ -135,9 +135,9 @@
 | `local/issue3371.pdf` | 不知道 | `ELXRTQWS` | pdf.js 的清单 |
 | `local/pr6531_1.pdf` | `asdfasdf` | `asdfasdf` | pdf.js 的清单；用户和所有者是同一个密码 |
 
-#### `public/encrypted/qpdf-generated/` — 自己生成的加密文件（30 个）
+#### `public/encrypted/qpdf-generated/` — 自己生成的加密文件（31 个）
 
-我们自己做的，用 qpdf 12.4.2 把 `public/` 里的小文件加密得到（来源写在 `manifest.tsv` 的第 5 列）：许可证同来源文件（都是 `public/` 里的，可以再分发）。`generate.py` 是生成脚本，`manifest.tsv` 是清单（文件名、用户密码、所有者密码、另外能打开它的密码、来源、用途），测试读这张清单。覆盖：RC4 40 位（R2）、RC4 128 位（R3，和 V4 的 `/CF` RC4）、AES-128（R4）、AES-256（R5、R6），有无用户密码，几种权限（`--print=none`、`--modify=none`、`--extract=n`、`--assemble=n`、全部禁止），中文密码（R6 的用户和所有者密码；R4 的 UTF-8 字节），超过 32 字节的密码，全角写法的密码（`ＡＢＣ１２３` 对应 `ABC123`，靠轻量 SASLprep 打开），`--cleartext-metadata`（`/EncryptMetadata false`），所有者密码也为空，带签名字典、表单、嵌入文件的文件，带对象流和交叉引用流的文件。这些密码是为测试编的。`python generate.py` 重新生成（每次的 `/ID` 和密钥不同，文件内容会变，清单不变）。
+我们自己做的，用 qpdf 12.4.2 把 `public/` 里的小文件加密得到（来源写在 `manifest.tsv` 的第 5 列）：许可证同来源文件（都是 `public/` 里的，可以再分发）。`generate.py` 是生成脚本，`manifest.tsv` 是清单（文件名、用户密码、所有者密码、另外能打开它的密码、来源、用途），测试读这张清单。覆盖：RC4 40 位（R2）、RC4 128 位（R3，和 V4 的 `/CF` RC4）、AES-128（R4）、AES-256（R5、R6），有无用户密码，几种权限（`--print=none`、`--modify=none`、`--extract=n`、`--assemble=n`、全部禁止），中文密码（R6 的用户和所有者密码；R4 的 UTF-8 字节），超过 32 字节的密码，正好 127 字节的 R6 密码（`utf8.r6-aes256-user-127bytes.pdf`：`0123456789` 重复 12 遍再加 `0123456`，R6 只认前 127 字节，qpdf 自己也不收更长的），全角写法的密码（`ＡＢＣ１２３` 对应 `ABC123`，靠轻量 SASLprep 打开），`--cleartext-metadata`（`/EncryptMetadata false`），所有者密码也为空，带签名字典、表单、嵌入文件的文件，带对象流和交叉引用流的文件。这些密码是为测试编的。`python generate.py` 重新生成（每次的 `/ID` 和密钥不同，文件内容会变，清单不变）。
 
 #### `public/cjk/` — 中日韩（CJK）（8 个）
 

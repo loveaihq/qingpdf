@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use qingpdf_core::info;
@@ -167,12 +168,14 @@ fn generated_files_open_with_the_right_passwords_and_nothing_else() {
             let u = as_user.encryption().unwrap().opened.unwrap();
             assert_eq!((u.kind, u.empty), (PasswordKind::User, false), "{label}");
         }
-        // The empty password is tried first, and opens a file without a user
-        // password as the user's; whoever gives the owner password is the owner
-        // all the same.
+        // A password that is given is tried before the empty one: the owner password
+        // opens the file as the owner's (unless it is the empty password itself), and
+        // `info` still knows whether a password was needed at all.
         let o = as_owner.encryption().unwrap().opened.unwrap();
-        let expected = if row.user.is_empty() { (PasswordKind::User, true) } else { (PasswordKind::Owner, false) };
+        let expected = if row.owner.is_empty() { (PasswordKind::User, true) } else { (PasswordKind::Owner, false) };
         assert_eq!((o.kind, o.empty), expected, "{label}");
+        assert_eq!(as_owner.encryption().unwrap().needs_password(), !row.user.is_empty(), "{label}");
+        assert_eq!(as_user.encryption().unwrap().needs_password(), !row.user.is_empty(), "{label}");
         assert!(as_owner.security().unwrap().is_owner_password(&row.owner), "{label}");
         assert!(as_user.security().unwrap().is_owner_password(&row.owner), "{label}");
         assert!(!as_user.security().unwrap().is_owner_password("wrong"), "{label}");
@@ -368,15 +371,88 @@ fn the_owner_password_decrypts_the_same_way() {
 
 // --- writing: the encryption is kept -----------------------------------------------------------
 
+/// What a document says in its strings and streams, as sets of byte strings
+/// (the cross-reference and object streams and the encryption dictionary left
+/// out: those are structure that every writer makes anew).
+struct Content {
+    strings: BTreeSet<Vec<u8>>,
+    streams: BTreeSet<Vec<u8>>,
+}
+
+fn content_of(doc: &Document) -> Content {
+    let mut content = Content { strings: BTreeSet::new(), streams: BTreeSet::new() };
+    for r in doc.object_refs() {
+        let Ok(object) = doc.get(r) else { continue };
+        let kind = object.as_dict().and_then(|d| d.get_name("Type")).map(|n| n.0.clone());
+        if matches!(kind.as_deref(), Some(b"XRef" | b"ObjStm"))
+            || object.as_dict().is_some_and(|d| d.contains_key("Filter") && d.contains_key("O") && d.contains_key("U"))
+        {
+            continue;
+        }
+        content.strings.extend(strings_of(&object));
+        if let Object::Stream(s) = &object {
+            content.streams.insert(s.data.clone());
+        }
+    }
+    content
+}
+
+/// The content of `file` as qpdf decrypts it (a QDF copy, read by us without any
+/// decryption).
+fn qpdf_content_of(qpdf: &Path, file: &Path, password: &str, out_dir: &Path, tag: &str) -> Content {
+    let decrypted = out_dir.join(format!("{tag}.qpdf-content.pdf"));
+    assert!(common::qpdf_decrypt(qpdf, file, password, &decrypted), "{tag}: qpdf could not decrypt the output");
+    let theirs = Document::from_bytes(std::fs::read(&decrypted).unwrap()).unwrap();
+    assert!(!theirs.is_encrypted(), "{tag}");
+    content_of(&theirs)
+}
+
+/// Judge an output by what an independent reader makes of its bytes: qpdf's
+/// decryption of `output` has only strings and streams that the (decrypted)
+/// `inputs` have, and, when `all_streams`, every stream of the inputs. A writer
+/// that forgot to encrypt, or encrypted with the wrong key, shows up here as
+/// garbage that no input has; comparing qpdf's reading of an output with our
+/// reading of the same bytes would never notice.
+fn output_decrypts_to_the_inputs(
+    qpdf: &Path,
+    output: &Path,
+    password: &str,
+    inputs: &[&Document],
+    out_dir: &Path,
+    tag: &str,
+    all_streams: bool,
+) {
+    let theirs = qpdf_content_of(qpdf, output, password, out_dir, tag);
+    let mut ours = Content { strings: BTreeSet::new(), streams: BTreeSet::new() };
+    for input in inputs {
+        let c = content_of(input);
+        ours.strings.extend(c.strings);
+        ours.streams.extend(c.streams);
+    }
+    let shown = |b: &Vec<u8>| String::from_utf8_lossy(&b[..b.len().min(40)]).into_owned();
+    let stray_strings: Vec<String> = theirs.strings.difference(&ours.strings).map(shown).collect();
+    let stray_streams: Vec<String> = theirs.streams.difference(&ours.streams).map(shown).collect();
+    assert!(stray_strings.is_empty(), "{tag}: qpdf decrypts strings that no input has: {stray_strings:?}");
+    assert!(stray_streams.is_empty(), "{tag}: qpdf decrypts streams that no input has: {stray_streams:?}");
+    if all_streams {
+        let missing: Vec<String> = ours.streams.difference(&theirs.streams).map(shown).collect();
+        assert!(missing.is_empty(), "{tag}: streams of the inputs that qpdf does not find in the output: {missing:?}");
+    }
+}
+
 /// What an output has to be, judged by qpdf and by reading it again: qpdf
 /// accepts it and shows the same revision, permissions, method and key as the
-/// input; our reader reads it back with the same pages and the same text; and
-/// qpdf's decryption of it is what our reader sees.
+/// input; our reader reads it back with the same pages; qpdf's decryption of it
+/// agrees with ours; and what qpdf decrypts is what the inputs say
+/// ([`output_decrypts_to_the_inputs`]).
+#[allow(clippy::too_many_arguments)]
 fn check_encrypted_output(
     qpdf: &Path,
     data: &[u8],
     input: &Path,
     password: &str,
+    inputs: &[&Document],
+    all_streams: bool,
     out_dir: &Path,
     tag: &str,
     expect_pages: usize,
@@ -394,7 +470,20 @@ fn check_encrypted_output(
     assert!(!doc.was_repaired(), "{tag}: the output needed repair");
     assert_eq!(doc.page_count().unwrap(), expect_pages, "{tag}");
     compare_with_qpdf(qpdf, &output, password, &doc, out_dir, tag);
+    output_decrypts_to_the_inputs(qpdf, &output, password, inputs, out_dir, tag, all_streams);
     doc
+}
+
+/// Does the file restrict what may be done with it, to whoever opened it with
+/// `password`: its permissions do not grant everything, and neither the owner
+/// password nor an empty owner password opened it?
+fn restricts(doc: &Document, password: &str) -> bool {
+    let enc = doc.encryption().unwrap();
+    let security = doc.security().unwrap();
+    !enc.permissions.allows_everything()
+        && !security.is_owner_password("")
+        && !(!password.is_empty() && security.is_owner_password(password))
+        && enc.opened.is_none_or(|a| a.kind != PasswordKind::Owner)
 }
 
 #[test]
@@ -411,19 +500,31 @@ fn every_operation_keeps_the_encryption_and_qpdf_agrees() {
         let pages = doc.page_count().unwrap();
         let contents = page_contents(&doc);
         let text = info_of(&doc);
-        let mut outputs: Vec<(String, Vec<u8>, usize)> = Vec::new();
+        // (what, bytes, pages, the output has every stream of the input)
+        let mut outputs: Vec<(String, Vec<u8>, usize, bool)> = Vec::new();
         let copy = ops::copy_all(&doc).unwrap();
-        outputs.push(("copy".into(), copy.data, pages));
+        outputs.push(("copy".into(), copy.data, pages, true));
         let first = ops::extract_pages(&doc, &[0]).unwrap();
-        outputs.push(("split".into(), first.data, 1));
+        outputs.push(("split".into(), first.data, 1, false));
         let turned = ops::rotate_pages(&doc, &(0..pages).collect::<Vec<_>>(), 90).unwrap();
-        outputs.push(("rotate".into(), turned.data, pages));
+        outputs.push(("rotate".into(), turned.data, pages, true));
         if pages > 1 {
             let rest = ops::delete_pages(&doc, &[0]).unwrap();
-            outputs.push(("delete".into(), rest.data, pages - 1));
+            outputs.push(("delete".into(), rest.data, pages - 1, false));
         }
-        let twice = ops::merge(&[Input { name: "a", doc: &doc }, Input { name: "b", doc: &doc }]).unwrap();
-        outputs.push(("merge with itself".into(), twice.data, pages * 2));
+        // A file that restricts what may be done with it cannot follow itself in a merge.
+        let twice = ops::merge(&[
+            Input { name: "a.pdf", doc: &doc, password: &row.user },
+            Input { name: "b.pdf", doc: &doc, password: &row.user },
+        ]);
+        if restricts(&doc, &row.user) {
+            match twice {
+                Err(Error::Invalid(m)) => assert!(m.contains("b.pdf restricts what can be done with it; put it first"), "{label}: {m}"),
+                other => panic!("{label}: the second copy restricts the file, but got {:?}", other.map(|o| o.pages)),
+            }
+        } else {
+            outputs.push(("merge with itself".into(), twice.unwrap().data, pages * 2, true));
+        }
         let mut every = Vec::new();
         ops::split_every(&doc, 1, &mut |n, out| {
             every.push((n, out.data));
@@ -431,11 +532,11 @@ fn every_operation_keeps_the_encryption_and_qpdf_agrees() {
         })
         .unwrap();
         for (n, data) in every.into_iter().take(2) {
-            outputs.push((format!("split-every-{n}"), data, 1));
+            outputs.push((format!("split-every-{n}"), data, 1, false));
         }
-        for (what, data, expect_pages) in outputs {
+        for (what, data, expect_pages, all_streams) in outputs {
             let tag = format!("o{i}-{}", what.replace(' ', "-"));
-            let out = check_encrypted_output(&qpdf, &data, &row.path, &row.user, &out_dir, &tag, expect_pages);
+            let out = check_encrypted_output(&qpdf, &data, &row.path, &row.user, &[&doc], all_streams, &out_dir, &tag, expect_pages);
             // The first page's text and the document information are what they were.
             if what == "copy" || what == "rotate" {
                 assert_eq!(page_contents(&out), contents, "{label}: {what}");
@@ -457,44 +558,130 @@ fn merging_follows_the_first_files_encryption() {
     let out_dir = common::fresh_out_dir("encryption-merge");
     let rows = generated();
     let find = |part: &str| rows.iter().find(|r| r.path.to_string_lossy().contains(part)).unwrap().clone();
+    // Restricted files (each denies something), opened with their owner passwords
+    // where they come after the first, and files that allow everything.
     let aes128 = find("bookmarks.r4-aes128-user-assemble-n");
     let aes256 = find("pdf20utf8.r6-aes256-user-modify-none");
     let rc4 = find("rects.r3-128-rc4-empty-extract-n");
+    let weak = find("bookmarks.r2-40-user");
+    let strong = find("attach.r6-aes256-empty-attachments");
     let plain_path = common::corpus_root().join("public").join("xref-classic").join("hello_world_2_pages.pdf");
     let plain = Document::open(&plain_path).unwrap();
-    let (d128, d256, drc4) = (open(&aes128.path, &aes128.user), open(&aes256.path, &aes256.user), open(&rc4.path, &rc4.user));
+    let d128 = open(&aes128.path, &aes128.user);
+    let d256 = open(&aes256.path, &aes256.owner);
+    let drc4 = open(&rc4.path, &rc4.owner);
+    assert!(restricts(&d128, &aes128.user), "the first file restricts");
+    assert!(!restricts(&d256, &aes256.owner) && !restricts(&drc4, &rc4.owner), "opened by their owners they do not");
 
-    // Encrypted first, plain second: the output is encrypted like the first.
-    let out = ops::merge(&[Input { name: "first", doc: &d128 }, Input { name: "plain", doc: &plain }]).unwrap();
-    assert!(out.warnings.iter().all(|w| !w.0.contains("encryption")), "{:?}", out.warnings);
+    // Encrypted first, plain second: the output is encrypted like the first, and nothing is said about it.
+    let out = ops::merge(&[Input { name: "first", doc: &d128, password: &aes128.user }, Input { name: "plain", doc: &plain, password: "" }]).unwrap();
+    assert!(out.warnings.iter().all(|w| !w.0.contains("encryption") && !w.0.contains("password")), "{:?}", out.warnings);
     let total = d128.page_count().unwrap() + plain.page_count().unwrap();
-    let merged = check_encrypted_output(&qpdf, &out.data, &aes128.path, &aes128.user, &out_dir, "enc-plain", total);
+    let merged = check_encrypted_output(&qpdf, &out.data, &aes128.path, &aes128.user, &[&d128, &plain], false, &out_dir, "enc-plain", total);
     assert!(merged.is_encrypted());
 
-    // Two files with different encryption: the second is decrypted with its key
-    // and written under the first's; its text survives.
-    let out = ops::merge(&[Input { name: "first", doc: &d128 }, Input { name: "second", doc: &d256 }, Input { name: "third", doc: &drc4 }]).unwrap();
+    // Three different encryptions: the later files are read with their own keys
+    // (their owners opened them) and written under the first's.
+    let out = ops::merge(&[
+        Input { name: "first", doc: &d128, password: &aes128.user },
+        Input { name: "second", doc: &d256, password: &aes256.owner },
+        Input { name: "third", doc: &drc4, password: &rc4.owner },
+    ])
+    .unwrap();
     assert!(out.warnings.iter().all(|w| !w.0.contains("not carried over; the output is not encrypted")), "{:?}", out.warnings);
+    // AES-256 under AES-128 is a weaker method for the second file; RC4-128 is not stronger.
+    let warned = |what: &str| out.warnings.iter().any(|w| w.0.contains(what));
+    assert!(warned("second: it is encrypted with AES-256, and the merged file with the first file's weaker AES-128"), "{:?}", out.warnings);
+    assert!(!warned("third: it is encrypted"), "{:?}", out.warnings);
+    // Both the first file and the second need a password: the output does too.
+    assert!(!warned("opens without one"), "{:?}", out.warnings);
     let total = d128.page_count().unwrap() + d256.page_count().unwrap() + drc4.page_count().unwrap();
-    let merged = check_encrypted_output(&qpdf, &out.data, &aes128.path, &aes128.user, &out_dir, "enc-enc-enc", total);
-    let expected: Vec<Vec<u8>> =
-        [&d128, &d256, &drc4].iter().flat_map(|d| page_contents(d)).collect();
+    let merged = check_encrypted_output(&qpdf, &out.data, &aes128.path, &aes128.user, &[&d128, &d256, &drc4], false, &out_dir, "enc-enc-enc", total);
+    let expected: Vec<Vec<u8>> = [&d128, &d256, &drc4].iter().flat_map(|d| page_contents(d)).collect();
     assert_eq!(page_contents(&merged), expected);
 
-    // Plain first, encrypted second: the output is not encrypted, and says so.
-    let out = ops::merge(&[Input { name: "plain.pdf", doc: &plain }, Input { name: "secret.pdf", doc: &d256 }]).unwrap();
+    // A plain first file and an encrypted one that allows everything: the output is not
+    // encrypted, and the user is told that, and that a password was needed.
+    let allowed = open(&weak.path, &weak.user);
+    assert!(!restricts(&allowed, &weak.user));
+    let out = ops::merge(&[Input { name: "plain.pdf", doc: &plain, password: "" }, Input { name: "secret.pdf", doc: &allowed, password: &weak.user }]).unwrap();
     let warning = out.warnings.iter().find(|w| w.0.contains("secret.pdf") && w.0.contains("encryption")).expect("a warning that names the later file");
     assert!(warning.0.contains("not encrypted"), "{}", warning.0);
+    assert!(out.warnings.iter().any(|w| w.0.contains("secret.pdf: it needed a password to open, and the merged file opens without one")), "{:?}", out.warnings);
     assert!(out.warnings.iter().all(|w| !w.0.contains("plain.pdf:")));
     let merged = Document::from_bytes(out.data.clone()).unwrap();
     assert!(!merged.is_encrypted());
-    let expected: Vec<Vec<u8>> = [&plain, &d256].iter().flat_map(|d| page_contents(d)).collect();
+    let expected: Vec<Vec<u8>> = [&plain, &allowed].iter().flat_map(|d| page_contents(d)).collect();
     assert_eq!(page_contents(&merged), expected);
     let written = out_dir.join("plain-enc.pdf");
     std::fs::write(&written, &out.data).unwrap();
-    common::qpdf_accepts(&qpdf, &written, "", &[(&plain_path, ""), (&aes256.path, &aes256.user)], "plain + encrypted");
+    common::qpdf_accepts(&qpdf, &written, "", &[(&plain_path, ""), (&weak.path, &weak.user)], "plain + encrypted");
     let shown = std::process::Command::new(&qpdf).arg("--show-encryption").arg(&written).output().unwrap();
     assert!(String::from_utf8_lossy(&shown.stdout).contains("not encrypted"));
+    output_decrypts_to_the_inputs_plain(&written, &[&plain, &allowed]);
+
+    // A weak first file and a strong later one: told that the output is weaker; no
+    // password warning (the output needs one, the later file needs none).
+    let weak_first = open(&weak.path, &weak.user);
+    let strong_later = open(&strong.path, &strong.user);
+    let out = ops::merge(&[Input { name: "weak.pdf", doc: &weak_first, password: &weak.user }, Input { name: "strong.pdf", doc: &strong_later, password: "" }]).unwrap();
+    assert!(out.warnings.iter().any(|w| w.0.contains("strong.pdf: it is encrypted with AES-256, and the merged file with the first file's weaker RC4 40-bit")), "{:?}", out.warnings);
+    assert!(out.warnings.iter().all(|w| !w.0.contains("opens without one")), "{:?}", out.warnings);
+    let total = weak_first.page_count().unwrap() + strong_later.page_count().unwrap();
+    check_encrypted_output(&qpdf, &out.data, &weak.path, &weak.user, &[&weak_first, &strong_later], false, &out_dir, "weak-strong", total);
+}
+
+/// Like [`output_decrypts_to_the_inputs`] for an output that is not encrypted: what is
+/// in it is in the inputs.
+fn output_decrypts_to_the_inputs_plain(output: &Path, inputs: &[&Document]) {
+    let theirs = content_of(&Document::open(output).unwrap());
+    let mut ours = Content { strings: BTreeSet::new(), streams: BTreeSet::new() };
+    for input in inputs {
+        let c = content_of(input);
+        ours.strings.extend(c.strings);
+        ours.streams.extend(c.streams);
+    }
+    assert!(theirs.strings.is_subset(&ours.strings) && theirs.streams.is_subset(&ours.streams));
+    assert!(theirs.streams.len() >= 2, "the pages' content streams are in the output");
+}
+
+/// A file that restricts what may be done with it may only be the first of a merge:
+/// the output has the first file's encryption, and a restriction anywhere else
+/// would be taken off.
+#[test]
+fn a_restricted_file_may_only_be_the_first_of_a_merge() {
+    let rows = generated();
+    let find = |part: &str| rows.iter().find(|r| r.path.to_string_lossy().contains(part)).unwrap().clone();
+    let restricted = find("bookmarks.r4-aes128-user-assemble-n");
+    let everything_denied = find("two.r6-aes256-user-everything-denied");
+    let plain_path = common::corpus_root().join("public").join("xref-classic").join("hello_world_2_pages.pdf");
+    let plain = Document::open(&plain_path).unwrap();
+    let by_user = open(&restricted.path, &restricted.user);
+    let by_owner = open(&restricted.path, &restricted.owner);
+    let denied_by_user = open(&everything_denied.path, &everything_denied.user);
+    let message = |name: &str| format!("{name} restricts what can be done with it; put it first so its protection carries over, or give its owner password");
+
+    // Plain first, restricted second: refused, naming the file, exactly as the rule says.
+    let r = ops::merge(&[Input { name: "plain.pdf", doc: &plain, password: "" }, Input { name: "restricted.pdf", doc: &by_user, password: &restricted.user }]);
+    assert!(matches!(&r, Err(Error::Invalid(m)) if *m == message("restricted.pdf")), "{:?}", r.map(|o| o.pages));
+    // Third place, and every permission denied: the same.
+    let r = ops::merge(&[
+        Input { name: "a.pdf", doc: &plain, password: "" },
+        Input { name: "b.pdf", doc: &plain, password: "" },
+        Input { name: "denied.pdf", doc: &denied_by_user, password: &everything_denied.user },
+    ]);
+    assert!(matches!(&r, Err(Error::Invalid(m)) if *m == message("denied.pdf")), "{:?}", r.map(|o| o.pages));
+    // Restricted first: its encryption carries over (to a file that is opened with its user password).
+    let out = ops::merge(&[Input { name: "restricted.pdf", doc: &by_user, password: &restricted.user }, Input { name: "plain.pdf", doc: &plain, password: "" }]).unwrap();
+    let merged = Document::from_bytes_with_password(out.data.clone(), &restricted.user).unwrap();
+    assert!(merged.is_encrypted() && merged.encryption().unwrap().permissions == by_user.encryption().unwrap().permissions);
+    // The owner password, given for it, lifts the restriction: it may come second.
+    let out = ops::merge(&[Input { name: "plain.pdf", doc: &plain, password: "" }, Input { name: "restricted.pdf", doc: &by_owner, password: &restricted.owner }]).unwrap();
+    assert!(!Document::from_bytes(out.data).unwrap().is_encrypted());
+    // The same file opened with the user password but whose owner password is also given:
+    // the password tells (it is the second input's own).
+    let out = ops::merge(&[Input { name: "plain.pdf", doc: &plain, password: "" }, Input { name: "restricted.pdf", doc: &by_user, password: &restricted.owner }]);
+    assert!(out.is_ok(), "the password that was given is the owner's: {:?}", out.map(|o| o.pages));
 }
 
 #[test]
@@ -584,6 +771,279 @@ fn a_damaged_file_with_encrypted_object_streams_is_repaired_and_read() {
             assert!(locked.is_locked(), "{part}");
         }
     }
+}
+
+// --- files an independent reviewer made, that other readers open and we must too -----------------
+//
+// `tests/encrypted_fixtures` holds small encrypted files made by `tests/tools/encrypted_hostile`:
+// strings that were never encrypted, a catalog inside an encrypted object stream in a damaged
+// file, data without padding, a signature whose /ByteRange is an indirect object, attachments
+// that are the only thing encrypted.
+
+fn fixture(name: &str) -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("encrypted_fixtures").join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn fixture_doc(name: &str, password: &str) -> Document {
+    Document::from_bytes_with_password(fixture(name), password).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+fn string_at(doc: &Document, num: u32, path: &[&str]) -> Vec<u8> {
+    let mut value = doc.get(qingpdf_core::ObjRef::new(num, 0)).unwrap();
+    for key in path {
+        value = doc.resolve(value.as_dict().and_then(|d| d.get(key)).unwrap_or_else(|| panic!("no /{key} in object {num}"))).unwrap();
+    }
+    match value {
+        Object::String(s) => s.bytes,
+        other => panic!("object {num}: not a string: {other:?}"),
+    }
+}
+
+/// A string that was never encrypted in an encrypted file (an encryption-unaware tool wrote
+/// it into the page's /PieceInfo and the outline) cost the whole page, so the file did not
+/// open. qpdf, MuPDF and PDFium open it; the string is kept as it is, and the user is told.
+#[test]
+fn strings_that_were_never_encrypted_are_kept_and_reported() {
+    for kind in ["aes-r4", "aes-r6"] {
+        let name = format!("badstr-{kind}.pdf");
+        let doc = fixture_doc(&name, "");
+        assert_eq!(doc.page_count().unwrap(), 2, "{name}");
+        assert_eq!(string_at(&doc, 3, &["PieceInfo", "X", "Private"]), b"plain", "{name}");
+        assert_eq!(string_at(&doc, 10, &["Title"]), b"plain title", "{name}");
+        assert_eq!(page_contents(&doc).len(), 2, "{name}");
+        // The warning is there once the objects were read, and says what happened.
+        let out = ops::copy_all(&doc).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let warning = out.warnings.iter().find(|w| w.0.contains("could not be decrypted")).unwrap_or_else(|| panic!("{name}: {:?}", out.warnings));
+        assert!(warning.0.contains("kept as they are") && warning.0.contains("first objects: 3, 10"), "{name}: {}", warning.0);
+        assert!(!out.warnings.iter().any(|w| w.0.contains("damaged object")), "{name}: {:?}", out.warnings);
+        // Written out, the plain strings are encrypted like all the others and read back the same.
+        let again = Document::from_bytes_with_password(out.data, "").unwrap();
+        assert_eq!(again.page_count().unwrap(), 2);
+        assert_eq!(page_contents(&again), page_contents(&doc), "{name}");
+        let found: Vec<Vec<u8>> = again
+            .object_refs()
+            .into_iter()
+            .filter_map(|r| again.get(r).ok())
+            .flat_map(|o| strings_of(&o))
+            .filter(|s| s == b"plain" || s == b"plain title")
+            .collect();
+        assert_eq!(found.len(), 2, "{name}: {found:?}");
+        // The command line says it too, and still writes the file.
+        let merged = ops::merge(&[Input { name: "bad.pdf", doc: &doc, password: "" }, Input { name: "bad again.pdf", doc: &fixture_doc(&name, ""), password: "" }]).unwrap();
+        assert!(merged.warnings.iter().any(|w| w.0.starts_with("bad.pdf: at least")), "{:?}", merged.warnings);
+    }
+}
+
+/// AES data that has no valid padding at the end (a writer that did not pad): qpdf, MuPDF and
+/// PDFium show the stream; so do we, with every decrypted byte.
+#[test]
+fn aes_data_without_padding_is_read_in_full() {
+    let expected = {
+        let mut text = b"BT /F1 12 Tf 10 10 Td (no padding here) Tj ET\n".repeat(3);
+        text.resize(text.len() + (16 - text.len() % 16) % 16, b' ');
+        text
+    };
+    for kind in ["aes-r4", "aes-r6"] {
+        let name = format!("nopad-{kind}.pdf");
+        let doc = fixture_doc(&name, "");
+        assert_eq!(page_contents(&doc), vec![expected.clone()], "{name}");
+        let out = ops::copy_all(&doc).unwrap();
+        assert!(out.warnings.is_empty(), "{name}: {:?}", out.warnings);
+        let again = Document::from_bytes_with_password(out.data, "").unwrap();
+        assert_eq!(page_contents(&again), vec![expected.clone()], "{name}");
+        if let Some(qpdf) = common::find_qpdf() {
+            // qpdf reads these bytes the same way.
+            let out_dir = common::fresh_out_dir(&format!("encryption-nopad-{kind}"));
+            let theirs = qpdf_content_of(&qpdf, &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("encrypted_fixtures").join(&name), "", &out_dir, "nopad");
+            assert!(theirs.streams.contains(&expected), "{name}: qpdf reads the stream differently");
+        }
+    }
+}
+
+/// A signature dictionary whose /ByteRange is an indirect reference: its /Contents is the
+/// signature, not encrypted, and must neither be decrypted nor make the dictionary unreadable.
+#[test]
+fn a_signature_with_an_indirect_byte_range_keeps_its_contents() {
+    for kind in ["aes-r4", "aes-r6"] {
+        let name = format!("sigref-{kind}.pdf");
+        let doc = fixture_doc(&name, "");
+        let signature = [0x30u8, 0x82, 0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        assert_eq!(string_at(&doc, 9, &["Contents"]), signature, "{name}");
+        assert_eq!(string_at(&doc, 9, &["M"]), b"D:20240101", "{name}: other strings of it are decrypted");
+        assert_eq!(string_at(&doc, 8, &["T"]), b"Sig1", "{name}");
+        let out = ops::copy_all(&doc).unwrap();
+        assert!(out.warnings.is_empty(), "{name}: {:?}", out.warnings);
+        assert!(common::contains(&out.data, b"3082DEADBEEF00000000"), "{name}: the signature is written as it is");
+        let again = Document::from_bytes_with_password(out.data, "").unwrap();
+        // The signature dictionary comes through (it did become null before), with its range.
+        let sigs: Vec<_> = again
+            .object_refs()
+            .into_iter()
+            .filter_map(|r| again.get(r).ok())
+            .filter(|o| o.as_dict().is_some_and(|d| d.contains_key("ByteRange")))
+            .collect();
+        assert_eq!(sigs.len(), 1, "{name}");
+        let d = sigs[0].as_dict().unwrap();
+        assert_eq!(d.get_name("SubFilter").unwrap(), &qingpdf_core::Name::from("adbe.pkcs7.detached"));
+        match d.get("Contents") {
+            Some(Object::String(s)) => assert_eq!(s.bytes, signature, "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+/// With `/EncryptMetadata false` the clear metadata stream stays clear, also when the file
+/// is damaged and its catalog, which names the stream, sits in an encrypted object stream
+/// that the scan only opens the second time (the first scan has no key).
+#[test]
+fn clear_metadata_survives_repair_when_the_catalog_is_in_an_object_stream() {
+    let xmp = b"<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">CLEAR METADATA TEXT</x:xmpmeta><?xpacket end=\"w\"?>";
+    for set in ["meta2", "meta3"] {
+        for kind in ["rc4-v4", "aes-r4", "aes-r6"] {
+            for broken in [false, true] {
+                let name = format!("{set}-{kind}{}.pdf", if broken { "-broken" } else { "" });
+                let doc = fixture_doc(&name, "");
+                assert_eq!(doc.was_repaired(), broken, "{name}");
+                assert_eq!(doc.page_count().unwrap(), 1, "{name}");
+                assert!(!doc.encryption().unwrap().encrypt_metadata, "{name}");
+                let Some(Object::Ref(metadata)) = doc.catalog().unwrap().get("Metadata").cloned() else { panic!("{name}: no /Metadata") };
+                let Object::Stream(stream) = doc.get(metadata).unwrap() else { panic!("{name}") };
+                assert_eq!(stream.data, xmp, "{name}: the metadata is in the clear and stays as it is");
+                // The encrypted strings and streams are read right all the same.
+                let Some(Object::Ref(info)) = doc.trailer().get("Info").cloned() else { panic!("{name}: no /Info") };
+                assert_eq!(string_at(&doc, info.num, &["Title"]), b"secret title", "{name}");
+                assert_eq!(page_contents(&doc), vec![b"BT /F1 12 Tf 10 10 Td (hi) Tj ET".to_vec()], "{name}");
+                // A copy keeps all that (the metadata in the clear in the output too).
+                let out = ops::copy_all(&doc).unwrap();
+                assert!(common::contains(&out.data, xmp), "{name}: the output has the metadata in the clear");
+                let again = Document::from_bytes_with_password(out.data, "").unwrap();
+                let Some(Object::Ref(m2)) = again.catalog().unwrap().get("Metadata").cloned() else { panic!("{name}") };
+                let Object::Stream(s2) = again.get(m2).unwrap() else { panic!("{name}") };
+                assert_eq!(s2.data, xmp, "{name}");
+            }
+        }
+    }
+}
+
+/// `/P` is not part of the key of revisions 5 and 6, so editing it changes what the file
+/// says it allows without anyone needing a password; `/Perms`, which only the file key can
+/// decrypt, says what it was. The file with every permission denied, with `/P` edited to
+/// allow everything: it must not be taken to allow anything, and `decrypt` must refuse it.
+#[test]
+fn edited_permission_flags_of_revision_6_are_noticed() {
+    let row = generated().into_iter().find(|r| r.path.to_string_lossy().contains("two.r6-aes256-user-everything-denied")).unwrap();
+    let original = std::fs::read(&row.path).unwrap();
+    let mut tampered = original.clone();
+    replace_first(&mut tampered, b"/P -3392", b"/P -0004"); // the same length: nothing else moves
+    // The untouched file: the check value agrees, and everything is denied.
+    let honest = Document::from_bytes_with_password(original.clone(), &row.user).unwrap();
+    assert!(honest.encryption().unwrap().perms_valid);
+    // The edited one: opens with the same password, its flags say "everything", but it is
+    // taken to allow nothing, says so in `info`, and `decrypt` refuses.
+    let doc = Document::from_bytes_with_password(tampered.clone(), &row.user).unwrap();
+    let enc = doc.encryption().unwrap();
+    assert!(!enc.perms_valid);
+    assert!(!enc.permissions.print && !enc.permissions.modify && !enc.permissions.copy, "{:?}", enc.permissions);
+    assert!(!enc.permissions.allows_everything());
+    match ops::decrypt(&doc, &row.user) {
+        Err(Error::Invalid(m)) => assert!(m.contains("owner password") && m.contains("/Perms"), "{m}"),
+        other => panic!("the edited file was decrypted: {:?}", other.map(|o| o.pages)),
+    }
+    // And what is written from it says what happened, and carries the same /Perms (still wrong).
+    let out = ops::copy_all(&doc).unwrap();
+    assert!(out.warnings.iter().any(|w| w.0.contains("/Perms") && w.0.contains("allow nothing")), "{:?}", out.warnings);
+    // It may not follow a plain file in a merge, either.
+    let plain = Document::open(common::corpus_root().join("public").join("xref-classic").join("hello_world_2_pages.pdf")).unwrap();
+    let r = ops::merge(&[Input { name: "plain.pdf", doc: &plain, password: "" }, Input { name: "edited.pdf", doc: &doc, password: &row.user }]);
+    assert!(matches!(&r, Err(Error::Invalid(m)) if m.contains("edited.pdf restricts what can be done with it")), "{:?}", r.map(|o| o.pages));
+    // With the owner password nothing is in the way (and the file key is the same).
+    let owner = Document::from_bytes_with_password(tampered, &row.owner).unwrap();
+    assert!(ops::decrypt(&owner, &row.owner).is_ok());
+    assert_eq!(owner.security().unwrap().file_key(), honest.security().unwrap().file_key());
+    // Every generated file and corpus file of revision 5 or 6 has a check value that agrees.
+    for row in generated() {
+        let doc = open(&row.path, &row.user);
+        assert!(doc.encryption().unwrap().perms_valid, "{}", name(&row.path));
+    }
+    for known in common::KNOWN {
+        let path = corpus_path(known.rel);
+        if path.is_file() {
+            let doc = open(&path, known.user);
+            assert!(doc.encryption().unwrap().perms_valid, "{}: /Perms does not agree with /P", known.rel);
+        }
+    }
+}
+
+/// Revisions 2 to 4 put `/P` into the key, so editing it makes the password stop working.
+#[test]
+fn edited_permission_flags_of_older_revisions_break_the_key() {
+    for part in ["bookmarks.r4-aes128-user-assemble-n", "bookmarks.r3-128-rc4-user-modify-none", "bookmarks.r2-40-user"] {
+        let row = generated().into_iter().find(|r| r.path.to_string_lossy().contains(part)).unwrap();
+        let mut bytes = std::fs::read(&row.path).unwrap();
+        let at = bytes.windows(4).position(|w| w == b"/P -").expect("a /P") + 4;
+        let end = at + bytes[at..].iter().take_while(|b| b.is_ascii_digit()).count();
+        bytes[end - 1] = if bytes[end - 1] == b'0' { b'1' } else { b'0' };
+        assert!(matches!(Document::from_bytes_with_password(bytes, &row.user), Err(Error::WrongPassword)), "{part}");
+    }
+}
+
+/// Only attachments are encrypted (`/StmF` and `/StrF` are Identity, `/EFF` names the filter): `info` says
+/// so, and the attachment and the stream with its own crypt filter are decrypted.
+#[test]
+fn a_file_that_encrypts_only_its_attachments_is_described_as_that() {
+    for (name, password) in [("eff-user.pdf", "u"), ("eff-empty.pdf", "")] {
+        let doc = fixture_doc(name, password);
+        let enc = doc.encryption().unwrap();
+        assert_eq!(enc.method_name(), "attachments only (AES-128)", "{name}");
+        assert_eq!((enc.stream_method, enc.string_method), (qingpdf_core::security::Method::None, qingpdf_core::security::Method::None));
+        assert_eq!(enc.needs_password(), !password.is_empty(), "{name}");
+        // Page one's stream is in the clear, the attachment (EFF) and page two's (its own /Crypt filter) are not.
+        let stream = |num: u32| match doc.get(qingpdf_core::ObjRef::new(num, 0)).unwrap() {
+            Object::Stream(s) => s.data,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(stream(4), b"BT /F1 12 Tf 10 10 Td (page one plain) Tj ET", "{name}");
+        assert_eq!(stream(11), b"ATTACHMENT BODY ".repeat(10), "{name}");
+        assert_eq!(stream(12), b"BT /F1 12 Tf 10 10 Td (page two crypt filter) Tj ET", "{name}");
+        // And written out the same way: read back, they are the same.
+        let out = ops::copy_all(&doc).unwrap();
+        let again = Document::from_bytes_with_password(out.data, password).unwrap();
+        assert_eq!(again.encryption().unwrap().method_name(), "attachments only (AES-128)", "{name}");
+        let contents = content_of(&again);
+        assert!(contents.streams.contains(&b"ATTACHMENT BODY ".repeat(10)), "{name}");
+        assert!(contents.streams.contains(b"BT /F1 12 Tf 10 10 Td (page two crypt filter) Tj ET".as_slice()), "{name}");
+    }
+}
+
+#[test]
+fn the_method_is_described_in_words() {
+    use qingpdf_core::security::{Method, Permissions};
+    let enc = |stream, string, file, bits| qingpdf_core::security::Encryption {
+        version: 4,
+        revision: 4,
+        key_bits: bits,
+        stream_method: stream,
+        string_method: string,
+        file_method: file,
+        encrypt_metadata: true,
+        permissions: Permissions::none(),
+        perms_valid: true,
+        opened: None,
+        password_needed: true,
+    };
+    assert_eq!(enc(Method::Rc4, Method::Rc4, Method::Rc4, 40).method_name(), "RC4 40-bit");
+    assert_eq!(enc(Method::Rc4, Method::Rc4, Method::Rc4, 128).method_name(), "RC4 128-bit");
+    assert_eq!(enc(Method::AesV2, Method::AesV2, Method::AesV2, 128).method_name(), "AES-128");
+    assert_eq!(enc(Method::AesV3, Method::AesV3, Method::AesV3, 256).method_name(), "AES-256");
+    assert_eq!(enc(Method::AesV2, Method::None, Method::AesV2, 128).method_name(), "streams AES-128, strings none");
+    assert_eq!(enc(Method::None, Method::None, Method::AesV3, 256).method_name(), "attachments only (AES-256)");
+    assert_eq!(enc(Method::AesV2, Method::AesV2, Method::AesV3, 128).method_name(), "AES-128, attachments AES-256");
+    assert_eq!(enc(Method::None, Method::None, Method::None, 128).method_name(), "none");
+    assert!(enc(Method::Rc4, Method::Rc4, Method::Rc4, 40).strength() < enc(Method::Rc4, Method::Rc4, Method::Rc4, 128).strength());
+    assert!(enc(Method::Rc4, Method::Rc4, Method::Rc4, 128).strength() < enc(Method::AesV2, Method::AesV2, Method::AesV2, 128).strength());
+    assert!(enc(Method::AesV2, Method::AesV2, Method::AesV2, 128).strength() < enc(Method::AesV3, Method::AesV3, Method::AesV3, 256).strength());
+    assert_eq!(enc(Method::None, Method::None, Method::None, 128).strength(), 0);
 }
 
 // --- the Identity crypt filter, EncryptMetadata false, per-stream crypt filters -------------------

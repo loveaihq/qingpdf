@@ -19,7 +19,7 @@ qingpdf img2pdf 1.jpg 2.png -o out.pdf              one image per page (JPEG kep
 qingpdf decrypt a.pdf -o plain.pdf --password P     write an unencrypted copy (owner password, or a file that allows everything)
 ```
 
-Every command that reads a PDF takes `--password <password>` for encrypted files (the empty password is always tried first); the results are encrypted the way the input was, with the same passwords and permissions. `info` shows how a file is protected and what its author allows.
+Every command that reads a PDF takes `--password <password>` for encrypted files (a password that is given is tried first, then the empty one); the results are encrypted the way the input was, with the same passwords and permissions. A file that restricts what may be done with it (it was not opened with its owner password and its author did not allow everything) can only be the first input of a merge, whose output then carries its protection, unless its owner password is given. `info` shows how a file is protected and what its author allows.
 
 Outputs are never written over an input, and an existing file is only replaced with `--force`. Run `qingpdf <command> --help` for details.
 

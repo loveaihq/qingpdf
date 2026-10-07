@@ -26,8 +26,6 @@ pub enum CipherError {
     /// AES data whose length is not a multiple of 16 bytes (7.6.2: the data
     /// is a 16-byte initialisation vector followed by whole blocks).
     Length,
-    /// The last block does not end in valid PKCS#7 padding (7.6.2).
-    Padding,
     /// The AES key is neither 16 nor 32 bytes long.
     Key,
 }
@@ -36,7 +34,6 @@ impl CipherError {
     pub fn message(self) -> &'static str {
         match self {
             CipherError::Length => "AES data is not a whole number of 16-byte blocks",
-            CipherError::Padding => "AES data does not end in valid padding",
             CipherError::Key => "the encryption key has the wrong length for AES",
         }
     }
@@ -191,15 +188,43 @@ pub fn aes_decrypt_vec(key: &[u8], data: Vec<u8>) -> Result<Vec<u8>, CipherError
         32 => cbc_decrypt_vec(&Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?, data)?,
         _ => return Err(CipherError::Key),
     };
-    // PKCS#7: the last byte says how many bytes of padding there are, 1 to 16,
-    // and every one of them has that value.
-    let pad = usize::from(plain.last().copied().ok_or(CipherError::Padding)?);
-    let keep = plain.len().checked_sub(pad).filter(|_| (1..=16).contains(&pad)).ok_or(CipherError::Padding)?;
-    if plain.get(keep..).is_none_or(|tail| tail.iter().any(|&b| usize::from(b) != pad)) {
-        return Err(CipherError::Padding);
+    // PKCS#7 (7.6.2): the last byte says how many bytes of padding there are, 1
+    // to 16. qpdf and pdf.js strip that many when the byte is in that range,
+    // without looking at the others, and keep every byte when it is not (a writer
+    // that did not pad, or damaged data): so do we, because qpdf, MuPDF and
+    // PDFium show such files as they were meant and refusing the object would
+    // lose it.
+    let pad = usize::from(plain.last().copied().unwrap_or(0));
+    if (1..=16).contains(&pad) {
+        plain.truncate(plain.len().saturating_sub(pad));
     }
-    plain.truncate(keep);
     Ok(plain)
+}
+
+/// Would [`aes_decrypt_vec`] accept `len` bytes of data under `key` (no error:
+/// the key is 16 or 32 bytes, and the data is empty, only a vector, or a vector
+/// and whole blocks)?
+pub fn aes_can_decrypt(key: &[u8], len: usize) -> bool {
+    check_key(key).is_ok() && (len == 0 || len == 16 || (len >= 32 && len.is_multiple_of(16)))
+}
+
+/// One block decrypted with AES-256 in ECB mode, as `/Perms` is stored (the
+/// extension of level 3 and ISO 32000-2).
+pub fn aes256_decrypt_block(key: &[u8], block: &[u8]) -> Result<[u8; 16], CipherError> {
+    let cipher = Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?;
+    let mut array: Array<u8, U16> = Array::from([0u8; 16]);
+    if block.len() != 16 {
+        return Err(CipherError::Length);
+    }
+    for (dst, src) in array.iter_mut().zip(block) {
+        *dst = *src;
+    }
+    cipher.decrypt_block(&mut array);
+    let mut out = [0u8; 16];
+    for (dst, src) in out.iter_mut().zip(array.iter()) {
+        *dst = *src;
+    }
+    Ok(out)
 }
 
 fn check_key(key: &[u8]) -> Result<(), CipherError> {
@@ -260,12 +285,14 @@ pub fn password_hash(revision: i64, password: &[u8], salt: &[u8], udata: &[u8]) 
     let mut round = 0usize;
     let mut buffer: Vec<u8> = Vec::new();
     loop {
-        // K1 is (password, K, udata) written 64 times over.
+        // K1 is (password, K, udata) written 64 times over: once, then the
+        // buffer doubled six times.
         buffer.clear();
-        for _ in 0..64 {
-            buffer.extend_from_slice(password);
-            buffer.extend_from_slice(&k);
-            buffer.extend_from_slice(udata);
+        buffer.extend_from_slice(password);
+        buffer.extend_from_slice(&k);
+        buffer.extend_from_slice(udata);
+        for _ in 0..6 {
+            buffer.extend_from_within(..);
         }
         // AES-128 in CBC mode without padding: the key is the first 16 bytes
         // of K, the vector the next 16.
@@ -431,20 +458,54 @@ mod tests {
         let key = [1u8; 16];
         let mut good = Vec::new();
         aes_encrypt_into(&key, [0u8; 16], b"hello world", &mut good).unwrap();
-        // Not a multiple of 16, a truncated vector, bad padding, a bad key.
+        // Not a multiple of 16, a truncated vector, a bad key.
         assert_eq!(aes_decrypt(&key, good.get(..31).unwrap()), Err(CipherError::Length));
         assert_eq!(aes_decrypt(&key, good.get(..7).unwrap()), Err(CipherError::Length));
-        let mut bad = good.clone();
-        *bad.last_mut().unwrap() ^= 0x55;
-        // Almost certainly not valid padding any more (it can be by chance: pick
-        // a change that cannot be).
-        let last = bad.len() - 1;
-        bad[last] = 0;
-        assert_eq!(aes_decrypt(&key, &bad), Err(CipherError::Padding));
         assert_eq!(aes_decrypt(&[1u8; 5], &good), Err(CipherError::Key));
         // Empty and vector-only data read as an empty string.
         assert_eq!(aes_decrypt(&key, &[]).unwrap(), Vec::<u8>::new());
         assert_eq!(aes_decrypt(&key, &[0u8; 16]).unwrap(), Vec::<u8>::new());
+    }
+
+    /// Data encrypted the way a writer does that does not pad (or pads wrongly): the
+    /// decrypted bytes are all kept, as qpdf and pdf.js keep them.
+    #[test]
+    fn aes_data_without_valid_padding_keeps_every_byte() {
+        let key = [1u8; 16];
+        let encrypt_raw = |plain: &[u8]| {
+            let cipher = Aes128::new_from_slice(&key).unwrap();
+            let mut body = plain.to_vec();
+            cbc_encrypt_in_place(&cipher, &[7u8; 16], &mut body);
+            let mut out = vec![7u8; 16];
+            out.extend_from_slice(&body);
+            out
+        };
+        // Whole blocks of text: the last byte is 'x', far beyond 16.
+        let text = b"BT /F1 12 Tf (no padding here, 32 bytes) Tj ET.".get(..32).unwrap().to_vec();
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&text)).unwrap(), text);
+        // A last byte of 0: nothing to strip.
+        let mut zero = vec![b'a'; 31];
+        zero.push(0);
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&zero)).unwrap(), zero);
+        // A last byte of 5 whose four neighbours are not 5: five bytes are stripped,
+        // as qpdf does (it does not look at the others).
+        let mut five = vec![b'a'; 31];
+        five.push(5);
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&five)).unwrap(), vec![b'a'; 27]);
+        // Valid padding still works, a whole block of it too.
+        let mut sixteen = vec![b'b'; 16];
+        sixteen.extend([16u8; 16]);
+        assert_eq!(aes_decrypt(&key, &encrypt_raw(&sixteen)).unwrap(), vec![b'b'; 16]);
+    }
+
+    #[test]
+    fn one_block_of_ecb_is_decrypted() {
+        // FIPS 197 appendix C.3: AES-256.
+        let key: Vec<u8> = (0u8..32).collect();
+        let cipher_text = hex("8ea2b7ca516745bfeafc49904b496089");
+        assert_eq!(aes256_decrypt_block(&key, &cipher_text).unwrap().to_vec(), hex("00112233445566778899aabbccddeeff"));
+        assert_eq!(aes256_decrypt_block(&key, &cipher_text[..15]), Err(CipherError::Length));
+        assert_eq!(aes256_decrypt_block(&key[..16], &cipher_text), Err(CipherError::Key));
     }
 
     #[test]

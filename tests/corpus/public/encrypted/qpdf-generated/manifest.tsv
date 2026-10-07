@@ -28,4 +28,5 @@ sig.r6-aes256-user-signature.pdf	user	owner		incremental/signature_reason.pdf	R6
 forms.r6-aes256-empty-forms.pdf		owner		outline-form-attach/multiple_form_types.pdf	R6, form fields with string values
 attach.r4-aes128-user-attachments.pdf	user	owner		outline-form-attach/embedded_attachments_with_desc.pdf	R4, an embedded file stream
 attach.r6-aes256-empty-attachments.pdf		owner		outline-form-attach/embedded_attachments_with_desc.pdf	R6, an embedded file stream
+utf8.r6-aes256-user-127bytes.pdf	0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456	owner		outline-form-attach/utf-8.pdf	R6, a password of exactly 127 bytes (the longest one that counts)
 utf8.r6-aes256-user-fullwidth.pdf	ABC123	owner	ＡＢＣ１２３	outline-form-attach/utf-8.pdf	R6, opens with the full-width form of the password too

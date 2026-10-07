@@ -47,6 +47,12 @@ impl DecodeBudget {
         self.left.get()
     }
 
+    /// Spend `bytes` of the budget for work that is not a decoding step (copying
+    /// an object stream that is read again, say).
+    pub(crate) fn charge_bytes(&self, bytes: usize) {
+        self.charge(bytes);
+    }
+
     fn charge(&self, bytes: usize) {
         self.left.set(self.left.get().saturating_sub(u64::try_from(bytes).unwrap_or(u64::MAX)));
     }

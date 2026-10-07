@@ -39,6 +39,7 @@ SOURCES = {
 }
 
 LONG = "correct horse battery staple, a very long password of more than thirty-two characters"
+LONGER = ("0123456789" * 12) + "0123456"  # exactly 127 bytes, the longest that R5 and R6 use
 
 # name, source, bits, user, owner, qpdf options, other passwords that open it, what it is for
 CASES = [
@@ -73,6 +74,7 @@ CASES = [
     ("r6-aes256-empty-forms", "forms", 256, "", "owner", ["--form=n"], [], "R6, form fields with string values"),
     ("r4-aes128-user-attachments", "attach", 128, "user", "owner", ["--use-aes=y"], [], "R4, an embedded file stream"),
     ("r6-aes256-empty-attachments", "attach", 256, "", "owner", [], [], "R6, an embedded file stream"),
+    ("r6-aes256-user-127bytes", "utf8", 256, LONGER, "owner", [], [], "R6, a password of exactly 127 bytes (the longest one that counts)"),
     ("r6-aes256-user-fullwidth", "utf8", 256, "ABC123", "owner", [], ["ＡＢＣ１２３"], "R6, opens with the full-width form of the password too"),
 ]
 

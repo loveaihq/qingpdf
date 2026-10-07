@@ -87,8 +87,8 @@ fn merging_a_paper_with_itself_keeps_the_links_of_the_second_copy_in_the_second_
     let doc = open("zh/lunwen/lunwen-arxiv-2601.14329-latex.pdf");
     let count = doc.page_count().unwrap();
     let out = ops::merge(&[
-        ops::Input { name: "a.pdf", doc: &doc },
-        ops::Input { name: "a again.pdf", doc: &doc },
+        ops::Input { name: "a.pdf", doc: &doc, password: "" },
+        ops::Input { name: "a again.pdf", doc: &doc, password: "" },
     ])
     .unwrap();
     let merged = Document::from_bytes(out.data).unwrap();

@@ -249,7 +249,7 @@ fn write_depth(out: &mut Vec<u8>, obj: &Object, depth: usize, enc: Option<&Objec
 fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize, enc: Option<&ObjectCrypt<'_>>) -> Result<()> {
     out.extend_from_slice(b"<<");
     // The contents of a signature are not encrypted (they are the signature).
-    let signature = matches!(d.get("ByteRange"), Some(Object::Array(_)));
+    let signature = crate::security::is_signature_dict(d);
     for (key, value) in d.iter() {
         if matches!(value, Object::Null) || skip.is_some_and(|s| key == s) {
             continue;

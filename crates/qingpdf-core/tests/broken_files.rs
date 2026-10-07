@@ -649,7 +649,7 @@ mod hostile {
         let bytes = hyperref_like(300, 10, 200);
         let (outcome, took) = run_within(move || {
             let doc = Document::from_bytes(bytes).expect("opens");
-            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).expect("merge");
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc, password: "" }, ops::Input { name: "b", doc: &doc, password: "" }]).expect("merge");
             let copy = Document::from_bytes(merged.data).expect("reopens");
             let pages = copy.pages().expect("pages");
             // Every link of the second copy leads to a page of the second copy.
@@ -708,7 +708,7 @@ mod hostile {
         let (outcome, took) = run_within(move || {
             let doc = Document::from_bytes(bytes).expect("opens");
             let counted = doc.page_count();
-            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc, password: "" }, ops::Input { name: "b", doc: &doc, password: "" }]).map(|o| o.pages);
             (counted, merged)
         });
         assert_quick(took, "a file that names one page a million times");
@@ -744,7 +744,7 @@ mod hostile {
         let (outcome, took) = run_within(move || {
             let doc = Document::from_bytes(bytes).expect("opens");
             let deleted = ops::delete_pages(&doc, &[1]).map(|o| o.pages);
-            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc, password: "" }, ops::Input { name: "b", doc: &doc, password: "" }]).map(|o| o.pages);
             (deleted, merged)
         });
         assert_quick(took, "delete and merge of a name tree whose leaves share one array");
@@ -767,7 +767,7 @@ mod hostile {
         let (outcome, took) = run_within(move || {
             let doc = Document::from_bytes(bytes).expect("opens");
             let split = ops::extract_pages(&doc, &[0]).map(|o| o.pages);
-            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc }, ops::Input { name: "b", doc: &doc }]).map(|o| o.pages);
+            let merged = ops::merge(&[ops::Input { name: "a", doc: &doc, password: "" }, ops::Input { name: "b", doc: &doc, password: "" }]).map(|o| o.pages);
             (split, merged)
         });
         assert_quick(took, "a name tree that names one huge key 1500 times");
@@ -1184,52 +1184,58 @@ mod encrypted {
         digits.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()).collect()
     }
 
+    /// A string of an encrypted file that is not a whole number of AES blocks cannot have been
+    /// encrypted: it is kept as it is (a program that did not know about the encryption wrote
+    /// it, almost always as plain text) and the copy says so; the object is not lost. A string
+    /// whose last block has no valid padding is decrypted, every byte of it kept.
     #[test]
-    fn damaged_aes_strings_are_errors_for_their_object() {
+    fn damaged_aes_strings_are_kept_and_never_cost_their_object() {
         for part in ["pdf20utf8.r4-aes128-empty-modify-none", "pdf20utf8.r6-aes256-user-modify-none"] {
             let (bytes, password) = generated_bytes(part);
             let title = string_bytes_after(&bytes, b"/Title");
             assert!(title.len() >= 32 && title.len().is_multiple_of(16), "{part}");
-            let reads_title = |patched: Vec<u8>| -> Result<(), Error> {
-                let doc = Document::from_bytes_with_password(patched, &password)?;
+            let title_of = |patched: Vec<u8>| -> (Document, Result<Vec<u8>, Error>) {
+                let doc = Document::from_bytes_with_password(patched, &password).unwrap();
                 let Some(Object::Ref(info)) = doc.trailer().get("Info").cloned() else { panic!("{part}: no /Info") };
-                doc.get(info).map(|_| ())
+                let read = doc.get(info).map(|o| match o.as_dict().and_then(|d| d.get("Title")) {
+                    Some(Object::String(s)) => s.bytes.clone(),
+                    other => panic!("{part}: {other:?}"),
+                });
+                (doc, read)
             };
-            assert!(reads_title(bytes.clone()).is_ok(), "{part}: the undamaged file reads");
-            // One byte too few, a vector cut short, no vector at all, one block of garbage after it.
+            let (_, undamaged) = title_of(bytes.clone());
+            let undamaged = undamaged.unwrap_or_else(|e| panic!("{part}: the undamaged file reads: {e}"));
+            // Not a whole number of blocks: a vector cut short, one byte too few, a vector and a stray byte.
             let cases: Vec<(&str, Vec<u8>)> = vec![
                 ("not a multiple of 16", title[..title.len() - 1].to_vec()),
                 ("a truncated IV", title[..5].to_vec()),
                 ("an IV and a stray byte", title[..17].to_vec()),
-                ("bad padding", {
-                    let mut t = title.clone();
-                    let last = t.len() - 1;
-                    t[last] = 0;
-                    t
-                }),
-                ("padding too long", {
-                    let mut t = title.clone();
-                    // The block before the last one is XORed into the last plaintext block:
-                    // a change there changes the last byte of plaintext predictably.
-                    let at = t.len() - 17;
-                    t[at] ^= 0x7F;
-                    t
-                }),
             ];
             for (what, damaged) in cases {
-                let result = reads_title(with_string(&bytes, b"/Title", &damaged));
-                match result {
-                    Err(Error::Syntax { message, .. }) => assert!(message.contains("object") || message.contains("AES"), "{part} {what}: {message}"),
-                    other => panic!("{part} {what}: expected a syntax error, got {other:?}"),
-                }
-                // Everything else still works: the copy drops the damaged object and says so.
-                let doc = Document::from_bytes_with_password(with_string(&bytes, b"/Title", &damaged), &password).unwrap();
-                let out = ops::copy_all(&doc).expect("a copy of a file with one damaged string");
-                assert!(out.warnings.iter().any(|w| w.0.contains("damaged object")), "{part} {what}: {:?}", out.warnings);
+                let (doc, read) = title_of(with_string(&bytes, b"/Title", &damaged));
+                assert_eq!(read.unwrap_or_else(|e| panic!("{part} {what}: the object was lost: {e}")), damaged, "{part} {what}: kept as it is");
+                let out = ops::copy_all(&doc).expect("a copy of a file with one string that was not encrypted");
+                assert!(out.warnings.iter().any(|w| w.0.contains("could not be decrypted")), "{part} {what}: {:?}", out.warnings);
+                assert!(!out.warnings.iter().any(|w| w.0.contains("damaged object")), "{part} {what}: {:?}", out.warnings);
+            }
+            // No valid padding: decrypted, nothing refused, nothing dropped.
+            let mut zero = title.clone();
+            let last = zero.len() - 1;
+            zero[last] = 0;
+            let mut long = title.clone();
+            let at = long.len() - 17;
+            long[at] ^= 0x7F; // the last plaintext byte becomes something far above 16
+            for (what, damaged) in [("last byte changed", zero), ("padding byte too big", long)] {
+                let (doc, read) = title_of(with_string(&bytes, b"/Title", &damaged));
+                let read = read.unwrap_or_else(|e| panic!("{part} {what}: {e}"));
+                assert!(!read.is_empty() && read != undamaged, "{part} {what}");
+                let out = ops::copy_all(&doc).unwrap();
+                assert!(out.warnings.iter().all(|w| !w.0.contains("could not be decrypted") && !w.0.contains("damaged")), "{part} {what}: {:?}", out.warnings);
             }
             // An empty string, or only a vector, reads as an empty string.
             for empty in [vec![], title[..16].to_vec()] {
-                assert!(reads_title(with_string(&bytes, b"/Title", &empty)).is_ok(), "{part}: an empty string");
+                let (_, read) = title_of(with_string(&bytes, b"/Title", &empty));
+                assert_eq!(read.unwrap(), Vec::<u8>::new(), "{part}: an empty string");
             }
         }
     }
@@ -1263,9 +1269,9 @@ mod encrypted {
 
     #[test]
     fn huge_strings_are_fast() {
-        // Five megabytes of ciphertext in a string: with RC4 they decrypt, with AES
-        // (random bytes: padding that does not fit) it is an error, both at once.
-        for (part, ok) in [("pdf20utf8.r4-128-rc4-v4-user", true), ("pdf20utf8.r4-aes128-empty-modify-none", false)] {
+        // Five megabytes of ciphertext in a string: with RC4 and with AES (random bytes: a
+        // padding that does not fit, so every byte stays) it is read, at once.
+        for part in ["pdf20utf8.r4-128-rc4-v4-user", "pdf20utf8.r4-aes128-empty-modify-none"] {
             let rows = common::generated();
             let row = rows.iter().find(|r| r.path.to_string_lossy().contains(part)).expect("the generated file");
             let bytes = std::fs::read(&row.path).unwrap();
@@ -1275,7 +1281,7 @@ mod encrypted {
             let doc = Document::from_bytes_with_password(patched, &row.user).unwrap();
             let Some(Object::Ref(info)) = doc.trailer().get("Info").cloned() else { panic!("{part}: no /Info") };
             let result = doc.get(info);
-            assert_eq!(result.is_ok(), ok, "{part}: {:?}", result.map(|_| ()));
+            assert!(result.is_ok(), "{part}: {:?}", result.map(|_| ()));
             assert!(started.elapsed() < limit(), "{part}: took {:?}", started.elapsed());
         }
     }

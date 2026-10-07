@@ -156,10 +156,10 @@ fn op_error(path: &Path, e: &Error) -> String {
     }
 }
 
-/// Open a file. If it needs a password, the empty one is tried first and then
-/// `password`; one that does not work is an error, and a file that needs one
-/// and was given none is returned locked (only `info` can say something about
-/// it then).
+/// Open a file. If it needs a password, `password` is tried first and then the
+/// empty one; a file that opens with neither is an error when a password was
+/// given, and is returned locked when none was (only `info` can say something
+/// about it then).
 fn open_pdf(path: &Path, password: &str) -> Result<Document, Failure> {
     Document::open_with_password(path, password).map_err(|e| open_error(path, &e))
 }
@@ -257,7 +257,7 @@ fn merge_command(inputs: &[PathBuf], output: &Path, force: bool, password: &str)
     let names: Vec<String> = inputs.iter().map(|p| p.display().to_string()).collect();
     check_output(output, inputs, force)?;
     let merge_inputs: Vec<Input<'_>> =
-        docs.iter().zip(&names).map(|(doc, name)| Input { name: name.as_str(), doc }).collect();
+        docs.iter().zip(&names).map(|(doc, name)| Input { name: name.as_str(), doc, password }).collect();
     let out = ops::merge(&merge_inputs).map_err(|e| match &e {
         Error::Invalid(m) => m.clone(),
         other => format!("merge failed: {other}"),
@@ -393,7 +393,8 @@ fn render_info(path: &Path, r: &Report) -> String {
 fn render_encryption(s: &mut String, e: &qingpdf_core::security::Encryption) {
     let metadata = if e.encrypt_metadata { "" } else { ", metadata not encrypted" };
     s.push_str(&format!("Encryption:          {} (V{}, R{}{metadata})\n", e.method_name(), e.version, e.revision));
-    let method_note = if e.stream_method == Method::None && e.string_method == Method::None {
+    let method_note = if e.stream_method == Method::None && e.string_method == Method::None && e.file_method == Method::None
+    {
         " (nothing is actually encrypted)"
     } else {
         ""
@@ -407,13 +408,24 @@ fn render_encryption(s: &mut String, e: &qingpdf_core::security::Encryption) {
                 (PasswordKind::User, false) => "the user password",
                 (PasswordKind::Owner, false) => "the owner password",
             };
-            if a.empty { format!("not needed (opened with {which})") } else { format!("needed (opened with {which})") }
+            if e.needs_password() {
+                format!("needed (opened with {which})")
+            } else if a.empty {
+                format!("not needed (opened with {which})")
+            } else {
+                format!("not needed (the empty password opens it too; opened with {which})")
+            }
         }
     };
     s.push_str(&format!("Password to open:    {password}{method_note}\n"));
     for (i, (what, allowed)) in e.permissions.list().iter().enumerate() {
         let label = if i == 0 { "Permissions:        " } else { "                    " };
         s.push_str(&format!("{label} {what}: {}\n", yes_no(*allowed)));
+    }
+    if !e.perms_valid {
+        s.push_str(
+            "                     (the permission flags /P do not agree with the check value /Perms that only the file key can read: someone may have edited them, so nothing is allowed when the file is opened with the user password)\n",
+        );
     }
 }
 

@@ -462,7 +462,7 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        // An empty password is allowed (it is what is tried first anyway); images have none.
+        // An empty password is allowed (it is what is tried when none is given); images have none.
         assert!(matches!(run(&["info", "a.pdf", "--password", ""]), Request::Info { password, .. } if password.is_empty()));
         assert!(fails(&["img2pdf", "a.png", "-o", "o.pdf", "--password", "x"]).contains("unknown option '--password'"));
         assert!(fails(&["info", "a.pdf", "--password"]).contains("needs a value"));

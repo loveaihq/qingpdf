@@ -48,8 +48,31 @@ const OBJSTM_CACHE_BYTES: usize = 96 * 1024 * 1024;
 /// big the dictionary may be once they are followed.
 const MAX_ENCRYPT_REFS: usize = 64;
 const MAX_ENCRYPT_BYTES: usize = 1 << 20;
+
+/// What is left of the references and the bytes the `/Encrypt` dictionary may
+/// take (counted over every object it is made of, repeats included).
+struct EncryptBudget {
+    refs: usize,
+    bytes: usize,
+}
+
+impl EncryptBudget {
+    fn charge(&mut self, obj: &Object) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_sub(obj.approx_size())
+            .ok_or_else(|| Error::Limit("it is absurdly large".to_string()))?;
+        Ok(())
+    }
+}
+
+/// How many objects with strings left as they were are listed one by one.
+const MAX_LISTED_RAW_OBJECTS: usize = 1000;
 /// The header must start within this many bytes of the beginning of the file.
 const HEADER_WINDOW: usize = 1024;
+/// The most object streams whose first read is remembered (so that a second one
+/// can be told from a first); past that every read counts as a re-read.
+const MAX_TRACKED_OBJSTMS: usize = 1 << 20;
 /// Page attributes a page inherits from its ancestors (7.7.3.4, Table 30).
 const INHERITABLE: [&str; 4] = ["Resources", "MediaBox", "CropBox", "Rotate"];
 const RESOURCES: usize = 0;
@@ -83,6 +106,14 @@ pub struct Document {
     /// not in the table, so an object missing from the table is "unsupported"
     /// or "over the limit", not "absent".
     unreadable: RefCell<Unopened>,
+    /// The object streams that have been read (decoded, and decrypted if need be)
+    /// at least once: reading one again, because the cache let it go, is paid
+    /// for out of `budget`.
+    objstms_read: RefCell<HashSet<u32>>,
+    /// Strings that could not be decrypted and were kept as they are (object
+    /// number -> how many); see [`Document::decryption_warning`].
+    strings_kept: RefCell<BTreeMap<u32, u32>>,
+    strings_kept_unlisted: Cell<u32>,
     /// The encryption (7.6) of the file, if it has any: set when the file is
     /// opened and never changed after. Locked until a password has opened it.
     security: Option<Security>,
@@ -460,7 +491,12 @@ impl Document {
                 let mut doc =
                     Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false, budget);
                 doc.repair_allowed.set(false);
-                let checked = doc.init_security(password).and_then(|()| doc.validate());
+                let checked = match doc.init_security(password) {
+                    // The encryption dictionary asks for more than is safe: scanning the
+                    // file again would not make it smaller.
+                    Err(e @ Error::Limit(_)) => return Err(e),
+                    other => other.and_then(|()| doc.validate()),
+                };
                 doc.repair_allowed.set(true);
                 match checked {
                     Ok(()) => return Ok(doc),
@@ -494,8 +530,14 @@ impl Document {
                 let mut doc =
                     Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true, budget);
                 *doc.unreadable.borrow_mut() = unopened.clone();
-                let checked = doc.init_security(password).and_then(|()| {
+                let secured = doc.init_security(password);
+                if let Err(e @ Error::Limit(_)) = secured {
+                    return Err(e);
+                }
+                let checked = secured.and_then(|()| {
                     doc.index_encrypted_object_streams();
+                    // The catalog may only be readable now, with the object streams.
+                    doc.refresh_root_metadata();
                     doc.validate()
                 });
                 match checked {
@@ -551,6 +593,9 @@ impl Document {
             uses_xref_streams: Cell::new(uses_xref_streams),
             nesting: Cell::new(0),
             unreadable: RefCell::new(Unopened::default()),
+            objstms_read: RefCell::new(HashSet::new()),
+            strings_kept: RefCell::new(BTreeMap::new()),
+            strings_kept_unlisted: Cell::new(0),
             security: None,
         }
     }
@@ -566,9 +611,11 @@ impl Document {
         };
         // The dictionary is never encrypted, so it is read before there is a key.
         let unreadable = |e: Error| match e {
-            Error::Syntax { .. } | Error::MissingObject { .. } | Error::Limit(_) => {
+            Error::Syntax { .. } | Error::MissingObject { .. } => {
                 Error::syntax(None, format!("cannot read the encryption dictionary ({e})"))
             }
+            // Too much (a reference cycle, objects of absurd size): stays a limit.
+            Error::Limit(m) => Error::Limit(format!("the encryption dictionary: {m}")),
             other => other,
         };
         let encrypt_num = entry.as_obj_ref().map(|r| r.num);
@@ -576,10 +623,10 @@ impl Document {
         if !matches!(resolved, Object::Dict(_)) {
             return Err(Error::syntax(None, "the /Encrypt entry does not lead to a dictionary"));
         }
-        let mut refs_left = MAX_ENCRYPT_REFS;
-        let dict = match self.inline_references(resolved, &mut refs_left, 0).map_err(unreadable)? {
-            Object::Dict(d) if d.approx_size() <= MAX_ENCRYPT_BYTES => d,
-            Object::Dict(_) => return Err(Error::syntax(None, "the encryption dictionary is absurdly large")),
+        let mut budget = EncryptBudget { refs: MAX_ENCRYPT_REFS, bytes: MAX_ENCRYPT_BYTES };
+        budget.charge(&resolved).map_err(unreadable)?;
+        let dict = match self.inline_references(resolved, &mut budget, 0).map_err(unreadable)? {
+            Object::Dict(d) => d,
             _ => return Err(Error::syntax(None, "the /Encrypt entry does not lead to a dictionary")),
         };
         let mut security = Security::from_dict(dict, self.first_file_id(), encrypt_num)?;
@@ -587,26 +634,35 @@ impl Document {
             self.security = Some(security);
             return if password.is_empty() { Ok(()) } else { Err(Error::WrongPassword) };
         }
-        // `/EncryptMetadata false` leaves the catalog's metadata stream in the
-        // clear; which stream that is, is found out with the key in place.
-        self.security = Some(security.clone());
+        self.security = Some(security);
         self.forget_loaded_objects();
-        if !security.encrypt_metadata() {
-            let metadata = match self.catalog().ok().and_then(|c| c.get("Metadata").cloned()) {
-                Some(Object::Ref(r)) => Some(r.num),
-                _ => None,
-            };
-            security.set_root_metadata(metadata);
-            self.security = Some(security);
-            self.forget_loaded_objects();
-        }
+        self.refresh_root_metadata();
         Ok(())
+    }
+
+    /// `/EncryptMetadata false` leaves the catalog's metadata stream in the
+    /// clear; which stream that is, is found out with the key in place, and
+    /// again when the catalog only becomes readable later (a damaged file's
+    /// object streams are found by a second scan, with the key).
+    fn refresh_root_metadata(&mut self) {
+        if !self.security.as_ref().is_some_and(|s| s.is_unlocked() && !s.encrypt_metadata()) {
+            return;
+        }
+        let metadata = match self.catalog().ok().and_then(|c| c.get("Metadata").cloned()) {
+            Some(Object::Ref(r)) => Some(r.num),
+            _ => None,
+        };
+        if let Some(security) = self.security.as_mut() {
+            security.set_root_metadata(metadata);
+        }
+        self.forget_loaded_objects();
     }
 
     /// Objects and object streams read before the key was known (or with a
     /// different state of it) are not to be reused.
     fn forget_loaded_objects(&self) {
         self.objstms.borrow_mut().clear();
+        self.objstms_read.borrow_mut().clear();
         let budget = self.cache.borrow().budget;
         *self.cache.borrow_mut() = ObjectCache { budget, ..ObjectCache::default() };
     }
@@ -625,26 +681,29 @@ impl Document {
     }
 
     /// `obj` with every reference replaced by what it leads to, at most
-    /// `refs_left` of them in all and eight deep (the encryption dictionary may
-    /// keep its `/CF` or its strings in objects of their own, 7.6.1 asks for
-    /// direct objects but files exist).
-    fn inline_references(&self, obj: Object, refs_left: &mut usize, depth: usize) -> Result<Object> {
+    /// `budget.refs` of them in all and eight deep, and at most `budget.bytes`
+    /// bytes of objects: each target is charged before it is copied into the
+    /// result (the encryption dictionary may keep its `/CF` or its strings in
+    /// objects of their own, 7.6.1 asks for direct objects but files exist; a
+    /// hostile one points sixty-four times at a 32 MiB string).
+    fn inline_references(&self, obj: Object, budget: &mut EncryptBudget, depth: usize) -> Result<Object> {
         Ok(match obj {
             Object::Ref(_) => {
-                if *refs_left == 0 || depth >= 8 {
-                    return Err(Error::Limit("the encryption dictionary refers to too many objects".to_string()));
+                if budget.refs == 0 || depth >= 8 {
+                    return Err(Error::Limit("it refers to too many objects".to_string()));
                 }
-                *refs_left -= 1;
+                budget.refs -= 1;
                 let target = self.resolve(&obj)?;
-                self.inline_references(target, refs_left, depth + 1)?
+                budget.charge(&target)?;
+                self.inline_references(target, budget, depth + 1)?
             }
             Object::Array(items) => Object::Array(
-                items.into_iter().map(|i| self.inline_references(i, refs_left, depth)).collect::<Result<Vec<_>>>()?,
+                items.into_iter().map(|i| self.inline_references(i, budget, depth)).collect::<Result<Vec<_>>>()?,
             ),
             Object::Dict(d) => {
                 let mut out = Dict::new();
                 for (key, value) in d.into_pairs() {
-                    out.set(key, self.inline_references(value, refs_left, depth)?);
+                    out.set(key, self.inline_references(value, budget, depth)?);
                 }
                 Object::Dict(out)
             }
@@ -801,9 +860,39 @@ impl Document {
         // above this point sees them decrypted. The generation is the file's
         // own, which the key depends on.
         if let Some(security) = &self.security {
-            security.decrypt_object(header, &mut object)?;
+            let kept = security.decrypt_object(header, &mut object)?;
+            if kept > 0 {
+                self.note_strings_kept(header.num, kept);
+            }
         }
         Ok(object)
+    }
+
+    fn note_strings_kept(&self, num: u32, strings: u32) {
+        let mut listed = self.strings_kept.borrow_mut();
+        if listed.len() < MAX_LISTED_RAW_OBJECTS || listed.contains_key(&num) {
+            listed.insert(num, strings);
+        } else {
+            self.strings_kept_unlisted.set(self.strings_kept_unlisted.get().saturating_add(1));
+        }
+    }
+
+    /// What to tell the user about the strings that were not decrypted, if any
+    /// were met so far: in an encrypted file a string that is not a whole
+    /// number of AES blocks was written by a program that did not know about
+    /// the encryption, almost always as plain text, and is kept as it is.
+    pub fn decryption_warning(&self) -> Option<String> {
+        let listed = self.strings_kept.borrow();
+        if listed.is_empty() {
+            return None;
+        }
+        let strings: u64 = listed.values().map(|&n| u64::from(n)).sum();
+        let objects = listed.len() as u64 + u64::from(self.strings_kept_unlisted.get());
+        let first: Vec<String> = listed.keys().take(5).map(u32::to_string).collect();
+        Some(format!(
+            "at least {strings} string(s) in {objects} object(s) of the input could not be decrypted (a program that did not know about the encryption wrote them, usually as plain text) and were kept as they are; first objects: {}",
+            first.join(", ")
+        ))
     }
 
     /// Rebuild the cross-reference table by scanning, once per document.
@@ -818,6 +907,7 @@ impl Document {
                 *self.xref.borrow_mut() = r.entries;
                 *self.unreadable.borrow_mut() = r.unopened;
                 self.objstms.borrow_mut().clear();
+                self.objstms_read.borrow_mut().clear();
                 let budget = self.cache.borrow().budget;
                 *self.cache.borrow_mut() = ObjectCache { budget, ..ObjectCache::default() };
                 self.uses_xref_streams.set(r.uses_xref_streams);
@@ -849,16 +939,41 @@ impl Document {
         let Some(XrefEntry::InUse { offset, .. }) = entry else {
             return Err(Error::syntax(None, format!("object stream {stream_num} is not an ordinary object")));
         };
+        // Reading an object stream again, because the cache let it go, copies and
+        // decrypts all of it once more, and a file whose objects are spread over
+        // streams in an order that needs more than the cache holds does that for
+        // every object: those re-reads are charged to the decoding budget (the
+        // size of the stream as it is in the file), so that this ends in a limit.
+        // The first read of a stream, and the content streams that a split reads
+        // again and again, are free.
+        let reread = {
+            let mut seen = self.objstms_read.borrow_mut();
+            seen.contains(&stream_num) || (seen.len() >= MAX_TRACKED_OBJSTMS) || !seen.insert(stream_num)
+        };
         let Object::Stream(stream) = self.load_at(stream_num, offset)? else {
             return Err(Error::syntax(None, format!("object {stream_num} is not a stream")));
         };
-        let decoded = match self.decode_stream_limited(&stream, MAX_OBJSTM_DECODED) {
-            Ok(d) => d,
-            // Say where the unsupported filter was met.
-            Err(Error::Unsupported(m)) => {
-                return Err(Error::Unsupported(format!("{m} in an object stream")));
+        if reread {
+            let size = stream.data.len();
+            if self.budget.remaining() < u64::try_from(size).unwrap_or(u64::MAX) {
+                return Err(Error::Limit("the document asks for more decoding work than is allowed".to_string()));
             }
-            Err(e) => return Err(e),
+            self.budget.charge_bytes(size);
+        }
+        let decoded = if stream.dict.contains_key("Filter") {
+            match self.decode_stream_limited(&stream, MAX_OBJSTM_DECODED) {
+                Ok(d) => d,
+                // Say where the unsupported filter was met.
+                Err(Error::Unsupported(m)) => {
+                    return Err(Error::Unsupported(format!("{m} in an object stream")));
+                }
+                Err(e) => return Err(e),
+            }
+        } else if stream.data.len() > MAX_OBJSTM_DECODED {
+            return Err(Error::Limit(format!("decoded stream larger than {MAX_OBJSTM_DECODED} bytes")));
+        } else {
+            // No filter: the data is the object stream, and is not copied again.
+            stream.data
         };
         Ok(Rc::new(ObjStm::parse(&stream.dict, decoded)?))
     }

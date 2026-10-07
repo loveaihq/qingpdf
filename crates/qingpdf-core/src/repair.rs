@@ -249,8 +249,15 @@ pub fn rebuild_budgeted(data: &[u8], decode_budget: &DecodeBudget, security: Opt
         return Err(Error::syntax(None, "no PDF objects found in the file"));
     };
 
-    // The newest trailer whose /Root points at an object we found.
-    let root_ok = |d: &Dict| matches!(d.get("Root"), Some(Object::Ref(r)) if entries.contains(r.num));
+    // The newest trailer whose /Root points at an object we found. In an encrypted
+    // file scanned without the key, the catalog may sit in an object stream that
+    // could not be opened: the trailer's own /Root is believed then, and the scan
+    // that has the key (the document makes one) finds the object.
+    let keyless_encrypted = security.is_none();
+    let root_ok = |d: &Dict| match d.get("Root") {
+        Some(Object::Ref(r)) => entries.contains(r.num) || (keyless_encrypted && d.contains_key("Encrypt")),
+        _ => false,
+    };
     let chosen = trailers.iter().rev().find(|(_, d)| root_ok(d)).map(|(_, d)| d.clone());
     let mut trailer = match chosen {
         Some(d) => d,

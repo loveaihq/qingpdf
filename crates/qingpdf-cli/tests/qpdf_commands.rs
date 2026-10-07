@@ -221,6 +221,7 @@ fn qpdf_accepts_the_output_of_every_command_on_encrypted_files() {
         let label = common::corpus_name(&row.path);
         let pages = Document::open_with_password(&row.path, &row.user).unwrap().page_count().unwrap();
         let input = row.path.as_path();
+        let plain = common::corpus_root().join("public").join("xref-classic").join("hello_world_2_pages.pdf");
         let with = |words: &[&str], files: &[&Path]| -> Vec<OsString> {
             let mut a = args(words, files);
             a.extend([OsString::from("--password"), OsString::from(&row.user)]);
@@ -230,7 +231,8 @@ fn qpdf_accepts_the_output_of_every_command_on_encrypted_files() {
         let mut jobs: Vec<(&str, Vec<OsString>, PathBuf)> = vec![
             ("split", with(&["split", "@", "--pages", "1", "-o", "@"], &[input, &out("split")]), out("split")),
             ("rotate", with(&["rotate", "@", "--angle", "90", "-o", "@"], &[input, &out("rotate")]), out("rotate")),
-            ("merge", with(&["merge", "@", "@", "-o", "@"], &[input, input, &out("merge")]), out("merge")),
+            // Another file behind it: a file that restricts what may be done with it can only be first.
+            ("merge", with(&["merge", "@", "@", "-o", "@"], &[input, &plain, &out("merge")]), out("merge")),
         ];
         if pages >= 2 {
             jobs.push(("delete", with(&["delete", "@", "--pages", "1", "-o", "@"], &[input, &out("delete")]), out("delete")));
@@ -239,7 +241,7 @@ fn qpdf_accepts_the_output_of_every_command_on_encrypted_files() {
             let (code, err) = qingpdf(&command);
             assert_eq!(code, 0, "{label}: {what}: {err}");
             let tag = format!("{label}: {what}");
-            common::qpdf_accepts(&qpdf, &output, &row.user, &[(input, &row.user)], &tag);
+            common::qpdf_accepts(&qpdf, &output, &row.user, &[(input, &row.user), (&plain, "")], &tag);
             let (before, after) =
                 (common::qpdf_encryption(&qpdf, input, &row.user).unwrap(), common::qpdf_encryption(&qpdf, &output, &row.user));
             let after = after.unwrap_or_else(|| panic!("{tag}: qpdf does not open the output with the password"));

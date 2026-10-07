@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::image::{self, Format, PageMode};
 use crate::object::{Dict, Name, ObjRef, Object};
 use crate::prune;
-use crate::security::PasswordKind;
+use crate::security::{Encryption, PasswordKind};
 use crate::writer::{Builder, Warning};
 
 /// A finished file and what to tell the user about it.
@@ -34,10 +34,13 @@ pub struct Output {
     pub pages: usize,
 }
 
-/// One input of a merge: the name to use in messages, and the document.
+/// One input of a merge: the name to use in messages, the document, and the
+/// password it was opened with (empty for none; it tells whether the owner opened
+/// a file that restricts what may be done with it).
 pub struct Input<'a> {
     pub name: &'a str,
     pub doc: &'a Document,
+    pub password: &'a str,
 }
 
 fn internal(what: &str) -> Error {
@@ -118,6 +121,8 @@ struct Loaded<'a> {
     /// The size of the file last written from this document: the next one is
     /// about as big (the pieces of a split), so the buffer is made that big.
     size_hint: Cell<usize>,
+    /// The name to use in messages (for a merge).
+    label: Option<&'a str>,
 }
 
 impl Loaded<'_> {
@@ -136,7 +141,7 @@ fn load(doc: &Document) -> Result<Loaded<'_>> {
     }
     let pages = doc.pages()?;
     let page_nums = pages.iter().map(|p| p.obj_ref.num).collect();
-    Ok(Loaded { doc, pages, page_nums, index: OnceCell::new(), size_hint: Cell::new(0) })
+    Ok(Loaded { doc, pages, page_nums, index: OnceCell::new(), size_hint: Cell::new(0), label: None })
 }
 
 /// Catalog entries that name pages by position or hold page references that
@@ -275,6 +280,25 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
     let (data, more) = b.finish(catalog_ref, info_ref)?;
     base.size_hint.set(data.len());
     warnings.extend(more);
+    // What was met in the encrypted inputs: strings that were not encrypted, and
+    // permission flags that someone may have edited.
+    for d in docs {
+        let say = |text: String| Warning(match d.label {
+            Some(name) => format!("{name}: {text}"),
+            None => text,
+        });
+        if let Some(text) = d.doc.decryption_warning() {
+            warnings.push(say(text));
+        }
+        if let Some(encryption) = d.doc.encryption()
+            && !encryption.perms_valid
+        {
+            warnings.push(say(
+                "its permission check value (/Perms) does not agree with its permission flags (/P), which someone may have edited; opened with the user password it is taken to allow nothing"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(Output { data, warnings, pages: out_pages.len() })
 }
 
@@ -508,11 +532,21 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
         return Err(Error::Invalid("nothing to merge".to_string()));
     }
     let mut docs = Vec::with_capacity(inputs.len());
-    for input in inputs {
+    for (i, input) in inputs.iter().enumerate() {
         if input.doc.is_locked() {
             return Err(Error::Invalid(format!("{}: the file is encrypted and needs a password", input.name)));
         }
-        docs.push(load(input.doc)?);
+        // The output has the first file's encryption, so only the first file can
+        // keep what restricts it: for any other the restriction would be lost.
+        if i > 0 && restricts(input.doc, input.password) {
+            return Err(Error::Invalid(format!(
+                "{} restricts what can be done with it; put it first so its protection carries over, or give its owner password",
+                input.name
+            )));
+        }
+        let mut loaded = load(input.doc)?;
+        loaded.label = Some(input.name);
+        docs.push(loaded);
     }
     // Each file is within the limit for pages; all of them together are too.
     let total = docs.iter().fold(0usize, |acc, d| acc.saturating_add(d.pages.len()));
@@ -525,12 +559,35 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
     // The first file's encryption is the output's (qpdf does the same). If it
     // has none, the output has none, and the encrypted files that came after
     // it lose theirs.
-    let first_is_encrypted = inputs.first().is_some_and(|i| i.doc.is_encrypted());
-    if !first_is_encrypted {
+    let first = inputs.first().and_then(|i| i.doc.encryption());
+    if first.is_none() {
         for input in inputs.iter().skip(1).filter(|i| i.doc.is_encrypted()) {
             out.warnings.push(Warning(format!(
                 "{}: its encryption was not carried over; the output is not encrypted because the first file is not",
                 input.name
+            )));
+        }
+    }
+    // A later file that is not restricted is written under the first file's
+    // encryption. Say when that opens what needed a password without one, or uses
+    // a weaker method.
+    let output_needs_password = first.as_ref().is_some_and(|e| e.needs_password());
+    for input in inputs.iter().skip(1) {
+        let Some(later) = input.doc.encryption() else { continue };
+        if later.needs_password() && !output_needs_password {
+            out.warnings.push(Warning(format!(
+                "{}: it needed a password to open, and the merged file opens without one",
+                input.name
+            )));
+        }
+        if let Some(first) = &first
+            && later.strength() > first.strength()
+        {
+            out.warnings.push(Warning(format!(
+                "{}: it is encrypted with {}, and the merged file with the first file's weaker {}",
+                input.name,
+                later.method_name(),
+                first.method_name()
             )));
         }
     }
@@ -545,6 +602,26 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
         }
     }
     Ok(out)
+}
+
+// --- who may take protection off ---------------------------------------------------------
+
+/// Does whoever opened the file have the owner's rights: the owner password
+/// opened it, or `password` (the one that was given) is the owner's, or the empty
+/// password is (an owner with no password)? The hash that decides that costs
+/// something for revisions 5 and 6, so callers ask only when it matters.
+fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str) -> bool {
+    encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
+        || doc.security().is_some_and(|s| (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password(""))
+}
+
+/// Does the file restrict what may be done with it, for whoever opened it: it is
+/// encrypted, its permissions do not grant everything, and it was not opened
+/// with the owner password? Such a file may only be the first of a merge, whose
+/// output carries its protection; and `decrypt` refuses it.
+fn restricts(doc: &Document, password: &str) -> bool {
+    let Some(encryption) = doc.encryption() else { return false };
+    !encryption.permissions.allows_everything() && !has_owner_rights(doc, &encryption, password)
 }
 
 // --- decrypt ----------------------------------------------------------------------------
@@ -563,17 +640,16 @@ pub fn decrypt(doc: &Document, password: &str) -> Result<Output> {
     if doc.is_locked() {
         return Err(Error::PasswordRequired);
     }
-    // The owner is whoever has the owner password: it opened the file, or it
-    // is what was given, or it is the empty one (an owner with no password).
-    let owner = encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
-        || doc.security().is_some_and(|s| {
-            (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password("")
-        });
-    if !owner && !encryption.permissions.allows_everything() {
+    if !has_owner_rights(doc, &encryption, password) && !encryption.permissions.allows_everything() {
         let denied: Vec<&str> =
             encryption.permissions.list().iter().filter(|(_, allowed)| !allowed).map(|(what, _)| *what).collect();
+        let tampered = if encryption.perms_valid {
+            ""
+        } else {
+            " (its permission check value /Perms does not agree with its flags /P, which someone may have edited, so it is taken to allow nothing)"
+        };
         return Err(Error::Invalid(format!(
-            "the encryption is not removed: the file was opened with the user password and its author did not allow: {}. Give the owner password with --password to remove it",
+            "the encryption is not removed: the file was opened with the user password and its author did not allow: {}{tampered}. Give the owner password with --password to remove it",
             denied.join(", ")
         )));
     }
@@ -1032,11 +1108,11 @@ mod tests {
             b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 5 5] >>");
             open(b.finish_classic(4, "/Root 1 0 R"))
         };
-        let a = Input { name: "a.pdf", doc: &src };
-        let b = Input { name: "b.pdf", doc: &newer };
+        let a = Input { name: "a.pdf", doc: &src, password: "" };
+        let b = Input { name: "b.pdf", doc: &newer, password: "" };
         assert_eq!(open(merge(&[a, b]).unwrap().data).version(), (1, 7));
-        let a = Input { name: "a.pdf", doc: &src };
-        let b = Input { name: "b.pdf", doc: &newer };
+        let a = Input { name: "a.pdf", doc: &src, password: "" };
+        let b = Input { name: "b.pdf", doc: &newer, password: "" };
         assert_eq!(open(merge(&[b, a]).unwrap().data).version(), (1, 7));
     }
 
@@ -1054,7 +1130,7 @@ mod tests {
             b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 5 5] >>");
             open(b.finish_classic(4, "/Root 1 0 R"))
         };
-        let out = merge(&[Input { name: "a", doc: &base }, Input { name: "b", doc: &newer }]).unwrap();
+        let out = merge(&[Input { name: "a", doc: &base, password: "" }, Input { name: "b", doc: &newer, password: "" }]).unwrap();
         let doc = open(out.data);
         assert_eq!(doc.version(), (1, 7));
         assert_eq!(doc.catalog().unwrap().get_name("Version").unwrap(), &Name::from("1.7"));
@@ -1075,7 +1151,7 @@ mod tests {
         assert!(matches!(split_every(&doc, 1, &mut |_, _| Ok(())), Err(Error::PasswordRequired)));
         assert!(matches!(decrypt(&doc, ""), Err(Error::PasswordRequired)));
         let plain = open(three_pages());
-        let r = merge(&[Input { name: "plain", doc: &plain }, Input { name: "locked.pdf", doc: &doc }]);
+        let r = merge(&[Input { name: "plain", doc: &plain, password: "" }, Input { name: "locked.pdf", doc: &doc, password: "" }]);
         assert!(matches!(r, Err(Error::Invalid(m)) if m.contains("locked.pdf") && m.contains("needs a password")));
     }
 
@@ -1126,7 +1202,7 @@ mod tests {
     fn merge_appends_pages_remaps_annotations_and_warns_about_what_is_dropped() {
         let first = open(three_pages());
         let second = open(rich_second_file());
-        let out = merge(&[Input { name: "one.pdf", doc: &first }, Input { name: "two.pdf", doc: &second }]).unwrap();
+        let out = merge(&[Input { name: "one.pdf", doc: &first, password: "" }, Input { name: "two.pdf", doc: &second, password: "" }]).unwrap();
         // Exactly one warning, for the second file, naming exactly what was lost.
         assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
         let w = &out.warnings[0].0;
@@ -1170,7 +1246,7 @@ mod tests {
     #[test]
     fn merge_a_file_with_itself_copies_everything_separately() {
         let one = open(rich_second_file());
-        let out = merge(&[Input { name: "a", doc: &one }, Input { name: "a again", doc: &one }]).unwrap();
+        let out = merge(&[Input { name: "a", doc: &one, password: "" }, Input { name: "a again", doc: &one, password: "" }]).unwrap();
         let doc = open(out.data);
         let pages = doc.pages().unwrap();
         assert_eq!(pages.len(), 2);
@@ -1190,7 +1266,7 @@ mod tests {
         assert!(merge(&[]).is_err());
         let a = open(sample_pdf());
         let b = open(sample_objstm_pdf());
-        let out = merge(&[Input { name: "a", doc: &a }, Input { name: "b", doc: &b }]).unwrap();
+        let out = merge(&[Input { name: "a", doc: &a, password: "" }, Input { name: "b", doc: &b, password: "" }]).unwrap();
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
         let doc = open(out.data);
         assert_eq!(doc.page_count().unwrap(), 2);
@@ -1427,7 +1503,7 @@ mod tests {
         // the second file's page 2, not to the first file's page 1.
         let first = open(linked(1, false, false));
         let second = open(linked(2, true, false));
-        let out = merge(&[Input { name: "a.pdf", doc: &first }, Input { name: "b.pdf", doc: &second }]).unwrap();
+        let out = merge(&[Input { name: "a.pdf", doc: &first, password: "" }, Input { name: "b.pdf", doc: &second, password: "" }]).unwrap();
         let doc = open(out.data);
         let pages = doc.pages().unwrap();
         assert_eq!(pages.len(), 4);
@@ -1454,7 +1530,7 @@ mod tests {
         assert_eq!(target.first(), Some(&Object::Ref(pages[0].obj_ref)));
         // Merging a file with itself: the second copy's links stay in the second copy.
         let one = open(linked(2, true, false));
-        let out = merge(&[Input { name: "a", doc: &one }, Input { name: "a again", doc: &one }]).unwrap();
+        let out = merge(&[Input { name: "a", doc: &one, password: "" }, Input { name: "a again", doc: &one, password: "" }]).unwrap();
         let doc = open(out.data);
         let pages = doc.pages().unwrap();
         let second_annots = pages[2].dict.get("Annots").and_then(Object::as_array).unwrap().to_vec();
@@ -1470,7 +1546,7 @@ mod tests {
     fn structure_links_of_later_files_are_dropped_and_the_bases_are_kept() {
         let first = open(linked(1, true, true));
         let second = open(linked(2, true, true));
-        let out = merge(&[Input { name: "a.pdf", doc: &first }, Input { name: "b.pdf", doc: &second }]).unwrap();
+        let out = merge(&[Input { name: "a.pdf", doc: &first, password: "" }, Input { name: "b.pdf", doc: &second, password: "" }]).unwrap();
         let doc = open(out.data);
         let pages = doc.pages().unwrap();
         assert_eq!(pages[0].dict.get_int("StructParents"), Some(5));
@@ -1612,8 +1688,8 @@ mod tests {
             rotate_pages(&src, &[0], 90).unwrap(),
             delete_pages(&src, &[1]).unwrap(),
             extract_pages(&src, &[0]).unwrap(),
-            merge(&[Input { name: "a.pdf", doc: &src }, Input { name: "b.pdf", doc: &second }]).unwrap(),
-            merge(&[Input { name: "b.pdf", doc: &second }, Input { name: "a.pdf", doc: &src }]).unwrap(),
+            merge(&[Input { name: "a.pdf", doc: &src, password: "" }, Input { name: "b.pdf", doc: &second, password: "" }]).unwrap(),
+            merge(&[Input { name: "b.pdf", doc: &second, password: "" }, Input { name: "a.pdf", doc: &src, password: "" }]).unwrap(),
         ];
         for out in outputs {
             assert!(

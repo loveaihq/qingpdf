@@ -27,8 +27,8 @@ never be one of the input files.
 Encrypted PDFs: a file that only restricts what may be done with it (printing,
 copying ...) opens without a password. For one that needs a password, add
 --password <password> to the command (it is used for every input that needs
-one; the empty password is always tried first). Results keep the encryption of
-the input; only 'decrypt' removes it.
+one; a password that is given is tried first, then the empty one). Results keep
+the encryption of the input; only 'decrypt' removes it.
 
 Exit status: 0 success, 1 error, 2 wrong command line.
 ";
@@ -69,7 +69,10 @@ was left behind for each of them.
 If the first file is encrypted, so is the result, with the first file's
 passwords and permissions (encrypted files that follow are decrypted and
 written under it). If the first file is not encrypted the result is not either,
-and a warning names the later encrypted files.
+and a warning names the later encrypted files. A file that restricts what may
+be done with it (it was not opened with its owner password, and its author did
+not allow everything) can only be the first one; give its owner password to put
+it later.
 
 Options:
   -o, --output <file>   The file to write (required)

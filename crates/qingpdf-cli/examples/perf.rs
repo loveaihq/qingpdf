@@ -114,6 +114,39 @@ fn encrypted() -> Result<bool, String> {
         println!("  {what:<34} plain {t_clear:>9.1?}  encrypted {t_secret:>9.1?}  extra {extra:>9.1?}  (target <= 5 ms)  {}", verdict(ok));
     }
 
+    // Revision 6 with the password that has to be found: the user's, the owner's
+    // (which is the slow one: its hash covers more data), Chinese ones, one that
+    // needs the second way of writing it (full-width letters), a long one, and a
+    // wrong one (an error, and what it costs to find out).
+    let owner_cases: [(&str, &str, &str, &str, Option<f64>); 8] = [
+        ("user password", "pdf20utf8.r6-aes256-user-modify-none.pdf", "pdf20/pdf20-utf8-test.pdf", "user", Some(3.0)),
+        ("owner password", "pdf20utf8.r6-aes256-user-modify-none.pdf", "pdf20/pdf20-utf8-test.pdf", "owner", Some(5.0)),
+        ("Chinese user password", "vertical.r6-aes256-user-chinese.pdf", "cjk/vertical.pdf", "密码", Some(3.0)),
+        ("Chinese owner password", "vertical.r6-aes256-user-chinese.pdf", "cjk/vertical.pdf", "主人", Some(5.0)),
+        ("full-width form of the user password", "utf8.r6-aes256-user-fullwidth.pdf", "outline-form-attach/utf-8.pdf", "ＡＢＣ１２３", None),
+        ("127 bytes of password", "utf8.r6-aes256-user-127bytes.pdf", "outline-form-attach/utf-8.pdf", &format!("{}0123456", "0123456789".repeat(12)), None),
+        ("wrong password", "pdf20utf8.r6-aes256-user-modify-none.pdf", "pdf20/pdf20-utf8-test.pdf", "not the password", None),
+        ("no password given (locked)", "pdf20utf8.r6-aes256-user-modify-none.pdf", "pdf20/pdf20-utf8-test.pdf", "", None),
+    ];
+    println!("\nopening a revision 6 file by the password (target for the first four: user <= 3 ms, owner <= 5 ms):");
+    for (what, encrypted, original, password, target) in owner_cases {
+        let secret = std::fs::read(dir.join(encrypted)).map_err(|e| e.to_string())?;
+        let clear = std::fs::read(public.join(original)).map_err(|e| e.to_string())?;
+        let open = |bytes: &[u8], password: &str| {
+            let doc = Document::from_bytes_with_password(bytes.to_vec(), password).map_err(|e| e.to_string());
+            let _ = std::hint::black_box(doc.map(|d| d.page_count()));
+        };
+        let t_clear = average(300, || open(&clear, ""));
+        let t_secret = average(300, || open(&secret, password));
+        let extra = t_secret.saturating_sub(t_clear);
+        let (limit, text) = match target {
+            Some(ms) => (ms, format!("(target <= {ms} ms)  {}", verdict(extra.as_secs_f64() * 1000.0 <= ms))),
+            None => (f64::MAX, "(no target)".to_string()),
+        };
+        all_ok &= extra.as_secs_f64() * 1000.0 <= limit;
+        println!("  {what:<40} plain {t_clear:>9.1?}  encrypted {t_secret:>9.1?}  extra {extra:>9.1?}  {text}");
+    }
+
     // AES decryption: a 128 MB stream written encrypted (with the keys of three
     // of those files), then read: the time `get` takes, less what it takes for
     // the same stream unencrypted (reading it and copying it).
@@ -211,7 +244,7 @@ fn main() -> Result<(), String> {
     let mut i = 0usize;
     while total < 1200 {
         let (path, doc, n) = sources.get(i % sources.len()).ok_or("no sources")?;
-        inputs.push(Input { name: "source", doc });
+        inputs.push(Input { name: "source", doc, password: "" });
         total += n;
         i += 1;
         let _ = path;

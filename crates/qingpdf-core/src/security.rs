@@ -68,6 +68,11 @@ pub struct Permissions {
 }
 
 impl Permissions {
+    /// Nothing is allowed.
+    pub fn none() -> Permissions {
+        Permissions::from_flags(0, 3)
+    }
+
     pub fn from_flags(p: u32, revision: i64) -> Permissions {
         let bit = |n: u32| p & (1u32 << (n - 1)) != 0;
         let old = revision < 3;
@@ -114,32 +119,72 @@ pub struct Encryption {
     pub key_bits: usize,
     pub stream_method: Method,
     pub string_method: Method,
+    /// How embedded files are encrypted (`/EFF`; the same as the streams unless
+    /// the file says otherwise).
+    pub file_method: Method,
     pub encrypt_metadata: bool,
+    /// What the author allows: the flags of the file, or nothing at all when it
+    /// was opened with the user password and the check value `/Perms` does
+    /// not agree with `/P` (see [`Encryption::perms_valid`]).
     pub permissions: Permissions,
+    /// Revisions 5 and 6 keep a check value of the permissions, which only the
+    /// file key can decrypt; false when it is missing, unreadable or says
+    /// something other than `/P` (someone edited `/P`, which is not part of the
+    /// key in those revisions). Always true for the older revisions, where
+    /// `/P` goes into the key.
+    pub perms_valid: bool,
     /// How the file was opened; `None` when it is still locked.
     pub opened: Option<Auth>,
+    /// Is a password needed: the empty one does not open the file.
+    pub password_needed: bool,
 }
 
 impl Encryption {
-    /// Is a password needed to open the file: the empty one did not work.
+    /// Is a password needed to open the file: the empty one does not open it.
     pub fn needs_password(&self) -> bool {
-        !self.opened.is_some_and(|a| a.empty)
+        self.password_needed
     }
 
-    /// "RC4 40-bit", "RC4 128-bit", "AES-128" or "AES-256"; when streams and
-    /// strings differ, both are named.
-    pub fn method_name(&self) -> String {
-        let name = |m: Method| match m {
+    /// How strong the method is, for comparing two files: none, RC4 40-bit,
+    /// longer RC4, AES-128, AES-256.
+    pub fn strength(&self) -> u8 {
+        let rank = |m: Method| match m {
+            Method::None => 0,
+            Method::Rc4 if self.key_bits <= 40 => 1,
+            Method::Rc4 => 2,
+            Method::AesV2 => 3,
+            Method::AesV3 => 4,
+        };
+        rank(self.stream_method).max(rank(self.string_method)).max(rank(self.file_method))
+    }
+
+    fn method_text(&self, m: Method) -> String {
+        match m {
             Method::None => "none".to_string(),
             Method::Rc4 => format!("RC4 {}-bit", self.key_bits),
             Method::AesV2 => "AES-128".to_string(),
             Method::AesV3 => "AES-256".to_string(),
-        };
-        if self.stream_method == self.string_method {
-            name(self.stream_method)
-        } else {
-            format!("streams {}, strings {}", name(self.stream_method), name(self.string_method))
         }
+    }
+
+    /// "RC4 40-bit", "RC4 128-bit", "AES-128" or "AES-256"; when streams and
+    /// strings differ, both are named; embedded files that are encrypted
+    /// differently from the streams are named too ("attachments only" when
+    /// that is all that is encrypted).
+    pub fn method_name(&self) -> String {
+        let (stream, string, file) = (self.stream_method, self.string_method, self.file_method);
+        if stream == Method::None && string == Method::None && file != Method::None {
+            return format!("attachments only ({})", self.method_text(file));
+        }
+        let mut text = if stream == string {
+            self.method_text(stream)
+        } else {
+            format!("streams {}, strings {}", self.method_text(stream), self.method_text(string))
+        };
+        if file != stream && file != Method::None {
+            text.push_str(&format!(", attachments {}", self.method_text(file)));
+        }
+        text
     }
 }
 
@@ -150,16 +195,6 @@ enum Order {
     UserThenOwner,
     UserOnly,
     OwnerOnly,
-}
-
-impl Order {
-    fn apply<T>(self, user: impl FnOnce() -> Option<T>, owner: impl FnOnce() -> Option<T>) -> Option<T> {
-        match self {
-            Order::UserThenOwner => user().or_else(owner),
-            Order::UserOnly => user(),
-            Order::OwnerOnly => owner(),
-        }
-    }
 }
 
 /// Everything the encryption dictionary says.
@@ -173,6 +208,9 @@ struct Params {
     u: Vec<u8>,
     oe: Vec<u8>,
     ue: Vec<u8>,
+    /// `/Perms` (revisions 5 and 6), cut or padded to 16 bytes; `None` if the
+    /// file has none.
+    perms: Option<Vec<u8>>,
     encrypt_metadata: bool,
     /// The first element of the trailer's `/ID` (empty if there is none): part
     /// of the key for revisions 2 to 4.
@@ -199,6 +237,20 @@ pub struct Security {
     /// The object number of the document's metadata stream (the catalog's
     /// `/Metadata`), which `/EncryptMetadata false` leaves in the clear.
     root_metadata: Option<u32>,
+    /// Does `/Perms` agree with `/P` (revisions 5 and 6; see
+    /// [`Encryption::perms_valid`])? Set when a password is accepted.
+    perms_valid: bool,
+}
+
+/// What the check value `/Perms` says once the file key decrypts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermsState {
+    /// It says what `/P` and `/EncryptMetadata` say.
+    Valid,
+    /// It is a `/Perms` (it has the marker `adb`), and says something else.
+    Disagrees,
+    /// Missing, or not what a `/Perms` looks like: the key is wrong, or it is damaged.
+    Garbage,
 }
 
 impl std::fmt::Debug for Security {
@@ -301,6 +353,7 @@ impl Security {
         } else {
             (fit(o, 32), fit(u, 32), Vec::new(), Vec::new())
         };
+        let perms = if v == 5 { string_entry(&dict, "Perms").map(|p| fit(p, 16)) } else { None };
         let encrypt_metadata = v < 4 || !matches!(dict.get("EncryptMetadata"), Some(Object::Bool(false)));
 
         // Crypt filters (7.6.5); below version 4 everything is RC4.
@@ -392,11 +445,12 @@ impl Security {
         }
         let key_bytes = usize::try_from(key_bits / 8).map_err(|_| syntax("the key length is out of range"))?;
         Ok(Security {
-            params: Params { v, r, key_bytes, p, o, u, oe, ue, encrypt_metadata, id0, filters, stream, string, file, dict },
+            params: Params { v, r, key_bytes, p, o, u, oe, ue, perms, encrypt_metadata, id0, filters, stream, string, file, dict },
             key: None,
             auth: None,
             encrypt_num,
             root_metadata: None,
+            perms_valid: true,
         })
     }
 
@@ -414,12 +468,24 @@ impl Security {
         self.root_metadata = num;
     }
 
-    /// The permissions the file grants (they are the same for either password
-    /// in what we store; qpdf too reports the flags and leaves it at that).
+    /// What the author allows: the flags `/P`. For revisions 5 and 6 they are
+    /// not part of the key, so anyone could have edited them; `/Perms` (which
+    /// only the file key decrypts) is the check. When it does not agree, a file
+    /// opened with the user password is taken to allow nothing; the owner has
+    /// every right anyway.
     pub fn permissions(&self) -> Permissions {
-        Permissions::from_flags(self.params.p, self.params.r)
+        let owner = self.auth.is_some_and(|a| a.kind == PasswordKind::Owner);
+        if self.perms_valid || owner {
+            Permissions::from_flags(self.params.p, self.params.r)
+        } else {
+            Permissions::none()
+        }
     }
 
+    /// Does `/Perms` agree with `/P` (always true below revision 5)?
+    pub fn perms_valid(&self) -> bool {
+        self.perms_valid
+    }
     /// The file key, if a password has been accepted. Tests compare it with
     /// the one qpdf shows.
     pub fn file_key(&self) -> Option<&[u8]> {
@@ -434,44 +500,59 @@ impl Security {
             (Method::AesV2, _) | (_, Method::AesV2) => 128,
             _ => p.key_bytes * 8,
         };
+        // Whether the empty password would have opened the file is only worked out
+        // here (for `info` and the commands that look at the permissions): when a
+        // password was given, the empty one was not tried.
+        let password_needed = match self.auth {
+            None => true,
+            Some(a) if a.empty => false,
+            Some(_) => self.try_text("", self.first_order()).is_none(),
+        };
         Encryption {
             version: p.v,
             revision: p.r,
             key_bits,
             stream_method: p.stream,
             string_method: p.string,
+            file_method: p.file,
             encrypt_metadata: p.encrypt_metadata,
             permissions: self.permissions(),
+            perms_valid: self.perms_valid,
             opened: self.auth,
+            password_needed,
         }
     }
 
     // --- passwords --------------------------------------------------------------
 
-    /// Try the empty password, then `password`, as user password and as owner
-    /// password. Returns whether one of them opened the file; then the key and
-    /// the kind of password are recorded. A password that is the user's and the
-    /// owner's both is recorded as the user's; whether the holder of the file
-    /// has the owner's rights is asked with [`Security::is_owner_password`]
-    /// (that costs another hash for revisions 5 and 6, and only the one command
-    /// that needs it pays).
+    /// Try `password` (if one is given) and then the empty password, as user
+    /// password and as owner password. Returns whether one of them opened the
+    /// file; then the key and the kind of password are recorded. A password that
+    /// is the user's and the owner's both is recorded as the user's; whether the
+    /// holder of the file has the owner's rights is asked with
+    /// [`Security::is_owner_password`].
     ///
-    /// Each check of a revision 5 or 6 password is a hash that takes about a
-    /// millisecond (revision 6 runs at least 64 rounds of AES and SHA-2), and
-    /// the empty password is tried for every file, so the cases are kept to
-    /// what is needed: the empty password is tried as the user's (the usual way
-    /// into a file with restrictions only) and, for the older revisions where
-    /// it costs nothing, as the owner's; what is given is tried as the user's
-    /// and then as the owner's. pdf.js does not try an empty owner password
-    /// either.
+    /// The cases are kept to what is needed, because each check of a revision 5
+    /// or 6 password is a hash that takes about a millisecond (revision 6 runs
+    /// at least 64 rounds of AES and SHA-2, and the owner's hash covers more
+    /// data): a password that is given goes first as the user's and then as the
+    /// owner's, and the empty password (which opens most files that have
+    /// restrictions only) comes after it, as the user's and, for the older
+    /// revisions where it costs nothing, as the owner's. pdf.js does not try an
+    /// empty owner password either. (The task asked for the empty password
+    /// first; with a password given that spends a hash on a password nobody
+    /// meant, so for a given password it is tried last.)
     pub(crate) fn authenticate(&mut self, password: &str) -> bool {
-        let first = if self.params.r >= 5 { Order::UserOnly } else { Order::UserThenOwner };
-        let mut found = self.try_text("", first).map(|(key, kind)| (key, Auth { kind, empty: true }));
-        if found.is_none() && !password.is_empty() {
+        let mut found = None;
+        if !password.is_empty() {
             found = self.try_text(password, Order::UserThenOwner).map(|(key, kind)| (key, Auth { kind, empty: false }));
+        }
+        if found.is_none() {
+            found = self.try_text("", self.first_order()).map(|(key, kind)| (key, Auth { kind, empty: true }));
         }
         match found {
             Some((key, auth)) => {
+                self.perms_valid = self.params.r < 5 || self.perms_state(&key) == PermsState::Valid;
                 self.key = Some(key);
                 self.auth = Some(auth);
                 true
@@ -480,15 +561,38 @@ impl Security {
         }
     }
 
+    /// The empty password is tried as the user's, and for the older revisions
+    /// also as the owner's.
+    fn first_order(&self) -> Order {
+        if self.params.r >= 5 { Order::UserOnly } else { Order::UserThenOwner }
+    }
+
     /// Is `password` the owner password, whether or not it is what opened the
-    /// file? The empty password opens a file as the user first, and a
-    /// password the user gives may be both.
+    /// file? The user password may be the owner's too, and a file may open with
+    /// the empty password as the user's. Revisions 5 and 6: the check hash only,
+    /// which is what costs least when the answer is no.
     pub fn is_owner_password(&self, password: &str) -> bool {
+        if self.params.r >= 5 {
+            let p = &self.params;
+            let (Some(o_hash), Some(o_val), Some(u48)) = (p.o.get(..32), p.o.get(32..40), p.u.get(..48)) else {
+                return false;
+            };
+            return self.encodings(password).iter().any(|pw| cipher::password_hash(p.r, pw, o_val, u48) == o_hash);
+        }
         self.try_text(password, Order::OwnerOnly).is_some()
     }
 
     fn try_text(&self, pw: &str, order: Order) -> Option<(Vec<u8>, PasswordKind)> {
-        self.encodings(pw).iter().find_map(|bytes| self.try_password(bytes, order))
+        let encodings = self.encodings(pw);
+        // Every way of writing the password as the user's before any as the
+        // owner's: the owner's check costs more.
+        let as_user = || encodings.iter().find_map(|bytes| self.try_password(bytes, Order::UserOnly));
+        let as_owner = || encodings.iter().find_map(|bytes| self.try_password(bytes, Order::OwnerOnly));
+        match order {
+            Order::UserThenOwner => as_user().or_else(as_owner),
+            Order::UserOnly => as_user(),
+            Order::OwnerOnly => as_owner(),
+        }
     }
 
     /// The byte strings a password may stand for. Revisions 2 to 4: the text in
@@ -527,6 +631,7 @@ impl Security {
     // Revisions 2 to 4 (7.6.3.3, 7.6.3.4).
 
     fn try_password_v4(&self, pw: &[u8], order: Order) -> Option<(Vec<u8>, PasswordKind)> {
+        // One of the two: `order` is `UserOnly` or `OwnerOnly` here.
         let as_user = || {
             let key = self.file_key_v4(&pad_password(pw));
             self.user_password_ok(&key).then_some((key, PasswordKind::User))
@@ -537,7 +642,7 @@ impl Security {
             let key = self.file_key_v4(&user_password);
             self.user_password_ok(&key).then_some((key, PasswordKind::Owner))
         };
-        order.apply(as_user, as_owner)
+        if order == Order::OwnerOnly { as_owner() } else { as_user() }
     }
 
     /// Algorithm 2: the file key for a user password (already padded).
@@ -620,17 +725,43 @@ impl Security {
             let intermediate = cipher::password_hash(r, pw, salt, udata);
             cipher::aes256_decrypt_no_padding(&intermediate, wrapped).ok()
         };
+        // The owner's hash covers more data than the user's, so it is the one to
+        // save: the file key comes first, and if `/Perms` decrypts to what it
+        // should look like under that key, the password is right (a wrong one
+        // passes with a chance of 2^-24) and the hash that checks it is not
+        // computed. Only when `/Perms` is missing or damaged does the check hash
+        // decide.
         let as_owner = || {
-            (cipher::password_hash(r, pw, o_val, u48) == o_hash)
-                .then(|| file_key(o_key, u48, &p.oe).map(|k| (k, PasswordKind::Owner)))
-                .flatten()
+            let key = file_key(o_key, u48, &p.oe)?;
+            match self.perms_state(&key) {
+                PermsState::Valid | PermsState::Disagrees => Some((key, PasswordKind::Owner)),
+                PermsState::Garbage => (cipher::password_hash(r, pw, o_val, u48) == o_hash).then_some((key, PasswordKind::Owner)),
+            }
         };
         let as_user = || {
             (cipher::password_hash(r, pw, u_val, &[]) == u_hash)
                 .then(|| file_key(u_key, &[], &p.ue).map(|k| (k, PasswordKind::User)))
                 .flatten()
         };
-        order.apply(as_user, as_owner)
+        if order == Order::OwnerOnly { as_owner() } else { as_user() }
+    }
+
+    /// Decrypt `/Perms` with the file key and see what it says (ISO 32000-2
+    /// Algorithm 2.A, and what qpdf and pdf.js check): bytes 0 to 3 are `/P`
+    /// (low byte first), 4 to 7 are 0xFF, byte 8 is `T` or `F` for
+    /// `/EncryptMetadata`, bytes 9 to 11 are `adb`. Only the marker and `/P` are
+    /// compared: `/P` is what the file is not allowed to be edited in, and real
+    /// files get the byte for the metadata wrong (bug_644.pdf of pdf.js says `F`
+    /// where the dictionary has no `/EncryptMetadata`).
+    fn perms_state(&self, key: &[u8]) -> PermsState {
+        let p = &self.params;
+        let Some(block) = p.perms.as_deref().and_then(|perms| cipher::aes256_decrypt_block(key, perms).ok()) else {
+            return PermsState::Garbage;
+        };
+        if block.get(9..12) != Some(b"adb".as_slice()) {
+            return PermsState::Garbage;
+        }
+        if block.get(..4) == Some(p.p.to_le_bytes().as_slice()) { PermsState::Valid } else { PermsState::Disagrees }
     }
 
     // --- decrypting -------------------------------------------------------------
@@ -724,10 +855,16 @@ impl Security {
 
     /// Decrypt, in place, the strings of object `obj` (which is object `r`) and
     /// the data of the stream it may be. Not for the encryption dictionary, for
-    /// cross-reference streams or for the contents of signatures.
-    pub(crate) fn decrypt_object(&self, r: ObjRef, obj: &mut Object) -> Result<()> {
+    /// cross-reference streams or for the contents of signatures. Returns how
+    /// many strings could not be decrypted and were left as they are: a string
+    /// that is not a whole number of AES blocks was not encrypted (a program
+    /// that does not know about the encryption wrote it, almost always as it
+    /// is), and one such string must not cost the whole object. A stream whose
+    /// data cannot be decrypted is an error.
+    pub(crate) fn decrypt_object(&self, r: ObjRef, obj: &mut Object) -> Result<u32> {
+        let mut kept = 0u32;
         if self.key.is_none() || self.encrypt_num == Some(r.num) {
-            return Ok(());
+            return Ok(kept);
         }
         let string_method = self.params.string;
         let string_key = self.object_key(string_method, r);
@@ -735,18 +872,18 @@ impl Security {
             Object::Stream(stream) => {
                 let is_xref = matches!(stream.dict.get("Type"), Some(Object::Name(n)) if n == "XRef");
                 if !is_xref && string_method != Method::None {
-                    decrypt_dict(self, string_method, &string_key, r, &mut stream.dict)?;
+                    decrypt_dict(self, string_method, &string_key, r, &mut stream.dict, &mut kept);
                 }
                 let method = self.stream_method(&stream.dict, self.root_metadata == Some(r.num))?;
                 if method != Method::None {
                     let key = self.object_key(method, r);
                     stream.data = self.decrypt_bytes(method, &key, r, std::mem::take(&mut stream.data))?;
                 }
-                Ok(())
             }
-            other if string_method != Method::None => decrypt_strings(self, string_method, &string_key, r, other),
-            _ => Ok(()),
+            other if string_method != Method::None => decrypt_strings(self, string_method, &string_key, r, other, &mut kept),
+            _ => {}
         }
+        Ok(kept)
     }
 
     /// The data of a stream that was read from the file as it is, decrypted
@@ -789,33 +926,44 @@ pub(crate) fn crypt_filter_name(dict: &Dict) -> Option<Name> {
     }
 }
 
-fn decrypt_dict(sec: &Security, method: Method, key: &[u8], r: ObjRef, dict: &mut Dict) -> Result<()> {
-    // The contents of a signature are not encrypted (qpdf: a dictionary with
-    // /ByteRange and /Contents; the signed bytes must stay as they are).
-    let signature = matches!(dict.get("ByteRange"), Some(Object::Array(_)));
+/// Is this a signature dictionary, whose `/Contents` is not encrypted (the
+/// signature covers those bytes)? One with `/Type /Sig` (or `/DocTimeStamp`) or
+/// a `/ByteRange` of any kind, direct or an indirect reference: qpdf wants
+/// `/Type /Sig` and `/ByteRange` and a string `/Contents`; `/Type` is optional
+/// in the standard and a reference is a legal value for the range.
+pub(crate) fn is_signature_dict(dict: &Dict) -> bool {
+    dict.contains_key("ByteRange")
+        || matches!(dict.get("Type"), Some(Object::Name(n)) if n == "Sig" || n == "DocTimeStamp")
+}
+
+fn decrypt_dict(sec: &Security, method: Method, key: &[u8], r: ObjRef, dict: &mut Dict, kept: &mut u32) {
+    let signature = is_signature_dict(dict);
     for (name, value) in dict.iter_mut() {
         if signature && name == "Contents" {
             continue;
         }
-        decrypt_strings(sec, method, key, r, value)?;
+        decrypt_strings(sec, method, key, r, value, kept);
     }
-    Ok(())
 }
 
-fn decrypt_strings(sec: &Security, method: Method, key: &[u8], r: ObjRef, obj: &mut Object) -> Result<()> {
+fn decrypt_strings(sec: &Security, method: Method, key: &[u8], r: ObjRef, obj: &mut Object, kept: &mut u32) {
     match obj {
         Object::String(s) => {
-            s.bytes = sec.decrypt_bytes(method, key, r, std::mem::take(&mut s.bytes))?;
+            // Not decryptable (AES data of the wrong length, say): left as it is.
+            if method != Method::Rc4 && !cipher::aes_can_decrypt(key, s.bytes.len()) {
+                *kept = kept.saturating_add(1);
+            } else if let Ok(plain) = sec.decrypt_bytes(method, key, r, std::mem::take(&mut s.bytes)) {
+                s.bytes = plain;
+            }
         }
         Object::Array(items) => {
             for item in items {
-                decrypt_strings(sec, method, key, r, item)?;
+                decrypt_strings(sec, method, key, r, item, kept);
             }
         }
-        Object::Dict(d) => decrypt_dict(sec, method, key, r, d)?,
+        Object::Dict(d) => decrypt_dict(sec, method, key, r, d, kept),
         _ => {}
     }
-    Ok(())
 }
 
 /// Algorithm 2 step a: the password padded or cut to 32 bytes.

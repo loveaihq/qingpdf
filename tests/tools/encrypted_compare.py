@@ -11,6 +11,10 @@ result with both engines, with the same password. The result must
     that engine (so the author's restrictions came through), and
   * look the same as the input (copy, delete, merge) in that engine.
 
+A merge puts the encrypted file first and a small plain file after it: a file
+that restricts what may be done with it can only be the first of a merge, and
+the output then has its encryption.
+
 `qingpdf decrypt` outputs must open without a password and look the same.
 
 This is a development check, not part of `cargo test`: it needs Python with
@@ -35,6 +39,8 @@ CORPUS = os.path.normpath(os.path.join(HERE, "..", "corpus"))
 GENERATED = os.path.join(CORPUS, "public", "encrypted", "qpdf-generated")
 QINGPDF = sys.argv[1] if len(sys.argv) > 1 else os.path.normpath(
     os.path.join(HERE, "..", "..", "target", "release", "qingpdf.exe"))
+PLAIN = os.path.join(CORPUS, "public", "xref-classic", "hello_world_2_pages.pdf")
+PLAIN_PAGES = 2
 SCALE = 0.5
 THRESHOLD = 0.5  # mean absolute difference per pixel, 0-255 grey levels
 MAX_PAGES = 6
@@ -179,7 +185,7 @@ def main():
             outputs = [("copy", ["split", path, "--pages", "1-"], "same", 0)]
             if pages >= 2:
                 outputs.append(("delete page 1", ["delete", path, "--pages", "1"], "tail", 1))
-            outputs.append(("merge with itself", ["merge", path, path], "twice", 0))
+            outputs.append(("merge with a plain file", ["merge", path, PLAIN], "plus", 0))
             for label, args, shape, skip in outputs:
                 out = os.path.join(tmp, "out.pdf")
                 code, message = qingpdf(*args, "-o", out, "--force", "--password", user)
@@ -199,16 +205,15 @@ def main():
                         if facts.get(key) != value:
                             problems.append(f"{name} [{label}]: {engine.name} says {key} {facts.get(key)!r} for the output, {value!r} for the input")
                     count = engine.pages(doc)
-                    expected = {"same": ref["count"], "tail": ref["count"] - skip, "twice": ref["count"] * 2}[shape]
+                    expected = {"same": ref["count"], "tail": ref["count"] - skip, "plus": ref["count"] + PLAIN_PAGES}[shape]
                     if count != expected:
                         problems.append(f"{name} [{label}]: {engine.name} counts {count} pages, expected {expected}")
                     else:
-                        # Of a merge with itself only the first copy is compared: the
-                        # second has no layer settings (/OCProperties) of its own, and
-                        # shows layers the first one hides (merge, layer 1).
+                        # Of a merge only the pages of the encrypted file are compared
+                        # (the plain file is not what is being checked).
                         for i in range(min(count, MAX_PAGES)):
                             j = i + skip if shape == "tail" else i
-                            if j >= len(ref["images"]) or (shape == "twice" and i >= ref["count"]):
+                            if j >= len(ref["images"]) or (shape == "plus" and i >= ref["count"]):
                                 continue
                             d = mean_difference(ref["images"][j], engine.render(doc, i))
                             if d >= THRESHOLD:
