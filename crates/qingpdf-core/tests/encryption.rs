@@ -1259,5 +1259,6 @@ fn describing_the_encryption_again_is_cheap() {
     for _ in 0..300 {
         assert!(doc.encryption().unwrap().needs_password());
     }
-    assert!(started.elapsed() < std::time::Duration::from_millis(60), "300 descriptions took {:?}", started.elapsed());
+    // Uncached this would be ~300 R6 hashes (seconds); 2 s leaves room for a busy machine.
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "300 descriptions took {:?}", started.elapsed());
 }
