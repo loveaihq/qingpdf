@@ -19,8 +19,8 @@ pub(crate) enum Operand {
     Name(Span),
     ArrayStart,
     ArrayEnd,
-    /// A dictionary (marked-content properties): skipped over, not kept.
-    Other,
+    /// A dictionary (marked-content properties, an inline image's `/DP`): the bytes from `<<` to `>>`.
+    Dict(Span),
 }
 
 /// What `Scanner::next` found.
@@ -163,7 +163,7 @@ impl<'a> Scanner<'a> {
                         if !self.skip_dict() {
                             return Item::End;
                         }
-                        Operand::Other
+                        Operand::Dict(self.data_span(pos, self.pos))
                     }
                     Tok::Keyword(k) => return Item::Operator(k),
                     Tok::End => return Item::End,
@@ -504,10 +504,30 @@ impl<'a> Scanner<'a> {
     /// After an `ID` operator: 8.9.7. Skip the binary data to the end of the `EI` that ends it:
     /// `EI` between white space, with something that reads like content stream text after it.
     pub fn skip_inline_image_data(&mut self) {
+        self.inline_image_data(None);
+    }
+
+    /// Like [`Scanner::skip_inline_image_data`], and the data itself. When the data's length is known
+    /// (`known_len`, for an image without a filter), `EI` is looked for right after it, and the search
+    /// by eye is used only when it is not there.
+    pub fn inline_image_data(&mut self, known_len: Option<usize>) -> &'a [u8] {
         let data = self.data;
         let mut pos = self.pos;
         if data.get(pos).is_some_and(|&b| class(b) == 1) {
             pos += 1;
+        }
+        if let Some(n) = known_len
+            && let Some(end) = pos.checked_add(n)
+            && end <= data.len()
+        {
+            let mut e = end;
+            while data.get(e).is_some_and(|&b| class(b) == 1) {
+                e += 1;
+            }
+            if data.get(e) == Some(&b'E') && data.get(e + 1) == Some(&b'I') && data.get(e + 2).is_none_or(|&b| class(b) == 1) {
+                self.pos = e + 2;
+                return data.get(pos..end).unwrap_or(&[]);
+            }
         }
         let mut i = pos;
         while i + 1 < data.len() {
@@ -519,12 +539,15 @@ impl<'a> Scanner<'a> {
                 let tail = data.get(i + 2..(i + 2 + 16).min(data.len())).unwrap_or(&[]);
                 if tail.iter().all(|&b| class(b) == 1 || (0x20..0x7F).contains(&b)) {
                     self.pos = i + 2;
-                    return;
+                    // The white space before `EI` is not data.
+                    let end = if i > pos { i - 1 } else { i };
+                    return data.get(pos..end).unwrap_or(&[]);
                 }
             }
             i += 1;
         }
         self.pos = data.len();
+        data.get(pos..).unwrap_or(&[])
     }
 }
 
@@ -548,7 +571,7 @@ mod tests {
                             Operand::Name(sp) => s += &format!("/{} ", String::from_utf8_lossy(sc.bytes(*sp))),
                             Operand::ArrayStart => s += "[ ",
                             Operand::ArrayEnd => s += "] ",
-                            Operand::Other => s += "<<>> ",
+                            Operand::Dict(_) => s += "<<>> ",
                         }
                     }
                     out.push(format!("{s}{}", String::from_utf8_lossy(k)));

@@ -49,6 +49,11 @@ impl DecodeBudget {
         self.left.get()
     }
 
+    /// Put `total` in place of what is left; gives back what was left.
+    pub(crate) fn replace(&self, total: u64) -> u64 {
+        self.left.replace(total)
+    }
+
     /// Spend `bytes` of the budget for work that is not a decoding step (copying
     /// an object stream that is read again, say).
     pub(crate) fn charge_bytes(&self, bytes: usize) {

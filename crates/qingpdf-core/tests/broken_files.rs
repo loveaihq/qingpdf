@@ -63,6 +63,13 @@ fn exercise(bytes: Vec<u8>) -> Outcome {
                     let _ = extractor.page_text(page);
                 }
             }
+            // Layer 3a: the first pages drawn (content streams, images, colour spaces, fonts of a damaged file).
+            if let Ok(pages) = doc.pages() {
+                let mut renderer = qingpdf_core::render::Renderer::new(&doc);
+                for page in pages.iter().take(2) {
+                    let _ = renderer.render_page(page, 24.0);
+                }
+            }
             let _ = doc.info();
             let _ = info::describe(&doc);
             match ops::copy_all(&doc) {

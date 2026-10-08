@@ -406,6 +406,18 @@ impl ObjStmCache {
     }
 }
 
+/// See [`Document::page_decode_budget`].
+pub(crate) struct PageDecodeBudget<'a> {
+    doc: &'a Document,
+    saved: u64,
+}
+
+impl Drop for PageDecodeBudget<'_> {
+    fn drop(&mut self) {
+        self.doc.budget.replace(self.saved);
+    }
+}
+
 /// Parsed objects kept by object number, until `budget` bytes are used.
 #[derive(Default)]
 struct ObjectCache {
@@ -1031,13 +1043,38 @@ impl Document {
         self.decode_stream_limited(s, MAX_DECODED_SIZE)
     }
 
-    fn decode_stream_limited(&self, s: &Stream, limit: usize) -> Result<Vec<u8>> {
+    /// Like [`Document::decode_stream`] with a cap on the size of each filter step's output.
+    pub(crate) fn decode_stream_limited(&self, s: &Stream, limit: usize) -> Result<Vec<u8>> {
         // Cross-reference streams are never encrypted (7.5.8.2).
         let is_xref_stream = matches!(s.dict.get("Type"), Some(Object::Name(n)) if n == "XRef");
         if self.is_locked() && !is_xref_stream {
             return Err(Error::PasswordRequired);
         }
         filter::decode_with_limit(&s.dict, &s.data, &|o| self.resolve(o), limit, 0, &self.budget)
+    }
+
+    /// A decoding budget of its own for the work of drawing one page (a long scan has a page's worth of
+    /// pixels to decode for each of its pages, far more than one budget for the whole document holds). What
+    /// the document had left is given back when the returned guard is dropped. The page is still held to
+    /// [`filter::DECODE_BUDGET`], and only drawing asks for this: every other command keeps one budget for
+    /// the whole document.
+    pub(crate) fn page_decode_budget(&self) -> PageDecodeBudget<'_> {
+        PageDecodeBudget { doc: self, saved: self.budget.replace(filter::DECODE_BUDGET) }
+    }
+
+    /// What is left of the decoding budget, in bytes.
+    pub(crate) fn budget_left(&self) -> u64 {
+        self.budget.remaining()
+    }
+
+    /// Count work the filters of [`crate::filter`] do not see (an image decoder's output) against the budget.
+    /// Past the budget, this is [`Error::Limit`].
+    pub(crate) fn charge_decoding(&self, bytes: usize) -> Result<()> {
+        self.budget.charge_bytes(bytes);
+        if self.budget.remaining() == 0 {
+            return Err(Error::Limit("the document asks for more decoding work than is allowed".to_string()));
+        }
+        Ok(())
     }
 
     /// Spend what is left of the decoding budget and forget the decoded object

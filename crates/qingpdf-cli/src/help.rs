@@ -16,6 +16,7 @@ Commands:
   rotate    Turn pages by a multiple of 90 degrees
   decrypt   Write a copy of an encrypted PDF without the encryption
   text      Extract the text of a PDF, in reading order
+  render    Draw pages as PNG images (graphics and images; letters as boxes for now)
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
 
 Options:
@@ -174,6 +175,29 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const RENDER: &str = "Usage:
+  qingpdf render <file.pdf> [--pages <list>] [--dpi <N>] -o <page_%d.png> [--force] [--password <password>]
+
+Draw pages as PNG images. The page is its crop box, turned by its /Rotate; one
+file is written per page, and the output name must contain %d (which becomes the
+page number) unless a single page is drawn.
+
+What is drawn: paths (fill, stroke, dashes, clipping), colours (device, ICC
+and Cal spaces as the device space, Indexed, Separation, DeviceN, Lab), images
+(Flate, LZW, JPEG, CCITT fax; masks), forms and Type 3 fonts. For now the
+characters of other fonts are drawn as an outline box each, and transparency,
+gradients and patterns are not drawn (grey blocks stand in for JBIG2 and JPEG
+2000 images). Annotations are not drawn.
+
+Options:
+  --pages <list>        The pages to draw (default: all)
+  --dpi <N>             Resolution, 1 to 2400 (default 150); a page may have
+                        at most 16 million pixels
+  -o, --output <file>   The file name pattern to write (required)
+  --force               Overwrite output files that exist
+  --password <password> The password of an encrypted file
+";
+
 const IMG2PDF: &str = "\
 Usage:
   qingpdf img2pdf <1.jpg> <2.png> [...] -o <output.pdf> [--page a4|fit] [--force]
@@ -203,6 +227,7 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Rotate) => format!("{ROTATE}{PAGE_LIST}"),
         Some(Command::Decrypt) => DECRYPT.to_string(),
         Some(Command::Text) => format!("{TEXT}{PAGE_LIST}"),
+        Some(Command::Render) => format!("{RENDER}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),
     }
 }

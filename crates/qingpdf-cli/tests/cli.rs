@@ -776,6 +776,69 @@ fn text_prints_or_writes_the_text_of_the_chosen_pages() {
 }
 
 #[test]
+fn render_writes_one_png_per_page() {
+    let dir = common::fresh_out_dir("cli-render");
+    let two = corpus("xref-classic/hello_world_2_pages.pdf");
+    let pattern = dir.join("page_%d.png");
+
+    let out = run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "36".as_ref(), "-o".as_ref(), pattern.as_os_str()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("page_1.png") && stdout(&out).contains("page_2.png"), "{}", stdout(&out));
+    // The text of the page is drawn as boxes, and the user is told.
+    assert!(stderr(&out).contains("page 1: ") && stderr(&out).contains("outline boxes"), "{}", stderr(&out));
+    for n in 1..=2 {
+        let png = std::fs::read(dir.join(format!("page_{n}.png"))).expect("written");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let reader = decoder.read_info().expect("a PNG");
+        // 200 by 200 points at 36 dpi
+        assert_eq!((reader.info().width, reader.info().height), (100, 100));
+    }
+
+    // Not over existing files without --force; --pages picks; the name needs %d for several pages.
+    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--pages".as_ref(), "2".as_ref(), "--dpi".as_ref(), "36".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--force"), "{}", stderr(&out));
+    let single = dir.join("only.png");
+    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), single.as_os_str(), "--pages".as_ref(), "2".as_ref(), "--dpi".as_ref(), "36".as_ref()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(single.is_file());
+    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), single.as_os_str(), "--force".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("%d"), "{}", stderr(&out));
+    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--pages".as_ref(), "3".as_ref(), "--force".as_ref()]);
+    assert_eq!(code(&out), 1, "a page that does not exist is an error");
+
+    // A page that would be too big is an error naming the way out; usage errors; the help.
+    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--dpi".as_ref(), "2400".as_ref(), "--force".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--dpi"), "{}", stderr(&out));
+    // When a later page fails, the pages before it were written and are reported (and page 2 is named).
+    let half = dir.join("half.pdf");
+    std::fs::write(
+        &half,
+        b"%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>endobj
+          3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]>>endobj
+4 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100000 100000]>>endobj
+          trailer<</Root 1 0 R/Size 5>>
+",
+    )
+    .expect("written");
+    let out = run([OsStr::new("render"), half.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--force".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stdout(&out).contains("page_1.png") && !stdout(&out).contains("page_2.png"), "{}", stdout(&out));
+    assert!(stderr(&out).contains("page 2"), "{}", stderr(&out));
+    assert_eq!(code(&run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "0".as_ref(), "-o".as_ref(), pattern.as_os_str()])), 2);
+    assert_eq!(code(&run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "abc".as_ref(), "-o".as_ref(), pattern.as_os_str()])), 2);
+    assert_eq!(code(&run([OsStr::new("render"), two.as_os_str()])), 2);
+    let help = stdout(&run(["render", "--help"]));
+    assert!(help.contains("qingpdf render") && help.contains("--dpi") && help.contains("%d"), "{help}");
+    assert!(stdout(&run(["--help"])).contains("render"));
+}
+
+#[test]
 fn text_obeys_the_copy_permission_and_the_password() {
     let dir = common::generated_dir();
     // copying not allowed, empty user password: refused, and the message says what to do

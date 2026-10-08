@@ -12,14 +12,14 @@
 //! # Ok::<(), qingpdf_core::Error>(())
 //! ```
 
-mod cmap;
+pub(crate) mod cmap;
 mod data;
 mod encodings;
-mod font;
+pub(crate) mod font;
 mod fontprog;
-mod interp;
+pub(crate) mod interp;
 mod layout;
-mod scan;
+pub(crate) mod scan;
 
 use std::rc::Rc;
 
@@ -31,7 +31,7 @@ use crate::ops::has_owner_rights;
 use interp::{Interp, Scope, Shared};
 
 /// Most decoded content stream bytes one page may have, all its streams together.
-const MAX_PAGE_CONTENT: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_PAGE_CONTENT: usize = 256 * 1024 * 1024;
 
 /// Reads the text of the pages of one document. Fonts and CMaps are kept between
 /// pages, so one extractor should do all the pages of a run.
@@ -57,7 +57,7 @@ impl<'a> TextExtractor<'a> {
         if self.doc.is_locked() {
             return Err(Error::PasswordRequired);
         }
-        let content = self.page_content(page)?;
+        let content = page_content(self.doc, page, &mut self.shared.warnings)?;
         let scope = Rc::new(Scope::new(self.doc, page.resources()));
         let mut interp = Interp::new(self.doc, &mut self.shared);
         interp.run(&content, &scope, 0)?;
@@ -84,45 +84,44 @@ impl<'a> TextExtractor<'a> {
     pub fn take_warnings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.shared.warnings.list)
     }
+}
 
-    /// The page's `/Contents` decoded and joined (7.8.2: several streams are one program, split at token borders).
-    fn page_content(&mut self, page: &Page) -> Result<Vec<u8>> {
-        let doc = self.doc;
-        let mut streams: Vec<Stream> = Vec::new();
-        match page.dict.get("Contents").map(|o| doc.resolve(o)) {
-            Some(Ok(Object::Stream(s))) => streams.push(s),
-            Some(Ok(Object::Array(items))) => {
-                for item in &items {
-                    if let Ok(Object::Stream(s)) = doc.resolve(item) {
-                        streams.push(s);
-                    }
+/// The page's `/Contents` decoded and joined (7.8.2: several streams are one program, split at token borders).
+pub(crate) fn page_content(doc: &Document, page: &Page, warnings: &mut font::Warnings) -> Result<Vec<u8>> {
+    let mut streams: Vec<Stream> = Vec::new();
+    match page.dict.get("Contents").map(|o| doc.resolve(o)) {
+        Some(Ok(Object::Stream(s))) => streams.push(s),
+        Some(Ok(Object::Array(items))) => {
+            for item in &items {
+                if let Ok(Object::Stream(s)) = doc.resolve(item) {
+                    streams.push(s);
                 }
             }
-            Some(Err(Error::Limit(m))) => return Err(Error::Limit(m)),
-            Some(Err(e)) => self.shared.warnings.add(format!("the page's /Contents could not be read: {e}")),
-            _ => {}
         }
-        let mut out = Vec::new();
-        for s in &streams {
-            match doc.decode_stream(s) {
-                Ok(data) => {
-                    if out.len().saturating_add(data.len()) > MAX_PAGE_CONTENT {
-                        return Err(Error::Limit("a page's content streams decode to more than 256 MiB".to_string()));
-                    }
-                    out.extend_from_slice(&data);
-                    out.push(b'\n');
-                }
-                Err(Error::Limit(m)) => return Err(Error::Limit(m)),
-                Err(e) => self.shared.warnings.add(format!("a content stream is skipped: {e}")),
-            }
-        }
-        Ok(out)
+        Some(Err(Error::Limit(m))) => return Err(Error::Limit(m)),
+        Some(Err(e)) => warnings.add(format!("the page's /Contents could not be read: {e}")),
+        _ => {}
     }
+    let mut out = Vec::new();
+    for s in &streams {
+        match doc.decode_stream(s) {
+            Ok(data) => {
+                if out.len().saturating_add(data.len()) > MAX_PAGE_CONTENT {
+                    return Err(Error::Limit("a page's content streams decode to more than 256 MiB".to_string()));
+                }
+                out.extend_from_slice(&data);
+                out.push(b'\n');
+            }
+            Err(Error::Limit(m)) => return Err(Error::Limit(m)),
+            Err(e) => warnings.add(format!("a content stream is skipped: {e}")),
+        }
+    }
+    Ok(out)
 }
 
 /// The part of the page that is shown: the crop box inside the media box (14.11.2), in default user
 /// space. `None` when the page gives no usable box.
-fn visible_box(page: &Page) -> Option<[f64; 4]> {
+pub(crate) fn visible_box(page: &Page) -> Option<[f64; 4]> {
     let b = match (page.crop_box(), page.media_box()) {
         (Some(c), Some(m)) => {
             let i = [c[0].max(m[0]), c[1].max(m[1]), c[2].min(m[2]), c[3].min(m[3])];

@@ -15,11 +15,12 @@ pub enum Command {
     Rotate,
     Decrypt,
     Text,
+    Render,
     Img2pdf,
 }
 
 impl Command {
-    pub const ALL: [Command; 8] = [
+    pub const ALL: [Command; 9] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -27,6 +28,7 @@ impl Command {
         Command::Rotate,
         Command::Decrypt,
         Command::Text,
+        Command::Render,
         Command::Img2pdf,
     ];
 
@@ -39,6 +41,7 @@ impl Command {
             Command::Rotate => "rotate",
             Command::Decrypt => "decrypt",
             Command::Text => "text",
+            Command::Render => "render",
             Command::Img2pdf => "img2pdf",
         }
     }
@@ -59,6 +62,7 @@ pub enum Request {
     Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool, password: String },
     Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
+    Render { input: PathBuf, pages: Option<String>, dpi: f64, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
 }
 
@@ -91,13 +95,14 @@ struct Allowed {
     every: bool,
     angle: bool,
     page: bool,
+    dpi: bool,
     /// `--password`: every command that reads a PDF file.
     password: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
     let none =
-        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, password: false };
+        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, password: false };
     match c {
         Command::Info => Allowed { password: true, ..none },
         Command::Merge => Allowed { output: true, force: true, password: true, ..none },
@@ -106,6 +111,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
         Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
+        Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
     }
 }
@@ -120,6 +126,7 @@ struct Collected {
     every: Option<String>,
     angle: Option<String>,
     page: Option<String>,
+    dpi: Option<String>,
     password: Option<String>,
 }
 
@@ -182,6 +189,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--every" if ok.every => {}
             "--angle" if ok.angle => {}
             "--page" if ok.page => {}
+            "--dpi" if ok.dpi => {}
             "--password" if ok.password => {}
             "--force" if ok.force => {
                 if inline.is_some() {
@@ -222,6 +230,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                     return Err(slot_taken("--angle"));
                 }
             }
+            "--dpi" => {
+                if got.dpi.replace(text(value, "--dpi", command)?).is_some() {
+                    return Err(slot_taken("--dpi"));
+                }
+            }
             "--password" => {
                 if got.password.replace(text(value, "--password", command)?).is_some() {
                     return Err(slot_taken("--password"));
@@ -239,7 +252,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, pages, every, angle, page, password } = got;
+    let Collected { mut inputs, output, force, pages, every, angle, page, dpi, password } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -304,6 +317,20 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 return Err(usage(c, "--force only goes with -o <output file>"));
             }
             Ok(Request::Text { input, pages, output, force, password })
+        }
+        Command::Render => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let output = output.to_str().ok_or_else(|| usage(c, "the output name is not valid text"))?.to_string();
+            let dpi = match dpi {
+                None => 150.0,
+                Some(d) => d
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && (qingpdf_core::render::MIN_DPI..=qingpdf_core::render::MAX_DPI).contains(v))
+                    .ok_or_else(|| usage(c, format!("--dpi must be a number from 1 to 2400, not '{d}'")))?,
+            };
+            Ok(Request::Render { input, pages, dpi, output, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {

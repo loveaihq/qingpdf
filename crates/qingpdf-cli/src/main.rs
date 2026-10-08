@@ -13,7 +13,7 @@ use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
 use qingpdf_core::security::{Method, PasswordKind};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
-use qingpdf_core::{Document, Error, Warning, text};
+use qingpdf_core::{Document, Error, Warning, render, text};
 
 use args::{Parsed, Request, UsageError};
 
@@ -115,6 +115,9 @@ fn run(request: Request) -> Result<(), Failure> {
         }
         Request::Text { input, pages, output, force, password } => {
             text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
+        }
+        Request::Render { input, pages, dpi, output, force, password } => {
+            render_command(&input, pages.as_deref(), dpi, &output, force, &password)
         }
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
     }
@@ -306,6 +309,41 @@ fn text_command(
             say(&format!("wrote {} ({} page{})\n", out.display(), wanted.len(), plural(wanted.len())));
         }
         None => say_text(&result),
+    }
+    Ok(())
+}
+
+fn render_command(input: &Path, pages: Option<&str>, dpi: f64, template: &str, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    let wanted: Vec<usize> = match pages {
+        Some(list) => page_list(&doc, input, list)?,
+        None => (0..doc.page_count().map_err(|e| op_error(input, &e))?).collect(),
+    };
+    if wanted.len() > 1 && !template.contains("%d") {
+        return Err("with more than one page the output name must contain %d (for example page_%d.png)".to_string());
+    }
+    // Work out and check every name before drawing anything.
+    let names: Vec<PathBuf> = wanted.iter().map(|&i| PathBuf::from(template.replace("%d", &(i + 1).to_string()))).collect();
+    for name in &names {
+        check_output(name, std::slice::from_ref(&input.to_path_buf()), force)?;
+    }
+    let all = doc.pages().map_err(|e| op_error(input, &e))?;
+    let mut renderer = render::Renderer::new(&doc);
+    // Each page is reported as soon as it is done, so that if a later page fails the pages written are known.
+    for (&index, name) in wanted.iter().zip(&names) {
+        let Some(page) = all.get(index) else { continue };
+        let drawn = renderer.render_page(page, dpi);
+        for w in renderer.take_warnings() {
+            eprintln!("warning: page {}: {}", index + 1, clean(&w));
+        }
+        let bitmap = drawn.map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
+        let png = bitmap.to_png().map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
+        write_file(name, &png)?;
+        say(&format!("wrote {} ({} x {} pixels)
+", name.display(), bitmap.width, bitmap.height));
+        if bitmap.boxed_characters > 0 {
+            eprintln!("warning: page {}: {} characters are drawn as outline boxes (the letters themselves come in a later step)", index + 1, bitmap.boxed_characters);
+        }
     }
     Ok(())
 }

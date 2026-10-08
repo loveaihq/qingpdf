@@ -40,6 +40,8 @@ impl Warnings {
 
 /// One character of a shown string.
 pub(crate) struct Shown {
+    /// The character code (a byte for a simple font; the code of the CMap for a composite one).
+    pub code: u32,
     pub uni: Uni,
     /// Horizontal advance in text space units (width / 1000, or width times the
     /// font matrix for Type 3).
@@ -629,6 +631,7 @@ impl Font {
                         simple.multi.get((packed & !MULTI_FLAG) as usize).map_or(Uni::None, |t| Uni::Many(t.clone()))
                     };
                     f(Shown {
+                        code: u32::from(b),
                         uni,
                         w0: f64::from(simple.widths.get(code).copied().unwrap_or(0.0)) * simple.width_scale,
                         vertical: None,
@@ -642,7 +645,7 @@ impl Font {
                     let (code, n) = comp.cmap.next_code(rest);
                     let n = n.max(1).min(rest.len());
                     let c = comp.char_at(code, n);
-                    f(Shown { uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32 });
+                    f(Shown { code, uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32 });
                     rest = rest.get(n..).unwrap_or(&[]);
                 }
             }

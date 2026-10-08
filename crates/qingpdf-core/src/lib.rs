@@ -15,6 +15,7 @@ pub mod object;
 pub mod ops;
 pub mod parser;
 mod prune;
+pub mod render;
 pub mod repair;
 pub mod security;
 pub mod text;
