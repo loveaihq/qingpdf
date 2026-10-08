@@ -134,6 +134,7 @@ fn render_case(program: &Path) -> Result<bool, String> {
         ("text page, fonts embedded as CFF (a LaTeX paper, Chinese and English)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2601.14329-latex.pdf"), 1, 50.0),
         ("text page, Chinese not embedded (SimSun from the system, a paper)", corpus.join("local").join("zh").join("lunwen").join("lunwen-arxiv-2410.20383-cnki-ttkn.pdf"), 1, 50.0),
         ("text page, Arial and Times not embedded (a Word paper)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2403.14268-word-tc.pdf"), 2, 50.0),
+        ("text page, tricky TrueType font run with its instructions (3b2: DFKaiShu title and authors, a Word paper)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2403.14268-word-tc.pdf"), 1, 50.0),
         ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 1, 150.0),
         ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 1, 150.0),
     ];
@@ -429,9 +430,15 @@ fn main() -> Result<(), String> {
     let fonts_growth_ok = fonts_grown <= 600_000;
     println!("  grown by fonts (3b):      {fonts_grown} bytes ({:.0} KB)  (target <= 0.6 MB)  {}", fonts_grown as f64 / 1000.0, verdict(fonts_growth_ok));
 
+    // Layer 3, step 3b2: at most 0.15 MB more than the 2,205,696 bytes before the instruction interpreter.
+    const BEFORE_TRICKY: u64 = 2_205_696;
+    let tricky_grown = bytes.saturating_sub(BEFORE_TRICKY);
+    let tricky_growth_ok = tricky_grown <= 150_000;
+    println!("  grown by tricky fonts (3b2): {tricky_grown} bytes ({:.0} KB)  (target <= 0.15 MB)  {}", tricky_grown as f64 / 1000.0, verdict(tricky_growth_ok));
+
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
     let render_ok = render_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

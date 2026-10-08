@@ -50,6 +50,11 @@ fn sfnt(version: &[u8; 4], tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
 
 /// A simple glyph: contours of (x, y, on the curve) points.
 fn tt_glyph(contours: &[&[(i16, i16, bool)]]) -> Vec<u8> {
+    tt_glyph_ins(contours, &[])
+}
+
+/// A simple glyph with instructions.
+fn tt_glyph_ins(contours: &[&[(i16, i16, bool)]], ins: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend(be16(contours.len() as u16));
     out.extend([0u8; 8]);
@@ -58,7 +63,8 @@ fn tt_glyph(contours: &[&[(i16, i16, bool)]]) -> Vec<u8> {
         end += c.len() as u16;
         out.extend(be16(end - 1));
     }
-    out.extend(be16(0));
+    out.extend(be16(ins.len() as u16));
+    out.extend(ins);
     let points: Vec<_> = contours.iter().flat_map(|c| c.iter()).collect();
     for p in &points {
         out.push(u8::from(p.2));
@@ -1192,4 +1198,303 @@ fn cff_fdselect_format_3_is_read_in_one_pass_and_bad_ranges_are_ignored() {
     d.extend(be16(8));
     assert_eq!(read_fd_select(&d, 0, 8).unwrap(), vec![1, 1, 1, 1, 1, 0, 0, 0]);
     assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+}
+
+// --- tricky fonts: glyphs made by their instructions (3b2) ----------------------------------------------------
+
+/// NPUSHW: signed 16-bit values.
+fn ins_words(v: &[i32]) -> Vec<u8> {
+    let mut out = vec![0x41, v.len() as u8];
+    for x in v {
+        out.extend((*x as i16).to_be_bytes());
+    }
+    out
+}
+
+fn ins_cat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.iter().flat_map(|p| p.iter().copied()).collect()
+}
+
+/// A composite glyph whose last component carries instructions.
+fn tt_composite_ins(parts: &[(u16, i16, i16)], ins: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend((-1i16).to_be_bytes());
+    out.extend([0u8; 8]);
+    for (i, (gid, dx, dy)) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        out.extend(be16(0x0003 | if last { 0x100 } else { 0x20 }));
+        out.extend(be16(*gid));
+        out.extend(dx.to_be_bytes());
+        out.extend(dy.to_be_bytes());
+    }
+    out.extend(be16(ins.len() as u16));
+    out.extend(ins);
+    out
+}
+
+/// A name table with one record: platform 3, name id 1 (the family).
+fn name_table(family: &str) -> Vec<u8> {
+    let text: Vec<u8> = family.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let mut t = vec![0, 0, 0, 1, 0, 18];
+    for v in [3u16, 1, 0x409, 1, text.len() as u16, 0] {
+        t.extend(v.to_be_bytes());
+    }
+    t.extend(text);
+    t
+}
+
+/// A TrueType font with 2048 units per em and the tables the instructions need.
+fn tricky_font(glyphs: &[Vec<u8>], fpgm: &[u8], prep: &[u8], family: Option<&str>) -> Vec<u8> {
+    let cvt: Vec<u8> = [100i16, 200, 300].iter().flat_map(|v| v.to_be_bytes()).collect();
+    tricky_font_tables(glyphs, &cvt, fpgm, prep, family)
+}
+
+fn tricky_font_tables(glyphs: &[Vec<u8>], cvt: &[u8], fpgm: &[u8], prep: &[u8], family: Option<&str>) -> Vec<u8> {
+    let mut glyf = Vec::new();
+    let mut offsets = vec![0u32];
+    for g in glyphs {
+        glyf.extend(g);
+        while glyf.len() % 4 != 0 {
+            glyf.push(0);
+        }
+        offsets.push(glyf.len() as u32);
+    }
+    let loca: Vec<u8> = offsets.iter().flat_map(|o| be32(*o)).collect();
+    let mut head = vec![0u8; 54];
+    head[18..20].copy_from_slice(&be16(2048));
+    head[50..52].copy_from_slice(&be16(1));
+    let mut maxp = vec![0u8; 32];
+    maxp[..4].copy_from_slice(&be32(0x0001_0000));
+    maxp[4..6].copy_from_slice(&be16(glyphs.len() as u16));
+    for (at, v) in [(16usize, 4u16), (18, 16), (20, 8), (22, 0), (24, 64)] {
+        maxp[at..at + 2].copy_from_slice(&be16(v));
+    }
+    let mut hhea = vec![0u8; 36];
+    hhea[4..6].copy_from_slice(&be16(1800));
+    hhea[6..8].copy_from_slice(&(-400i16).to_be_bytes());
+    hhea[34..36].copy_from_slice(&be16(1));
+    let mut hmtx = Vec::new();
+    hmtx.extend(be16(2048));
+    hmtx.extend(be16(0));
+    let cmap = cmap_format4(3, 1, &[(65, 1), (66, 2), (67, 3)]);
+    let mut tables: Vec<(&[u8; 4], Vec<u8>)> =
+        vec![(b"cmap", cmap), (b"cvt ", cvt.to_vec()), (b"fpgm", fpgm.to_vec()), (b"glyf", glyf), (b"head", head), (b"hhea", hhea), (b"hmtx", hmtx), (b"loca", loca), (b"maxp", maxp), (b"prep", prep.to_vec())];
+    if let Some(f) = family {
+        tables.push((b"name", name_table(f)));
+    }
+    sfnt(&[0, 1, 0, 0], &tables)
+}
+
+const SQUARE_800: [(i16, i16, bool); 4] = [(0, 0, true), (0, 800, true), (800, 800, true), (800, 0, true)];
+
+/// Glyph 1: a square of 800 units whose right side the instructions pull in to 100 units. Glyph 2: a tall bar, no instructions.
+/// Glyph 3: a composite of glyph 1 moved 1000 units right.
+fn narrowing_glyphs() -> Vec<Vec<u8>> {
+    // SVTCA[x]; set the x of points 2 and 3 to 6400 (100 units in 26.6).
+    let narrow = ins_cat(&[&[0x01], &ins_words(&[2, 6400]), &[0x48], &ins_words(&[3, 6400]), &[0x48]]);
+    vec![tt_rect(0, 0, 0, 0), tt_glyph_ins(&[&SQUARE_800], &narrow), tt_rect(100, 0, 300, 900), tt_composite(&[(1, 1000, 0)])]
+}
+
+fn hinted_bounds(tt: &TtFont, gid: u32) -> Result<Option<Rect>, &'static str> {
+    let mut b = Builder::new(tt.hinted_matrix());
+    tt.outline_hinted(gid, &mut b)?;
+    Ok(b.finish().map(|p| p.bounds()))
+}
+
+#[test]
+fn tricky_fonts_are_known_by_their_name_table_and_their_pdf_name() {
+    let tricky = load_tt(tricky_font(&narrowing_glyphs(), &[], &[], Some("DFKai-SB"))).unwrap();
+    assert!(tricky.is_tricky());
+    assert!(!load_tt(tricky_font(&narrowing_glyphs(), &[], &[], Some("Arial"))).unwrap().is_tricky());
+    assert!(!load_tt(tricky_font(&narrowing_glyphs(), &[], &[], None)).unwrap().is_tricky());
+    assert!(TtFont::is_tricky_name(b"ABCDEF+DFKaiShu-SB-Estd-BF"));
+    assert!(TtFont::is_tricky_name(b"MingLiU"));
+    assert!(!TtFont::is_tricky_name(b"Arial"));
+    assert!(!TtFont::is_tricky_name(b"\xCB\xCE\xCC\xE5"));
+}
+
+#[test]
+fn instructions_put_the_strokes_of_a_tricky_glyph_in_place() {
+    let tt = load_tt(tricky_font(&narrowing_glyphs(), &[], &[], Some("DFKai-SB"))).unwrap();
+    // Without instructions the square is 800 units wide (0.39 em); with them its right side is at 100 units (0.049 em).
+    let plain = tt_bounds(&tt, 1).unwrap().unwrap();
+    assert!((plain.right() - 800.0 / 2048.0).abs() < 1e-4);
+    let hinted = hinted_bounds(&tt, 1).unwrap().unwrap();
+    assert!((hinted.right() - 100.0 / 2048.0).abs() < 1e-3, "{hinted:?}");
+    // (Rect::top is the smallest y, bottom the largest: the em has y up.)
+    assert!((hinted.bottom() - 800.0 / 2048.0).abs() < 1e-3 && hinted.left().abs() < 1e-3 && hinted.top().abs() < 1e-3);
+    // A glyph with no instructions comes out as it is.
+    let bar = hinted_bounds(&tt, 2).unwrap().unwrap();
+    assert!((bar.left() - 100.0 / 2048.0).abs() < 1e-3 && (bar.right() - 300.0 / 2048.0).abs() < 1e-3 && (bar.bottom() - 900.0 / 2048.0).abs() < 1e-3);
+    // A composite: each component is hinted first and then put in place.
+    let comp = hinted_bounds(&tt, 3).unwrap().unwrap();
+    assert!((comp.left() - 1000.0 / 2048.0).abs() < 1e-3 && (comp.right() - 1100.0 / 2048.0).abs() < 1e-3, "{comp:?}");
+}
+
+#[test]
+fn a_composite_glyphs_own_instructions_see_the_hinted_components() {
+    // The composite (the tall bar moved 50 right) pulls its top two points (1 and 2) down to 100 units; the program sees
+    // pixels (26.6), not font units, so the target is 6400.
+    let program = ins_cat(&[&[0x00], &ins_words(&[1, 6400]), &[0x48], &ins_words(&[2, 6400]), &[0x48]]);
+    let glyphs = vec![tt_rect(0, 0, 0, 0), tt_rect(0, 0, 0, 0), tt_rect(100, 0, 300, 900), tt_composite_ins(&[(2, 50, 0)], &program)];
+    let tt = load_tt(tricky_font(&glyphs, &[], &[], Some("DFKai-SB"))).unwrap();
+    let b = hinted_bounds(&tt, 3).unwrap().unwrap();
+    assert!((b.bottom() - 100.0 / 2048.0).abs() < 1e-3 && b.top().abs() < 1e-3, "{b:?}");
+    assert!((b.left() - 150.0 / 2048.0).abs() < 1e-3 && (b.right() - 350.0 / 2048.0).abs() < 1e-3, "{b:?}");
+}
+
+#[test]
+fn font_programs_run_first_and_their_work_is_charged_once() {
+    // fpgm defines function 0 (storage 0 += 1); prep calls it 3000 times; the glyph program puts the x of points 2 and 3 at storage 0.
+    let body = ins_cat(&[&[0x40, 2, 0, 0], &[0x43, 0x40, 1, 1, 0x60, 0x42]]);
+    let fpgm = ins_cat(&[&[0x40, 1, 0, 0x2C], &body, &[0x2D]]);
+    let prep = ins_cat(&[&ins_words(&[3000, 0]), &[0x2A]]);
+    let program = ins_cat(&[&[0x01, 0x40, 1, 2, 0x40, 1, 0, 0x43, 0x48], &[0x40, 1, 3, 0x40, 1, 0, 0x43, 0x48]]);
+    let glyphs = vec![tt_rect(0, 0, 0, 0), tt_glyph_ins(&[&SQUARE_800], &program), tt_glyph_ins(&[&SQUARE_800], &program)];
+    let tt = load_tt(tricky_font(&glyphs, &fpgm, &prep, Some("DFKai-SB"))).unwrap();
+    let mut first = Builder::new(tt.hinted_matrix());
+    tt.outline_hinted(1, &mut first).unwrap();
+    let mut second = Builder::new(tt.hinted_matrix());
+    tt.outline_hinted(2, &mut second).unwrap();
+    // The control value program ran 3000 calls of a six-instruction function, and only for the first glyph.
+    assert!(first.work() > 15_000, "{}", first.work());
+    assert!(second.work() < 200, "{}", second.work());
+    let right = first.finish().unwrap().bounds().right();
+    assert!((right - 3000.0 / 64.0 / 2048.0).abs() < 1e-3, "{right}");
+}
+
+#[test]
+fn hostile_instructions_fail_the_hinting_not_the_font() {
+    // A glyph program that loops for ever; instructions that underflow the stack; one that overflows it.
+    let endless = ins_cat(&[&ins_words(&[-4]), &[0x1C]]);
+    let glyphs = vec![tt_rect(0, 0, 0, 0), tt_glyph_ins(&[&SQUARE_800], &endless), tt_glyph_ins(&[&SQUARE_800], &[0x60]), tt_glyph_ins(&[&SQUARE_800], &ins_cat(&[&[0x40, 1, 1], &[0x20], &ins_words(&[-5]), &[0x1C]]))];
+    let tt = load_tt(tricky_font(&glyphs, &[], &[], Some("DFKai-SB"))).unwrap();
+    for gid in 1..=3 {
+        let mut b = Builder::new(tt.hinted_matrix());
+        assert!(tt.outline_hinted(gid, &mut b).is_err(), "glyph {gid}");
+        // The work the failed program did is still counted (the endless one used its whole allowance).
+        if gid == 1 {
+            assert!(b.work() >= 100_000, "{}", b.work());
+        }
+        // The plain outline of the glyph is still there.
+        let plain = tt_bounds(&tt, gid).unwrap().unwrap();
+        assert!((plain.right() - 800.0 / 2048.0).abs() < 1e-4);
+    }
+    // A control value program that never ends: the hinting of the font is off for good.
+    let tt = load_tt(tricky_font(&[tt_rect(0, 0, 0, 0), tt_rect(0, 0, 800, 800)], &[], &endless, Some("DFKai-SB"))).unwrap();
+    let mut b = Builder::new(tt.hinted_matrix());
+    assert!(tt.outline_hinted(1, &mut b).is_err());
+    assert!(b.work() >= 100_000, "{}", b.work());
+    let mut b = Builder::new(tt.hinted_matrix());
+    assert!(tt.outline_hinted(1, &mut b).is_err());
+    assert!(b.work() < 100, "{}", b.work());
+}
+
+#[test]
+fn random_damage_to_a_tricky_font_never_panics() {
+    let mut state = 777u64;
+    let mut next = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    let fpgm = ins_cat(&[&[0x40, 1, 0, 0x2C, 0x40, 2, 0, 0, 0x43, 0x40, 1, 1, 0x60, 0x42, 0x2D]]);
+    let prep = ins_cat(&[&ins_words(&[20, 0]), &[0x2A]]);
+    let good = tricky_font(&narrowing_glyphs(), &fpgm, &prep, Some("DFKai-SB"));
+    let started = Instant::now();
+    for round in 0..1500 {
+        let mut d = good.clone();
+        for _ in 0..1 + round % 5 {
+            let at = next() % d.len();
+            d[at] = next() as u8;
+        }
+        if round % 7 == 0 {
+            d.truncate(next() % d.len());
+        }
+        if let Ok(tt) = load_tt(d) {
+            for g in 0..5u32 {
+                let mut b = Builder::new(tt.hinted_matrix());
+                let _ = tt.outline_hinted(g, &mut b);
+            }
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+}
+
+const TRICKY_TT: &str = "/Subtype /TrueType /BaseFont /ABCDEF+DFKaiShu-SB /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Encoding /WinAnsiEncoding";
+
+#[test]
+fn a_page_draws_a_tricky_font_with_its_instructions_and_no_other_font() {
+    // The square A is pulled in to 100 units (4.9 pixels at 100 points) by its instructions.
+    let font = tricky_font(&narrowing_glyphs(), &[], &[], None);
+    let page = |dict: &str| {
+        let doc = text_page(dict, "/Flags 32", &font, "FontFile2", "BT /F1 100 Tf 0 0 Td (A) Tj ET");
+        let (b, w) = draw(&doc);
+        assert!(w.is_empty(), "{w:?}");
+        b.unwrap()
+    };
+    let tricky = page(TRICKY_TT);
+    assert_eq!(pixel(&tricky, 2, 80), [0, 0, 0]);
+    assert_eq!(pixel(&tricky, 20, 80), WHITE);
+    // The same font under a name that is not on the list is drawn as its outlines are (39 pixels wide).
+    let plain = page("/Subtype /TrueType /BaseFont /Test /FirstChar 65 /LastChar 66 /Widths [1000 1000] /Encoding /WinAnsiEncoding");
+    assert_eq!(pixel(&plain, 2, 80), [0, 0, 0]);
+    assert_eq!(pixel(&plain, 20, 80), [0, 0, 0]);
+}
+
+#[test]
+fn a_tricky_font_whose_instructions_fail_is_drawn_without_them_and_warns_once() {
+    let endless = ins_cat(&[&ins_words(&[-4]), &[0x1C]]);
+    let glyphs = vec![tt_rect(0, 0, 0, 0), tt_glyph_ins(&[&SQUARE_800], &endless), tt_glyph_ins(&[&SQUARE_800], &[0x60]), tt_rect(0, 0, 0, 0)];
+    let font = tricky_font(&glyphs, &[], &[], None);
+    let doc = text_page(TRICKY_TT, "/Flags 32", &font, "FontFile2", "BT /F1 100 Tf 0 0 Td (ABAB) Tj ET");
+    let (b, w) = draw(&doc);
+    let b = b.unwrap();
+    // A is the square, 39 pixels wide: the plain outline.
+    assert_eq!(pixel(&b, 20, 80), [0, 0, 0]);
+    let said: Vec<_> = w.iter().filter(|m| m.contains("instructions")).collect();
+    assert_eq!(said.len(), 1, "{w:?}");
+}
+
+#[test]
+fn glyphs_that_each_run_their_instructions_to_the_limit_are_cut_off_by_the_pages_budget() {
+    // 2000 different glyphs, each with a program that runs until it is cut off (200,000 instructions): about a hundred of them
+    // get that far before the page's work (20 million) is used up; the page is drawn all the same.
+    let endless = ins_cat(&[&ins_words(&[-4]), &[0x1C]]);
+    let glyphs: Vec<Vec<u8>> = (0..2001).map(|g| if g == 0 { tt_rect(0, 0, 0, 0) } else { tt_glyph_ins(&[&SQUARE_800], &endless) }).collect();
+    let font = tricky_font(&glyphs, &[], &[], None);
+    let codes: String = (1..=2000u32).map(|g| format!("{g:04X}")).collect();
+    let font_dict = "/Subtype /Type0 /BaseFont /ABCDEF+DFKaiShu-SB /Encoding /Identity-H /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /ABCDEF+DFKaiShu-SB /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 1000 /CIDToGIDMap /Identity /FontDescriptor 6 0 R >>]";
+    let doc = text_page(font_dict, "/Flags 4", &font, "FontFile2", &format!("BT /F1 4 Tf 0 90 Td <{codes}> Tj ET"));
+    let started = Instant::now();
+    let (b, w) = draw(&doc);
+    assert!(b.is_ok());
+    assert!(w.iter().any(|m| m.contains("took more work than a page may spend")), "{w:?}");
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}
+
+/// A table of a given length whose checksum (the sum of its 32-bit words) is `sum`.
+fn forged_table(len: usize, sum: u32) -> Vec<u8> {
+    let mut t = vec![0u8; len];
+    t[..4].copy_from_slice(&sum.to_be_bytes());
+    t
+}
+
+#[test]
+fn a_font_is_tricky_by_the_checksums_of_its_tables_even_without_a_name_or_a_pdf_name() {
+    // The tables of DFKaiShu as FreeType lists them (the programs are only filled to length: this test is about the finding).
+    let (cvt, fpgm, prep) = (forged_table(0x350, 0x11E5_EAD4), forged_table(0x9063, 0x5A30_CA3B), forged_table(0x7E, 0x13A4_2602));
+    let font = tricky_font_tables(&narrowing_glyphs(), &cvt, &fpgm, &prep, None);
+    assert!(load_tt(font.clone()).unwrap().is_tricky());
+    // A system font is a file: the same finding, and the tables are kept to run.
+    let path = std::env::temp_dir().join(format!("qingpdf-tricky-{}.ttf", std::process::id()));
+    std::fs::write(&path, &font).unwrap();
+    let from_file = TtFont::from_file(&path, 0);
+    let plain = tricky_font_tables(&narrowing_glyphs(), &cvt, &fpgm[..0x9062], &prep, Some("DFKai-SB"));
+    std::fs::write(&path, &plain).unwrap();
+    let not_from_file = TtFont::from_file(&path, 0);
+    let _ = std::fs::remove_file(&path);
+    assert!(from_file.unwrap().is_tricky());
+    // One byte short in a table, and no tricky checksum: a system font is judged by its tables alone.
+    assert!(!not_from_file.unwrap().is_tricky());
+    assert!(load_tt(plain).unwrap().is_tricky(), "by its name table, as an embedded font");
 }

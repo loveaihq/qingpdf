@@ -25,6 +25,7 @@ mod image;
 mod interp;
 mod outline;
 mod sysfont;
+mod ttvm;
 mod type1;
 
 #[cfg(test)]

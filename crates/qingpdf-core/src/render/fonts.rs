@@ -325,6 +325,11 @@ pub(crate) struct Loaded {
     cache: RefCell<FxMap<u64, Lookup>>,
     cache_bytes: Cell<usize>,
     error: Cell<Option<&'static str>>,
+    /// The font is a "tricky" TrueType font: its glyphs are made with their instructions run (3b2).
+    hinted: bool,
+    /// Why the instructions of a glyph could not be run (said once for the font; its glyphs are drawn without them).
+    hint_error: Cell<Option<&'static str>>,
+    hint_warned: Cell<bool>,
     budget: Budget,
 }
 
@@ -365,6 +370,11 @@ impl Loaded {
     }
 
     fn new(program: Rc<Held>, mode: Mode, substituted: bool, plan: &Plan, budget: &Budget) -> Loaded {
+        // The tables decide for a system font; a font of the PDF is also known by the name the PDF gives it.
+        let hinted = match &program.program {
+            Program::Tt(tt) => tt.is_tricky() || (!substituted && TtFont::is_tricky_name(&plan.raw_name)),
+            _ => false,
+        };
         Loaded {
             program,
             mode,
@@ -374,6 +384,9 @@ impl Loaded {
             cache: RefCell::new(FxMap::default()),
             cache_bytes: Cell::new(0),
             error: Cell::new(None),
+            hinted,
+            hint_error: Cell::new(None),
+            hint_warned: Cell::new(false),
             budget: budget.clone(),
         }
     }
@@ -421,7 +434,9 @@ impl Loaded {
 
     /// The first thing that went wrong with a glyph since the last call.
     pub fn take_error(&self) -> Option<String> {
-        self.error.take().map(|why| format!("font {}: a glyph could not be read ({why}); it is not drawn", self.name))
+        self.error.take().map(|why| format!("font {}: a glyph could not be read ({why}); it is not drawn", self.name)).or_else(|| {
+            self.hint_error.take().map(|why| format!("font {}: its glyph instructions could not be run ({why}); its glyphs are drawn without them", self.name))
+        })
     }
 
     pub fn clear_glyphs(&self) {
@@ -598,10 +613,32 @@ impl Loaded {
         // What the reader did is charged to the page whether a glyph came out of it or not.
         let (built, advance, spent) = match &self.program.program {
             Program::Tt(tt) => {
-                let mut b = super::outline::Builder::new(tt.em_matrix());
-                let done = tt.outline(gid, &mut b);
-                let spent = b.work();
-                (done.map(|()| b.finish()), if self.substituted { tt.advance(gid).unwrap_or(0.0) } else { 0.0 }, spent)
+                let advance = if self.substituted { tt.advance(gid).unwrap_or(0.0) } else { 0.0 };
+                let mut spent = 0;
+                let mut hinted = None;
+                if self.hinted {
+                    // A tricky font: its instructions are run, once, at a large size; a font whose instructions fail is drawn without them.
+                    let mut b = super::outline::Builder::new(tt.hinted_matrix());
+                    let done = tt.outline_hinted(gid, &mut b);
+                    spent = b.work();
+                    match done {
+                        Ok(()) => hinted = Some(b.finish()),
+                        Err(why) => {
+                            if !self.hint_warned.replace(true) {
+                                self.hint_error.set(Some(why));
+                            }
+                        }
+                    }
+                }
+                match hinted {
+                    Some(path) => (Ok(path), advance, spent),
+                    None => {
+                        let mut b = super::outline::Builder::new(tt.em_matrix());
+                        let done = tt.outline(gid, &mut b);
+                        spent += b.work();
+                        (done.map(|()| b.finish()), advance, spent)
+                    }
+                }
             }
             Program::Cff(cff) => {
                 let mut b = cff.builder(gid);

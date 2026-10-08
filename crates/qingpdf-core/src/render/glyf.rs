@@ -17,6 +17,11 @@ use crate::text::fontprog::{self, Post, Sub, u8_at, u16_at};
 
 use super::outline::{Builder, Res};
 
+mod hint;
+mod tricky;
+
+use hint::ProgSrc;
+
 /// Composite glyphs may nest this deep.
 const MAX_COMPOSITE_DEPTH: usize = 8;
 /// Components one glyph may have in all, however they nest.
@@ -149,6 +154,15 @@ pub(crate) struct TtFont {
     pub cmap: Option<Cmap>,
     post: Option<Vec<u8>>,
     names: OnceLock<HashMap<String, u32>>,
+    /// The `maxp` table (the limits of the instructions), the ascender and the descender of `hhea` (the phantom points).
+    maxp: Vec<u8>,
+    ascender: i16,
+    descender: i16,
+    /// Where the `cvt `, `fpgm` and `prep` tables are, and whether the font needs them run (3b2).
+    prog: ProgSrc,
+    tricky: bool,
+    /// The state `fpgm` and `prep` leave, made at the first hinted glyph (or why it could not be made).
+    hint: OnceLock<Result<super::ttvm::Globals, &'static str>>,
 }
 
 impl TtFont {
@@ -160,7 +174,13 @@ impl TtFont {
         }
         let (goff, glen) = fontprog::sfnt_table_range(&data, face, b"glyf").ok_or("no glyf table")?;
         let mut get = |tag: &[u8; 4]| -> Option<Vec<u8>> { fontprog::sfnt_table_face(&data, face, tag).map(<[u8]>::to_vec) };
-        TtFont::build(&mut get, Glyf::Memory { data: data.clone(), off: goff, len: glen }, true)
+        let mut font = TtFont::build(&mut get, Glyf::Memory { data: data.clone(), off: goff, len: glen }, true)?;
+        let range = |tag: &[u8; 4]| fontprog::sfnt_table_range(&data, face, tag).unwrap_or((0, 0));
+        let (cvt, fpgm, prep) = (range(b"cvt "), range(b"fpgm"), range(b"prep"));
+        let slice = |r: (usize, usize)| data.get(r.0..r.0.saturating_add(r.1)).unwrap_or_default();
+        font.tricky = tricky::tables_are_tricky(slice(cvt), slice(fpgm), slice(prep)) || get(b"name").is_some_and(|n| tricky::name_table_is_tricky(&n));
+        font.prog = ProgSrc::Memory { data: data.clone(), cvt, fpgm, prep };
+        Ok(font)
     }
 
     /// A font file on disk: only the small tables are read now, the glyph records when they are needed.
@@ -203,7 +223,14 @@ impl TtFont {
             read_at(&file, off, len)
         };
         let handle = Arc::new(file.try_clone().map_err(|_| "cannot read the font file")?);
-        TtFont::build(&mut get, Glyf::File { file: handle, off: goff, len: glen }, false)
+        let mut font = TtFont::build(&mut get, Glyf::File { file: handle, off: goff, len: glen }, false)?;
+        // A system font is tricky only by its tables (the old MingLiU of Windows before 7 is); they are kept when it is.
+        let (cvt, fpgm, prep) = (get(b"cvt ").unwrap_or_default(), get(b"fpgm").unwrap_or_default(), get(b"prep").unwrap_or_default());
+        if tricky::tables_are_tricky(&cvt, &fpgm, &prep) {
+            font.tricky = true;
+            font.prog = ProgSrc::Owned { cvt, fpgm, prep };
+        }
+        Ok(font)
     }
 
     fn build(get: &mut dyn FnMut(&[u8; 4]) -> Option<Vec<u8>>, glyf: Glyf, keep_post: bool) -> Res<TtFont> {
@@ -219,10 +246,29 @@ impl TtFont {
         let entries = loca.len() / if loca_long { 4 } else { 2 };
         let num_glyphs = declared.min(entries.saturating_sub(1));
         let hmtx = get(b"hmtx").unwrap_or_default();
-        let num_hmetrics = get(b"hhea").and_then(|h| u16_at(&h, 34)).map_or(0, usize::from).min(hmtx.len() / 4);
+        let hhea = get(b"hhea").unwrap_or_default();
+        let num_hmetrics = u16_at(&hhea, 34).map_or(0, usize::from).min(hmtx.len() / 4);
+        let (ascender, descender) = (u16_at(&hhea, 4).unwrap_or(0) as i16, u16_at(&hhea, 6).unwrap_or(0) as i16);
         let cmap = get(b"cmap").map(Cmap::new);
         let post = if keep_post { get(b"post") } else { None };
-        Ok(TtFont { units_per_em, num_glyphs, loca, loca_long, glyf, hmtx, num_hmetrics, cmap, post, names: OnceLock::new() })
+        Ok(TtFont {
+            units_per_em,
+            num_glyphs,
+            loca,
+            loca_long,
+            glyf,
+            hmtx,
+            num_hmetrics,
+            cmap,
+            post,
+            names: OnceLock::new(),
+            maxp,
+            ascender,
+            descender,
+            prog: ProgSrc::None,
+            tricky: false,
+            hint: OnceLock::new(),
+        })
     }
 
     #[cfg(test)]
@@ -232,7 +278,7 @@ impl TtFont {
 
     /// Bytes this font keeps in memory.
     pub fn memory(&self) -> usize {
-        self.loca.len() + self.hmtx.len() + self.post.as_ref().map_or(0, Vec::len) + self.cmap.as_ref().map_or(0, Cmap::bytes) + 256
+        self.loca.len() + self.hmtx.len() + self.post.as_ref().map_or(0, Vec::len) + self.cmap.as_ref().map_or(0, Cmap::bytes) + self.prog.bytes() + 256
     }
 
     /// The advance of a glyph in em units.
@@ -313,36 +359,11 @@ impl TtFont {
                 return Err("a glyph has too many components");
             }
             *budget -= 1;
-            let flags = u16_at(&rec, pos).ok_or("truncated composite glyph")?;
-            let child = usize::from(u16_at(&rec, pos + 2).ok_or("truncated composite glyph")?);
-            pos += 4;
-            let (dx, dy) = if flags & 1 != 0 {
-                let (x, y) = (u16_at(&rec, pos).ok_or("truncated composite glyph")?, u16_at(&rec, pos + 2).ok_or("truncated composite glyph")?);
-                pos += 4;
-                if flags & 2 != 0 { (f64::from(x as i16), f64::from(y as i16)) } else { (0.0, 0.0) }
-            } else {
-                let (x, y) = (u8_at(&rec, pos).ok_or("truncated composite glyph")?, u8_at(&rec, pos + 1).ok_or("truncated composite glyph")?);
-                pos += 2;
-                if flags & 2 != 0 { (f64::from(x as i8), f64::from(y as i8)) } else { (0.0, 0.0) }
-            };
-            let f2dot14 = |p: usize| -> Res<f64> { Ok(f64::from(u16_at(&rec, p).ok_or("truncated composite glyph")? as i16) / 16384.0) };
+            let comp = parse_component(&rec, &mut pos)?;
+            let (flags, child) = (comp.flags, comp.child);
+            let (dx, dy) = if flags & 2 != 0 { (f64::from(comp.arg1), f64::from(comp.arg2)) } else { (0.0, 0.0) };
             // x' = a x + c y + e, y' = b x + d y + f
-            let (mut a, mut b, mut c, mut d) = (1.0, 0.0, 0.0, 1.0);
-            if flags & 8 != 0 {
-                a = f2dot14(pos)?;
-                d = a;
-                pos += 2;
-            } else if flags & 0x40 != 0 {
-                a = f2dot14(pos)?;
-                d = f2dot14(pos + 2)?;
-                pos += 4;
-            } else if flags & 0x80 != 0 {
-                a = f2dot14(pos)?;
-                b = f2dot14(pos + 2)?;
-                c = f2dot14(pos + 4)?;
-                d = f2dot14(pos + 6)?;
-                pos += 8;
-            }
+            let [a, b, c, d] = comp.matrix;
             let (dx, dy) = if flags & 0x800 != 0 && flags & 0x1000 == 0 { (a * dx + c * dy, b * dx + d * dy) } else { (dx, dy) };
             let start = out.pts.len();
             stack.push(gid);
@@ -360,6 +381,49 @@ impl TtFont {
             }
         }
     }
+}
+
+/// One component of a composite glyph (OpenType, glyf): its flags, glyph, arguments and 2 x 2 matrix.
+struct Comp {
+    flags: u16,
+    child: usize,
+    /// The offset (font units) when ARGS_ARE_XY_VALUES, else the point numbers (in the glyph so far, in the component).
+    arg1: i32,
+    arg2: i32,
+    /// [a, b, c, d]: x' = a x + c y, y' = b x + d y.
+    matrix: [f64; 4],
+}
+
+/// Read the component at `pos` and move `pos` past it.
+fn parse_component(rec: &[u8], pos: &mut usize) -> Res<Comp> {
+    const CUT: &str = "truncated composite glyph";
+    let flags = u16_at(rec, *pos).ok_or(CUT)?;
+    let child = usize::from(u16_at(rec, *pos + 2).ok_or(CUT)?);
+    *pos += 4;
+    let xy = flags & 2 != 0;
+    let (arg1, arg2) = if flags & 1 != 0 {
+        let (x, y) = (u16_at(rec, *pos).ok_or(CUT)?, u16_at(rec, *pos + 2).ok_or(CUT)?);
+        *pos += 4;
+        if xy { (i32::from(x as i16), i32::from(y as i16)) } else { (i32::from(x), i32::from(y)) }
+    } else {
+        let (x, y) = (u8_at(rec, *pos).ok_or(CUT)?, u8_at(rec, *pos + 1).ok_or(CUT)?);
+        *pos += 2;
+        if xy { (i32::from(x as i8), i32::from(y as i8)) } else { (i32::from(x), i32::from(y)) }
+    };
+    let f2dot14 = |p: usize| -> Res<f64> { Ok(f64::from(u16_at(rec, p).ok_or(CUT)? as i16) / 16384.0) };
+    let mut matrix = [1.0, 0.0, 0.0, 1.0];
+    if flags & 8 != 0 {
+        let a = f2dot14(*pos)?;
+        matrix = [a, 0.0, 0.0, a];
+        *pos += 2;
+    } else if flags & 0x40 != 0 {
+        matrix = [f2dot14(*pos)?, 0.0, 0.0, f2dot14(*pos + 2)?];
+        *pos += 4;
+    } else if flags & 0x80 != 0 {
+        matrix = [f2dot14(*pos)?, f2dot14(*pos + 2)?, f2dot14(*pos + 4)?, f2dot14(*pos + 6)?];
+        *pos += 8;
+    }
+    Ok(Comp { flags, child, arg1, arg2, matrix })
 }
 
 /// The contours of a glyph: points (x, y, on the curve) and where each contour ends.
