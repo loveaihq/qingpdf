@@ -342,7 +342,12 @@ fn render_command(input: &Path, pages: Option<&str>, dpi: f64, template: &str, f
         say(&format!("wrote {} ({} x {} pixels)
 ", name.display(), bitmap.width, bitmap.height));
         if bitmap.boxed_characters > 0 {
-            eprintln!("warning: page {}: {} characters are drawn as outline boxes (the letters themselves come in a later step)", index + 1, bitmap.boxed_characters);
+            let [no_font, no_char, not_in_font] = bitmap.boxed_causes;
+            eprintln!(
+                "warning: page {}: {} characters are drawn as outline boxes (no font for them: {no_font}; code with no character: {no_char}; character not in the font: {not_in_font})",
+                index + 1,
+                bitmap.boxed_characters
+            );
         }
     }
     Ok(())

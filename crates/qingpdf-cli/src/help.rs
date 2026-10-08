@@ -184,10 +184,12 @@ page number) unless a single page is drawn.
 
 What is drawn: paths (fill, stroke, dashes, clipping), colours (device, ICC
 and Cal spaces as the device space, Indexed, Separation, DeviceN, Lab), images
-(Flate, LZW, JPEG, CCITT fax; masks), forms and Type 3 fonts. For now the
-characters of other fonts are drawn as an outline box each, and transparency,
-gradients and patterns are not drawn (grey blocks stand in for JBIG2 and JPEG
-2000 images). Annotations are not drawn.
+(Flate, LZW, JPEG, CCITT fax; masks), forms, text (the font programs of the
+PDF: TrueType, Type 1, CFF; fonts it does not carry come from the system fonts,
+Chinese, Japanese and Korean ones included; a character whose glyph cannot be
+had is drawn as an outline box). Transparency groups, gradients and patterns
+are not drawn (grey blocks stand in for JBIG2 and JPEG 2000 images).
+Annotations are not drawn.
 
 Options:
   --pages <list>        The pages to draw (default: all)

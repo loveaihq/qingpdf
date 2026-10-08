@@ -13,10 +13,10 @@
 //! ```
 
 pub(crate) mod cmap;
-mod data;
+pub(crate) mod data;
 mod encodings;
 pub(crate) mod font;
-mod fontprog;
+pub(crate) mod fontprog;
 pub(crate) mod interp;
 mod layout;
 pub(crate) mod scan;

@@ -37,7 +37,7 @@ pub(crate) enum Kind {
 /// `Some(Uni::None)` where it has one that stands for no character we know.
 pub(crate) type Table = Vec<Option<Uni>>;
 
-type Res<T> = Result<T, &'static str>;
+pub(crate) type Res<T> = Result<T, &'static str>;
 
 /// Most character codes a cmap enumeration visits (hostile segment tables overlap).
 const MAX_CMAP_VISITS: usize = 1 << 18;
@@ -79,46 +79,72 @@ fn named(name: &str) -> Option<Uni> {
     (name != ".notdef").then(|| uni_of_glyph_name(name))
 }
 
+/// The standard strings of CFF (Technical Note #5176, Appendix A) as a list: index `sid`.
+pub(crate) fn cff_standard_string(sid: usize) -> Option<&'static str> {
+    static LIST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| CFF_STANDARD_STRINGS.split_ascii_whitespace().collect()).get(sid).copied()
+}
+
+/// The glyph name StandardEncoding gives a code (Adobe Type 1 Font Format, Appendix; Technical Note
+/// #5176, Appendix B). The 149 characters of the encoding, in the order of their codes, are the
+/// standard strings 1 to 149 of CFF.
+pub(crate) fn standard_encoding_sid(code: u8) -> Option<u16> {
+    if data::STANDARD.get(usize::from(code)).copied().unwrap_or(0) == 0 {
+        return None;
+    }
+    let rank = data::STANDARD.iter().take(usize::from(code)).filter(|&&cp| cp != 0).count();
+    u16::try_from(rank + 1).ok()
+}
+
+pub(crate) fn standard_encoding_name(code: u8) -> Option<&'static str> {
+    cff_standard_string(usize::from(standard_encoding_sid(code)?))
+}
+
 // --- bytes ------------------------------------------------------------------------------------------
 
-fn u8_at(d: &[u8], o: usize) -> Option<u8> {
+pub(crate) fn u8_at(d: &[u8], o: usize) -> Option<u8> {
     d.get(o).copied()
 }
 
-fn u16_at(d: &[u8], o: usize) -> Option<u16> {
+pub(crate) fn u16_at(d: &[u8], o: usize) -> Option<u16> {
     Some(u16::from_be_bytes(d.get(o..o.checked_add(2)?)?.try_into().ok()?))
 }
 
-fn u32_at(d: &[u8], o: usize) -> Option<u32> {
+pub(crate) fn u32_at(d: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes(d.get(o..o.checked_add(4)?)?.try_into().ok()?))
 }
 
-fn usize_at(d: &[u8], o: usize) -> Option<usize> {
+/// A little-endian number (the segment lengths of a PFB file).
+pub(crate) fn u32_at_le(d: &[u8], o: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(o..o.checked_add(4)?)?.try_into().ok()?))
+}
+
+pub(crate) fn usize_at(d: &[u8], o: usize) -> Option<usize> {
     usize::try_from(u32_at(d, o)?).ok()
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn is_ws(b: u8) -> bool {
+pub(crate) fn is_ws(b: u8) -> bool {
     matches!(b, 0 | 9 | 10 | 12 | 13 | 32)
 }
 
 // --- Type 1 -----------------------------------------------------------------------------------------
 
-enum Tok<'a> {
+pub(crate) enum Tok<'a> {
     Name(&'a [u8]),
     Word(&'a [u8]),
 }
 
-struct Lexer<'a> {
-    s: &'a [u8],
-    pos: usize,
+pub(crate) struct Lexer<'a> {
+    pub s: &'a [u8],
+    pub pos: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn next_token(&mut self) -> Option<Tok<'a>> {
+    pub fn next_token(&mut self) -> Option<Tok<'a>> {
         loop {
             let b = u8_at(self.s, self.pos)?;
             if is_ws(b) {
@@ -163,19 +189,28 @@ fn t1_code(word: &[u8]) -> Option<usize> {
 }
 
 fn type1(program: &[u8]) -> Res<Table> {
+    Ok(match type1_encoding(program)? {
+        None => standard_table(),
+        Some(names) => names.iter().map(|n| n.as_ref().and_then(|n| named(&String::from_utf8_lossy(n)))).collect(),
+    })
+}
+
+/// The glyph name the cleartext part of a Type 1 program gives each code; `None` for
+/// `/Encoding StandardEncoding def`.
+pub(crate) fn type1_encoding(program: &[u8]) -> Res<Option<Vec<Option<Vec<u8>>>>> {
     // Only the cleartext part, which ends where the encrypted part begins.
     let clear = program.get(..find(program, b"eexec").unwrap_or(program.len())).unwrap_or(program);
     let at = find(clear, b"/Encoding").ok_or("no /Encoding in the cleartext part")?;
     let mut lexer = Lexer { s: clear.get(at + 9..).unwrap_or(&[]), pos: 0 };
     let mut tok = lexer.next_token();
     match &tok {
-        Some(Tok::Word(w)) if *w == b"StandardEncoding" => return Ok(standard_table()),
+        Some(Tok::Word(w)) if *w == b"StandardEncoding" => return Ok(None),
         Some(Tok::Word(w)) if w.first().is_some_and(u8::is_ascii_alphabetic) && *w != b"dup" => {
             return Err("a predefined encoding other than StandardEncoding");
         }
         _ => {}
     }
-    let mut table: Table = vec![None; 256];
+    let mut table: Vec<Option<Vec<u8>>> = vec![None; 256];
     // 0: nothing, 1: after `dup`, 2: after `dup <code>`
     let mut state = 0u8;
     let mut code = 0usize;
@@ -194,7 +229,7 @@ fn type1(program: &[u8]) -> Res<Table> {
             },
             Tok::Name(n) if state == 2 => {
                 if let Some(slot) = table.get_mut(code) {
-                    *slot = named(&String::from_utf8_lossy(n));
+                    *slot = (n != b".notdef").then(|| n.to_vec());
                     entries += 1;
                 }
                 state = 0;
@@ -206,23 +241,23 @@ fn type1(program: &[u8]) -> Res<Table> {
     if entries == 0 {
         return Err("no encoding array in the cleartext part");
     }
-    Ok(table)
+    Ok(Some(table))
 }
 
 // --- CFF --------------------------------------------------------------------------------------------
 
 /// An INDEX (Technical Note #5176, 5): where its objects are.
-struct Index {
-    count: usize,
+pub(crate) struct Index {
+    pub count: usize,
     off_size: usize,
     offsets: usize,
     /// Object offsets are relative to the byte before the first object.
     base: usize,
-    end: usize,
+    pub end: usize,
 }
 
 impl Index {
-    fn parse(d: &[u8], pos: usize) -> Res<Index> {
+    pub fn parse(d: &[u8], pos: usize) -> Res<Index> {
         const BAD: &str = "bad INDEX in the CFF data";
         let count = usize::from(u16_at(d, pos).ok_or(BAD)?);
         if count == 0 {
@@ -245,7 +280,7 @@ impl Index {
         d.get(at..at.checked_add(self.off_size)?)?.iter().try_fold(0usize, |acc, &b| acc.checked_mul(256)?.checked_add(usize::from(b)))
     }
 
-    fn get<'a>(&self, d: &'a [u8], i: usize) -> Option<&'a [u8]> {
+    pub fn get<'a>(&self, d: &'a [u8], i: usize) -> Option<&'a [u8]> {
         if i >= self.count {
             return None;
         }
@@ -257,12 +292,19 @@ impl Index {
     }
 }
 
-/// The (operator, last operand) pairs of a DICT. Operators of two bytes are 1200 plus the second.
-fn dict_entries(d: &[u8]) -> Res<Vec<(u16, f64)>> {
+/// The (operator, operands) pairs of a DICT. Operators of two bytes are 1200 plus the second. At
+/// most 256 entries of at most 48 operands each are kept (Technical Note #5176, 4).
+pub(crate) fn dict_operands(d: &[u8]) -> Res<Vec<(u16, Vec<f64>)>> {
     const BAD: &str = "bad DICT in the CFF data";
+    const MAX_OPERANDS: usize = 48;
     let mut out = Vec::new();
-    let mut last = 0.0;
+    let mut args: Vec<f64> = Vec::new();
     let mut pos = 0usize;
+    let push = |args: &mut Vec<f64>, v: f64| {
+        if args.len() < MAX_OPERANDS {
+            args.push(v);
+        }
+    };
     while let Some(b0) = u8_at(d, pos) {
         pos += 1;
         match b0 {
@@ -274,36 +316,49 @@ fn dict_entries(d: &[u8]) -> Res<Vec<(u16, f64)>> {
                     u16::from(b0)
                 };
                 if out.len() < 256 {
-                    out.push((op, last));
+                    out.push((op, std::mem::take(&mut args)));
+                } else {
+                    args.clear();
                 }
-                last = 0.0;
             }
             28 => {
-                last = f64::from(i16::from_be_bytes(u16_at(d, pos).ok_or(BAD)?.to_be_bytes()));
+                push(&mut args, f64::from(i16::from_be_bytes(u16_at(d, pos).ok_or(BAD)?.to_be_bytes())));
                 pos += 2;
             }
             29 => {
-                last = f64::from(i32::from_be_bytes(u32_at(d, pos).ok_or(BAD)?.to_be_bytes()));
+                push(&mut args, f64::from(i32::from_be_bytes(u32_at(d, pos).ok_or(BAD)?.to_be_bytes())));
                 pos += 4;
             }
             30 => {
                 // A real number: nibbles up to the 0xf end marker.
-                loop {
+                let mut text = String::new();
+                'nibbles: loop {
                     let b = u8_at(d, pos).ok_or(BAD)?;
                     pos += 1;
-                    if b & 0x0f == 0x0f || b >> 4 == 0x0f {
-                        break;
+                    for nib in [b >> 4, b & 0x0f] {
+                        match nib {
+                            0..=9 => text.push(char::from(b'0' + nib)),
+                            0xa => text.push('.'),
+                            0xb => text.push('E'),
+                            0xc => text.push_str("E-"),
+                            0xe => text.push('-'),
+                            0xf => break 'nibbles,
+                            _ => {}
+                        }
+                    }
+                    if text.len() > 64 {
+                        return Err(BAD);
                     }
                 }
-                last = 0.0;
+                push(&mut args, text.parse::<f64>().ok().filter(|v| v.is_finite()).unwrap_or(0.0));
             }
-            32..=246 => last = f64::from(b0) - 139.0,
+            32..=246 => push(&mut args, f64::from(b0) - 139.0),
             247..=250 => {
-                last = (f64::from(b0) - 247.0) * 256.0 + f64::from(u8_at(d, pos).ok_or(BAD)?) + 108.0;
+                push(&mut args, (f64::from(b0) - 247.0) * 256.0 + f64::from(u8_at(d, pos).ok_or(BAD)?) + 108.0);
                 pos += 1;
             }
             251..=254 => {
-                last = -(f64::from(b0) - 251.0) * 256.0 - f64::from(u8_at(d, pos).ok_or(BAD)?) - 108.0;
+                push(&mut args, -(f64::from(b0) - 251.0) * 256.0 - f64::from(u8_at(d, pos).ok_or(BAD)?) - 108.0);
                 pos += 1;
             }
             _ => return Err(BAD),
@@ -312,7 +367,12 @@ fn dict_entries(d: &[u8]) -> Res<Vec<(u16, f64)>> {
     Ok(out)
 }
 
-fn offset_operand(v: f64) -> Option<usize> {
+/// The (operator, last operand) pairs of a DICT.
+fn dict_entries(d: &[u8]) -> Res<Vec<(u16, f64)>> {
+    Ok(dict_operands(d)?.into_iter().map(|(op, args)| (op, args.last().copied().unwrap_or(0.0))).collect())
+}
+
+pub(crate) fn offset_operand(v: f64) -> Option<usize> {
     (0.0..1e9).contains(&v).then_some(v as usize)
 }
 
@@ -327,7 +387,7 @@ fn sid_name(sid: u16, strings: &Index, d: &[u8]) -> Option<String> {
 }
 
 /// Glyph id to string id for `n` glyphs (Technical Note #5176, 13).
-fn charset(d: &[u8], off: usize, n: usize) -> Res<Vec<u16>> {
+pub(crate) fn charset(d: &[u8], off: usize, n: usize) -> Res<Vec<u16>> {
     const BAD: &str = "bad charset in the CFF data";
     let mut sids = vec![0u16; n];
     match off {
@@ -381,32 +441,11 @@ fn charset(d: &[u8], off: usize, n: usize) -> Res<Vec<u16>> {
     Ok(sids)
 }
 
-fn cff(d: &[u8]) -> Res<Table> {
-    const BAD: &str = "bad CFF header";
-    if u8_at(d, 0) != Some(1) {
-        return Err("not a CFF font (version 1)");
-    }
-    let header = usize::from(u8_at(d, 2).ok_or(BAD)?);
-    let names = Index::parse(d, header)?;
-    let tops = Index::parse(d, names.end)?;
-    let strings = Index::parse(d, tops.end)?;
-    let top = dict_entries(tops.get(d, 0).ok_or("no Top DICT")?)?;
-    let operand = |op: u16| top.iter().find(|(o, _)| *o == op).map(|&(_, v)| v);
-    if operand(1230).is_some() {
-        return Err("a CID-keyed CFF font");
-    }
-    let encoding = operand(16).map_or(Some(0), offset_operand).ok_or("bad Encoding offset")?;
-    if encoding == 0 {
-        return Ok(standard_table());
-    }
-    if encoding == 1 {
-        return Err("the predefined Expert encoding");
-    }
-    let charstrings = operand(17).and_then(offset_operand).ok_or("no CharStrings in the Top DICT")?;
-    let glyphs = Index::parse(d, charstrings)?.count;
-    let sids = charset(d, operand(15).map_or(Some(0), offset_operand).ok_or("bad charset offset")?, glyphs)?;
+/// A custom CFF Encoding (formats 0 and 1, and the supplement; Technical Note #5176, 12): the glyph
+/// of each code (0: none) and the (code, string id) pairs of the supplement.
+pub(crate) type CffEncoding = ([usize; 256], Vec<(usize, u16)>);
 
-    // Encoding formats 0 and 1, and the supplement (Technical Note #5176, 12).
+pub(crate) fn cff_encoding(d: &[u8], encoding: usize) -> Res<CffEncoding> {
     const BAD_ENC: &str = "bad Encoding in the CFF data";
     let format = u8_at(d, encoding).ok_or(BAD_ENC)?;
     let mut pos = encoding + 1;
@@ -440,6 +479,45 @@ fn cff(d: &[u8]) -> Res<Table> {
         }
         _ => return Err(BAD_ENC),
     }
+    let mut supplement = Vec::new();
+    if format & 0x80 != 0 {
+        let n = usize::from(u8_at(d, pos).ok_or(BAD_ENC)?);
+        for i in 0..n {
+            let at = pos + 1 + 3 * i;
+            let code = usize::from(u8_at(d, at).ok_or(BAD_ENC)?);
+            let sid = u16_at(d, at + 1).ok_or(BAD_ENC)?;
+            supplement.push((code, sid));
+        }
+    }
+    Ok((gid_of_code, supplement))
+}
+
+fn cff(d: &[u8]) -> Res<Table> {
+    const BAD: &str = "bad CFF header";
+    if u8_at(d, 0) != Some(1) {
+        return Err("not a CFF font (version 1)");
+    }
+    let header = usize::from(u8_at(d, 2).ok_or(BAD)?);
+    let names = Index::parse(d, header)?;
+    let tops = Index::parse(d, names.end)?;
+    let strings = Index::parse(d, tops.end)?;
+    let top = dict_entries(tops.get(d, 0).ok_or("no Top DICT")?)?;
+    let operand = |op: u16| top.iter().find(|(o, _)| *o == op).map(|&(_, v)| v);
+    if operand(1230).is_some() {
+        return Err("a CID-keyed CFF font");
+    }
+    let encoding = operand(16).map_or(Some(0), offset_operand).ok_or("bad Encoding offset")?;
+    if encoding == 0 {
+        return Ok(standard_table());
+    }
+    if encoding == 1 {
+        return Err("the predefined Expert encoding");
+    }
+    let charstrings = operand(17).and_then(offset_operand).ok_or("no CharStrings in the Top DICT")?;
+    let glyphs = Index::parse(d, charstrings)?.count;
+    let sids = charset(d, operand(15).map_or(Some(0), offset_operand).ok_or("bad charset offset")?, glyphs)?;
+
+    let (gid_of_code, supplement) = cff_encoding(d, encoding)?;
     let mut table: Table = vec![None; 256];
     for (code, slot) in table.iter_mut().enumerate() {
         let gid = gid_of_code.get(code).copied().unwrap_or(0);
@@ -448,15 +526,9 @@ fn cff(d: &[u8]) -> Res<Table> {
             *slot = name.as_deref().and_then(named);
         }
     }
-    if format & 0x80 != 0 {
-        let n = usize::from(u8_at(d, pos).ok_or(BAD_ENC)?);
-        for i in 0..n {
-            let at = pos + 1 + 3 * i;
-            let code = usize::from(u8_at(d, at).ok_or(BAD_ENC)?);
-            let sid = u16_at(d, at + 1).ok_or(BAD_ENC)?;
-            if let (Some(slot), Some(name)) = (table.get_mut(code), sid_name(sid, &strings, d)) {
-                *slot = named(&name);
-            }
+    for (code, sid) in supplement {
+        if let (Some(slot), Some(name)) = (table.get_mut(code), sid_name(sid, &strings, d)) {
+            *slot = named(&name);
         }
     }
     Ok(table)
@@ -464,30 +536,58 @@ fn cff(d: &[u8]) -> Res<Table> {
 
 // --- sfnt and TrueType ------------------------------------------------------------------------------
 
-fn is_sfnt(d: &[u8]) -> bool {
+pub(crate) fn is_sfnt(d: &[u8]) -> bool {
     matches!(d.get(..4), Some([0, 1, 0, 0] | b"true" | b"OTTO" | b"ttcf"))
 }
 
-fn sfnt_table<'a>(d: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
-    let base = if d.get(..4) == Some(b"ttcf") { usize_at(d, 12)? } else { 0 };
+pub(crate) fn sfnt_table<'a>(d: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
+    sfnt_table_face(d, 0, tag)
+}
+
+/// The number of fonts in a TrueType collection (1 for a plain font).
+pub(crate) fn sfnt_faces(d: &[u8]) -> usize {
+    if d.get(..4) == Some(b"ttcf") { usize_at(d, 8).unwrap_or(0).min(64) } else { 1 }
+}
+
+/// Where the table directory of font number `face` starts (a collection has several).
+pub(crate) fn sfnt_directory(d: &[u8], face: usize) -> Option<usize> {
+    if d.get(..4) == Some(b"ttcf") {
+        if face >= sfnt_faces(d) {
+            return None;
+        }
+        usize_at(d, 12usize.checked_add(face.checked_mul(4)?)?)
+    } else {
+        (face == 0).then_some(0)
+    }
+}
+
+/// A table of font number `face`: (offset, length) in the file, both inside it.
+pub(crate) fn sfnt_table_range(d: &[u8], face: usize, tag: &[u8; 4]) -> Option<(usize, usize)> {
+    let base = sfnt_directory(d, face)?;
     let n = usize::from(u16_at(d, base.checked_add(4)?)?).min(MAX_SFNT_TABLES);
     for i in 0..n {
         let rec = base.checked_add(12)?.checked_add(i * 16)?;
         if d.get(rec..rec.checked_add(4)?) == Some(tag) {
-            let off = usize_at(d, rec + 8)?;
-            return d.get(off..off.checked_add(usize_at(d, rec + 12)?)?);
+            let off = usize_at(d, rec.checked_add(8)?)?;
+            let len = usize_at(d, rec.checked_add(12)?)?;
+            return (off.checked_add(len)? <= d.len()).then_some((off, len));
         }
     }
     None
 }
 
-struct Sub {
-    platform: u16,
-    encoding: u16,
-    off: usize,
+pub(crate) fn sfnt_table_face<'a>(d: &'a [u8], face: usize, tag: &[u8; 4]) -> Option<&'a [u8]> {
+    let (off, len) = sfnt_table_range(d, face, tag)?;
+    d.get(off..off + len)
 }
 
-fn cmap_subtables(cmap: &[u8]) -> Vec<Sub> {
+pub(crate) struct Sub {
+    pub platform: u16,
+    pub encoding: u16,
+    pub off: usize,
+}
+
+pub(crate) fn cmap_subtables(cmap: &[u8]) -> Vec<Sub> {
     let n = usize::from(u16_at(cmap, 2).unwrap_or(0)).min(MAX_SUBTABLES);
     (0..n)
         .filter_map(|i| {
@@ -513,7 +613,7 @@ fn format4_glyph(c: &[u8], off: usize, seg: usize, i: usize, code: u32) -> Optio
 }
 
 /// The glyph a cmap subtable gives a code (formats 0, 4, 6 and 12); `None` for no glyph.
-fn cmap_lookup(c: &[u8], off: usize, code: u32) -> Option<u16> {
+pub(crate) fn cmap_lookup(c: &[u8], off: usize, code: u32) -> Option<u16> {
     let gid = match u16_at(c, off)? {
         0 => u8_at(c, off + 6 + usize::try_from(code).ok().filter(|&v| v < 256)?).map(u16::from)?,
         4 => {
@@ -621,14 +721,14 @@ fn cmap_enumerate(c: &[u8], off: usize, left: &mut usize, f: &mut dyn FnMut(u32,
 }
 
 /// Glyph names of a `post` table of format 2.0.
-struct Post<'a> {
+pub(crate) struct Post<'a> {
     table: &'a [u8],
     glyphs: usize,
     names: Vec<&'a [u8]>,
 }
 
 impl<'a> Post<'a> {
-    fn parse(table: &'a [u8]) -> Option<Post<'a>> {
+    pub fn parse(table: &'a [u8]) -> Option<Post<'a>> {
         if u32_at(table, 0)? != 0x0002_0000 {
             return None;
         }
@@ -642,7 +742,7 @@ impl<'a> Post<'a> {
         Some(Post { table, glyphs, names })
     }
 
-    fn name(&self, gid: u16) -> Option<String> {
+    pub fn name(&self, gid: u16) -> Option<String> {
         if usize::from(gid) >= self.glyphs {
             return None;
         }

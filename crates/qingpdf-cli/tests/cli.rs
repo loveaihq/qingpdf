@@ -784,8 +784,8 @@ fn render_writes_one_png_per_page() {
     let out = run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "36".as_ref(), "-o".as_ref(), pattern.as_os_str()]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(stdout(&out).contains("page_1.png") && stdout(&out).contains("page_2.png"), "{}", stdout(&out));
-    // The text of the page is drawn as boxes, and the user is told.
-    assert!(stderr(&out).contains("page 1: ") && stderr(&out).contains("outline boxes"), "{}", stderr(&out));
+    // The letters of the page are drawn from system fonts (or boxes, with a word to the user, where there are none).
+    assert!(!stderr(&out).contains("error"), "{}", stderr(&out));
     for n in 1..=2 {
         let png = std::fs::read(dir.join(format!("page_{n}.png"))).expect("written");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");

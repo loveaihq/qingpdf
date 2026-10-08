@@ -86,8 +86,6 @@ fn average(n: u32, mut f: impl FnMut()) -> Duration {
     started.elapsed() / n
 }
 
-/// Encrypted files: the cost of opening them, and how fast AES decrypts.
-/// Returns whether the targets were met.
 /// Layer 2: the time of `qingpdf text` on the longest text file we have.
 fn text_case(program: &Path) -> Result<bool, String> {
     let corpus = root().join("tests").join("corpus");
@@ -124,47 +122,85 @@ fn text_case(program: &Path) -> Result<bool, String> {
     Ok(ok)
 }
 
-/// One page drawn at 150 dpi, inside this process (the drawing alone) and by the program (start,
-/// drawing, PNG file). Returns whether the targets were met.
+/// One page drawn at 150 dpi, inside this process (the drawing alone, and the first drawing of all, which reads
+/// the system fonts) and by the program (start, drawing, PNG file). Returns whether the targets were met.
 fn render_case(program: &Path) -> Result<bool, String> {
     let corpus = root().join("tests").join("corpus");
     let out_dir = root().join("tests").join("out").join("perf");
-    // (label, file, target in ms for the drawing, page)
+    // (label, file, page, target in ms for the drawing)
     let cases = [
-        ("text page (letters as boxes)", corpus.join("local").join("xref-classic").join("tracemonkey.pdf"), 50.0),
-        ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 150.0),
-        ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 150.0),
+        ("text page, Type 1 fonts embedded (tracemonkey, English)", corpus.join("local").join("xref-classic").join("tracemonkey.pdf"), 1, 50.0),
+        ("text page, TrueType fonts embedded (a government report, Chinese)", corpus.join("public").join("zh").join("gongwen").join("gongwen-2024-nicheng-work-report.pdf"), 2, 50.0),
+        ("text page, fonts embedded as CFF (a LaTeX paper, Chinese and English)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2601.14329-latex.pdf"), 1, 50.0),
+        ("text page, Chinese not embedded (SimSun from the system, a paper)", corpus.join("local").join("zh").join("lunwen").join("lunwen-arxiv-2410.20383-cnki-ttkn.pdf"), 1, 50.0),
+        ("text page, Arial and Times not embedded (a Word paper)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2403.14268-word-tc.pdf"), 2, 50.0),
+        ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 1, 150.0),
+        ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 1, 150.0),
     ];
     let mut all_ok = true;
     println!("
-render, page 1 at 150 dpi:");
-    for (label, file, target_ms) in cases {
+render, one page at 150 dpi:");
+    for (label, file, page_number, target_ms) in cases {
         if !file.is_file() {
             println!("  {label}: {} is not here, skipped (tests/tools/make_scan_fixture.py makes the CCITT one)", file.display());
             continue;
         }
         let doc = Document::open(&file).map_err(|e| e.to_string())?;
         let pages = doc.pages().map_err(|e| e.to_string())?;
-        let page = pages.first().ok_or("no pages")?;
+        let page = pages.get(page_number - 1).ok_or("no such page")?;
+        // The first drawing of the process: reads the system fonts this page needs (the files are in the system's cache).
+        let started = Instant::now();
+        let mut first_renderer = qingpdf_core::render::Renderer::new(&doc);
+        let first_result = first_renderer.render_page(page, 150.0).map_err(|e| e.to_string())?;
+        let first = started.elapsed().as_secs_f64() * 1000.0;
         let drawn = average(20, || {
             let mut r = qingpdf_core::render::Renderer::new(&doc);
             let _ = r.render_page(page, 150.0);
         });
         let png = out_dir.join("render.png");
+        let page_arg = page_number.to_string();
         let (fastest, median) = time_runs(
             program,
-            &["render".as_ref(), file.as_os_str(), "--pages".as_ref(), "1".as_ref(), "--dpi".as_ref(), "150".as_ref(), "-o".as_ref(), png.as_os_str(), "--force".as_ref()],
+            &["render".as_ref(), file.as_os_str(), "--pages".as_ref(), page_arg.as_ref(), "--dpi".as_ref(), "150".as_ref(), "-o".as_ref(), png.as_os_str(), "--force".as_ref()],
         )?;
         let ms = drawn.as_secs_f64() * 1000.0;
-        let ok = ms <= target_ms;
+        let ok = ms <= target_ms && first <= target_ms * 1.5;
         all_ok &= ok;
         println!("  {label}:");
+        println!("    the first drawing in the process (system fonts read):  {first:.1} ms  (boxes {}, glyphs not in their fonts {})", first_result.boxed_characters, first_result.absent_glyphs);
         println!("    drawing alone (average of 20): {ms:.1} ms  (target <= {target_ms:.0} ms)  {}", verdict(ok));
         println!("    the program, start to PNG on disk: fastest {fastest:.3?}, median of {RUNS} {median:.3?}");
     }
+    all_ok &= book_case(&corpus)?;
     Ok(all_ok)
 }
 
+/// The first 100 pages of the 468-page e-book at 150 dpi, one renderer for all of them: the average time of a page.
+fn book_case(corpus: &Path) -> Result<bool, String> {
+    let book = corpus.join("local").join("zh").join("ebook").join("ebook-wikisource-yijikao-468p.pdf");
+    if !book.is_file() {
+        println!("  the 468-page e-book is not here, skipped");
+        return Ok(true);
+    }
+    let doc = Document::open(&book).map_err(|e| e.to_string())?;
+    let pages = doc.pages().map_err(|e| e.to_string())?;
+    let mut renderer = qingpdf_core::render::Renderer::new(&doc);
+    let started = Instant::now();
+    let mut slowest = Duration::ZERO;
+    let count = pages.len().min(100);
+    for page in pages.iter().take(count) {
+        let t = Instant::now();
+        renderer.render_page(page, 150.0).map_err(|e| e.to_string())?;
+        slowest = slowest.max(t.elapsed());
+    }
+    let total = started.elapsed();
+    let per_page = total.as_secs_f64() * 1000.0 / count as f64;
+    println!("  e-book (468 pages), the first {count} pages in one renderer: {:.2} s, {per_page:.1} ms a page on average, slowest {:.1} ms  (target <= 50 ms a page)  {}", total.as_secs_f64(), slowest.as_secs_f64() * 1000.0, verdict(per_page <= 50.0));
+    Ok(per_page <= 50.0)
+}
+
+/// Encrypted files: the cost of opening them, and how fast AES decrypts.
+/// Returns whether the targets were met.
 fn encrypted() -> Result<bool, String> {
     let public = root().join("tests").join("corpus").join("public");
     let dir = public.join("encrypted").join("qpdf-generated");
@@ -387,9 +423,15 @@ fn main() -> Result<(), String> {
     let render_growth_ok = render_grown <= 1_000_000;
     println!("  grown by rendering (3a):  {render_grown} bytes ({:.0} KB)  (target <= 1 MB)  {}", render_grown as f64 / 1000.0, verdict(render_growth_ok));
 
+    // Layer 3, step 3b: at most 0.6 MB more than the 2,057,216 bytes before the fonts.
+    const BEFORE_FONTS: u64 = 2_057_216;
+    let fonts_grown = bytes.saturating_sub(BEFORE_FONTS);
+    let fonts_growth_ok = fonts_grown <= 600_000;
+    println!("  grown by fonts (3b):      {fonts_grown} bytes ({:.0} KB)  (target <= 0.6 MB)  {}", fonts_grown as f64 / 1000.0, verdict(fonts_growth_ok));
+
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
     let render_ok = render_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

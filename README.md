@@ -2,9 +2,9 @@
 
 A small, fast, offline PDF tool with its own engine, written in Rust. *Qīng* (轻) means "light".
 
-Most PDF tools today are hundreds of megabytes. qingpdf is one 2.0 MB executable that needs nothing installed, never goes online, and is built to do Chinese PDFs right.
+Most PDF tools today are hundreds of megabytes. qingpdf is one 2.2 MB executable that needs nothing installed, never goes online, and is built to do Chinese PDFs right.
 
-**Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`. Ordinary fonts are drawn as boxes for now. There is no viewer, conversion or editing yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
+**Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`. There is no viewer, conversion or editing yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
 
 ## What it does now
 
@@ -25,13 +25,13 @@ Every command that reads a PDF takes `--password <password>` for encrypted files
 
 Outputs are never written over an input, and an existing file is only replaced with `--force`. Run `qingpdf <command> --help` for details.
 
-`render` draws paths, colours, clipping, images (JPEG, CCITT fax, Flate and more), forms and Type 3 fonts. Other fonts are drawn as one outline box per character until the font step. Transparency, gradients, patterns and annotations are not drawn yet, and JPEG 2000 and JBIG2 images show as grey blocks. On this PC at 150 dpi a whole run takes 41 ms for a text page, 84 ms for a JPEG scan and 53 ms for a CCITT fax A4 scan.
+`render` draws paths, colours, clipping, images (JPEG, CCITT fax, Flate and more), forms and text. Embedded TrueType, OpenType, CFF and Type 1 fonts are read by qingpdf's own code; fonts that are not embedded (common in Chinese government documents) are drawn with the system's fonts, such as SimSun, SimHei, KaiTi and FangSong on Windows. Transparency, gradients, patterns and annotations are not drawn yet, and JPEG 2000 and JBIG2 images show as grey blocks. On this PC at 150 dpi drawing a text page takes 15–39 ms, a JPEG scan 38 ms and a CCITT fax A4 scan 23 ms.
 
 ## Hard rules
 
 Every release is measured against these; a feature that breaks one is not added.
 
-1. Windows download ≤ 20 MB (today: 2.0 MB).
+1. Windows download ≤ 20 MB (today: 2.2 MB).
 2. First page of a 100-page PDF on screen in ≤ 1 s (today `info` on 1000 pages: ~50 ms).
 3. Page turns ≤ 100 ms.
 4. ≤ 200 MB memory for a 100-page document.
@@ -67,7 +67,7 @@ Third-party software and data, with their licence texts, are listed in [THIRD-PA
 
 ## 中文简介
 
-qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，但普通字体暂时只画成方框，字体等功能在后面。阅读界面、转换和编辑还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
+qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。阅读界面、转换和编辑还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
 
 ## 许可证
 

@@ -42,6 +42,12 @@ impl Warnings {
 pub(crate) struct Shown {
     /// The character code (a byte for a simple font; the code of the CMap for a composite one).
     pub code: u32,
+    /// The CID of a composite font's character (the code itself for a simple font).
+    pub cid: u32,
+    /// The character the glyph is for, as the encoding or the character collection gives it and
+    /// without the clean-ups `uni` gets (ligatures stay one character): 0 if unknown. For drawing
+    /// with a font that is not the PDF's own.
+    pub glyph_uni: u32,
     pub uni: Uni,
     /// Horizontal advance in text space units (width / 1000, or width times the
     /// font matrix for Type 3).
@@ -74,11 +80,34 @@ struct Simple {
     /// Width of each code in glyph space units (the font's own, else the missing width).
     widths: Vec<f32>,
     width_scale: f64,
+    /// For drawing: the character of each code as the encoding gives it (0 none).
+    glyph_uni: Vec<u32>,
+    /// The glyph names /Differences gives to codes.
+    names: Vec<Option<Vec<u8>>>,
+    /// The base encoding of the code table, and whether the PDF names one (or has /Differences).
+    table: &'static [u16; 256],
+    named_base: bool,
+    win_mac: bool,
+    has_widths: bool,
+}
+
+/// What drawing a simple font needs besides its characters.
+pub(crate) struct SimpleInfo<'a> {
+    pub names: &'a [Option<Vec<u8>>],
+    pub table: &'static [u16; 256],
+    /// The PDF's /Encoding is a name or has a /BaseEncoding.
+    pub named_base: bool,
+    /// The PDF's /Encoding, or the /BaseEncoding of its dictionary, is MacRomanEncoding or WinAnsiEncoding (9.6.6.4).
+    pub win_mac: bool,
+    /// The font dictionary has a /Widths array (the 14 standard fonts may come without).
+    pub has_widths: bool,
 }
 
 const MULTI_FLAG: u32 = 0x8000_0000;
 
 struct CachedChar {
+    cid: u32,
+    glyph_uni: u32,
     uni: Uni,
     w0: f64,
     vertical: Option<(f64, f64, f64)>,
@@ -322,7 +351,37 @@ impl Font {
             })
             .collect();
         let widths = widths.iter().map(|&w| w as f32).collect();
-        Font { name, vertical: false, body: Body::Simple(Simple { uni: packed, multi, widths, width_scale }) }
+        // For drawing: the encoding's own character for each code, before ToUnicode (which is for
+        // text and may say "fi" for a ligature glyph), then ToUnicode when the encoding says nothing.
+        let glyph_uni: Vec<u32> = (0..256usize)
+            .map(|code| {
+                if let Some(Some(name)) = renamed.get(code) {
+                    let named = data::glyph_name_to_unicode(&String::from_utf8_lossy(name)).first().copied().unwrap_or(0);
+                    if named != 0 {
+                        return named;
+                    }
+                    // A glyph name that says nothing of Unicode ("g5167"): what /ToUnicode says, if it does.
+                    return match to_uni.as_ref().map(|tu| tu.get(u32::try_from(code).unwrap_or(0))) {
+                        Some(Uni::One(c)) => u32::from(c),
+                        _ => 0,
+                    };
+                }
+                match table.get(code) {
+                    Some(&cp) if cp != 0 => u32::from(cp),
+                    _ => match uni.get(code) {
+                        Some(Uni::One(c)) => u32::from(*c),
+                        _ => 0,
+                    },
+                }
+            })
+            .collect();
+        let named_base = base_name.is_some() || matches!(&encoding, Some(Object::Name(_)));
+        let win_mac = matches!(base_name.as_deref(), Some("WinAnsiEncoding" | "MacRomanEncoding"));
+        Font {
+            name,
+            vertical: false,
+            body: Body::Simple(Simple { uni: packed, multi, widths, width_scale, glyph_uni, names: renamed, table, named_base, win_mac, has_widths: have_widths }),
+        }
     }
 
     fn load_composite(
@@ -551,6 +610,30 @@ fn lookup_w(table: &[(u32, u32, f64)], cid: u32) -> Option<f64> {
 }
 
 impl Composite {
+    /// The character a glyph is for when the font is not the PDF's own: the code of a
+    /// Unicode-coded CMap, the CID of a `UCS` collection, the collection's table, else the
+    /// /ToUnicode. 0 for none.
+    fn glyph_unicode(&self, code: u32, cid: u32) -> u32 {
+        if self.cmap.codes_are_unicode() {
+            return match self.cmap.kind {
+                cmap::Kind::Utf16 if code > 0xFFFF => {
+                    char::decode_utf16([(code >> 16) as u16, code as u16]).next().and_then(Result::ok).map_or(0, u32::from)
+                }
+                _ => code,
+            };
+        }
+        if self.cid_is_unicode {
+            return cid;
+        }
+        if let Some(cp) = self.ordering.and_then(|o| o.cid_to_unicode(cid)) {
+            return cp;
+        }
+        match self.to_uni.as_ref().map(|tu| tu.get(code)) {
+            Some(Uni::One(c)) => u32::from(c),
+            _ => 0,
+        }
+    }
+
     fn unicode(&self, code: u32, cid: u32) -> Uni {
         if let Some(tu) = &self.to_uni {
             let u = tu.get(code);
@@ -606,7 +689,7 @@ impl Composite {
                 None => (self.dw2.1 / 1000.0, w0 / 2.0, self.dw2.0 / 1000.0),
             }
         });
-        let value = Rc::new(CachedChar { uni: self.unicode(code, cid), w0, vertical });
+        let value = Rc::new(CachedChar { cid, glyph_uni: self.glyph_unicode(code, cid), uni: self.unicode(code, cid), w0, vertical });
         let mut cache = self.cache.borrow_mut();
         if cache.len() < 200_000 {
             cache.insert(key, value.clone());
@@ -616,6 +699,22 @@ impl Composite {
 }
 
 impl Font {
+    /// What drawing needs of a simple font; `None` for a composite one.
+    pub fn simple_info(&self) -> Option<SimpleInfo<'_>> {
+        match &self.body {
+            Body::Simple(s) => Some(SimpleInfo { names: &s.names, table: s.table, named_base: s.named_base, win_mac: s.win_mac, has_widths: s.has_widths }),
+            Body::Composite(_) => None,
+        }
+    }
+
+    /// The Adobe character collection of a composite font, when it is one of the four with tables.
+    pub fn ordering(&self) -> Option<Ordering> {
+        match &self.body {
+            Body::Composite(c) => c.ordering,
+            Body::Simple(_) => None,
+        }
+    }
+
     /// Split a shown string into characters and call `f` for each.
     pub fn show(&self, s: &[u8], mut f: impl FnMut(Shown)) {
         match &self.body {
@@ -632,6 +731,8 @@ impl Font {
                     };
                     f(Shown {
                         code: u32::from(b),
+                        cid: u32::from(b),
+                        glyph_uni: simple.glyph_uni.get(code).copied().unwrap_or(0),
                         uni,
                         w0: f64::from(simple.widths.get(code).copied().unwrap_or(0.0)) * simple.width_scale,
                         vertical: None,
@@ -645,7 +746,7 @@ impl Font {
                     let (code, n) = comp.cmap.next_code(rest);
                     let n = n.max(1).min(rest.len());
                     let c = comp.char_at(code, n);
-                    f(Shown { code, uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32 });
+                    f(Shown { code, cid: c.cid, glyph_uni: c.glyph_uni, uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32 });
                     rest = rest.get(n..).unwrap_or(&[]);
                 }
             }

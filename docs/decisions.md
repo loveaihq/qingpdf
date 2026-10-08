@@ -361,3 +361,84 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **CCITT**：`/Columns` 上限从 1600 万降到 100 万（真实传真几千像素；每行的变化位置数组最大 4 MB）；输出缓冲按数据能给出的量预留（数据字节数的 32 倍，至少 4 KiB），不再按头里声明的行数预留 48 MB。
 - **CLI `render` 每页完成就打印警告和"wrote ..."**，某页失败时用户知道前面写了哪些。
 - **layer-1 遗留（`bug_216.pdf`、`bug_544880.pdf` 0 页 vs PDFium 1 页）不是我们的错**：前者 `/Pages` 有 `/Count 1` 但没有 `/Kids`，后者 `/Kids [2 0 R]` 指向 `/Pages` 自己；两个文件里都没有一个页对象，PDFium 报的 1 是直接读的 `/Count`。我们不信 `/Count`，页数以真正走到的页对象为准，所以没改。
+
+## 第 3 层 3b：字体（字形）
+
+### 结构和依赖
+
+- **取代 3a 里"文字"那一条**（非 Type 3 字体每个字符画一个轮廓框）：现在画真字形，框只留给取不到字形的字符。
+- 没有新依赖。新文件都在 `render/` 下：`outline.rs`（字形轮廓的构造器和大小上限）、`glyf.rs`（TrueType、`cmap`、`hmtx`）、`cff.rs`（Type 2 charstring，含 CID-keyed）、`type1.rs`（eexec、charstring、flex、seac）、`sysfont.rs`（系统字体）、`fonts.rs`（字形选择、缓存、预算）、`interp/text.rs`（画字：模式、位图缓存、裁剪）。容器（INDEX、DICT、charset、encoding、`cmap` 子表、`post`）一律复用 `text/fontprog.rs`，只是把它们改成 `pub(crate)`，另加了 `dict_operands`（带实数和多操作数）、TTC 按号取字体、Type 1 的 encoding 名字表、CFF 自定义 encoding 的 gid 表。
+- 文字层的改动：`Shown` 多了 `cid` 和 `glyph_uni`（不经"清理"的字符：ToUnicode 会把连字拆成两个字符，画字要的是编码本身给的那个字符）；简单字体多了 `/Differences` 的名字表和 `/Widths` 有没有；`/Differences` 里名字不是 Unicode 名（`g5167` 这种）时 `glyph_uni` 取 `/ToUnicode`（PDFium 也这样，`issue13316_reduced.pdf` 靠它）。
+
+### 字形读取
+
+- **TrueType**：简单字形和组合字形（平移、缩放、2x2；"点匹配"当平移 0）；系统字体的 `glyf` 不读进内存，只读 `head/maxp/hhea/hmtx/loca/cmap` 这些小表，字形记录按偏移读（Windows `seek_read`、Unix `read_at`），所以 18 MB 的 `simsun.ttc` 打开只占不到 1 MB、不到 1 毫秒。**不做 hinting。**
+- **CFF**：hstem/vstem/hintmask/cntrmask 跳过（按栈上参数算出 stem 数再跳掩码字节）、rmoveto 系、全部曲线操作符、flex 四种、算术和栈操作符、subr 和 gsubr（bias）、`endchar` 的四参数 seac（按 StandardEncoding 取 charset 里的字形）；CID-keyed：FDArray、FDSelect（格式 0 和 3）、每个 FD 自己的 Private/Subrs 和 FontMatrix；`FontFile3 /OpenType` 取 `CFF ` 表并带上文件的 `cmap`。
+- **Type 1**：PFB 段头、eexec 二进制和十六进制两种、`lenIV`（负数不加密）、Subrs、CharStrings、`hsbw/sbw`、`seac`（附件位置 sbx + adx − asb）、OtherSubrs 0–3（flex 的 7 个点按 0/1/2 收集，3 是换 hint，别的把参数原样还给 `pop`）。**Type 1 的字形号是 CharStrings 里的位置加 1**（pdfTeX 的子集字体第一项常常不是 `.notdef`，字形 `A` 排在第 0 个，曾因此被当成 `.notdef` 没画）。
+- **限制**（超了是这个字形的错误，字体其余照用）：字体程序解码后 ≤ 32 MiB；一个字形最多 40,000 个轮廓段（`Builder` 里数）；TrueType 组合深度 ≤ 8、组件总数 ≤ 256、点数 ≤ 40,000、字形记录 ≤ 1 MiB、自己包含自己是错误；CFF 和 Type 1 的 charstring 每个字形最多运行 20 万个（CFF）和 10 万个（Type 1）操作符加操作数、subr 嵌套 ≤ 10、操作数栈 ≤ 96（CFF）和 48（Type 1）、`seac` 只许一层；Type 1 的 Subr 和字形各 ≤ 65,535 个、读私有部分的记号 ≤ 200 万个。来自文件的偏移和长度一律用 `checked_add` 或 `get`。
+- 每画一个字形还要从页面的轮廓段预算（每页 800 万，和路径共用）里扣它的段数，用光后这一页后面的字形不画并给警告（不然一个字体里每个字形 4 万段、页面上显示 200 万次，要光栅化几十分钟）。
+
+### 字形选择
+
+- **简单字体**：Type 1 和 CFF 按 9.6.6.2：`/Differences` 的名字直接找字形名（找不到就把名字当 AGL 名转成 Unicode 再找）；PDF 写了编码名或 `/BaseEncoding`：按编码的 Unicode 找字形名（用 AGL 反查，不另带编码名表），找不到才用字体自己的 encoding；PDF 没写编码：字体自己的 encoding，再试 Unicode。**TrueType 按 9.6.6.4**：非符号且有 `/Encoding` 的：Unicode 过 `cmap`（3,10）、（0,x）、（3,1），再（1,0）用 MacRoman 码，再 `post` 字形名，最后（3,0）和（1,0）按码；符号字体或没有 `/Encoding`：（3,0）的码本身和 0xF000/0xF100/0xF200 加码，再（1,0），再 Unicode；没有 `cmap` 的子集字体，字形号就是码。
+- **CID 字体**：TrueType 用 `CIDToGIDMap`（`Identity` 或流，流上限 256 KB），CFF 是 CID-keyed 的按 charset 找 CID，不是的 CID 就是字形号。字形号 0（`.notdef`）一律不画。
+- **宽度以 PDF 的为准**。例外：没有 `/Widths` 的字体（标准 14 字体可以不写，`pdf20-utf8-test`、`issue8088` 这类），排版用代用字体的字形前进量（连空格也是，否则词距不对）；有 `/Widths` 但代用字体的字形比它宽 2% 以上的，水平压到 PDF 的宽度（PDFium 同）。粗体、斜体：选对应的粗斜体字体文件，没有就用常规的，不做合成粗体或斜体。
+
+### 没嵌字体的回退
+
+- 名字、`/Flags`（等宽、衬线、斜体、ForceBold）、`/FontWeight`、`/ItalicAngle` 和字符集（`/Ordering`）决定请求：西文落到 Arial、Times New Roman、Courier New，名字是 Georgia、Verdana、Tahoma、Calibri、Cambria、Consolas、Segoe UI 的用它们自己；Symbol 用 `symbol.ttf`（（3,0）的 0xF0xx）；ZapfDingbats 没有对应字体，用 Segoe UI Symbol 的 Dingbats 区（U+27xx）。中日韩：字符集决定语种，名字决定风格（宋体 `simsun.ttc`、黑体 `simhei.ttf`、微软雅黑 `msyh.ttc`、楷体 `simkai.ttf`、仿宋 `simfang.ttf`；繁体 `mingliu.ttc`、`msjh.ttc`；日文 `msmincho.ttc`、`msgothic.ttc`、`YuGothR.ttc`；韩文 `malgun.ttf`、`batang.ttc`）；名字认 ASCII、UTF-8 和 GBK 字节（`#CB#CE#CC#E5` 就是"宋体"）。**`mingliub.ttc` 不放在细明体的首选上**：它是 MingLiU-ExtB，只有扩展 B 的字，不含常用字。
+- **简单 TrueType 字体、没有 `FontFile2`、`/BaseFont` 的前四个字节是宋体、楷体、黑体、仿宋、新宋的 GBK 码：字符串当 GBK 双字节读**（首字节 0x81–0xFE、次字节 0x40–0xFE 合成一个字，字画在首字节的位置，次字节只留宽度；PDFium 同；`XiaoBiaoSong.pdf`、`SimFang-variant.pdf`）。GBK 码到 Unicode 用 `GBK-EUC-H` 加 GB1 的 CID 表。
+- 康熙部首和兼容汉字（CID 表给的 U+2Fxx）先找原值，找不到按 NFKC 找统一汉字（`cnki-ttkn.pdf` 的 450 个字符靠它）。系统字体里没有的字符画占位框（原因 `NotInFont`），编码没说是什么字符的画占位框（`NoCharacter`），没有系统字体的画占位框（`NoFont`）；CLI 的警告里分开报数。
+- **系统字体文件的读法**：不扫描目录；按请求生成候选文件名，在 `%WINDIR%\Fonts`（和用户字体目录）里逐个 `is_file`，第一个有的打开；结果（包括没找到）整个进程只做一次，放在进程级的缓存里，所有字体表合计 ≤ 96 MiB。macOS（`/System/Library/Fonts` 等）、Linux（liberation、dejavu、wqy、noto 等常见目录）只是写了候选名和目录，**没有在那两种系统上试过**；Linux 上 CFF 的 `.otf` 和 `.ttc` 中文字体（Noto CJK）读不了（只读 `glyf`），那里中文会画占位框。
+
+### 文字渲染模式、竖排、缓存
+
+- `Tr` 0–7 全做：1、2、5、6 描边（在用户空间里描，线宽用图形状态的，和路径同一条代码），4–7 把字形（非零环绕的并集）在 `ET` 时并入裁剪区（**这个文字对象里一个字形也没有加进去，裁剪区不变**，和 pdf.js 一样）；3 什么都不画，7 不画框；不是 0–7 的值当没写。Type 3 仍然只有模式 3 隐藏它。
+- **竖排**：字形原点是笔位减位置向量（`W2`/`DW2`，没有就是（w0/2, 880））；GSUB `vert` 的竖排字形替换不做（竖排里的标点用横排的字形；`-V` 的 CMap 的 CID 和 Adobe 的略有不同，3a 记过）。
+- **字形缓存**：轮廓按（字体，字形）缓存，单个字体 ≤ 4 MiB、全体 ≤ 16 MiB（用光时从头来）；字体程序全体 ≤ 64 MiB（超了先让别的字体卸掉程序再读）、单个 ≤ 32 MiB；小字号（字形框每边 ≤ 96 像素）的填充走覆盖位图缓存，键是（字形，矩阵到 1/16 像素每 em，x 的四分之一像素位置），≤ 8 MiB。大字形、描边、裁剪走路径。
+- **字形落点（按 PDFium 实测定的）**：基线 y 取整到整像素，x 向下取整到四分之一像素。试过各种量化、整体平移和覆盖率的 gamma，对 PDFium 的平均像素差（tracemonkey，72 dpi）：x、y 都取四分之一像素 7.7，x、y 都取整 7.5，y 取整、x 取四分之一像素 5.6，再把 x 平移 −0.125 像素（即向下取整）4.5；gamma 越偏离 1 越差。PDFium 的字比我们多 7% 到 9% 的墨，但加深不降低差，没有采用。
+
+### 和 PDFium 对照（`tests/tools/render_compare.py --engine-compare`，72 dpi，每个文件前 8 页）
+
+- 脚本现在包括文字页，输出分三组：完全画出的页（没有框、没用 3c 的功能）、有字符画成框的页、用 3c 功能的页；另外按原因统计框、列出框最多的文件，`--all` 再按文件列出超阈值的页。`crates/qingpdf-cli/examples/box_census.rs` 把整个语料库的每一页都画一遍（24 dpi）数框。
+- 结果（384 页，38 个文件有问题没比，同 3a）：**不含 3c 功能的 344 页平均像素差 2.55**（阈值 3.0）；其中完全画出的 342 页平均 2.57，**132 页 ≥ 3**；有框的 2 页 0.36；用 3c 的 40 页平均 39.6（JBIG2/JPEG 2000 灰块、图案，预期不同）。超阈值的页的原因：① 文字密集的页（多数 4.5 到 8，约 115 页：`tracemonkey`、`TAMReview`、各篇论文、公文）：PDFium 用 FreeType 的抗锯齿，每个字形的位置和笔画粗细都差一点，不是错（放大对看没有偏移，缩小对看一致）；② `pdf20-utf8-test.pdf` 和它的加密副本（49）：页上的红蓝两个方块属于默认关闭的可选内容层，PDFium 不画，我们没做 OCG（3a 记过）；③ `issue19176`（11.6）、`gongwen-1954-gazette02-scan` 的 6 页（7 到 11）等：3a 记过的，9 x 11 像素的页和 4 倍缩小的扫描页，不是文字。
+- **整个语料库（4285 页）画成占位框的字符 3 个，另有 1 个字形字体里没有（什么也不画）**：`issue12823.pdf` 2 个（`NotoColorEmoji` 没有后代字体，表情符号系统字体里没有，原因 `NotInFont`）、`issue19182.pdf` 1 个（同因）；`lunwen-arxiv-2601.14329-latex.pdf` 1 个字形不在内嵌字体里。**"没有系统字体"和"编码不认识"的一个也没有**（后一种在测试里用不存在的字形名造出来验证）。
+- **看过的中文页**（100 dpi）：公文 `nicheng-work-report`、`service-mfg-plan`、`guoban-mulu-2015`、武汉公报；没嵌字体的 `zh-gb1-h-noembed`（STSong-Light）、`cnki-ttkn`（GBK-EUC-H，宋体由 `simsun.ttc` 顶）、`zh-cns1-h-noembed`；竖排的合川县志（内嵌，从右到左、从上到下，位置正确）、`vertical.pdf`；日文 `noembed-sjis`。字形正确、位置不偏。韩文没有语料可看。
+- **一个已知的错：内嵌的"tricky"字体需要 TrueType 指令解释器**。`lunwen-arxiv-2403.14268-word-tc.pdf` 的题目和作者用 `DFKaiShu-SB-Estd-BF`（标楷体，笔画组合式的字形，靠指令把笔画摆到位）：不跑指令，笔画缺着画出来（FreeType 的 tricky 字体清单里有这个名字，PDFium 因此对它开 hinting）。我们不做 hinting（任务单），这个字体的字是错的；同类的有 DFKai-SB、DFMing、MingLiU 等一批台湾和日本的老字体。要做得写 TrueType 字节码虚拟机，是单独一步。
+
+### 速度、内存、大小（本机，release，2026-10-08）
+
+`cargo run --release --example perf -p qingpdf-cli`，150 dpi，"画"是进程内的平均（每次一个新的 `Renderer`，字形缓存是空的）：
+
+| 页 | 画 | 进程里第一次画（含读系统字体） |
+|---|---|---|
+| `tracemonkey` 第 1 页（Type 1，英文） | 15.5 ms | 15.6 ms |
+| 公文 `nicheng-work-report` 第 2 页（TrueType 内嵌，中文） | 29.0 ms | 46.8 ms |
+| `lunwen-arxiv-2601` 第 1 页（CFF 内嵌，中英文） | 34.1 ms | 33.7 ms |
+| `cnki-ttkn` 第 1 页（宋体不嵌，系统 `simsun.ttc`） | 34.5 ms | 36.3 ms |
+| `word-tc` 第 2 页（Arial、Times 不嵌） | 37.4 ms | 37.6 ms |
+
+- 468 页那本书前 100 页（一个 `Renderer`）：平均每页 **43.3 ms**，最慢 68.4 ms（Type 3 图片蒙版字形，和本步的字体无关）。目标 ≤ 50 ms。
+- 峰值内存（外部轮询工作集）：文字页 20 到 25 MB；那本书画前 100 页 52.5 MB；32 页的报告画全 34 MB。目标 200 MB。
+- `qingpdf.exe` 2,195,968 字节，比 3a 的 2,057,216 多 138,752 字节（目标 ≤ 0.6 MB）；`perf` 里的 `BEFORE_FONTS` 记下了这个基线。
+
+### 测试
+
+- `render/font_tests.rs`（17 个，审查后又加 10 个，见上一节）：代码里逐字节造出 TrueType、CFF、Type 1（含 eexec 加密、PFB 段头、十六进制）字体，验证轮廓、各渲染模式、竖排、`CIDToGIDMap`、9.6.6.4 的符号和非符号选择、`/Differences`。
+- 坏字体（同一文件）：每个长度的截断、`loca` 越界和倒序、组合字形自包含和互相包含、嵌套过深、组件过多、组件树、点数和 `maxp` 声称过多、`unitsPerEm` 为 0；CFF 和 Type 1 的 subr 自环、栈溢出、几十万个操作符、hintmask 越界、数字被截、eexec 是噪声、`seac` 套 `seac`；三种字体各 1500 轮随机改字节加截断；字体程序读不出是警告并换系统字体，一个字形坏了其余照画；缓存在预算内；200 万个字形是 `Error::Limit`；字形段预算；`Tr 9` 当没写。
+- `sysfont.rs`：名字到请求、系统字体整个进程只开一次且只读小表。`render/mod.rs` 原有类型 3 测试里的两个框改成"编码里名字不是字符的框"（有系统字体就不会有"没有字体"的框，不能拿它当测试依据）。
+
+### 审查后的修补（恶意输入；`render/font_tests.rs` 后半是一一对应的回归测试）
+
+- **Type 1 的 subr 每个字体只解密一次**：按号放进 `OnceLock`，缓存总量不会超过私有部分本身的大小，不另设预算。每次调用还把 subr 的字节数记进 charstring 的 10 万额度（字形自己的字节也记）。"64 KB 的 subr 调 3.3 万次"（以前 3.4 秒）现在第二次调用就是这个字形的错误。
+- **每页字形轮廓的工作量 2000 万**（`Budget` 里的计数，`Interp::new` 时重置）：CFF 和 Type 1 的操作数（Type 1 再加 subr 字节）、TrueType 读的点和轮廓数和组合字形搬的点、再加每个轮廓段 1。**字形失败或没画出东西也照扣**（一个坏字形最多 20 万），所以"3000 个各烧 20 万步的字形"（4.6 秒）最多烧 100 个。用光后还没做过的字形不画、给一条警告；做好缓存的字形照画。这样的字形不进缓存，下一页有新额度。
+- **字形位图缓存插入时就限到 8 MiB**（超了整个清空），不等 `show` 结束。**整个落在页面或裁剪区外的字形不光栅化**（也不进缓存；判断在字形外接框两边各留 2 像素，所以不改变画出来的像素）。
+- **文字裁剪（Tr 4–7）：一个文字对象最多 100 万个轮廓段**，超了警告，后面的字形不再并入裁剪（裁剪区只含前面的字形）。不像 3a 的蒙版上限那样退到外接矩形：这里没有便宜又可靠的外接矩形，丢后面的字形同样不会多画。
+- **直接写在 `/Resources` 里的字体字典也缓存**，键是（这个资源字典的编号，名字）。编号是每个 `Resources` 自己取的，不用地址：地址会在释放后被别的字典复用，会把另一个字体当成它。**字体程序按 FontFile 流的引用共享**：一张 `Weak` 表，没有字体用着就随之释放，预算只算一次，N 个字体字典共用一个 FontFile 只解析一次。
+- **TrueType 的轮廓数（`ends`）也算进 40,000 点的上限**：1.4 KB 的文件（3.2 万个轮廓、256 个组件）曾产生 71 MB 的临时数据。
+- **CFF FDSelect 格式 3 一遍扫完**：范围必须递增，起点在已填到的位置之前、或终点不大于起点的范围忽略，终点截到字形数；O(字形数 + 范围数)，以前 O(范围 × 字形)。
+- **每页最多读 128 MiB 字体程序**（解码后的字节；坏程序也算，共享命中的不算）。多个超过 32 MiB 的大字体交替使用时每次都要卸载再读，解析时间没有计过。用光后还没读过的字体画框并警告；**不记成"失败"**（失败是永久的），下一页重新有额度。
+- **简单 TrueType 字形走编码（9.6.6.4）的条件**：Nonsymbolic 标志，或 `/Encoding` 是 MacRomanEncoding / WinAnsiEncoding（名字，或字典里的 `/BaseEncoding`）且没有 `/Differences`（PDFium 的条件）。规范前后两段互相冲突（"有名字 MacRoman/WinAnsi 就走编码"、"符号标志置位则忽略 Encoding"），两者都有时听 Encoding。其余（只有 `/Differences`、符号字体、没有编码）直接查 cmap，查不到再用 `/Differences` 的名字查 `post`。以前是"有 `/Encoding` 且不是纯符号"，只有 `/Differences` 的也走编码。
+- **`gbk_pairs`（字符串按 GBK 双字节读）只用于没有任何字体程序的字体**（`FontFile`、`FontFile2`、`FontFile3` 都没有）；以前只看有没有 `FontFile2`。
+- **改完以后对照语料库**：`--engine-compare`（384 页）逐页和改之前（只把第 9 条换回旧逻辑）比，没有一页的像素差变化，平均仍是 2.554，框仍是 3；`box_census` 画全部 4285 页，新加的几条警告（工作量用光、程序读够了、裁剪段数超限）一页也没有出现，所以这些上限碰不到正常文件。
+- 改完后 `perf`：文字页画一次 15.9 到 38.5 ms（目标 ≤ 50），468 页那本书前 100 页平均 44.5 ms；`qingpdf.exe` 2,205,696 字节（修补前 2,195,968，多 9,728）。

@@ -7,11 +7,12 @@ They must look the same. This is a development check, not part of
 
     python tests/tools/render_compare.py [path/to/qingpdf.exe]
 
-Second mode (layer 3, step 3a): `--engine-compare` renders the pages of every corpus file
+Second mode (layer 3): `--engine-compare` renders the pages of every corpus file
 with `qingpdf render` and with PDFium at the same dpi, and reports the mean pixel difference
-page by page. Pages on which qingpdf drew characters as outline boxes (every font but
-Type 3, until step 3b) are left out: PDFium draws real letters there. The box count comes from
-the warning `page N: K characters are drawn as outline boxes` that `qingpdf render` prints.
+page by page. Text pages are compared too (step 3b). Pages on which qingpdf could not get the
+glyph of some characters and drew an outline box instead are counted apart, and so are the
+pages that use something of step 3c; the boxes are tallied by cause. The box count comes from
+the warning `page N: K characters are drawn as outline boxes (...)` that `qingpdf render` prints.
 
     python tests/tools/render_compare.py --engine-compare [path/to/qingpdf.exe]
         [--dpi 72] [--max-pages 8] [--threshold 3.0] [--only substring]
@@ -114,8 +115,9 @@ def engine_compare():
     shadings, blend modes and soft masks: step 3c) are compared too, but counted apart: they are
     expected to differ."""
     from PIL import Image
-    rows = []          # (diff, rel, page, note, uses 3c features)
-    skipped_text = 0   # pages left out because they have letters drawn as boxes
+    rows = []          # (diff, rel, page, note, uses 3c features, boxes)
+    causes = [0, 0, 0] # boxes by cause: no font, no character, not in the font
+    box_files = {}     # file -> boxes
     failed = []        # files qingpdf did not render, or PDFium did not open
     started = time.time()
     with tempfile.TemporaryDirectory() as tmp:
@@ -140,9 +142,13 @@ def engine_compare():
                     message = (run.stderr or run.stdout).strip().splitlines()
                     failed.append(f"{rel} page {n}: qingpdf: {message[-1][:140] if message else 'failed'}")
                     break
-                if re.search(r"characters are drawn as outline boxes", run.stderr):
-                    skipped_text += 1
-                    continue
+                boxes = 0
+                m = re.search(r"page \d+: (\d+) characters are drawn as outline boxes \(no font for them: (\d+); code with no character: (\d+); character not in the font: (\d+)\)", run.stderr)
+                if m:
+                    boxes = int(m.group(1))
+                    for k in range(3):
+                        causes[k] += int(m.group(2 + k))
+                    box_files[rel] = box_files.get(rel, 0) + boxes
                 later = "not drawn yet" in run.stderr or "grey block" in run.stderr
                 try:
                     ours = np.asarray(Image.open(out).convert("RGB"), dtype=np.int16)
@@ -151,11 +157,11 @@ def engine_compare():
                     failed.append(f"{rel} page {n}: {e}")
                     continue
                 if abs(ours.shape[0] - ref.shape[0]) > 1 or abs(ours.shape[1] - ref.shape[1]) > 1:
-                    rows.append((999.0, rel, n, f"size {ours.shape[1]}x{ours.shape[0]} against PDFium's {ref.shape[1]}x{ref.shape[0]}", later))
+                    rows.append((999.0, rel, n, f"size {ours.shape[1]}x{ours.shape[0]} against PDFium's {ref.shape[1]}x{ref.shape[0]}", later, boxes))
                     continue
                 h, w = min(ours.shape[0], ref.shape[0]), min(ours.shape[1], ref.shape[1])
                 diff = float(np.abs(ours[:h, :w] - ref[:h, :w]).mean())
-                rows.append((diff, rel, n, "uses 3c features: " + "; ".join(sorted({l.split(": ", 1)[-1][:60] for l in run.stderr.splitlines() if "not drawn yet" in l or "grey block" in l})) if later else "", later))
+                rows.append((diff, rel, n, "uses 3c features: " + "; ".join(sorted({l.split(": ", 1)[-1][:60] for l in run.stderr.splitlines() if "not drawn yet" in l or "grey block" in l})) if later else (f"{boxes} boxes" if boxes else ""), later, boxes))
                 if ARGS.save and diff >= ARGS.threshold:
                     os.makedirs(ARGS.save, exist_ok=True)
                     delta = np.clip(255 - np.abs(ours[:h, :w] - ref[:h, :w]) * 2, 0, 255).astype(np.uint8)
@@ -163,8 +169,14 @@ def engine_compare():
                     Image.fromarray(side).save(os.path.join(ARGS.save, rel.replace(os.sep, "_") + f"_p{n}.png"))
             doc.close()
     print(f"engine compare at {ARGS.dpi:g} dpi, {time.time() - started:.0f} s")
-    print(f"pages compared: {len(rows)}   left out because letters are boxes: {skipped_text}   files with a problem: {len(failed)}")
-    for title, group in (("pages with 3a features only", [r for r in rows if not r[4]]), ("pages that use 3c features (expected to differ)", [r for r in rows if r[4]])):
+    print(f"pages compared: {len(rows)}   files with a problem: {len(failed)}")
+    print(f"characters drawn as boxes on these pages: {sum(causes)} (no font for them: {causes[0]}; code with no character: {causes[1]}; character not in the font: {causes[2]})")
+    for rel, n in sorted(box_files.items(), key=lambda kv: -kv[1])[:12]:
+        print(f"    {n:6d} boxes  {rel}")
+    allrows = rows
+    mean_all = sum(r[0] for r in rows if not r[4]) / max(1, len([r for r in rows if not r[4]]))
+    print(f"mean pixel difference over all pages without 3c features (boxes included): {mean_all:.3f}")
+    for title, group in (("pages drawn completely (no boxes, no 3c features)", [r for r in rows if not r[4] and not r[5]]), ("pages with some characters drawn as boxes (no 3c features)", [r for r in rows if not r[4] and r[5]]), ("pages that use 3c features (expected to differ)", [r for r in rows if r[4]])):
         group.sort(key=lambda r: -r[0])
         print(f"--- {title}: {len(group)}")
         if not group:
@@ -173,8 +185,19 @@ def engine_compare():
         over = [r for r in group if r[0] >= ARGS.threshold]
         print(f"mean pixel difference {mean:.3f} (0-255); pages at or over {ARGS.threshold:g}: {len(over)}")
         print("pages over the threshold:" if ARGS.all else "worst 10:")
-        for diff, rel, n, note, _ in (over if ARGS.all else group[:10]):
+        for diff, rel, n, note, _, _ in (over if ARGS.all else group[:10]):
             print(f"  {diff:7.2f}  {rel} page {n} {note}")
+        if ARGS.all and over:
+            # The same pages by file: to explain them a file at a time.
+            by_file = {}
+            for diff, rel, n, note, _, _ in over:
+                by_file.setdefault(rel, []).append(diff)
+            print("over the threshold, by file (pages over / pages compared, worst, mean of those over):")
+            totals = {}
+            for r in group:
+                totals[r[1]] = totals.get(r[1], 0) + 1
+            for rel, diffs in sorted(by_file.items(), key=lambda kv: -max(kv[1])):
+                print(f"  {len(diffs):2d}/{totals.get(rel, 0):2d}  worst {max(diffs):6.2f}  mean {sum(diffs) / len(diffs):5.2f}  {rel}")
     for line in failed:
         print("  problem:", line)
     return 0

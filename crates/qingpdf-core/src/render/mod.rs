@@ -1,7 +1,6 @@
-//! Rendering (layer 3, step 3a): a page drawn to pixels. Paths, colours, clipping, images,
-//! form XObjects and Type 3 fonts are drawn; the characters of other fonts are drawn as an
-//! outline box each (3b brings the glyphs), and transparency, gradients and patterns are
-//! not drawn yet (3c).
+//! Rendering (layer 3): a page drawn to pixels. Paths, colours, clipping, images, form XObjects
+//! and text (embedded or system fonts) are drawn; a character whose glyph cannot be had is an outline
+//! box. Transparency groups, gradients and patterns are not drawn yet (3c).
 //!
 //! ```no_run
 //! # use qingpdf_core::{Document, render};
@@ -17,11 +16,19 @@
 #![allow(clippy::chunks_exact_to_as_chunks)]
 
 mod ccitt;
+mod cff;
 mod color;
+mod fonts;
 mod func;
+mod glyf;
 mod image;
 mod interp;
+mod outline;
+mod sysfont;
+mod type1;
 
+#[cfg(test)]
+mod font_tests;
 #[cfg(test)]
 mod hostile_tests;
 
@@ -48,8 +55,13 @@ pub struct Bitmap {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    /// Characters that were drawn as an outline box (every font but Type 3, until step 3b).
+    /// Characters that were drawn as an outline box because their glyph could not be had.
     pub boxed_characters: usize,
+    /// Of those: the font has no program and no system font stands in for it; the encoding does not say
+    /// what character the code is; the font has no glyph for the character.
+    pub boxed_causes: [usize; 3],
+    /// Characters whose glyph the font does not have; nothing is drawn for them.
+    pub absent_glyphs: usize,
 }
 
 impl Bitmap {
@@ -125,12 +137,29 @@ impl<'a> Renderer<'a> {
         let mut interp = Interp::new(self.doc, &mut self.shared, pixmap, base, meter.clone());
         let result = interp.run(&content, &resources, 0);
         let boxed_characters = interp.boxed;
+        let boxed_causes = interp.boxed_by;
+        let absent_glyphs = interp.absent;
         let pixmap = interp.pixmap;
         if meter.was_refused() {
             self.shared.warnings.add("the page asks for more colour conversion work than is allowed; some spot colours are shown as greys");
         }
         result?;
-        Ok(Bitmap { width: pixmap.width(), height: pixmap.height(), rgba: pixmap.take(), boxed_characters })
+        Ok(Bitmap { width: pixmap.width(), height: pixmap.height(), rgba: pixmap.take(), boxed_characters, boxed_causes, absent_glyphs })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_bytes_for_test(&self) -> (usize, usize, usize) {
+        self.shared.cache_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bitmap_peak_for_test(&self) -> usize {
+        self.shared.bitmap_peak()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn font_entries_for_test(&self) -> usize {
+        self.shared.font_entries()
     }
 
     /// What went wrong without stopping the rendering so far (each kind once, at most 50), and forget it.
@@ -328,13 +357,15 @@ mod tests {
 
     #[test]
     fn type3_glyphs_forms_and_boxes() {
+        // A Type 3 glyph is drawn from its procedure, a form is drawn and clipped; a character the encoding names
+        // with something that is no character has no glyph to draw and is a box.
         let font = "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /sq 6 0 R >> \
                     /Encoding << /Type /Encoding /Differences [97 /sq] >> /FirstChar 97 /LastChar 97 /Widths [1000] >>";
         let doc = page_doc(
             "",
             "<< /Font << /T3 5 0 R /H 7 0 R >> /XObject << /Fm 8 0 R >> >>",
-            b"BT /T3 40 Tf 10 10 Td 1 0 0 rg (aa) Tj ET q 1 0 0 1 0 50 cm /Fm Do Q BT /H 10 Tf 60 60 Td (AB) Tj ET",
-            &[(5, font), (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")],
+            b"BT /T3 40 Tf 10 10 Td 1 0 0 rg (aa) Tj ET q 1 0 0 1 0 50 cm /Fm Do Q BT /H 10 Tf 60 60 Td (A) Tj ET",
+            &[(5, font), (7, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Differences [65 /nosuchglyphname] >> >>")],
             &[
                 (6, "", b"1000 0 0 0 1000 1000 d1 100 100 800 800 re f"),
                 (8, "/Type /XObject /Subtype /Form /BBox [0 0 20 20] /Matrix [1 0 0 1 60 0]", b"0 0 1 rg 0 0 100 100 re f"),
@@ -350,7 +381,8 @@ mod tests {
         // The form is clipped to its bounding box: 20 points, moved by 60 and 50.
         assert_eq!(pixel(&b, 78, 48), [0, 0, 255]);
         assert_eq!(pixel(&b, 90, 40), WHITE);
-        assert_eq!(b.boxed_characters, 2);
+        assert_eq!(b.boxed_characters, 1);
+        assert_eq!(b.boxed_causes, [0, 1, 0]);
     }
 
     #[test]

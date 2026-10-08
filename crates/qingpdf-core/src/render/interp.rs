@@ -7,6 +7,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tiny_skia::{
     BlendMode, Color, FillRule, FilterQuality, LineCap, LineJoin, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Stroke, StrokeDash, Transform,
@@ -21,8 +22,11 @@ use crate::text::interp::{FxMap, Matrix, mul};
 use crate::text::scan::{Item, Operand, Scanner};
 
 use super::color::ColorSpace;
+use super::fonts::{Budget, GlyphSource};
 use super::func::Meter;
 use super::image::{self, Loaded};
+
+mod text;
 
 /// Most operators one page may run, forms and glyph procedures included.
 pub(crate) const MAX_OPERATORS: usize = 2_000_000;
@@ -117,8 +121,12 @@ enum Cat {
     ColorSpace,
 }
 
+static RESOURCES_SERIAL: AtomicU32 = AtomicU32::new(1);
+
 /// A `/Resources` dictionary, its sub-dictionaries read when first needed.
 pub(crate) struct Resources {
+    /// Tells this dictionary from every other one made (names the fonts written into it).
+    id: u32,
     dict: Dict,
     fonts: OnceCell<FxMap<Vec<u8>, Object>>,
     xobjects: OnceCell<FxMap<Vec<u8>, Object>>,
@@ -131,6 +139,7 @@ impl Resources {
     pub fn new(doc: &Document, resources: Option<&Object>) -> Rc<Resources> {
         let dict = resources.and_then(|r| doc.resolve(r).ok()).and_then(|o| o.as_dict().cloned()).unwrap_or_default();
         Rc::new(Resources {
+            id: RESOURCES_SERIAL.fetch_add(1, Ordering::Relaxed),
             dict,
             fonts: OnceCell::new(),
             xobjects: OnceCell::new(),
@@ -176,6 +185,8 @@ struct Type3 {
 struct FontEntry {
     font: Font,
     type3: Option<Type3>,
+    /// Where the glyphs of any other font come from.
+    glyphs: Option<GlyphSource>,
 }
 
 struct Form {
@@ -210,15 +221,50 @@ struct Placement {
     target: (usize, usize),
 }
 
+/// A font dictionary the renderer has made a reader for: an indirect object, or a dictionary written into a resource
+/// dictionary (named by that dictionary, which is numbered, and the name it has there).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FontKey {
+    Ref(ObjRef),
+    Direct(u32, Vec<u8>),
+}
+
 #[derive(Default)]
 pub(crate) struct Shared {
-    fonts: FxMap<ObjRef, Option<Rc<FontEntry>>>,
+    fonts: FxMap<FontKey, Option<Rc<FontEntry>>>,
     pub cmaps: HashMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
     forms: FxMap<ObjRef, Option<Rc<Form>>>,
     cache_bytes: usize,
     images: HashMap<ImageKey, Rc<Prepared>>,
     image_bytes: usize,
+    /// Bytes held by font programs and glyph outlines.
+    budget: Budget,
+    /// Coverage bitmaps of glyphs.
+    bitmaps: FxMap<text::BitmapKey, Option<Rc<text::GlyphBitmap>>>,
+    bitmap_bytes: usize,
+    /// The most bytes the glyph bitmaps came to at any moment (tests look at it).
+    #[cfg(test)]
+    bitmap_peak: usize,
+}
+
+impl Shared {
+    /// (bytes of glyph bitmaps, of glyph outlines, of font programs) held now.
+    #[cfg(test)]
+    pub(crate) fn cache_bytes(&self) -> (usize, usize, usize) {
+        (self.bitmap_bytes, self.budget.glyphs.get(), self.budget.programs.get())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bitmap_peak(&self) -> usize {
+        self.bitmap_peak
+    }
+
+    /// Font readers made so far.
+    #[cfg(test)]
+    pub(crate) fn font_entries(&self) -> usize {
+        self.fonts.len()
+    }
 }
 
 // --- graphics state -----------------------------------------------------------------------------------
@@ -350,10 +396,14 @@ impl PathData {
 /// What a shown character needs from the font.
 struct Shown {
     code: u32,
+    cid: u32,
+    glyph_uni: u32,
     w0: f64,
     vertical: Option<(f64, f64, f64)>,
     is_space: bool,
     blank: bool,
+    /// The second byte of a GBK pair: its width counts, it draws nothing.
+    skip: bool,
 }
 
 pub(crate) struct Interp<'a> {
@@ -384,8 +434,15 @@ pub(crate) struct Interp<'a> {
     /// Inside a `d1` glyph: colours are the text's, whatever the glyph says.
     uncolored: bool,
     chars: Vec<Shown>,
-    /// Characters drawn as boxes so far.
+    /// Characters drawn as boxes so far, and by cause (no font, no character, not in the font).
     pub boxed: usize,
+    pub boxed_by: [usize; 3],
+    /// Characters whose glyph the font does not have, drawn as nothing.
+    pub absent: usize,
+    /// The outlines of the glyphs shown in a clipping mode since `BT`, in device space.
+    text_clip: Option<PathBuilder>,
+    /// Outline segments in `text_clip`.
+    text_clip_segs: usize,
     gray: Arc<ColorSpace>,
     rgb: Arc<ColorSpace>,
     cmyk: Arc<ColorSpace>,
@@ -394,6 +451,8 @@ pub(crate) struct Interp<'a> {
 impl<'a> Interp<'a> {
     pub fn new(doc: &'a Document, shared: &'a mut Shared, pixmap: Pixmap, base: Matrix, meter: Meter) -> Interp<'a> {
         let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
+        // The page starts with all the font work it may do.
+        shared.budget.start_page();
         let gray = Arc::new(ColorSpace::Gray);
         let black = Colour { space: gray.clone(), rgb: [0.0; 3], none: false };
         Interp {
@@ -441,6 +500,10 @@ impl<'a> Interp<'a> {
             uncolored: false,
             chars: Vec::new(),
             boxed: 0,
+            boxed_by: [0; 3],
+            absent: 0,
+            text_clip: None,
+            text_clip_segs: 0,
             gray,
             rgb: Arc::new(ColorSpace::Rgb),
             cmyk: Arc::new(ColorSpace::Cmyk),
@@ -635,8 +698,10 @@ impl<'a> Interp<'a> {
             OP_BT => {
                 self.tm = IDENTITY;
                 self.tlm = IDENTITY;
+                self.text_clip = None;
+                self.text_clip_segs = 0;
             }
-            OP_ET => {}
+            OP_ET => self.end_text()?,
             OP_TC => {
                 if let Some([v]) = numbers::<1>(ops) {
                     self.gs.tc = v;
@@ -663,7 +728,10 @@ impl<'a> Interp<'a> {
                 }
             }
             OP_TR => {
-                if let Some([v]) = numbers::<1>(ops) {
+                // 9.3.6: the modes are 0 to 7; anything else is left alone.
+                if let Some([v]) = numbers::<1>(ops)
+                    && (0.0..8.0).contains(&v)
+                {
                     self.gs.mode = v as i64;
                 }
             }
@@ -1170,13 +1238,21 @@ impl<'a> Interp<'a> {
         };
         match entry {
             Object::Ref(r) => self.font_from_ref(r),
-            Object::Dict(d) => Some(Rc::new(self.load_font(&d))),
+            Object::Dict(d) => {
+                let key = FontKey::Direct(res.id, name.to_vec());
+                if let Some(hit) = self.shared.fonts.get(&key) {
+                    return hit.clone();
+                }
+                let loaded = Some(Rc::new(self.load_font(&d)));
+                self.shared.fonts.insert(key, loaded.clone());
+                loaded
+            }
             _ => None,
         }
     }
 
     fn font_from_ref(&mut self, r: ObjRef) -> Option<Rc<FontEntry>> {
-        if let Some(hit) = self.shared.fonts.get(&r) {
+        if let Some(hit) = self.shared.fonts.get(&FontKey::Ref(r)) {
             return hit.clone();
         }
         let loaded = match self.doc.get(r) {
@@ -1187,15 +1263,17 @@ impl<'a> Interp<'a> {
                 None
             }
         };
-        self.shared.fonts.insert(r, loaded.clone());
+        self.shared.fonts.insert(FontKey::Ref(r), loaded.clone());
         loaded
     }
 
     fn load_font(&mut self, d: &Dict) -> FontEntry {
         let doc = self.doc;
         let font = Font::load(doc, d, &mut self.shared.cmaps, &mut self.shared.warnings);
-        let type3 = if d.get_name("Subtype").is_some_and(|n| n.as_bytes() == b"Type3") { self.load_type3(d) } else { None };
-        FontEntry { font, type3 }
+        let is_type3 = d.get_name("Subtype").is_some_and(|n| n.as_bytes() == b"Type3");
+        let type3 = if is_type3 { self.load_type3(d) } else { None };
+        let glyphs = (!is_type3).then(|| GlyphSource::new(doc, d, &font));
+        FontEntry { font, type3, glyphs }
     }
 
     fn load_type3(&mut self, d: &Dict) -> Option<Type3> {
@@ -1236,85 +1314,6 @@ impl<'a> Interp<'a> {
         };
         let resources = d.get("Resources").map(|r| Resources::new(doc, Some(r)));
         Some(Type3 { matrix, names, procs, resources, cache: RefCell::new(FxMap::default()) })
-    }
-
-    /// Show strings (9.4.4): a Type 3 glyph is drawn, any other character as an outline box.
-    fn show(&mut self, strings: &[&[u8]], res: &Rc<Resources>, depth: usize) -> Result<()> {
-        let Some(entry) = self.gs.font.clone() else { return Ok(()) };
-        let (size, tc, tw, th, rise) = (self.gs.size, self.gs.tc, self.gs.tw, self.gs.th, self.gs.rise);
-        // The outline boxes stand in for glyphs, which neither show in mode 3 nor in mode 7 (which clips instead);
-        // a Type 3 glyph is only hidden by mode 3 (9.3.6: no other mode has any effect on it).
-        let visible = !matches!(self.gs.mode, 3 | 7);
-        let type3_visible = self.gs.mode != 3;
-        let full = self.full();
-        let mut boxes = PathBuilder::new();
-        let mut any_box = false;
-        for s in strings {
-            let mut chars = std::mem::take(&mut self.chars);
-            chars.clear();
-            entry.font.show(s, |ch| {
-                chars.push(Shown {
-                    code: ch.code,
-                    w0: ch.w0,
-                    vertical: ch.vertical,
-                    is_space: ch.is_space_code,
-                    blank: is_blank(&ch.uni),
-                });
-            });
-            for ch in &chars {
-                // A glyph is work even if it draws nothing (a Type 3 glyph may show strings of its own).
-                self.charge_op()?;
-                let tx_ty = match ch.vertical {
-                    None => {
-                        let tx = (ch.w0 * size + tc + if ch.is_space { tw } else { 0.0 }) * th;
-                        (tx * self.tm[0], tx * self.tm[1])
-                    }
-                    Some((w1, _, _)) => {
-                        let ty = w1 * size + tc + if ch.is_space { tw } else { 0.0 };
-                        (ty * self.tm[2], ty * self.tm[3])
-                    }
-                };
-                if let Some(t3) = &entry.type3 {
-                    if type3_visible {
-                        self.type3_glyph(t3, ch.code, res, depth)?;
-                    }
-                } else if visible && !ch.blank && ch.w0 > 0.0 && size != 0.0 {
-                    // The box of the character in text space: its width, from a bit below the
-                    // baseline to a bit above the x-height of an average font.
-                    let (x0, x1, y0, y1) = match ch.vertical {
-                        None => (0.0, ch.w0 * size * th, rise - 0.2 * size, rise + 0.8 * size),
-                        Some((_, vx, vy)) => (-vx * size, (-vx + ch.w0) * size, rise - vy * size - 0.2 * size, rise - vy * size + 0.8 * size),
-                    };
-                    let tm_ctm = mul(&self.tm, &full);
-                    let pts = [apply(&tm_ctm, x0, y0), apply(&tm_ctm, x1, y0), apply(&tm_ctm, x1, y1), apply(&tm_ctm, x0, y1)];
-                    self.boxed += 1;
-                    // Text that runs straight across the page: the box is drawn right here, pixel by pixel.
-                    let upright = tm_ctm[1].abs() <= 1e-6 * tm_ctm[0].abs().max(1e-9) && tm_ctm[2].abs() <= 1e-6 * tm_ctm[3].abs().max(1e-9);
-                    if !(upright && self.draw_box_fast(&pts)) {
-                        for (i, (x, y)) in pts.iter().enumerate() {
-                            let (x, y) = (x.clamp(-1e7, 1e7) as f32, y.clamp(-1e7, 1e7) as f32);
-                            if i == 0 {
-                                boxes.move_to(x, y);
-                            } else {
-                                boxes.line_to(x, y);
-                            }
-                        }
-                        boxes.close();
-                        any_box = true;
-                    }
-                }
-                self.tm[4] += tx_ty.0;
-                self.tm[5] += tx_ty.1;
-            }
-            self.chars = chars;
-        }
-        if !finite(&self.tm) {
-            self.tm = IDENTITY;
-        }
-        if any_box && let Some(path) = boxes.finish() {
-            self.stroke_boxes(&path)?;
-        }
-        Ok(())
     }
 
     /// One pixel wide outline of an upright box, written straight into the page; false when the
