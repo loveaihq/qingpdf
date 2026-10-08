@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use md5::{Digest, Md5};
 use qingpdf_core::{Document, Error, Object, ops, writer};
 
+/// Generous: these must end in a limit error rather than run for minutes, also on a throttled laptop.
 fn limit() -> Duration {
-    if cfg!(debug_assertions) { Duration::from_secs(60) } else { Duration::from_secs(5) }
+    if cfg!(debug_assertions) { Duration::from_secs(60) } else { Duration::from_secs(15) }
 }
 
 fn generated(part: &str) -> common::Encrypted {

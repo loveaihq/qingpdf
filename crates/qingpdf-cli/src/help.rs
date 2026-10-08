@@ -187,9 +187,11 @@ and Cal spaces as the device space, Indexed, Separation, DeviceN, Lab), images
 (Flate, LZW, JPEG, CCITT fax; masks), forms, text (the font programs of the
 PDF: TrueType, Type 1, CFF; fonts it does not carry come from the system fonts,
 Chinese, Japanese and Korean ones included; a character whose glyph cannot be
-had is drawn as an outline box). Transparency groups, gradients and patterns
-are not drawn (grey blocks stand in for JBIG2 and JPEG 2000 images).
-Annotations are not drawn.
+had is drawn as an outline box), transparency (groups, soft masks, blend modes),
+gradients (all seven shading types), tiling and shading patterns, and optional
+content that is off (hidden layers). A page that asks for more work than is
+allowed stops there with a warning and keeps what it has drawn. Grey blocks
+stand in for JBIG2 and JPEG 2000 images. Annotations are not drawn.
 
 Options:
   --pages <list>        The pages to draw (default: all)

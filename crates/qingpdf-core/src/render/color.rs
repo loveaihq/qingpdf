@@ -24,8 +24,9 @@ pub(crate) enum ColorSpace {
     Indexed { hival: usize, table: Vec<[f32; 3]> },
     /// Separation (one component) and DeviceN. `none`: every colorant is /None, nothing is painted.
     Tint { n: usize, alt: Arc<ColorSpace>, func: Arc<Function>, none: bool },
-    /// A pattern space; the colour of an uncoloured pattern is in the base space.
-    Pattern,
+    /// A pattern space (8.6.6.1); the colour of an uncoloured tiling pattern is in the base space, when
+    /// the space names one (`[/Pattern /DeviceRGB]`).
+    Pattern(Option<Arc<ColorSpace>>),
 }
 
 impl ColorSpace {
@@ -35,7 +36,7 @@ impl ColorSpace {
             ColorSpace::Rgb | ColorSpace::Lab { .. } => 3,
             ColorSpace::Cmyk => 4,
             ColorSpace::Tint { n, .. } => *n,
-            ColorSpace::Pattern => 0,
+            ColorSpace::Pattern(_) => 0,
         }
     }
 
@@ -95,7 +96,7 @@ impl ColorSpace {
                     [1.0 - t; 3]
                 }
             }
-            ColorSpace::Pattern => [0.0; 3],
+            ColorSpace::Pattern(_) => [0.0; 3],
         }
     }
 
@@ -115,7 +116,7 @@ impl ColorSpace {
                     b"DeviceGray" | b"G" | b"CalGray" => ColorSpace::Gray,
                     b"DeviceRGB" | b"RGB" | b"CalRGB" => ColorSpace::Rgb,
                     b"DeviceCMYK" | b"CMYK" => ColorSpace::Cmyk,
-                    b"Pattern" => ColorSpace::Pattern,
+                    b"Pattern" => ColorSpace::Pattern(None),
                     name => {
                         // A name from the resources (it must not name itself).
                         let found = lookup(name)?;
@@ -163,7 +164,7 @@ impl ColorSpace {
                     }
                     b"Indexed" | b"I" => {
                         let base = ColorSpace::load_at(doc, items.get(1)?, lookup, meter, depth + 1)?;
-                        if matches!(*base, ColorSpace::Pattern | ColorSpace::Indexed { .. }) {
+                        if matches!(*base, ColorSpace::Pattern(_) | ColorSpace::Indexed { .. }) {
                             return None;
                         }
                         let hival = doc.resolve(items.get(2)?).ok()?.as_int()?.clamp(0, 255) as usize;
@@ -204,7 +205,7 @@ impl ColorSpace {
                             return None;
                         }
                         let alt = ColorSpace::load_at(doc, items.get(2)?, lookup, meter, depth + 1)?;
-                        if matches!(*alt, ColorSpace::Pattern) {
+                        if matches!(*alt, ColorSpace::Pattern(_)) {
                             return None;
                         }
                         let func = Function::load(doc, items.get(3)?)?;
@@ -213,7 +214,20 @@ impl ColorSpace {
                         }
                         Some(Arc::new(ColorSpace::Tint { n, alt, func, none }))
                     }
-                    b"Pattern" => Some(Arc::new(ColorSpace::Pattern)),
+                    b"Pattern" => {
+                        // [/Pattern base]: the space of the colour of an uncoloured pattern.
+                        let base = match items.get(1) {
+                            Some(b) => {
+                                let base = ColorSpace::load_at(doc, b, lookup, meter, depth + 1)?;
+                                if matches!(*base, ColorSpace::Pattern(_)) {
+                                    return None;
+                                }
+                                Some(base)
+                            }
+                            None => None,
+                        };
+                        Some(Arc::new(ColorSpace::Pattern(base)))
+                    }
                     _ => None,
                 }
             }
@@ -222,25 +236,45 @@ impl ColorSpace {
     }
 }
 
-/// DeviceCMYK to RGB, a polynomial fitted to Adobe's SWOP conversion (the one viewers use,
-/// not the plain `(1 - c) (1 - k)`, which is far more saturated).
+/// DeviceCMYK to RGB by a table, with the quadrilinear interpolation of the 16 entries around the colour. The table has
+/// the 9 x 9 x 9 x 9 colours whose inks are multiples of 1/8, three bytes each, cyan slowest and black fastest; it
+/// is the conversion the other viewers show (Adobe's SWOP profile: a plain `(1 - c) (1 - k)` is far more
+/// saturated), measured from PDFium's output by `tests/tools/make_cmyk_table.py`. Against PDFium on random
+/// colours it is 0.5 off on average and 6 at worst (the polynomial of step 3a was 4 and 39).
+static CMYK_TABLE: &[u8; 9 * 9 * 9 * 9 * 3] = include_bytes!("cmyk.bin");
+
 pub(crate) fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [f32; 3] {
-    let r = 255.0
-        + c * (-4.387_332_384_609_988 * c + 54.486_151_941_891_76 * m + 18.822_905_021_653_02 * y + 212.256_624_516_395_85 * k - 285.233_102_613_700_4)
-        + m * (1.714_976_347_736_213_4 * m - 5.609_673_690_404_731_5 * y - 17.873_870_861_415_444 * k - 5.497_006_427_196_366)
-        + y * (-2.521_734_013_168_303_3 * y - 21.248_923_337_353_073 * k + 17.511_927_084_181_3)
-        + k * (-21.861_221_474_636_05 * k - 189.481_808_359_227_47);
-    let g = 255.0
-        + c * (8.841_041_422_036_149 * c + 60.118_027_045_597_366 * m + 6.871_425_592_049_007 * y + 31.159_100_130_055_922 * k - 79.297_084_481_654_8)
-        + m * (-15.310_361_306_967_817 * m + 17.575_251_261_109_482 * y + 131.352_509_124_939_76 * k - 190.945_330_258_895_1)
-        + y * (4.444_339_102_852_739 * y + 9.863_286_149_340_5 * k - 24.867_415_825_558_78)
-        + k * (-20.737_325_471_181_034 * k - 187.804_537_097_197_2);
-    let b = 255.0
-        + c * (0.884_252_243_000_329_6 * c + 8.078_677_503_112_928 * m + 30.899_783_097_037_29 * y - 0.238_832_386_891_789_34 * k - 14.183_576_799_673_286)
-        + m * (10.495_932_734_320_72 * m + 63.023_784_947_540_52 * y + 50.606_957_656_360_734 * k - 112.238_842_537_192_53)
-        + y * (0.032_960_411_148_732_17 * y + 115.603_844_496_466_41 * k - 193.582_093_568_615_05)
-        + k * (-22.338_168_073_098_86 * k - 180.126_139_747_083_67);
-    [(r / 255.0).clamp(0.0, 1.0) as f32, (g / 255.0).clamp(0.0, 1.0) as f32, (b / 255.0).clamp(0.0, 1.0) as f32]
+    // Bytes between neighbours along each ink.
+    const STRIDE: [usize; 4] = [729 * 3, 81 * 3, 9 * 3, 3];
+    let mut lo = [0usize; 4];
+    let mut frac = [0f32; 4];
+    for ((l, f), v) in lo.iter_mut().zip(frac.iter_mut()).zip([c, m, y, k]) {
+        let t = (if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } * 8.0) as f32;
+        *l = (t as usize).min(7);
+        *f = t - *l as f32;
+    }
+    let base: usize = lo.iter().zip(STRIDE).map(|(l, s)| l * s).sum();
+    let mut out = [0f32; 3];
+    for corner in 0..16u32 {
+        let (mut w, mut at) = (1.0f32, base);
+        for ((bit, f), s) in (0..4).zip(frac).zip(STRIDE) {
+            if (corner >> bit) & 1 == 1 {
+                w *= f;
+                at += s;
+            } else {
+                w *= 1.0 - f;
+            }
+        }
+        if w == 0.0 {
+            continue;
+        }
+        if let Some(px) = CMYK_TABLE.get(at..at + 3) {
+            for (slot, &v) in out.iter_mut().zip(px) {
+                *slot += w * f32::from(v);
+            }
+        }
+    }
+    out.map(|v| (v / 255.0).clamp(0.0, 1.0))
 }
 
 /// CIE L*a*b* (8.6.5.4) to sRGB, taking the white point as D50 whatever `/WhitePoint` says: to XYZ, to linear sRGB, gamma.

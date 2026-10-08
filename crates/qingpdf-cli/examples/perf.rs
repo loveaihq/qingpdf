@@ -137,13 +137,16 @@ fn render_case(program: &Path) -> Result<bool, String> {
         ("text page, tricky TrueType font run with its instructions (3b2: DFKaiShu title and authors, a Word paper)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2403.14268-word-tc.pdf"), 1, 50.0),
         ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 1, 150.0),
         ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 1, 150.0),
+        ("flyer page, transparency and shading (3c: 48 groups at partial opacity, 4 soft-masked gradients, 5 shading fills, 40 pattern fills, 40 blended circles)", out_dir.join("transparency-heavy.pdf"), 1, 150.0),
     ];
     let mut all_ok = true;
+    // The drawing time of the first case (the Type 1 text page), to say how much slower the others are than ordinary text.
+    let mut text_ms: Option<f64> = None;
     println!("
 render, one page at 150 dpi:");
     for (label, file, page_number, target_ms) in cases {
         if !file.is_file() {
-            println!("  {label}: {} is not here, skipped (tests/tools/make_scan_fixture.py makes the CCITT one)", file.display());
+            println!("  {label}: {} is not here, skipped (tests/tools/make_scan_fixture.py makes the CCITT one, make_transparency_fixtures.py --perf the flyer)", file.display());
             continue;
         }
         let doc = Document::open(&file).map_err(|e| e.to_string())?;
@@ -170,6 +173,11 @@ render, one page at 150 dpi:");
         println!("  {label}:");
         println!("    the first drawing in the process (system fonts read):  {first:.1} ms  (boxes {}, glyphs not in their fonts {})", first_result.boxed_characters, first_result.absent_glyphs);
         println!("    drawing alone (average of 20): {ms:.1} ms  (target <= {target_ms:.0} ms)  {}", verdict(ok));
+        match text_ms {
+            None => text_ms = Some(ms),
+            Some(base) if base > 0.0 => println!("    {:.1} times the drawing time of the first page above (the CPU may be throttled on battery: the ratio holds, the milliseconds do not)", ms / base),
+            Some(_) => {}
+        }
         println!("    the program, start to PNG on disk: fastest {fastest:.3?}, median of {RUNS} {median:.3?}");
     }
     all_ok &= book_case(&corpus)?;
@@ -419,26 +427,35 @@ fn main() -> Result<(), String> {
     let text_grown = BEFORE_RENDER.saturating_sub(BEFORE_TEXT);
     let text_growth_ok = text_grown <= 1_000_000;
     println!("  grown by text extraction: {text_grown} bytes ({:.0} KB)  (target <= 1 MB; the size recorded at layer 2)  {}", text_grown as f64 / 1000.0, verdict(text_growth_ok));
-    // Layer 3, step 3a: at most 1 MB more than the 1,322,496 bytes before rendering.
-    let render_grown = bytes.saturating_sub(BEFORE_RENDER);
-    let render_growth_ok = render_grown <= 1_000_000;
-    println!("  grown by rendering (3a):  {render_grown} bytes ({:.0} KB)  (target <= 1 MB)  {}", render_grown as f64 / 1000.0, verdict(render_growth_ok));
-
-    // Layer 3, step 3b: at most 0.6 MB more than the 2,057,216 bytes before the fonts.
+    // Layer 3, step 3a: at most 1 MB more than the 1,322,496 bytes before rendering. Like the lines above, taken from
+    // the size recorded when the step was finished (2,057,216 bytes, the size before the fonts).
     const BEFORE_FONTS: u64 = 2_057_216;
-    let fonts_grown = bytes.saturating_sub(BEFORE_FONTS);
-    let fonts_growth_ok = fonts_grown <= 600_000;
-    println!("  grown by fonts (3b):      {fonts_grown} bytes ({:.0} KB)  (target <= 0.6 MB)  {}", fonts_grown as f64 / 1000.0, verdict(fonts_growth_ok));
+    let render_grown = BEFORE_FONTS.saturating_sub(BEFORE_RENDER);
+    let render_growth_ok = render_grown <= 1_000_000;
+    println!("  grown by rendering (3a):  {render_grown} bytes ({:.0} KB)  (target <= 1 MB; the size recorded at 3a)  {}", render_grown as f64 / 1000.0, verdict(render_growth_ok));
 
-    // Layer 3, step 3b2: at most 0.15 MB more than the 2,205,696 bytes before the instruction interpreter.
+    // Layer 3, step 3b: at most 0.6 MB more than the 2,057,216 bytes before the fonts (2,205,696 when 3b was finished).
     const BEFORE_TRICKY: u64 = 2_205_696;
-    let tricky_grown = bytes.saturating_sub(BEFORE_TRICKY);
+    let fonts_grown = BEFORE_TRICKY.saturating_sub(BEFORE_FONTS);
+    let fonts_growth_ok = fonts_grown <= 600_000;
+    println!("  grown by fonts (3b):      {fonts_grown} bytes ({:.0} KB)  (target <= 0.6 MB; the size recorded at 3b)  {}", fonts_grown as f64 / 1000.0, verdict(fonts_growth_ok));
+
+    // Layer 3, step 3b2: at most 0.15 MB more than the 2,205,696 bytes before the instruction interpreter (2,267,648
+    // bytes when 3b2 was finished).
+    const BEFORE_3C: u64 = 2_267_648;
+    let tricky_grown = BEFORE_3C.saturating_sub(BEFORE_TRICKY);
     let tricky_growth_ok = tricky_grown <= 150_000;
-    println!("  grown by tricky fonts (3b2): {tricky_grown} bytes ({:.0} KB)  (target <= 0.15 MB)  {}", tricky_grown as f64 / 1000.0, verdict(tricky_growth_ok));
+    println!("  grown by tricky fonts (3b2): {tricky_grown} bytes ({:.0} KB)  (target <= 0.15 MB; the size recorded at 3b2)  {}", tricky_grown as f64 / 1000.0, verdict(tricky_growth_ok));
+
+    // Layer 3, step 3c (transparency, shadings, patterns, optional content, the CMYK table): at most 0.4 MB more than the
+    // 2,267,648 bytes before it.
+    let transparency_grown = bytes.saturating_sub(BEFORE_3C);
+    let transparency_growth_ok = transparency_grown <= 400_000;
+    println!("  grown by transparency (3c): {transparency_grown} bytes ({:.0} KB)  (target <= 0.4 MB)  {}", transparency_grown as f64 / 1000.0, verdict(transparency_growth_ok));
 
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
     let render_ok = render_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && transparency_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

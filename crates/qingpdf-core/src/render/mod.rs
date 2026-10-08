@@ -1,6 +1,8 @@
 //! Rendering (layer 3): a page drawn to pixels. Paths, colours, clipping, images, form XObjects
 //! and text (embedded or system fonts) are drawn; a character whose glyph cannot be had is an outline
-//! box. Transparency groups, gradients and patterns are not drawn yet (3c).
+//! box. Transparency (groups, soft masks, blend modes, knockout), shadings (types 1 to 7), tiling and
+//! shading patterns, and optional content (layers that are off) are drawn too (3c). Annotations and the
+//! JBIG2 and JPEG 2000 image formats are not (3c2).
 //!
 //! ```no_run
 //! # use qingpdf_core::{Document, render};
@@ -23,15 +25,20 @@ mod func;
 mod glyf;
 mod image;
 mod interp;
+mod oc;
 mod outline;
+mod shading;
 mod sysfont;
 mod ttvm;
 mod type1;
+mod work;
 
 #[cfg(test)]
 mod font_tests;
 #[cfg(test)]
 mod hostile_tests;
+#[cfg(test)]
+mod transparency_tests;
 
 use tiny_skia::{Color, Pixmap};
 
@@ -140,7 +147,19 @@ impl<'a> Renderer<'a> {
         let boxed_characters = interp.boxed;
         let boxed_causes = interp.boxed_by;
         let absent_glyphs = interp.absent;
+        let work_over = interp.work_over();
+        #[cfg(test)]
+        let last_work = interp.work_used();
         let pixmap = interp.pixmap;
+        #[cfg(test)]
+        {
+            self.shared.last_work = last_work;
+        }
+        if work_over {
+            self.shared
+                .warnings
+                .add("the page asks for more work (transparency, shadings, patterns, optional content) than is allowed; the rest of it is not drawn");
+        }
         if meter.was_refused() {
             self.shared.warnings.add("the page asks for more colour conversion work than is allowed; some spot colours are shown as greys");
         }
@@ -161,6 +180,18 @@ impl<'a> Renderer<'a> {
     #[cfg(test)]
     pub(crate) fn font_entries_for_test(&self) -> usize {
         self.shared.font_entries()
+    }
+
+    /// The work meter's units the last page drawn used.
+    #[cfg(test)]
+    pub(crate) fn last_work_for_test(&self) -> f64 {
+        self.shared.last_work
+    }
+
+    /// (bytes held in forms, shadings and patterns, patterns kept, shadings kept).
+    #[cfg(test)]
+    pub(crate) fn object_cache_for_test(&self) -> (usize, usize, usize) {
+        self.shared.object_cache()
     }
 
     /// What went wrong without stopping the rendering so far (each kind once, at most 50), and forget it.

@@ -1072,7 +1072,7 @@ SOFTWARE.
 
 ## Embedded data sets
 
-These tables are compiled into qingpdf-core for text extraction. The licence texts below are copied from the `third_party/` folder of this repository.
+These tables are compiled into qingpdf-core (for text extraction, and for drawing). The licence texts below are copied from the `third_party/` folder of this repository, except PDFium's, which is copied from the licence file that comes with pypdfium2 5.14.0 (`pdfium.txt` in its `BUILD_LICENSES`).
 
 ### Adobe cmap-resources (CID to Unicode tables and predefined CMaps)
 
@@ -1195,4 +1195,41 @@ Except as contained in this notice, the name of a copyright holder shall
 not be used in advertising or otherwise to promote the sale, use or other
 dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
+```
+
+### PDFium (the DeviceCMYK to RGB table)
+
+- Licence: BSD-3-Clause
+- Upstream: https://pdfium.googlesource.com/pdfium/
+- Embedded in: crates/qingpdf-core/src/render/cmyk.bin
+- Note: the table is 6561 colours of three bytes, made by `tests/tools/make_cmyk_table.py`, which draws a grid of DeviceCMYK swatches with PDFium (through pypdfium2 5.14.0) and writes down the colour PDFium shows for each. It holds measurements of PDFium's output, not PDFium's code. It is credited here because it reproduces PDFium's conversion of DeviceCMYK, which PDFium keeps as a table of its own.
+
+```text
+Copyright 2014 The PDFium Authors
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```

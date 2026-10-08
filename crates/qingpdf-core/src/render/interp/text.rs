@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use tiny_skia::{FillRule, Path, PathBuilder, PathSegment, Pixmap, Transform};
+use tiny_skia::{FillRule, Mask, Path, PathBuilder, PathSegment, Transform};
 
 use super::{FontEntry, Interp, Resources, Shown, apply, finite, is_blank, mul};
 use crate::error::Result;
@@ -67,8 +67,9 @@ impl Interp<'_> {
         let (size, tc, tw, th, rise) = (self.gs.size, self.gs.tc, self.gs.tw, self.gs.th, self.gs.rise);
         let mode = self.gs.mode;
         // Mode 3 shows nothing, whatever the font; no other mode has an effect on a Type 3 glyph (9.3.6).
-        let visible = mode != 3;
-        let type3_visible = mode != 3;
+        // (Optional content that is hidden shows nothing either.)
+        let visible = mode != 3 && self.hidden == 0;
+        let type3_visible = mode != 3 && self.hidden == 0;
         let full = self.full();
         let no_widths = entry.glyphs.as_ref().is_some_and(|g| g.no_widths);
         let gbk_pairs = entry.glyphs.as_ref().is_some_and(|g| g.gbk_pairs);
@@ -270,6 +271,8 @@ impl Interp<'_> {
         }
         let color = self.gs.fill.rgb;
         let alpha = self.gs.fill_alpha;
+        // A pattern, a blend mode, a soft mask or a knockout group: the glyph goes through the general path machinery.
+        let general = self.gs.fill.pattern.is_some() || !self.plain();
         // Size on the device: the box of the outline under the 2 by 2 part of the matrix.
         let b = glyph.path.bounds();
         let corners = [(b.left(), b.top()), (b.right(), b.top()), (b.right(), b.bottom()), (b.left(), b.bottom())];
@@ -290,10 +293,10 @@ impl Interp<'_> {
             return Ok(());
         }
         let small = hx - lx <= MAX_BITMAP_SIDE && hy - ly <= MAX_BITMAP_SIDE;
-        if !small || m[4].abs() > 1e6 || m[5].abs() > 1e6 {
+        if general || !small || m[4].abs() > 1e6 || m[5].abs() > 1e6 {
             let ts = Transform::from_row(m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32);
             if let Some(path) = glyph.path.clone().transform(ts) {
-                self.fill_device(&path, FillRule::Winding, color, alpha)?;
+                self.fill_current(&path, FillRule::Winding)?;
             }
             return Ok(());
         }
@@ -465,12 +468,10 @@ fn rasterize(path: &Path, m: [f64; 4], sx: f64) -> Option<GlyphBitmap> {
     if w > 400 || h > 400 {
         return None;
     }
-    let mut pm = Pixmap::new(w, h)?;
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color(tiny_skia::Color::BLACK);
-    paint.anti_alias = true;
-    pm.fill_path(&placed, &paint, FillRule::Winding, Transform::from_translate(-(left as f32), -(top as f32)), None);
-    let alpha: Vec<u8> = pm.data().chunks_exact(4).map(|p| p.get(3).copied().unwrap_or(0)).collect();
+    // Coverage straight into an 8-bit mask: the same scan conversion as a black fill on a bitmap, without the colour pipeline.
+    let mut mask = Mask::new(w, h)?;
+    mask.fill_path(&placed, FillRule::Winding, true, Transform::from_translate(-(left as f32), -(top as f32)));
+    let alpha = mask.take();
     Some(GlyphBitmap { left, top, width: w as usize, height: h as usize, alpha })
 }
 

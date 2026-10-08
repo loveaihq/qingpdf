@@ -471,26 +471,27 @@ fn simple_glyph(rec: &[u8], contours: usize, out: &mut Contours) -> Res<()> {
             }
         }
     }
-    let coords = |short: u8, same: u8, pos: &mut usize| -> Res<Vec<f32>> {
-        let mut v = Vec::with_capacity(count);
+    // The points are made in place: the x pass fills the first number of each, the y pass the second.
+    let first = out.pts.len();
+    out.pts.extend(flags.iter().map(|&f| (0.0f32, 0.0f32, f & 1 != 0)));
+    let made = out.pts.get_mut(first..).ok_or(BAD)?;
+    for (axis, (short, same)) in [(2u8, 16u8), (4, 32)].into_iter().enumerate() {
         let mut acc = 0i32;
-        for &f in &flags {
+        for (p, &f) in made.iter_mut().zip(&flags) {
             if f & short != 0 {
-                let d = i32::from(u8_at(rec, *pos).ok_or(BAD)?);
-                *pos += 1;
+                let d = i32::from(u8_at(rec, pos).ok_or(BAD)?);
+                pos += 1;
                 acc += if f & same != 0 { d } else { -d };
             } else if f & same == 0 {
-                acc += i32::from(u16_at(rec, *pos).ok_or(BAD)? as i16);
-                *pos += 2;
+                acc += i32::from(u16_at(rec, pos).ok_or(BAD)? as i16);
+                pos += 2;
             }
-            v.push(acc as f32);
+            if axis == 0 {
+                p.0 = acc as f32;
+            } else {
+                p.1 = acc as f32;
+            }
         }
-        Ok(v)
-    };
-    let xs = coords(2, 16, &mut pos)?;
-    let ys = coords(4, 32, &mut pos)?;
-    for ((x, y), f) in xs.into_iter().zip(ys).zip(flags) {
-        out.pts.push((x, y, f & 1 != 0));
     }
     Ok(())
 }

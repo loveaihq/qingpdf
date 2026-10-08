@@ -307,6 +307,20 @@
 |---|---|---|---|
 | `issue7229.pdf` | [pdf.js@17bb244](https://github.com/mozilla/pdf.js/blob/17bb2442fe53f348ee8e2e0b3e7c1c7d09468cd7/test/pdfs/issue7229.pdf) | pdf.js 仓库里的文件，来源/许可不明（多半来自 bug 报告或第三方文档） | v1.3；2页；经典xref；增量更新(2个%EOF)；**2 页 A4 扫描件形态：整页 1654x2338 DCT 图片，无文字（不是中文扫描件）** |
 
+### public/transparency/ — 项目自己生成的透明、渐变、图案测试页（第 3 层 3c，7 个）
+
+2026-10-08 加入。**全部由 `tests/tools/make_transparency_fixtures.py`（用 `tests/tools/pdfmaker.py` 写 PDF）生成**，没有任何第三方内容；脚本和这些文件都是 qingpdf 项目自己写的，许可证同项目（MIT OR Apache-2.0）。重新生成：`python tests/tools/make_transparency_fixtures.py`；速度测试用的重页另用 `--perf` 生成到 `tests/out/perf/`（不提交）。和 PDFium 对照：`python tests/tools/render_compare.py --engine-compare --only transparency --all`。页里没有字体，只有图形，所以不会混进文字渲染的差别。
+
+| 文件 | 内容 |
+|---|---|
+| `blend-modes.pdf` | 16 种混合模式，每格一块不透明矩形和一个半透明圆，盖在三色条上 |
+| `soft-masks.pdf` | 软蒙版：亮度（渐变）、Alpha（不同透明度的圆）、`/BC` 加 `/TR`、蒙版作用在一个组上 |
+| `groups.pdf` | 透明组：组和逐个对象的差别、isolated 与 non-isolated 里的 Multiply、knockout 与非 knockout |
+| `shadings.pdf` | shading 类型 1 到 7，带 `/Extend`（含不延伸的）、条带、两圆不同心的径向 |
+| `tiling-patterns.pdf` | 平铺图案：彩色、无色（两种颜色）、旋转的矩阵、步长大于盒子、盒子大于步长（邻格重叠）、大格、嵌套图案、描边和圆形填充 |
+| `optional-content.pdf` | 可选内容：OCG 开关、OCMD（`/P` 各策略、`/VE` 表达式）、XObject 的 `/OC`、`BDC /OC` |
+| `cmyk-swatches.pdf` | 40 个 CMYK 色块（单色阶梯、两色和三色、黑加色、杂色），对照 CMYK 转 RGB |
+
 ## 缺口（这几个来源覆盖不到的）
 
 用户自己提供的中文 PDF 放仓库外面，用 `QINGPDF_PRIVATE_CORPUS` 指过去。下面这些是特别需要补的。

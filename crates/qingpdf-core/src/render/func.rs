@@ -210,8 +210,27 @@ impl Function {
         loader.load_at(obj, 0)
     }
 
+    /// Read several function objects (the entries of an array of 1-out functions) with one loader, so that an
+    /// object named more than once is read once and the limits count all of them together.
+    pub fn load_many(doc: &Document, objs: &[Object]) -> Option<Vec<Arc<Function>>> {
+        if objs.is_empty() || objs.len() > MAX_ARITY {
+            return None;
+        }
+        let mut loader = Loader { doc, memo: HashMap::new(), nodes_left: MAX_NODES, weight_left: MAX_WEIGHT };
+        objs.iter().map(|o| loader.load_at(o, 0)).collect()
+    }
+
     pub fn inputs(&self) -> usize {
         self.domain.len()
+    }
+
+    /// How many numbers the function returns.
+    pub fn outputs(&self) -> usize {
+        match &self.kind {
+            Kind::Sampled { outputs, .. } | Kind::PostScript { outputs, .. } => *outputs,
+            Kind::Exponential { c0, .. } => c0.len(),
+            Kind::Stitching { functions, .. } => functions.first().map_or(0, |f| f.outputs()),
+        }
     }
 
     /// Run the function. `out` is cleared and receives the outputs. `false` (and no outputs) when the

@@ -1,6 +1,6 @@
-//! The content stream interpreter that draws (ISO 32000-1 8.2 to 8.7, 8.9, 8.10, 9.3, 9.6.5):
-//! the graphics state, paths, clipping, colours, images, form XObjects, Type 3 glyphs and,
-//! for the other fonts, an outline box per character (the real glyphs come in step 3b).
+//! The content stream interpreter that draws (ISO 32000-1 8.2 to 8.7, 8.9, 8.10, 9.3, 9.6.5, 11):
+//! the graphics state, paths, clipping, colours, patterns and shadings, images, form XObjects,
+//! transparency groups and soft masks (`layers.rs`), Type 3 glyphs and the glyphs of the other fonts.
 //! Operators are read by the same scanner text extraction uses.
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -25,8 +25,14 @@ use super::color::ColorSpace;
 use super::fonts::{Budget, GlyphSource};
 use super::func::Meter;
 use super::image::{self, Loaded};
+use super::oc::OcConfig;
+use super::shading::{self, Shading};
+use super::work::Work;
 
+mod layers;
 mod text;
+
+use layers::{Ink, PatternDef, PatternPaint, ShadeEntry, SmKey, SoftMask, Tile, TileKey};
 
 /// Most operators one page may run, forms and glyph procedures included.
 pub(crate) const MAX_OPERATORS: usize = 2_000_000;
@@ -85,7 +91,7 @@ ops! {
     OP_B_CLOSE = b"b"; OP_B_CLOSE_STAR = b"b*"; OP_N = b"n"; OP_CLIP = b"W"; OP_CLIP_STAR = b"W*";
     OP_G = b"g"; OP_G_UPPER = b"G"; OP_RG = b"rg"; OP_RG_UPPER = b"RG"; OP_K = b"k"; OP_K_UPPER = b"K";
     OP_CS = b"cs"; OP_CS_UPPER = b"CS"; OP_SC = b"sc"; OP_SC_UPPER = b"SC"; OP_SCN = b"scn"; OP_SCN_UPPER = b"SCN";
-    OP_SH = b"sh"; OP_DO = b"Do"; OP_BT = b"BT"; OP_ET = b"ET";
+    OP_SH = b"sh"; OP_DO = b"Do"; OP_BT = b"BT"; OP_ET = b"ET"; OP_BDC = b"BDC"; OP_BMC = b"BMC"; OP_EMC = b"EMC";
     OP_TC = b"Tc"; OP_TW = b"Tw"; OP_TZ = b"Tz"; OP_TL = b"TL"; OP_TF = b"Tf"; OP_TR = b"Tr"; OP_TS = b"Ts";
     OP_TD = b"Td"; OP_TD_UPPER = b"TD"; OP_TM = b"Tm"; OP_T_STAR = b"T*"; OP_TJ = b"Tj"; OP_TJ_ARRAY = b"TJ";
     OP_QUOTE = b"'"; OP_DQUOTE = b"\""; OP_D0 = b"d0"; OP_D1 = b"d1";
@@ -119,6 +125,9 @@ enum Cat {
     XObject,
     ExtGState,
     ColorSpace,
+    Pattern,
+    Shading,
+    Properties,
 }
 
 static RESOURCES_SERIAL: AtomicU32 = AtomicU32::new(1);
@@ -132,7 +141,12 @@ pub(crate) struct Resources {
     xobjects: OnceCell<FxMap<Vec<u8>, Object>>,
     ext_g_states: OnceCell<FxMap<Vec<u8>, Object>>,
     color_spaces: OnceCell<FxMap<Vec<u8>, Object>>,
+    patterns: OnceCell<FxMap<Vec<u8>, Object>>,
+    shadings: OnceCell<FxMap<Vec<u8>, Object>>,
+    properties: OnceCell<FxMap<Vec<u8>, Object>>,
     loaded_spaces: RefCell<FxMap<Vec<u8>, Option<Arc<ColorSpace>>>>,
+    /// Does some graphics state dictionary here ask for a blend mode other than Normal?
+    has_blend: OnceCell<bool>,
 }
 
 impl Resources {
@@ -145,7 +159,11 @@ impl Resources {
             xobjects: OnceCell::new(),
             ext_g_states: OnceCell::new(),
             color_spaces: OnceCell::new(),
+            patterns: OnceCell::new(),
+            shadings: OnceCell::new(),
+            properties: OnceCell::new(),
             loaded_spaces: RefCell::new(FxMap::default()),
+            has_blend: OnceCell::new(),
         })
     }
 
@@ -155,6 +173,9 @@ impl Resources {
             Cat::XObject => (&self.xobjects, "XObject"),
             Cat::ExtGState => (&self.ext_g_states, "ExtGState"),
             Cat::ColorSpace => (&self.color_spaces, "ColorSpace"),
+            Cat::Pattern => (&self.patterns, "Pattern"),
+            Cat::Shading => (&self.shadings, "Shading"),
+            Cat::Properties => (&self.properties, "Properties"),
         };
         cell.get_or_init(|| {
             let sub = self.dict.get(key).and_then(|o| doc.resolve(o).ok());
@@ -167,6 +188,45 @@ impl Resources {
 
     fn get(&self, doc: &Document, cat: Cat, name: &[u8]) -> Option<Object> {
         self.table(doc, cat).get(name).cloned()
+    }
+
+    /// Does a graphics state dictionary of these resources set a blend mode other than Normal (11.3.5)? A
+    /// transparency group that is isolated matters only if something inside it blends.
+    fn has_blend(&self, doc: &Document) -> bool {
+        *self.has_blend.get_or_init(|| {
+            self.table(doc, Cat::ExtGState).values().take(256).any(|entry| {
+                let Ok(Object::Dict(d)) = doc.resolve(entry) else { return false };
+                d.get("BM").and_then(|b| doc.resolve(b).ok()).is_some_and(|b| blend_of(&b) != BlendMode::SourceOver)
+            })
+        })
+    }
+}
+
+/// The blend mode a `/BM` entry names (11.3.5): a name, or an array of names of which the first known one counts.
+/// Anything else is Normal.
+fn blend_of(obj: &Object) -> BlendMode {
+    let one = |n: &[u8]| match n {
+        b"Multiply" => Some(BlendMode::Multiply),
+        b"Screen" => Some(BlendMode::Screen),
+        b"Overlay" => Some(BlendMode::Overlay),
+        b"Darken" => Some(BlendMode::Darken),
+        b"Lighten" => Some(BlendMode::Lighten),
+        b"ColorDodge" => Some(BlendMode::ColorDodge),
+        b"ColorBurn" => Some(BlendMode::ColorBurn),
+        b"HardLight" => Some(BlendMode::HardLight),
+        b"SoftLight" => Some(BlendMode::SoftLight),
+        b"Difference" => Some(BlendMode::Difference),
+        b"Exclusion" => Some(BlendMode::Exclusion),
+        b"Hue" => Some(BlendMode::Hue),
+        b"Saturation" => Some(BlendMode::Saturation),
+        b"Color" => Some(BlendMode::Color),
+        b"Luminosity" => Some(BlendMode::Luminosity),
+        _ => None,
+    };
+    match obj {
+        Object::Name(n) => one(n.as_bytes()).unwrap_or(BlendMode::SourceOver),
+        Object::Array(a) => a.iter().find_map(|o| if let Object::Name(n) = o { one(n.as_bytes()) } else { None }).unwrap_or(BlendMode::SourceOver),
+        _ => BlendMode::SourceOver,
     }
 }
 
@@ -189,11 +249,19 @@ struct FontEntry {
     glyphs: Option<GlyphSource>,
 }
 
+/// A form that is a transparency group (11.4, 8.10.3): isolated, knockout.
+#[derive(Clone, Copy)]
+struct Group {
+    isolated: bool,
+    knockout: bool,
+}
+
 struct Form {
     content: Vec<u8>,
     matrix: Matrix,
     bbox: Option<[f64; 4]>,
     resources: Option<Rc<Resources>>,
+    group: Option<Group>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -246,6 +314,15 @@ pub(crate) struct Shared {
     /// The most bytes the glyph bitmaps came to at any moment (tests look at it).
     #[cfg(test)]
     bitmap_peak: usize,
+    /// Shadings and patterns read, by object (each is read once however many times it is used); they count in `cache_bytes`.
+    shadings: FxMap<ObjRef, Option<Rc<Shading>>>,
+    patterns: FxMap<ObjRef, Option<Rc<PatternDef>>>,
+    /// The work the last page drawn used (tests look at it).
+    #[cfg(test)]
+    pub last_work: f64,
+    /// The optional content configuration of the document, and whether the content of an XObject is shown.
+    oc: Option<Rc<OcConfig>>,
+    xobject_shown: FxMap<ObjRef, bool>,
 }
 
 impl Shared {
@@ -264,6 +341,12 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn font_entries(&self) -> usize {
         self.fonts.len()
+    }
+
+    /// (bytes held in forms, shadings and patterns, patterns kept, shadings kept).
+    #[cfg(test)]
+    pub(crate) fn object_cache(&self) -> (usize, usize, usize) {
+        (self.cache_bytes, self.patterns.len(), self.shadings.len())
     }
 }
 
@@ -351,8 +434,10 @@ impl Clip {
 struct Colour {
     space: Arc<ColorSpace>,
     rgb: [f32; 3],
-    /// Nothing is painted with it (a pattern, which comes with step 3c, or a /None separation).
+    /// Nothing is painted with it (a pattern not yet chosen, or a /None separation).
     none: bool,
+    /// The pattern it paints with, once `scn` has named one.
+    pattern: Option<Rc<PatternPaint>>,
 }
 
 #[derive(Clone)]
@@ -363,6 +448,12 @@ struct GState {
     stroke: Colour,
     fill_alpha: f32,
     stroke_alpha: f32,
+    /// The blend mode (11.3.5); `SourceOver` is Normal.
+    blend: BlendMode,
+    /// The soft mask in force (11.6.5), in the device space of the layer it was made in.
+    smask: Option<Rc<SoftMask>>,
+    /// `/AIS`: the alpha constants are shape, not opacity (11.6.4.4).
+    ais: bool,
     line_width: f64,
     cap: LineCap,
     join: LineJoin,
@@ -446,6 +537,71 @@ pub(crate) struct Interp<'a> {
     gray: Arc<ColorSpace>,
     rgb: Arc<ColorSpace>,
     cmyk: Arc<ColorSpace>,
+    /// Pattern space to device space of the stream being run: a pattern's matrix is relative to it (8.7.3.1).
+    pattern_base: Matrix,
+    /// Layers (groups, soft masks, pattern cells) being drawn, bytes of them alive, and the pixels of layers and
+    /// of pattern cells the page may still make.
+    layer_depth: usize,
+    live_layers: Rc<Cell<usize>>,
+    layer_pixels_left: u64,
+    tile_pixels_left: u64,
+    /// The layer being drawn is a knockout group (11.4.6.2): each object replaces what is under it.
+    knockout: bool,
+    /// Marked content that is hidden (optional content that is off) is open this many levels deep; `mc_stack`
+    /// tells for each open level whether it is one of them.
+    hidden: usize,
+    /// (There is no cap on its depth: each level is an operator, and a page has at most [`MAX_OPERATORS`].)
+    mc_stack: Vec<bool>,
+    /// `EMC` closes no level below this (the marked content of a caller is not the form's to close).
+    mc_floor: usize,
+    shading_budget: shading::Budget,
+    /// The work the page may still do on layers, masks, shadings, patterns and optional content.
+    work: Work,
+    /// The depth of the stream being run (a form, a glyph, a pattern cell, a soft mask group): a pattern cell
+    /// nests inside it.
+    form_depth: usize,
+    /// Shadings written in a resource dictionary, read for this page: by the dictionary and the name.
+    page_shadings: FxMap<(u32, Vec<u8>), Option<Rc<Shading>>>,
+    /// The bitmaps of the last few shadings drawn, for the next `sh` or fill that asks for the same.
+    shade_cache: Vec<ShadeEntry>,
+    /// Pattern cells made, newest last, and their bytes.
+    tiles: Vec<(TileKey, Rc<Tile>)>,
+    tile_bytes: usize,
+    patterns_in_progress: Vec<ObjRef>,
+    /// The clip mask times the soft mask, for the clip and mask in force and a few before them (made only when something
+    /// is drawn), newest last.
+    sm_cache: Vec<(Rc<Clip>, Rc<SoftMask>, Rc<MaskBuf>)>,
+    /// The last few soft masks made, newest last, kept for the next `gs` that asks for the same.
+    smasks: Vec<(SmKey, Rc<SoftMask>)>,
+}
+
+/// The graphics state a page, a pattern cell or a soft mask group starts with (8.4.2).
+fn initial_gstate(w: i32, h: i32, gray: &Arc<ColorSpace>) -> GState {
+    let black = Colour { space: gray.clone(), rgb: [0.0; 3], none: false, pattern: None };
+    GState {
+        ctm: IDENTITY,
+        clip: Rc::new(Clip::new([0, 0, w, h], None)),
+        fill: black.clone(),
+        stroke: black,
+        fill_alpha: 1.0,
+        stroke_alpha: 1.0,
+        blend: BlendMode::SourceOver,
+        smask: None,
+        ais: false,
+        line_width: 1.0,
+        cap: LineCap::Butt,
+        join: LineJoin::Miter,
+        miter: 10.0,
+        dash: None,
+        font: None,
+        size: 0.0,
+        tc: 0.0,
+        tw: 0.0,
+        th: 1.0,
+        tl: 0.0,
+        rise: 0.0,
+        mode: 0,
+    }
 }
 
 impl<'a> Interp<'a> {
@@ -454,33 +610,14 @@ impl<'a> Interp<'a> {
         // The page starts with all the font work it may do.
         shared.budget.start_page();
         let gray = Arc::new(ColorSpace::Gray);
-        let black = Colour { space: gray.clone(), rgb: [0.0; 3], none: false };
+        let oc = shared.oc.get_or_insert_with(|| Rc::new(OcConfig::load(doc)));
+        oc.start_page();
         Interp {
             doc,
             shared,
             pixmap,
             base,
-            gs: GState {
-                ctm: IDENTITY,
-                clip: Rc::new(Clip::new([0, 0, w, h], None)),
-                fill: black.clone(),
-                stroke: black,
-                fill_alpha: 1.0,
-                stroke_alpha: 1.0,
-                line_width: 1.0,
-                cap: LineCap::Butt,
-                join: LineJoin::Miter,
-                miter: 10.0,
-                dash: None,
-                font: None,
-                size: 0.0,
-                tc: 0.0,
-                tw: 0.0,
-                th: 1.0,
-                tl: 0.0,
-                rise: 0.0,
-                mode: 0,
-            },
+            gs: initial_gstate(w, h, &gray),
             stack: Vec::new(),
             path: PathData::default(),
             cur: (0.0, 0.0),
@@ -507,15 +644,57 @@ impl<'a> Interp<'a> {
             gray,
             rgb: Arc::new(ColorSpace::Rgb),
             cmyk: Arc::new(ColorSpace::Cmyk),
+            pattern_base: base,
+            layer_depth: 0,
+            live_layers: Rc::new(Cell::new(0)),
+            layer_pixels_left: layers::MAX_LAYER_PIXELS,
+            tile_pixels_left: layers::MAX_TILE_PIXELS_PER_PAGE,
+            knockout: false,
+            hidden: 0,
+            mc_stack: Vec::new(),
+            mc_floor: 0,
+            shading_budget: shading::Budget::new(),
+            work: Work::new(),
+            form_depth: 0,
+            page_shadings: FxMap::default(),
+            shade_cache: Vec::new(),
+            tiles: Vec::new(),
+            tile_bytes: 0,
+            patterns_in_progress: Vec::new(),
+            sm_cache: Vec::new(),
+            smasks: Vec::new(),
         }
+    }
+
+
+    /// The units of work the page has used (tests look at it).
+    #[cfg(test)]
+    pub fn work_used(&self) -> f64 {
+        self.work.used()
+    }
+
+    /// Has the page used up its work? It was stopped, and what is drawn is kept.
+    pub fn work_over(&self) -> bool {
+        self.work.is_over()
     }
 
     /// Run one content stream.
     pub fn run(&mut self, content: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
+        let outer = std::mem::replace(&mut self.form_depth, depth);
+        let result = self.run_stream(content, res, depth);
+        self.form_depth = outer;
+        result
+    }
+
+    fn run_stream(&mut self, content: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
         let mut sc = Scanner::new(content);
         let mut ops: Vec<Operand> = Vec::new();
         loop {
             let Item::Operator(op) = sc.next(&mut ops) else { return Ok(()) };
+            // A page that has used up its work draws nothing more (what is drawn stays); `render_page` says so.
+            if self.work.is_over() {
+                return Ok(());
+            }
             self.charge_op()?;
             if op == b"BI" {
                 self.inline_image(&mut sc, &mut ops, res)?;
@@ -584,7 +763,7 @@ impl<'a> Interp<'a> {
             OP_D => self.set_dash(ops),
             OP_GS => {
                 if let Some(Operand::Name(n)) = ops.last() {
-                    self.ext_g_state(sc.bytes(*n), res);
+                    self.ext_g_state(sc.bytes(*n), res, depth)?;
                 }
             }
             // --- paths ---
@@ -685,8 +864,20 @@ impl<'a> Interp<'a> {
                     }
                 }
             }
-            OP_SC | OP_SC_UPPER | OP_SCN | OP_SCN_UPPER => self.set_color(op == OP_SC || op == OP_SCN, ops),
-            OP_SH => self.warn("shading fills (sh) are not drawn yet"),
+            OP_SC | OP_SC_UPPER | OP_SCN | OP_SCN_UPPER => self.set_color(op == OP_SC || op == OP_SCN, ops, sc, res),
+            OP_SH => {
+                if let Some(Operand::Name(n)) = ops.last() {
+                    let name = sc.bytes(*n).to_vec();
+                    self.paint_shading(&name, res)?;
+                }
+            }
+            // --- marked content (14.6), for optional content (8.11.3) ---
+            OP_BDC => {
+                let hide = self.marked_content_hidden(ops, sc, res);
+                self.open_marked_content(hide);
+            }
+            OP_BMC => self.open_marked_content(false),
+            OP_EMC => self.close_marked_content(),
             // --- XObjects ---
             OP_DO => {
                 if let Some(Operand::Name(n)) = ops.last() {
@@ -875,13 +1066,12 @@ impl<'a> Interp<'a> {
         }
         let m = self.full();
         let invertible = finite(&m) && (m[0] * m[3] - m[1] * m[2]).abs() > 1e-12;
-        if invertible {
+        if invertible && self.hidden == 0 {
             if fill
                 && !self.gs.fill.none
                 && let Some(p) = self.device_path(&m)
             {
-                let color = self.gs.fill.rgb;
-                self.fill_device(&p, rule, color, self.gs.fill_alpha)?;
+                self.fill_current(&p, rule)?;
             }
             if stroke && !self.gs.stroke.none {
                 self.stroke_path(&m)?;
@@ -918,36 +1108,51 @@ impl<'a> Interp<'a> {
         (area[0] < area[2] && area[1] < area[3]).then_some((area, inside))
     }
 
-    /// The mask to draw with: none when the clip is a rectangle that contains everything drawn.
-    fn mask_for(&self, inside: bool) -> Option<Rc<MaskBuf>> {
-        let clip = &self.gs.clip;
-        if clip.mask.is_none() && inside {
-            return None;
-        }
-        clip.mask_for(self.pixmap.width(), self.pixmap.height(), &self.live_masks)
-    }
-
     fn paint_of(&self, color: [f32; 3], alpha: f32) -> Paint<'static> {
         let mut paint = Paint::default();
         paint.set_color(Color::from_rgba(color[0].clamp(0.0, 1.0), color[1].clamp(0.0, 1.0), color[2].clamp(0.0, 1.0), alpha.clamp(0.0, 1.0)).unwrap_or(Color::BLACK));
         paint.anti_alias = true;
+        paint.blend_mode = self.gs.blend;
         paint
     }
 
+    /// Fill a device-space path with a plain colour (a stand-in block, say).
     fn fill_device(&mut self, path: &tiny_skia::Path, rule: FillRule, color: [f32; 3], alpha: f32) -> Result<()> {
-        if self.gs.clip.is_empty() {
+        self.fill_with(path, rule, None, color, alpha)
+    }
+
+    /// Fill a device-space path with the current fill colour: a colour, or a pattern.
+    fn fill_current(&mut self, path: &tiny_skia::Path, rule: FillRule) -> Result<()> {
+        let (pattern, color, alpha) = (self.gs.fill.pattern.clone(), self.gs.fill.rgb, self.gs.fill_alpha);
+        self.fill_with(path, rule, pattern, color, alpha)
+    }
+
+    fn fill_with(&mut self, path: &tiny_skia::Path, rule: FillRule, pattern: Option<Rc<PatternPaint>>, color: [f32; 3], alpha: f32) -> Result<()> {
+        if self.gs.clip.is_empty() || self.hidden > 0 {
             return Ok(());
         }
         let Some((area, inside)) = self.visible(path.bounds(), 1.0) else { return Ok(()) };
         self.charge_area(f64::from(area[2] - area[0]) * f64::from(area[3] - area[1]))?;
-        let mask = self.mask_for(inside);
-        let paint = self.paint_of(color, alpha);
+        let ink = match &pattern {
+            Some(p) => self.pattern_ink(p, area)?,
+            None => Ink::Solid(color),
+        };
+        let mask = self.mask_for(inside)?;
+        if self.knockout {
+            self.knock_out_fill(path, rule, as_mask(&mask), alpha);
+        }
+        let Some(paint) = self.paint_from(&ink, alpha) else { return Ok(()) };
         self.pixmap.fill_path(path, &paint, rule, Transform::identity(), as_mask(&mask));
         Ok(())
     }
 
+    /// True when drawing can go straight to the pixels: Normal blend mode, no soft mask, not in a knockout group.
+    fn plain(&self) -> bool {
+        self.gs.blend == BlendMode::SourceOver && self.gs.smask.is_none() && !self.knockout
+    }
+
     fn stroke_path(&mut self, m: &Matrix) -> Result<()> {
-        if self.gs.clip.is_empty() {
+        if self.gs.clip.is_empty() || self.hidden > 0 {
             return Ok(());
         }
         let det = (m[0] * m[3] - m[1] * m[2]).abs();
@@ -991,8 +1196,19 @@ impl<'a> Interp<'a> {
         let reach = (width * if uniform { 1.0 } else { scale }) as f32 * stroke.miter_limit.clamp(1.0, 10.0) * 0.5 + 1.0;
         let Some((area, inside)) = self.visible(device_bounds, reach) else { return Ok(()) };
         self.charge_area(f64::from(area[2] - area[0]) * f64::from(area[3] - area[1]))?;
-        let mask = self.mask_for(inside);
-        let paint = self.paint_of(self.gs.stroke.rgb, self.gs.stroke_alpha);
+        let pattern = self.gs.stroke.pattern.clone();
+        let alpha = self.gs.stroke_alpha;
+        let ink = match &pattern {
+            Some(p) => self.pattern_ink(p, area)?,
+            None => Ink::Solid(self.gs.stroke.rgb),
+        };
+        let mask = self.mask_for(inside)?;
+        if self.knockout {
+            let mut clear = self.paint_of([0.0; 3], if self.gs.ais { alpha } else { 1.0 });
+            clear.blend_mode = BlendMode::DestinationOut;
+            self.pixmap.stroke_path(&path, &clear, &stroke, transform, as_mask(&mask));
+        }
+        let Some(paint) = self.paint_from(&ink, alpha) else { return Ok(()) };
         self.pixmap.stroke_path(&path, &paint, &stroke, transform, as_mask(&mask));
         Ok(())
     }
@@ -1088,8 +1304,9 @@ impl<'a> Interp<'a> {
         if self.uncolored {
             return;
         }
-        let pattern = matches!(*space, ColorSpace::Pattern);
-        let colour = Colour { rgb: if pattern { [0.0; 3] } else { space.to_rgb(comps, &self.meter) }, none: pattern || space.is_none(), space };
+        // A pattern space starts with no pattern chosen: nothing is painted until `scn` names one.
+        let pattern = matches!(*space, ColorSpace::Pattern(_));
+        let colour = Colour { rgb: if pattern { [0.0; 3] } else { space.to_rgb(comps, &self.meter) }, none: pattern || space.is_none(), space, pattern: None };
         if fill {
             self.gs.fill = colour;
         } else {
@@ -1097,13 +1314,27 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn set_color(&mut self, fill: bool, ops: &[Operand]) {
+    fn set_color(&mut self, fill: bool, ops: &[Operand], sc: &Scanner<'_>, res: &Rc<Resources>) {
         if self.uncolored {
             return;
         }
         let space = if fill { self.gs.fill.space.clone() } else { self.gs.stroke.space.clone() };
-        if matches!(*space, ColorSpace::Pattern) {
-            self.warn("pattern fills and strokes (tiling patterns and shadings) are not drawn yet");
+        if let ColorSpace::Pattern(base) = &*space {
+            // 8.7.3.2: `c1 ... cn /Name scn`; the numbers are the colour of an uncoloured tiling pattern.
+            let Some(Operand::Name(n)) = ops.last() else { return };
+            let name = sc.bytes(*n).to_vec();
+            let comps: Vec<f64> = ops.iter().filter_map(|o| if let Operand::Num(v) = o { Some(*v) } else { None }).collect();
+            let rgb = match base {
+                Some(b) if comps.len() >= b.components() => b.to_rgb(comps.get(comps.len() - b.components()..).unwrap_or(&[]), &self.meter),
+                _ => [0.0; 3],
+            };
+            let pattern = self.pattern_paint(&name, rgb, res);
+            let colour = Colour { space: space.clone(), rgb: [0.0; 3], none: pattern.is_none(), pattern };
+            if fill {
+                self.gs.fill = colour;
+            } else {
+                self.gs.stroke = colour;
+            }
             return;
         }
         let n = space.components();
@@ -1120,7 +1351,7 @@ impl<'a> Interp<'a> {
             b"DeviceGray" | b"G" => return Some(self.gray.clone()),
             b"DeviceRGB" | b"RGB" => return Some(self.rgb.clone()),
             b"DeviceCMYK" | b"CMYK" => return Some(self.cmyk.clone()),
-            b"Pattern" => return Some(Arc::new(ColorSpace::Pattern)),
+            b"Pattern" => return Some(Arc::new(ColorSpace::Pattern(None))),
             _ => {}
         }
         if let Some(hit) = res.loaded_spaces.borrow().get(name) {
@@ -1158,10 +1389,10 @@ impl<'a> Interp<'a> {
         self.gs.dash = dash_of(values, phase).map(Rc::new);
     }
 
-    fn ext_g_state(&mut self, name: &[u8], res: &Rc<Resources>) {
+    fn ext_g_state(&mut self, name: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
         let doc = self.doc;
-        let Some(entry) = res.get(doc, Cat::ExtGState, name) else { return };
-        let Ok(Object::Dict(d)) = doc.resolve(&entry) else { return };
+        let Some(entry) = res.get(doc, Cat::ExtGState, name) else { return Ok(()) };
+        let Ok(Object::Dict(d)) = doc.resolve(&entry) else { return Ok(()) };
         let num = |k: &str| d.get(k).and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_f64());
         if let Some(v) = num("LW") {
             self.gs.line_width = v.abs();
@@ -1195,13 +1426,20 @@ impl<'a> Interp<'a> {
             self.gs.font = self.font_from_ref(*r);
             self.gs.size = size;
         }
-        let blend = d.get("BM").and_then(|o| doc.resolve(o).ok());
-        let soft_mask = d.get("SMask").and_then(|o| doc.resolve(o).ok());
-        if matches!(&blend, Some(Object::Name(n)) if n.as_bytes() != b"Normal" && n.as_bytes() != b"Compatible")
-            || matches!(&soft_mask, Some(Object::Dict(_)))
-        {
-            self.warn("blend modes and soft masks in graphics state dictionaries are not drawn yet");
+        if let Some(b) = d.get("BM").and_then(|o| doc.resolve(o).ok()) {
+            self.gs.blend = blend_of(&b);
         }
+        if let Some(Object::Bool(v)) = d.get("AIS").and_then(|o| doc.resolve(o).ok()) {
+            self.gs.ais = v;
+        }
+        match d.get("SMask").and_then(|o| doc.resolve(o).ok()) {
+            Some(Object::Dict(sd)) => {
+                self.gs.smask = self.make_soft_mask(&sd, res, depth)?;
+            }
+            Some(Object::Name(_)) => self.gs.smask = None,
+            _ => {}
+        }
+        Ok(())
     }
 
     // --- text ------------------------------------------------------------------------------------------
@@ -1319,7 +1557,7 @@ impl<'a> Interp<'a> {
     /// One pixel wide outline of an upright box, written straight into the page; false when the
     /// clip is not a rectangle that holds the whole box (then it is drawn as a path).
     fn draw_box_fast(&mut self, pts: &[(f64, f64); 4]) -> bool {
-        if self.gs.mode == 3 || self.gs.mode == 7 || self.gs.clip.mask.is_some() {
+        if self.gs.mode == 3 || self.gs.mode == 7 || self.gs.clip.mask.is_some() || !self.plain() {
             return false;
         }
         let colour = if matches!(self.gs.mode, 1 | 5) { &self.gs.stroke } else { &self.gs.fill };
@@ -1384,7 +1622,7 @@ impl<'a> Interp<'a> {
         }
         let Some((area, inside)) = self.visible(path.bounds(), 1.0) else { return Ok(()) };
         self.charge_area(f64::from(area[2] - area[0]) * f64::from(area[3] - area[1]))?;
-        let mask = self.mask_for(inside);
+        let mask = self.mask_for(inside)?;
         let paint = self.paint_of(colour.rgb, alpha);
         let stroke = Stroke { width: 1.0, ..Stroke::default() };
         self.pixmap.stroke_path(path, &paint, &stroke, Transform::identity(), as_mask(&mask));
@@ -1455,8 +1693,16 @@ impl<'a> Interp<'a> {
 
     fn do_xobject(&mut self, name: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
         let doc = self.doc;
+        if self.hidden > 0 {
+            return Ok(());
+        }
         let Some(entry) = res.get(doc, Cat::XObject, name) else { return Ok(()) };
         let r = entry.as_obj_ref();
+        if let Some(r) = r
+            && !self.xobject_shown(r)
+        {
+            return Ok(());
+        }
         // An image already prepared at this size.
         if let Some(r) = r {
             if let Some(place) = self.placement() {
@@ -1544,7 +1790,14 @@ impl<'a> Interp<'a> {
         };
         let bbox = crate::document::rectangle(stream.dict.get("BBox").and_then(|o| doc.resolve(o).ok()).as_ref());
         let resources = stream.dict.get("Resources").map(|res| Resources::new(doc, Some(res)));
-        let form = Rc::new(Form { content, matrix, bbox, resources });
+        let group = match stream.dict.get("Group").and_then(|g| doc.resolve(g).ok()) {
+            Some(Object::Dict(g)) if g.get_name("S").is_some_and(|s| s.as_bytes() == b"Transparency") => {
+                let flag = |k: &str| matches!(g.get(k).and_then(|o| doc.resolve(o).ok()), Some(Object::Bool(true)));
+                Some(Group { isolated: flag("I"), knockout: flag("K") })
+            }
+            _ => None,
+        };
+        let form = Rc::new(Form { content, matrix, bbox, resources, group });
         if let Some(r) = r
             && self.shared.cache_bytes.saturating_add(form.content.len()) <= MAX_CACHE_BYTES
         {
@@ -1579,7 +1832,19 @@ impl<'a> Interp<'a> {
         let path_saved = std::mem::take(&mut self.path);
         self.in_progress.push(r);
         let inner = form.resources.clone().unwrap_or_else(|| res.clone());
-        let result = if self.gs.clip.is_empty() { Ok(()) } else { self.run(&form.content, &inner, depth + 1) };
+        // The form's own space is the default one for the patterns it uses.
+        let own_space = self.full();
+        let pattern_base = std::mem::replace(&mut self.pattern_base, own_space);
+        let marked = self.enter_marked_content();
+        let result = if self.gs.clip.is_empty() {
+            Ok(())
+        } else if let Some(group) = form.group.filter(|g| self.group_needs_layer(g, &inner)) {
+            self.run_group(form, &inner, depth + 1, group)
+        } else {
+            self.run(&form.content, &inner, depth + 1)
+        };
+        self.leave_marked_content(marked);
+        self.pattern_base = pattern_base;
         self.in_progress.pop();
         self.path = path_saved;
         self.stack_floor = floor;
@@ -1593,7 +1858,7 @@ impl<'a> Interp<'a> {
     // --- images ----------------------------------------------------------------------------------------
 
     fn draw_image(&mut self, stream: &Stream, r: Option<ObjRef>, res: &Rc<Resources>) -> Result<()> {
-        if self.gs.clip.is_empty() {
+        if self.gs.clip.is_empty() || self.hidden > 0 {
             return Ok(());
         }
         let doc = self.doc;
@@ -1651,7 +1916,7 @@ impl<'a> Interp<'a> {
 
     /// Draw a prepared image over the unit square.
     fn draw_prepared(&mut self, prepared: &Prepared, place: &Placement) -> Result<()> {
-        if self.gs.clip.is_empty() {
+        if self.gs.clip.is_empty() || self.hidden > 0 {
             return Ok(());
         }
         let pixmap = &prepared.pixmap;
@@ -1661,6 +1926,7 @@ impl<'a> Interp<'a> {
             && usize::try_from(pixmap.width()).ok() == Some(place.target.0)
             && usize::try_from(pixmap.height()).ok() == Some(place.target.1)
             && self.gs.fill_alpha >= 0.999
+            && self.plain()
         {
             return self.blit(pixmap, prepared.opaque, rect, place.flip_x, place.flip_y);
         }
@@ -1701,9 +1967,25 @@ impl<'a> Interp<'a> {
         self.charge_area(f64::from(area[2] - area[0]) * f64::from(area[3] - area[1]))?;
         let scale = m[0].hypot(m[1]).max(m[2].hypot(m[3]));
         let quality = if scale > 1.0 { FilterQuality::Nearest } else { FilterQuality::Bilinear };
-        let paint = PixmapPaint { opacity: self.gs.fill_alpha, blend_mode: BlendMode::SourceOver, quality };
+        let paint = PixmapPaint { opacity: self.gs.fill_alpha, blend_mode: self.gs.blend, quality };
         let transform = Transform::from_row(m[0] as f32, m[1] as f32, m[2] as f32, m[3] as f32, m[4] as f32, m[5] as f32);
-        let mask = self.mask_for(inside);
+        let mask = self.mask_for(inside)?;
+        if self.knockout {
+            // The image replaces what is under it (11.4.6.2): clear its footprint first.
+            let mut pb = PathBuilder::new();
+            for (i, (x, y)) in corners.iter().enumerate() {
+                let (x, y) = (x.clamp(-1e7, 1e7) as f32, y.clamp(-1e7, 1e7) as f32);
+                if i == 0 {
+                    pb.move_to(x, y);
+                } else {
+                    pb.line_to(x, y);
+                }
+            }
+            pb.close();
+            if let Some(footprint) = pb.finish() {
+                self.knock_out_fill(&footprint, FillRule::Winding, as_mask(&mask), self.gs.fill_alpha);
+            }
+        }
         self.pixmap.draw_pixmap(0, 0, pixmap.as_ref(), &paint, transform, as_mask(&mask));
         Ok(())
     }
