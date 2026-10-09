@@ -149,6 +149,12 @@ impl<'a> Scanner<'a> {
                         _ => continue,
                     }
                 }
+                b'%' => {
+                    // A comment (7.2.3) is skipped; the token after it is read in its turn (`token` would hand it
+                    // back to a caller that drops numbers and names).
+                    self.skip_space();
+                    continue;
+                }
                 _ if class(b) == 0 => {
                     while data.get(self.pos).is_some_and(|&c| class(c) == 0) {
                         self.pos += 1;
@@ -587,6 +593,13 @@ mod tests {
             got,
             vec!["BT", "/F1 12 Tf", "1 0 0 1 -0.5 3.25 Tm", "(a(b)\n) Tj", "[ (x) -20 (AB) ] TJ", "ET", "Q"]
         );
+    }
+
+    #[test]
+    fn a_comment_does_not_take_the_token_after_it() {
+        // (A comment first in a stream, as in the PDF Association's annotation sample, lost the number after it.)
+        assert_eq!(run(b"% c\r\n1.0 1.0 0.0 rg\r\n% d\n/F1 12 Tf %e\n7 w"), vec!["1 1 0 rg", "/F1 12 Tf", "7 w"]);
+        assert_eq!(run(b"1 0 0 rg % c\n/P BDC"), vec!["1 0 0 rg", "/P BDC"]);
     }
 
     #[test]

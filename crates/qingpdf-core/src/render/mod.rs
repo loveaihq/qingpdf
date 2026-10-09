@@ -2,7 +2,8 @@
 //! and text (embedded or system fonts) are drawn; a character whose glyph cannot be had is an outline
 //! box. Transparency (groups, soft masks, blend modes, knockout), shadings (types 1 to 7), tiling and
 //! shading patterns, and optional content (layers that are off) are drawn too (3c), and so are the JBIG2 and
-//! JPEG 2000 image formats (3c2). Annotations are not (3c2).
+//! JPEG 2000 image formats (3c2), and the appearance streams of annotations (3c2-3; [`Renderer::set_annotations`]
+//! turns them off).
 //!
 //! ```no_run
 //! # use qingpdf_core::{Document, render};
@@ -36,6 +37,8 @@ mod ttvm;
 mod type1;
 mod work;
 
+#[cfg(test)]
+mod annot_tests;
 #[cfg(test)]
 mod font_tests;
 #[cfg(test)]
@@ -96,11 +99,17 @@ impl Bitmap {
 pub struct Renderer<'a> {
     doc: &'a Document,
     shared: Shared,
+    annotations: bool,
 }
 
 impl<'a> Renderer<'a> {
     pub fn new(doc: &'a Document) -> Renderer<'a> {
-        Renderer { doc, shared: Shared::default() }
+        Renderer { doc, shared: Shared::default(), annotations: true }
+    }
+
+    /// Draw the annotations' appearances (12.5) on top of the page's content, or not. They are drawn by default.
+    pub fn set_annotations(&mut self, on: bool) {
+        self.annotations = on;
     }
 
     /// Draw one page at `dpi` dots per inch (a page is 72 user units to the inch). The visible part
@@ -145,8 +154,12 @@ impl<'a> Renderer<'a> {
         let content = text::page_content(self.doc, page, &mut self.shared.warnings)?;
         let resources = Resources::new(self.doc, page.resources());
         let meter = Meter::new(MAX_FUNCTION_STEPS);
+        let annotations = self.annotations;
         let mut interp = Interp::new(self.doc, &mut self.shared, pixmap, base, meter.clone());
         let result = interp.run(&content, &resources, 0);
+        if annotations && result.is_ok() {
+            interp.draw_annotations(page, &resources);
+        }
         let boxed_characters = interp.boxed;
         let boxed_causes = interp.boxed_by;
         let absent_glyphs = interp.absent;

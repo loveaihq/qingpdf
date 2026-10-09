@@ -495,8 +495,10 @@ impl Interp<'_> {
         let doc = self.doc;
         let Some(gref) = sd.get("G").and_then(Object::as_obj_ref) else { return Ok(None) };
         let luminosity = sd.get_name("S").is_some_and(|s| s.as_bytes() == b"Luminosity");
-        let Ok(Object::Stream(stream)) = doc.resolve(&Object::Ref(gref)) else { return Ok(None) };
-        let Some(form) = self.load_form(&stream, Some(gref))? else { return Ok(None) };
+        let group_ref = Object::Ref(gref);
+        let Ok(Some(group)) = self.work.resolve(doc, &group_ref) else { return Ok(None) };
+        let Object::Stream(stream) = &*group else { return Ok(None) };
+        let Some(form) = self.load_form(stream, Some(gref))? else { return Ok(None) };
         // Where the group can show: its box under the matrices, inside the clip.
         let m = mul(&mul(&form.matrix, &self.gs.ctm), &self.base);
         let clip = self.gs.clip.rect;
@@ -579,12 +581,13 @@ impl Interp<'_> {
     /// `/BC` of a soft mask in the colour space of its group, as RGB (black when there is none).
     fn mask_backdrop(&mut self, sd: &Dict, group_form: &Dict, res: &Rc<Resources>) -> [f32; 3] {
         let doc = self.doc;
-        let Some(Object::Array(bc)) = sd.get("BC").and_then(|o| doc.resolve(o).ok()) else { return [0.0; 3] };
-        let comps: Vec<f64> = bc.iter().filter_map(|o| doc.resolve(o).ok().and_then(|o| o.as_f64())).collect();
+        let backdrop = self.entry(sd, "BC");
+        let Some(Object::Array(bc)) = backdrop.as_deref() else { return [0.0; 3] };
+        let comps: Vec<f64> = bc.iter().filter_map(|o| self.work.read(doc, o).and_then(|o| o.as_f64())).collect();
         let lookup = |n: &[u8]| res.get(doc, Cat::ColorSpace, n);
         let space = group_form
             .get("Group")
-            .and_then(|g| doc.resolve(g).ok())
+            .and_then(|g| self.work.read(doc, g))
             .and_then(|g| g.as_dict().and_then(|g| g.get("CS").cloned()))
             .and_then(|cs| ColorSpace::load(doc, &cs, &lookup, &self.meter))
             .filter(|s| s.components() == comps.len());
@@ -600,7 +603,7 @@ impl Interp<'_> {
     fn mask_transfer(&mut self, sd: &Dict) -> Option<Vec<u8>> {
         let doc = self.doc;
         let obj = sd.get("TR")?;
-        if matches!(doc.resolve(obj).ok()?, Object::Name(_)) {
+        if matches!(&*self.work.read(doc, obj)?, Object::Name(_)) {
             return None;
         }
         let f = super::super::func::Function::load(doc, obj)?;
@@ -782,36 +785,33 @@ impl Interp<'_> {
 
     fn read_pattern(&mut self, entry: &Object, key: Option<ObjRef>, res: &Rc<Resources>) -> Option<Rc<PatternDef>> {
         let doc = self.doc;
-        let resolved = match doc.resolve(entry) {
-            Ok(o) => o,
+        let resolved = match self.work.resolve(doc, entry) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                if !self.work.is_over() {
+                    self.warn("a pattern could not be read");
+                }
+                return None;
+            }
             Err(e) => {
                 self.warn(format!("a pattern could not be read: {e}"));
                 return None;
             }
         };
-        let dict = resolved.as_dict()?.clone();
-        let matrix = match dict.get("Matrix").and_then(|o| doc.resolve(o).ok()) {
-            Some(Object::Array(a)) if a.len() == 6 => {
-                let mut m = IDENTITY;
-                for (slot, v) in m.iter_mut().zip(&a) {
-                    *slot = doc.resolve(v).ok().and_then(|o| o.as_f64()).unwrap_or(*slot);
-                }
-                if finite(&m) { m } else { IDENTITY }
-            }
-            _ => IDENTITY,
-        };
-        let number = |k: &str| dict.get(k).and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_f64()).filter(|v| v.is_finite());
-        match dict.get("PatternType").and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_int()) {
+        let dict = resolved.as_dict()?;
+        let matrix = self.matrix_of(dict.get("Matrix"), IDENTITY);
+        let number = |k: &str| self.number(dict, k).filter(|v| v.is_finite());
+        match self.entry(dict, "PatternType").and_then(|o| o.as_int()) {
             Some(2) => {
                 let shading = self.load_shading(dict.get("Shading")?, res, None)?;
                 Some(Rc::new(PatternDef::Shading { shading, matrix }))
             }
             Some(1) => {
-                let Object::Stream(stream) = &resolved else { return None };
-                let bbox = crate::document::rectangle(dict.get("BBox").and_then(|o| doc.resolve(o).ok()).as_ref())?;
+                let Object::Stream(stream) = &*resolved else { return None };
+                let bbox = self.work.rectangle(doc, dict.get("BBox"))?;
                 let bbox = [bbox[0].min(bbox[2]), bbox[1].min(bbox[3]), bbox[0].max(bbox[2]), bbox[1].max(bbox[3])];
                 let (xstep, ystep) = (number("XStep").unwrap_or(bbox[2] - bbox[0]), number("YStep").unwrap_or(bbox[3] - bbox[1]));
-                let paint_type = dict.get("PaintType").and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_int()).unwrap_or(1);
+                let paint_type = self.entry(dict, "PaintType").and_then(|o| o.as_int()).unwrap_or(1);
                 let content = match doc.decode_stream(stream) {
                     Ok(c) => c,
                     Err(e) => {
@@ -823,7 +823,7 @@ impl Interp<'_> {
                 if !self.work.charge(content.len() as f64 * cost::DECODE_BYTE) {
                     return None;
                 }
-                let resources = dict.get("Resources").map(|r| Resources::new(doc, Some(r)));
+                let resources = dict.get("Resources").map(|r| self.resources_of(r));
                 Some(Rc::new(PatternDef::Tiling(Rc::new(TilingDef {
                     obj: key.unwrap_or(ObjRef::new(0, 0)),
                     paint_type,
@@ -1050,8 +1050,10 @@ impl Interp<'_> {
         if let Some(v) = self.shared.xobject_shown.get(&r) {
             return *v;
         }
-        let shown = match self.doc.resolve(&Object::Ref(r)) {
-            Ok(Object::Stream(s)) => s.dict.get("OC").is_none_or(|o| oc.visible(self.doc, o, None, &mut self.work)),
+        let target = Object::Ref(r);
+        let held = self.work.read(self.doc, &target);
+        let shown = match held.as_deref() {
+            Some(Object::Stream(s)) => s.dict.get("OC").is_none_or(|o| oc.visible(self.doc, o, None, &mut self.work)),
             _ => true,
         };
         if self.work.is_over() {

@@ -681,14 +681,29 @@ fn main() -> Result<(), String> {
     println!("  grown by tricky fonts (3b2): {tricky_grown} bytes ({:.0} KB)  (target <= 0.15 MB; the size recorded at 3b2)  {}", tricky_grown as f64 / 1000.0, verdict(tricky_growth_ok));
 
     // Layer 3, step 3c (transparency, shadings, patterns, optional content, the CMYK table): at most 0.4 MB more than the
-    // 2,267,648 bytes before it.
-    let transparency_grown = bytes.saturating_sub(BEFORE_3C);
+    // 2,267,648 bytes before it (2,407,424 bytes when 3c was finished).
+    const AFTER_3C: u64 = 2_407_424;
+    let transparency_grown = AFTER_3C.saturating_sub(BEFORE_3C);
     let transparency_growth_ok = transparency_grown <= 400_000;
-    println!("  grown by transparency (3c): {transparency_grown} bytes ({:.0} KB)  (target <= 0.4 MB)  {}", transparency_grown as f64 / 1000.0, verdict(transparency_growth_ok));
+    println!("  grown by transparency (3c): {transparency_grown} bytes ({:.0} KB)  (target <= 0.4 MB; the size recorded at 3c)  {}", transparency_grown as f64 / 1000.0, verdict(transparency_growth_ok));
+
+    // Layer 3, step 3c2: JBIG2 at most 0.15 MB (2,534,912 bytes when finished), JPX at most 0.25 MB (2,780,672 bytes when
+    // finished), annotation appearances at most 0.05 MB more than that.
+    const AFTER_JBIG2: u64 = 2_534_912;
+    const AFTER_JPX: u64 = 2_780_672;
+    let jbig2_grown = AFTER_JBIG2.saturating_sub(AFTER_3C);
+    let jbig2_growth_ok = jbig2_grown <= 150_000;
+    println!("  grown by JBIG2 (3c2-1):   {jbig2_grown} bytes ({:.0} KB)  (target <= 0.15 MB; the size recorded at 3c2-1)  {}", jbig2_grown as f64 / 1000.0, verdict(jbig2_growth_ok));
+    let jpx_grown = AFTER_JPX.saturating_sub(AFTER_JBIG2);
+    let jpx_growth_ok = jpx_grown <= 250_000;
+    println!("  grown by JPX (3c2-2):     {jpx_grown} bytes ({:.0} KB)  (target <= 0.25 MB; the size recorded at 3c2-2)  {}", jpx_grown as f64 / 1000.0, verdict(jpx_growth_ok));
+    let annots_grown = bytes.saturating_sub(AFTER_JPX);
+    let annots_growth_ok = annots_grown <= 50_000;
+    println!("  grown by annotations (3c2-3): {annots_grown} bytes ({:.0} KB)  (target <= 0.05 MB)  {}", annots_grown as f64 / 1000.0, verdict(annots_growth_ok));
 
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
     let render_ok = render_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && transparency_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && transparency_growth_ok && jbig2_growth_ok && jpx_growth_ok && annots_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

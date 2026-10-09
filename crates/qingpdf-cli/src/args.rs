@@ -62,7 +62,7 @@ pub enum Request {
     Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool, password: String },
     Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
-    Render { input: PathBuf, pages: Option<String>, dpi: f64, output: String, force: bool, password: String },
+    Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
 }
 
@@ -96,13 +96,15 @@ struct Allowed {
     angle: bool,
     page: bool,
     dpi: bool,
+    /// `--no-annots`: `render` only.
+    no_annots: bool,
     /// `--password`: every command that reads a PDF file.
     password: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
     let none =
-        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, password: false };
+        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, no_annots: false, password: false };
     match c {
         Command::Info => Allowed { password: true, ..none },
         Command::Merge => Allowed { output: true, force: true, password: true, ..none },
@@ -111,7 +113,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
         Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
-        Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, password: true, ..none },
+        Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
     }
 }
@@ -122,6 +124,7 @@ struct Collected {
     inputs: Vec<PathBuf>,
     output: Option<PathBuf>,
     force: bool,
+    no_annots: bool,
     pages: Option<String>,
     every: Option<String>,
     angle: Option<String>,
@@ -198,6 +201,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 got.force = true;
                 continue;
             }
+            "--no-annots" if ok.no_annots => {
+                if inline.is_some() {
+                    return Err(usage(c, "--no-annots does not take a value"));
+                }
+                got.no_annots = true;
+                continue;
+            }
             _ => {
                 // Show the option, never what was given with it: that may be a password.
                 let shown = name.split('=').next().unwrap_or("");
@@ -252,7 +262,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, pages, every, angle, page, dpi, password } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -330,7 +340,7 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                     .filter(|v| v.is_finite() && (qingpdf_core::render::MIN_DPI..=qingpdf_core::render::MAX_DPI).contains(v))
                     .ok_or_else(|| usage(c, format!("--dpi must be a number from 1 to 2400, not '{d}'")))?,
             };
-            Ok(Request::Render { input, pages, dpi, output, force, password })
+            Ok(Request::Render { input, pages, dpi, annots: !no_annots, output, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {
@@ -512,6 +522,18 @@ mod tests {
         assert!(!message.contains("topsecret"), "{message}");
         let message = fails(&["info", "a.pdf", "--passwrd=topsecret"]);
         assert!(message.contains("--passwrd") && !message.contains("topsecret"), "{message}");
+    }
+
+    #[test]
+    fn render_draws_annotations_unless_told_not_to() {
+        let annots = |args: &[&str]| match run(args) {
+            Request::Render { annots, .. } => annots,
+            other => panic!("{other:?}"),
+        };
+        assert!(annots(&["render", "a.pdf", "-o", "p.png"]));
+        assert!(!annots(&["render", "a.pdf", "--no-annots", "-o", "p.png"]));
+        assert!(fails(&["render", "a.pdf", "--no-annots=1", "-o", "p.png"]).contains("--no-annots"));
+        assert!(fails(&["text", "a.pdf", "--no-annots"]).contains("unknown option '--no-annots'"));
     }
 
     #[test]

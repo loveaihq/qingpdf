@@ -28,10 +28,14 @@ use super::image::{self, Loaded};
 use super::jbig2;
 use super::oc::OcConfig;
 use super::shading::{self, Shading};
-use super::work::Work;
+use super::work::{Held, Work, cost};
 
+mod annots;
 mod layers;
 mod text;
+
+#[cfg(test)]
+pub(crate) use annots::MAX_ANNOTS;
 
 use layers::{Ink, PatternDef, PatternPaint, ShadeEntry, SmKey, SoftMask, Tile, TileKey};
 
@@ -152,7 +156,10 @@ pub(crate) struct Resources {
 
 impl Resources {
     pub fn new(doc: &Document, resources: Option<&Object>) -> Rc<Resources> {
-        let dict = resources.and_then(|r| doc.resolve(r).ok()).and_then(|o| o.as_dict().cloned()).unwrap_or_default();
+        Resources::of(resources.and_then(|r| doc.resolve(r).ok()).and_then(|o| o.as_dict().cloned()).unwrap_or_default())
+    }
+
+    fn of(dict: Dict) -> Rc<Resources> {
         Rc::new(Resources {
             id: RESOURCES_SERIAL.fetch_add(1, Ordering::Relaxed),
             dict,
@@ -304,6 +311,8 @@ pub(crate) struct Shared {
     pub cmaps: HashMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
     forms: FxMap<ObjRef, Option<Rc<Form>>>,
+    /// Resource dictionaries that are objects of their own, each made once however many forms share it.
+    resources: FxMap<ObjRef, Rc<Resources>>,
     cache_bytes: usize,
     images: HashMap<ImageKey, Rc<Prepared>>,
     image_bytes: usize,
@@ -669,6 +678,50 @@ impl<'a> Interp<'a> {
         }
     }
 
+
+    /// The entry `key` of `d`, read through the page's meter ([`Work::resolve`]: a reference is read once and kept).
+    fn entry<'d>(&self, d: &'d Dict, key: &str) -> Option<Held<'d>> {
+        d.get(key).and_then(|o| self.work.read(self.doc, o))
+    }
+
+    fn number(&self, d: &Dict, key: &str) -> Option<f64> {
+        self.entry(d, key).and_then(|o| o.as_f64())
+    }
+
+    /// A matrix of six numbers (8.3.3), each written in place or by reference; `default` for the whole of it when it is
+    /// not an array of six, and for any number that is not one.
+    fn matrix_of(&self, o: Option<&Object>, default: Matrix) -> Matrix {
+        let held = o.and_then(|o| self.work.read(self.doc, o));
+        let Some(Object::Array(a)) = held.as_deref() else { return default };
+        if a.len() != 6 {
+            return default;
+        }
+        let mut m = default;
+        for (slot, v) in m.iter_mut().zip(a) {
+            *slot = self.work.read(self.doc, v).and_then(|o| o.as_f64()).filter(|v| v.is_finite()).unwrap_or(*slot);
+        }
+        m
+    }
+
+    /// The resources a form, a pattern or a Type 3 font names with `o`. A dictionary that is an object of its own is read
+    /// through the page's meter and made once, however many forms (a thousand annotations' appearance streams, say)
+    /// name it; what is not kept is paid for by the copy each time.
+    fn resources_of(&mut self, o: &Object) -> Rc<Resources> {
+        let Object::Ref(r) = o else { return Resources::new(self.doc, Some(o)) };
+        if let Some(hit) = self.shared.resources.get(r) {
+            return hit.clone();
+        }
+        let dict = self.work.read(self.doc, o).and_then(|h| h.as_dict().cloned()).unwrap_or_default();
+        let size = dict.approx_size();
+        let made = Resources::of(dict);
+        if self.shared.cache_bytes.saturating_add(size) <= MAX_CACHE_BYTES {
+            self.shared.cache_bytes += size;
+            self.shared.resources.insert(*r, made.clone());
+        } else {
+            self.work.spend(size as f64 * cost::RESOLVE_DATA_BYTE);
+        }
+        made
+    }
 
     /// The units of work the page has used (tests look at it).
     #[cfg(test)]
@@ -1220,7 +1273,16 @@ impl<'a> Interp<'a> {
 
     fn clip_rect_user(&mut self, r: [f64; 4]) -> Result<()> {
         let m = self.full();
-        let corners = [apply(&m, r[0], r[1]), apply(&m, r[2], r[1]), apply(&m, r[2], r[3]), apply(&m, r[0], r[3])];
+        let mut corners = [apply(&m, r[0], r[1]), apply(&m, r[2], r[1]), apply(&m, r[2], r[3]), apply(&m, r[0], r[3])];
+        // A box with no width or no height (a horizontal line's) is a pixel across in that direction: PDFium rounds a
+        // rectangle clip outwards, so what lies on such a box shows.
+        let (min_x, max_x) = corners.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (x, _)| (lo.min(*x), hi.max(*x)));
+        let (min_y, max_y) = corners.iter().fold((f64::MAX, f64::MIN), |(lo, hi), (_, y)| (lo.min(*y), hi.max(*y)));
+        if max_x - min_x < 1e-3 || max_y - min_y < 1e-3 {
+            let (cx, cy) = ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0);
+            let (hx, hy) = ((max_x - min_x).max(1.0) / 2.0, (max_y - min_y).max(1.0) / 2.0);
+            corners = [(cx - hx, cy - hy), (cx + hx, cy - hy), (cx + hx, cy + hy), (cx - hx, cy + hy)];
+        }
         let mut pb = PathBuilder::new();
         for (i, (x, y)) in corners.iter().enumerate() {
             let (x, y) = (x.clamp(-1e7, 1e7) as f32, y.clamp(-1e7, 1e7) as f32);
@@ -1395,49 +1457,54 @@ impl<'a> Interp<'a> {
     fn ext_g_state(&mut self, name: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
         let doc = self.doc;
         let Some(entry) = res.get(doc, Cat::ExtGState, name) else { return Ok(()) };
-        let Ok(Object::Dict(d)) = doc.resolve(&entry) else { return Ok(()) };
-        let num = |k: &str| d.get(k).and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_f64());
-        if let Some(v) = num("LW") {
+        let Ok(Some(held)) = self.work.resolve(doc, &entry) else { return Ok(()) };
+        let Object::Dict(d) = &*held else { return Ok(()) };
+        if let Some(v) = self.number(d, "LW") {
             self.gs.line_width = v.abs();
         }
-        if let Some(v) = num("LC") {
+        if let Some(v) = self.number(d, "LC") {
             self.gs.cap = cap_of(v as i64);
         }
-        if let Some(v) = num("LJ") {
+        if let Some(v) = self.number(d, "LJ") {
             self.gs.join = join_of(v as i64);
         }
-        if let Some(v) = num("ML") {
+        if let Some(v) = self.number(d, "ML") {
             self.gs.miter = v.max(1.0);
         }
-        if let Some(v) = num("CA") {
+        if let Some(v) = self.number(d, "CA") {
             self.gs.stroke_alpha = v.clamp(0.0, 1.0) as f32;
         }
-        if let Some(v) = num("ca") {
+        if let Some(v) = self.number(d, "ca") {
             self.gs.fill_alpha = v.clamp(0.0, 1.0) as f32;
         }
-        if let Some(Object::Array(a)) = d.get("D").and_then(|o| doc.resolve(o).ok()) {
-            let list = a.first().and_then(|o| doc.resolve(o).ok());
-            let phase = a.get(1).and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_f64()).unwrap_or(0.0) as f32;
-            if let Some(Object::Array(items)) = list {
-                let values: Vec<f32> = items.iter().filter_map(|o| doc.resolve(o).ok().and_then(|o| o.as_f64())).map(|v| v as f32).collect();
+        if let Some(dash) = self.entry(d, "D")
+            && let Object::Array(a) = &*dash
+        {
+            let list = a.first().and_then(|o| self.work.read(doc, o));
+            let phase = a.get(1).and_then(|o| self.work.read(doc, o)).and_then(|o| o.as_f64()).unwrap_or(0.0) as f32;
+            if let Some(Object::Array(items)) = list.as_deref() {
+                let values: Vec<f32> = items.iter().filter_map(|o| self.work.read(doc, o).and_then(|o| o.as_f64())).map(|v| v as f32).collect();
                 self.gs.dash = dash_of(values, phase).map(Rc::new);
             }
         }
-        if let Some(Object::Array(a)) = d.get("Font").and_then(|o| doc.resolve(o).ok())
-            && let (Some(Object::Ref(r)), Some(size)) = (a.first(), a.get(1).and_then(|o| doc.resolve(o).ok()).and_then(|o| o.as_f64()))
+        if let Some(font) = self.entry(d, "Font")
+            && let Object::Array(a) = &*font
+            && let (Some(Object::Ref(r)), Some(size)) = (a.first(), a.get(1).and_then(|o| self.work.read(doc, o)).and_then(|o| o.as_f64()))
         {
             self.gs.font = self.font_from_ref(*r);
             self.gs.size = size;
         }
-        if let Some(b) = d.get("BM").and_then(|o| doc.resolve(o).ok()) {
+        if let Some(b) = self.entry(d, "BM") {
             self.gs.blend = blend_of(&b);
         }
-        if let Some(Object::Bool(v)) = d.get("AIS").and_then(|o| doc.resolve(o).ok()) {
+        if let Some(ais) = self.entry(d, "AIS")
+            && let Object::Bool(v) = *ais
+        {
             self.gs.ais = v;
         }
-        match d.get("SMask").and_then(|o| doc.resolve(o).ok()) {
+        match self.entry(d, "SMask").as_deref() {
             Some(Object::Dict(sd)) => {
-                self.gs.smask = self.make_soft_mask(&sd, res, depth)?;
+                self.gs.smask = self.make_soft_mask(sd, res, depth)?;
             }
             Some(Object::Name(_)) => self.gs.smask = None,
             _ => {}
@@ -1519,24 +1586,17 @@ impl<'a> Interp<'a> {
 
     fn load_type3(&mut self, d: &Dict) -> Option<Type3> {
         let doc = self.doc;
-        let matrix = match d.get("FontMatrix").and_then(|o| doc.resolve(o).ok()) {
-            Some(Object::Array(a)) if a.len() == 6 => {
-                let mut m = [0.001, 0.0, 0.0, 0.001, 0.0, 0.0];
-                for (slot, v) in m.iter_mut().zip(&a) {
-                    *slot = doc.resolve(v).ok().and_then(|o| o.as_f64()).filter(|v| v.is_finite()).unwrap_or(*slot);
-                }
-                m
-            }
-            _ => [0.001, 0.0, 0.0, 0.001, 0.0, 0.0],
-        };
+        let matrix = self.matrix_of(d.get("FontMatrix"), [0.001, 0.0, 0.0, 0.001, 0.0, 0.0]);
         let mut names: Vec<Option<Vec<u8>>> = vec![None; 256];
-        if let Some(Object::Dict(enc)) = d.get("Encoding").and_then(|o| doc.resolve(o).ok())
-            && let Some(Object::Array(items)) = enc.get("Differences").and_then(|o| doc.resolve(o).ok())
+        let encoding = self.entry(d, "Encoding");
+        if let Some(Object::Dict(enc)) = encoding.as_deref()
+            && let Some(differences) = self.entry(enc, "Differences")
+            && let Object::Array(items) = &*differences
         {
             let mut code: Option<usize> = None;
-            for item in &items {
-                match doc.resolve(item).ok() {
-                    Some(Object::Integer(n)) => code = usize::try_from(n).ok(),
+            for item in items {
+                match self.work.read(doc, item).as_deref() {
+                    Some(Object::Integer(n)) => code = usize::try_from(*n).ok(),
                     Some(Object::Name(n)) => {
                         if let Some(c) = code {
                             if let Some(slot) = names.get_mut(c) {
@@ -1549,11 +1609,11 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let procs = match d.get("CharProcs").and_then(|o| doc.resolve(o).ok()) {
-            Some(Object::Dict(p)) => p.into_pairs().into_iter().map(|(k, v)| (k.0, v)).collect(),
+        let procs = match self.entry(d, "CharProcs").as_deref() {
+            Some(Object::Dict(p)) => p.clone().into_pairs().into_iter().map(|(k, v)| (k.0, v)).collect(),
             _ => return None,
         };
-        let resources = d.get("Resources").map(|r| Resources::new(doc, Some(r)));
+        let resources = d.get("Resources").map(|r| self.resources_of(r));
         Some(Type3 { matrix, names, procs, resources, cache: RefCell::new(FxMap::default()) })
     }
 
@@ -1673,13 +1733,9 @@ impl<'a> Interp<'a> {
     fn load_glyph_proc(&mut self, t3: &Type3, code: u8) -> Result<Option<Rc<Vec<u8>>>> {
         let Some(Some(name)) = t3.names.get(usize::from(code)) else { return Ok(None) };
         let Some(entry) = t3.procs.get(name) else { return Ok(None) };
-        let obj = match self.doc.resolve(entry) {
-            Ok(o) => o,
-            Err(Error::Limit(m)) => return Err(Error::Limit(m)),
-            Err(_) => return Ok(None),
-        };
-        let Object::Stream(s) = obj else { return Ok(None) };
-        match self.doc.decode_stream(&s) {
+        let Some(held) = self.work.resolve(self.doc, entry)? else { return Ok(None) };
+        let Object::Stream(s) = &*held else { return Ok(None) };
+        match self.doc.decode_stream(s) {
             Ok(data) => {
                 self.shared.cache_bytes = self.shared.cache_bytes.saturating_add(data.len());
                 Ok(Some(Rc::new(data)))
@@ -1719,20 +1775,18 @@ impl<'a> Interp<'a> {
                 return self.run_form(r, &form, res, depth);
             }
         }
-        let obj = match doc.resolve(&entry) {
-            Ok(o) => o,
-            Err(Error::Limit(m)) => return Err(Error::Limit(m)),
-            Err(e) => {
-                self.warn(format!("XObject /{} could not be read: {e}", String::from_utf8_lossy(name)));
-                return Ok(());
+        let Some(held) = self.work.resolve(doc, &entry)? else {
+            if !self.work.is_over() {
+                self.warn(format!("XObject /{} could not be read", String::from_utf8_lossy(name)));
             }
+            return Ok(());
         };
-        let Object::Stream(stream) = obj else { return Ok(()) };
+        let Object::Stream(stream) = &*held else { return Ok(()) };
         let subtype = stream.dict.get_name("Subtype").map(|n| n.as_bytes().to_vec());
         match subtype.as_deref() {
-            Some(b"Image") => self.draw_image(&stream, r, res),
-            Some(b"Form") => self.draw_form(&stream, r, res, depth),
-            None if stream.dict.contains_key("BBox") => self.draw_form(&stream, r, res, depth),
+            Some(b"Image") => self.draw_image(stream, r, res),
+            Some(b"Form") => self.draw_form(stream, r, res, depth),
+            None if stream.dict.contains_key("BBox") => self.draw_form(stream, r, res, depth),
             _ => Ok(()),
         }
     }
@@ -1781,21 +1835,12 @@ impl<'a> Interp<'a> {
                 return Ok(None);
             }
         };
-        let matrix = match stream.dict.get("Matrix").and_then(|o| doc.resolve(o).ok()) {
-            Some(Object::Array(a)) if a.len() == 6 => {
-                let mut m = IDENTITY;
-                for (slot, v) in m.iter_mut().zip(&a) {
-                    *slot = doc.resolve(v).ok().and_then(|o| o.as_f64()).unwrap_or(*slot);
-                }
-                if finite(&m) { m } else { IDENTITY }
-            }
-            _ => IDENTITY,
-        };
-        let bbox = crate::document::rectangle(stream.dict.get("BBox").and_then(|o| doc.resolve(o).ok()).as_ref());
-        let resources = stream.dict.get("Resources").map(|res| Resources::new(doc, Some(res)));
-        let group = match stream.dict.get("Group").and_then(|g| doc.resolve(g).ok()) {
+        let matrix = self.matrix_of(stream.dict.get("Matrix"), IDENTITY);
+        let bbox = self.work.rectangle(doc, stream.dict.get("BBox"));
+        let resources = stream.dict.get("Resources").map(|res| self.resources_of(res));
+        let group = match self.entry(&stream.dict, "Group").as_deref() {
             Some(Object::Dict(g)) if g.get_name("S").is_some_and(|s| s.as_bytes() == b"Transparency") => {
-                let flag = |k: &str| matches!(g.get(k).and_then(|o| doc.resolve(o).ok()), Some(Object::Bool(true)));
+                let flag = |k: &str| matches!(self.entry(g, k).as_deref(), Some(Object::Bool(true)));
                 Some(Group { isolated: flag("I"), knockout: flag("K") })
             }
             _ => None,

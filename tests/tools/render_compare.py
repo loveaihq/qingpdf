@@ -15,7 +15,11 @@ pages that use something of step 3c; the boxes are tallied by cause. The box cou
 the warning `page N: K characters are drawn as outline boxes (...)` that `qingpdf render` prints.
 
     python tests/tools/render_compare.py --engine-compare [path/to/qingpdf.exe]
-        [--dpi 72] [--max-pages 8] [--threshold 3.0] [--only substring]
+        [--dpi 72] [--max-pages 8] [--threshold 3.0] [--only substring] [--no-annots]
+
+Annotations are drawn on both sides (step 3c2-3: `qingpdf render` by default; PDFium with FPDF_ANNOT, and with its form
+fill environment so that it draws form fields too). `--no-annots` leaves them out on both sides, which is the comparison
+made before that step.
 """
 
 import argparse
@@ -40,6 +44,7 @@ _ap.add_argument("--dpi", type=float, default=72.0)
 _ap.add_argument("--max-pages", type=int, default=8)
 _ap.add_argument("--threshold", type=float, default=3.0)
 _ap.add_argument("--only", default="")
+_ap.add_argument("--no-annots", action="store_true", help="draw no annotations, on either side")
 _ap.add_argument("--all", action="store_true", help="list every page at or over the threshold, not just the worst 10")
 _ap.add_argument("--save", default="", help="folder to put side by side pictures (ours | PDFium | difference) of the pages over the threshold")
 ARGS = _ap.parse_args()
@@ -127,6 +132,10 @@ def engine_compare():
                 continue
             try:
                 doc = pdfium.PdfDocument(path)
+                if not ARGS.no_annots:
+                    # The form fill environment is what makes PDFium draw form fields (widgets); with the
+                    # annotation flag alone it leaves them out.
+                    doc.init_forms()
                 count = len(doc)
             except Exception:
                 failed.append(f"{rel}: PDFium cannot open it")
@@ -136,7 +145,7 @@ def engine_compare():
                 out = os.path.join(tmp, "page.png")
                 if os.path.exists(out):
                     os.remove(out)
-                run = subprocess.run([QINGPDF, "render", path, "--pages", str(n), "--dpi", str(ARGS.dpi), "-o", out, "--force"],
+                run = subprocess.run([QINGPDF, "render", path, "--pages", str(n), "--dpi", str(ARGS.dpi), "-o", out, "--force"] + (["--no-annots"] if ARGS.no_annots else []),
                                      capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
                 if run.returncode != 0:
                     message = (run.stderr or run.stdout).strip().splitlines()
@@ -152,7 +161,7 @@ def engine_compare():
                 later = "not drawn yet" in run.stderr or "grey block" in run.stderr
                 try:
                     ours = np.asarray(Image.open(out).convert("RGB"), dtype=np.int16)
-                    ref = np.asarray(doc[i].render(scale=ARGS.dpi / 72.0, may_draw_forms=False, draw_annots=False).to_pil().convert("RGB"), dtype=np.int16)
+                    ref = np.asarray(doc[i].render(scale=ARGS.dpi / 72.0, may_draw_forms=not ARGS.no_annots, draw_annots=not ARGS.no_annots).to_pil().convert("RGB"), dtype=np.int16)
                 except Exception as e:
                     failed.append(f"{rel} page {n}: {e}")
                     continue

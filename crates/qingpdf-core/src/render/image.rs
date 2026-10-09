@@ -25,7 +25,7 @@ use super::color::ColorSpace;
 use super::func::Meter;
 use super::jbig2;
 use super::jpx;
-use super::work::Work;
+use super::work::{Held, Work};
 
 /// Most pixels one image may have.
 pub(crate) const MAX_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
@@ -156,17 +156,18 @@ struct Samples {
     alpha: Option<Vec<u8>>,
 }
 
-fn get(dict: &Dict, doc: &Document, key: &str) -> Option<Object> {
-    doc.resolve(dict.get(key)?).ok()
+/// The entry `key` of `dict`, read through the page's meter (a reference is read once for the page and kept).
+fn get<'d>(dict: &'d Dict, env: &Env<'_>, key: &str) -> Option<Held<'d>> {
+    env.work.read(env.doc, dict.get(key)?)
 }
 
-fn int(doc: &Document, dict: &Dict, key: &str) -> Option<i64> {
-    get(dict, doc, key).and_then(|o| o.as_int().or_else(|| o.as_f64().map(|f| f as i64)))
+fn int(env: &Env<'_>, dict: &Dict, key: &str) -> Option<i64> {
+    get(dict, env, key).and_then(|o| o.as_int().or_else(|| o.as_f64().map(|f| f as i64)))
 }
 
-fn number_list(doc: &Document, obj: &Object) -> Option<Vec<f64>> {
+fn number_list(env: &Env<'_>, obj: &Object) -> Option<Vec<f64>> {
     let items = obj.as_array()?;
-    items.iter().map(|o| doc.resolve(o).ok().and_then(|o| o.as_f64()).filter(|v| v.is_finite())).collect()
+    items.iter().map(|o| env.work.read(env.doc, o).and_then(|o| o.as_f64()).filter(|v| v.is_finite())).collect()
 }
 
 const SPECIAL: [&[u8]; 4] = [b"DCTDecode", b"CCITTFaxDecode", b"JBIG2Decode", b"JPXDecode"];
@@ -175,16 +176,16 @@ const SPECIAL: [&[u8]; 4] = [b"DCTDecode", b"CCITTFaxDecode", b"JBIG2Decode", b"
 pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> Result<Loaded> {
     let doc = env.doc;
     let dict = &stream.dict;
-    let w = int(doc, dict, "Width").unwrap_or(0);
-    let h = int(doc, dict, "Height").unwrap_or(0);
+    let w = int(env, dict, "Width").unwrap_or(0);
+    let h = int(env, dict, "Height").unwrap_or(0);
     if w <= 0 || h <= 0 || (w as u64).saturating_mul(h as u64) > MAX_IMAGE_PIXELS {
         return Err(Error::Limit(format!("image of {w} by {h} pixels is empty or too large")));
     }
     let (w, h) = (w as usize, h as usize);
-    let is_mask = matches!(get(dict, doc, "ImageMask"), Some(Object::Bool(true)));
-    let declared_bpc = int(doc, dict, "BitsPerComponent");
+    let is_mask = matches!(get(dict, env, "ImageMask").as_deref(), Some(Object::Bool(true)));
+    let declared_bpc = int(env, dict, "BitsPerComponent");
     // (A JPEG 2000 file has its own bits per sample: the dictionary's entry is ignored, 7.4.9.)
-    let is_jpx = filter_list(doc, dict).iter().any(|n| n.as_bytes() == b"JPXDecode");
+    let is_jpx = filter_list(env, dict).iter().any(|n| n.as_bytes() == b"JPXDecode");
     let bpc = if is_mask { 1 } else if is_jpx { 8 } else { declared_bpc.unwrap_or(8) };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return Err(Error::Invalid(format!("image with {bpc} bits per component")));
@@ -193,9 +194,9 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     let space: Option<Arc<ColorSpace>> = if is_mask {
         None
     } else {
-        get(dict, doc, "ColorSpace").and_then(|o| ColorSpace::load(doc, &o, env.lookup, env.meter))
+        get(dict, env, "ColorSpace").and_then(|o| ColorSpace::load(doc, &o, env.lookup, env.meter))
     };
-    let has_mask = !is_mask && ["SMask", "Mask"].iter().any(|k| matches!(get(dict, doc, k), Some(Object::Stream(_))));
+    let has_mask = !is_mask && ["SMask", "Mask"].iter().any(|k| matches!(get(dict, env, k).as_deref(), Some(Object::Stream(_))));
     // The size the picture is made at: the image's own, shrunk to its place on the device (and to a size we can hold).
     let out_size = |w: usize, h: usize| -> (usize, usize) {
         let (mut out_w, mut out_h) = (w.min(env.target.0).max(1), h.min(env.target.1).max(1));
@@ -209,7 +210,7 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     // The mask is made first when the picture's size is known now (not so for a JPEG, which says how big it is itself):
     // its buffers are gone before the picture's are made, so the two are never held together.
     let mut alpha = None;
-    let alpha_made = has_mask && !filter_list(doc, dict).iter().any(|n| matches!(n.as_bytes(), b"DCTDecode" | b"JPXDecode"));
+    let alpha_made = has_mask && !filter_list(env, dict).iter().any(|n| matches!(n.as_bytes(), b"DCTDecode" | b"JPXDecode"));
     if alpha_made {
         let (out_w, out_h) = out_size(w, h);
         alpha = soft_alpha(env, dict, out_w, out_h, warnings)?;
@@ -222,7 +223,7 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     let (w, h) = (samples.w, samples.h);
     let file_alpha = samples.alpha.take();
     // (A JPEG 2000 picture has its own range of samples: /Decode is ignored, unless the picture is a stencil mask, 7.4.9.)
-    let decode = get(dict, doc, "Decode").and_then(|o| number_list(doc, &o)).filter(|_| is_mask || !is_jpx);
+    let decode = get(dict, env, "Decode").and_then(|o| number_list(env, &o)).filter(|_| is_mask || !is_jpx);
     let space = if is_mask {
         None
     } else {
@@ -239,7 +240,7 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     let mut pixels = match &space {
         None => resample(&samples, &stencil_plan(decode.as_deref(), env.fill), None, out_w, out_h),
         Some(space) => {
-            let key = color_key(doc, dict, &samples);
+            let key = color_key(env, dict, &samples);
             let plan = color_plan(&samples, space, decode.as_deref(), key.clone(), env.meter);
             resample(&samples, &plan, key.as_deref(), out_w, out_h)
         }
@@ -283,18 +284,18 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
 
 /// The alpha of the image's `/SMask` or `/Mask` (8.9.6) for `ow` by `oh` pixels; `None`: it has none we can use.
 fn soft_alpha(env: &Env<'_>, dict: &Dict, ow: usize, oh: usize, warnings: &mut Warnings) -> Result<Option<Vec<u8>>> {
-    if let Some(Object::Stream(mask)) = get(dict, env.doc, "SMask") {
-        mask_alpha(env, &mask, false, ow, oh, warnings)
-    } else if let Some(Object::Stream(mask)) = get(dict, env.doc, "Mask") {
-        mask_alpha(env, &mask, true, ow, oh, warnings)
+    if let Some(Object::Stream(mask)) = get(dict, env, "SMask").as_deref() {
+        mask_alpha(env, mask, false, ow, oh, warnings)
+    } else if let Some(Object::Stream(mask)) = get(dict, env, "Mask").as_deref() {
+        mask_alpha(env, mask, true, ow, oh, warnings)
     } else {
         Ok(None)
     }
 }
 
 /// `/Mask [min max ...]` (8.9.6.4): ranges of raw sample values that are not painted.
-fn color_key(doc: &Document, dict: &Dict, samples: &Samples) -> Option<Vec<(u16, u16)>> {
-    let list = number_list(doc, &get(dict, doc, "Mask")?)?;
+fn color_key(env: &Env<'_>, dict: &Dict, samples: &Samples) -> Option<Vec<(u16, u16)>> {
+    let list = number_list(env, &*get(dict, env, "Mask")?)?;
     if list.len() != samples.ncomp * 2 {
         return None;
     }
@@ -302,10 +303,10 @@ fn color_key(doc: &Document, dict: &Dict, samples: &Samples) -> Option<Vec<(u16,
 }
 
 /// The names in a stream's `/Filter`.
-fn filter_list(doc: &Document, dict: &Dict) -> Vec<Name> {
-    match get(dict, doc, "Filter") {
-        Some(Object::Name(n)) => vec![n],
-        Some(Object::Array(items)) => items.iter().filter_map(|o| doc.resolve(o).ok().and_then(|o| o.as_name().cloned())).collect(),
+fn filter_list(env: &Env<'_>, dict: &Dict) -> Vec<Name> {
+    match get(dict, env, "Filter").as_deref() {
+        Some(Object::Name(n)) => vec![n.clone()],
+        Some(Object::Array(items)) => items.iter().filter_map(|o| env.work.read(env.doc, o).and_then(|o| o.as_name().cloned())).collect(),
         _ => Vec::new(),
     }
 }
@@ -324,10 +325,10 @@ fn read_samples(
     let doc = env.doc;
     let dict = &stream.dict;
     // The filter list, up to the first one that is an image codec.
-    let names = filter_list(doc, dict);
-    let parms: Vec<Option<Dict>> = match get(dict, doc, "DecodeParms") {
-        Some(Object::Dict(d)) => vec![Some(d)],
-        Some(Object::Array(items)) => items.iter().map(|o| doc.resolve(o).ok().and_then(|o| if let Object::Dict(d) = o { Some(d) } else { None })).collect(),
+    let names = filter_list(env, dict);
+    let parms: Vec<Option<Dict>> = match get(dict, env, "DecodeParms").as_deref() {
+        Some(Object::Dict(d)) => vec![Some(d.clone())],
+        Some(Object::Array(items)) => items.iter().map(|o| env.work.read(doc, o).and_then(|o| if let Object::Dict(d) = &*o { Some(d.clone()) } else { None })).collect(),
         _ => Vec::new(),
     };
     let special = names.iter().position(|n| SPECIAL.contains(&n.as_bytes()));
@@ -358,8 +359,8 @@ fn read_samples(
     match codec.as_bytes() {
         b"DCTDecode" => jpeg(env, &data, (w as u64).saturating_mul(h as u64)).map(Some),
         b"CCITTFaxDecode" => {
-            let p = |key: &str| parm.as_ref().and_then(|d| d.get(key)).and_then(|o| doc.resolve(o).ok());
-            let flag = |key: &str| matches!(p(key), Some(Object::Bool(true)));
+            let p = |key: &str| parm.as_ref().and_then(|d| d.get(key)).and_then(|o| env.work.read(doc, o));
+            let flag = |key: &str| matches!(p(key).as_deref(), Some(Object::Bool(true)));
             let columns = p("Columns").and_then(|o| o.as_int()).filter(|&c| c > 0).unwrap_or(1728) as usize;
             if columns > MAX_CCITT_COLUMNS {
                 return Err(Error::Limit("CCITT image too wide".to_string()));
@@ -404,7 +405,7 @@ fn read_samples(
         b"JBIG2Decode" => {
             let entry = parm.as_ref().and_then(|d| d.get("JBIG2Globals"));
             // Read only when the page has not decoded this stream already.
-            let load = || entry.and_then(|o| doc.resolve(o).ok()).and_then(|o| if let Object::Stream(s) = o { doc.decode_stream_limited(&s, MAX_IMAGE_BYTES).ok() } else { None });
+            let load = || entry.and_then(|o| env.work.read(doc, o)).and_then(|o| if let Object::Stream(s) = &*o { doc.decode_stream_limited(s, MAX_IMAGE_BYTES).ok() } else { None });
             let globals = entry.map(|o| jbig2::GlobalsSource { key: o.as_obj_ref(), cache: env.globals, load: &load });
             let page = match jbig2::decode_with_globals(&data, globals, (w, h), env.work) {
                 Ok(p) => p,
@@ -424,7 +425,7 @@ fn read_samples(
         }
         _ => {
             // JPXDecode.
-            let alpha = match int(doc, dict, "SMaskInData") {
+            let alpha = match int(env, dict, "SMaskInData") {
                 Some(1) => jpx::Alpha::Straight,
                 Some(2) => jpx::Alpha::Premultiplied,
                 _ => jpx::Alpha::Ignore,
@@ -1084,20 +1085,20 @@ fn comps_pixel(space: &ColorSpace, luts: &[Vec<f32>], meter: &Meter, a: &[f32], 
 /// An explicit mask or a soft mask as alpha for `ow` by `oh` pixels (`None`: the mask is not usable).
 fn mask_alpha(env: &Env<'_>, mask: &Stream, stencil: bool, ow: usize, oh: usize, warnings: &mut Warnings) -> Result<Option<Vec<u8>>> {
     let doc = env.doc;
-    let mw = int(doc, &mask.dict, "Width").unwrap_or(0);
-    let mh = int(doc, &mask.dict, "Height").unwrap_or(0);
+    let mw = int(env, &mask.dict, "Width").unwrap_or(0);
+    let mh = int(env, &mask.dict, "Height").unwrap_or(0);
     if mw <= 0 || mh <= 0 || (mw as u64) * (mh as u64) > MAX_IMAGE_PIXELS {
         return Ok(None);
     }
     env.charge_pixels((mw as u64) * (mh as u64))?;
     let inner = Env { doc, lookup: env.lookup, fill: [0.0; 3], target: (ow, oh), meter: env.meter, pixels_left: env.pixels_left, work: env.work, globals: env.globals };
-    let stencil = stencil || matches!(get(&mask.dict, doc, "ImageMask"), Some(Object::Bool(true)));
-    let bpc = if stencil { 1 } else { int(doc, &mask.dict, "BitsPerComponent").unwrap_or(8) };
+    let stencil = stencil || matches!(get(&mask.dict, env, "ImageMask").as_deref(), Some(Object::Bool(true)));
+    let bpc = if stencil { 1 } else { int(env, &mask.dict, "BitsPerComponent").unwrap_or(8) };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return Ok(None);
     }
     let Some(samples) = read_samples(&inner, mask, mw as usize, mh as usize, bpc as u32, (Some(1), false), warnings)? else { return Ok(None) };
-    let decode = get(&mask.dict, doc, "Decode").and_then(|o| number_list(doc, &o));
+    let decode = get(&mask.dict, env, "Decode").and_then(|o| number_list(env, &o));
     // Shrunk to our size (or left as it is when smaller), then each pixel of ours takes the mask pixel at its middle.
     let (mut rw, mut rh) = (samples.w.min(ow), samples.h.min(oh));
     if rw * rh > MAX_MASK_PIXELS {

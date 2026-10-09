@@ -146,11 +146,14 @@ impl OcConfig {
         {
             return *hit;
         }
-        let Ok(Object::Dict(d)) = doc.resolve(oc) else { return true };
-        let (is_group, shown) = if is_type(&d, "OCMD") {
-            (false, self.membership(doc, &d, work))
-        } else if is_type(&d, "OCG") {
-            (true, self.group_on(r, &d))
+        // (Read through the page's meter: a reference to something else than a group, a membership dictionary or a
+        // dictionary is read once for the page, not for every annotation or operator that names it.)
+        let held = work.read(doc, oc);
+        let Some(Object::Dict(d)) = held.as_deref() else { return true };
+        let (is_group, shown) = if is_type(d, "OCMD") {
+            (false, self.membership(doc, d, work))
+        } else if is_type(d, "OCG") {
+            (true, self.group_on(r, d))
         } else {
             (false, true)
         };
@@ -227,8 +230,9 @@ impl OcConfig {
         {
             return is_group.then_some(shown);
         }
-        let Ok(Object::Dict(d)) = doc.resolve(obj) else { return None };
-        is_type(&d, "OCG").then(|| self.visible(doc, obj, None, work))
+        let held = work.read(doc, obj);
+        let Some(Object::Dict(d)) = held.as_deref() else { return None };
+        is_type(d, "OCG").then(|| self.visible(doc, obj, None, work))
     }
 
     /// 8.11.2.2, Table 99.
@@ -237,35 +241,36 @@ impl OcConfig {
             return true;
         }
         // A visibility expression wins over `/OCGs` and `/P`.
+        let ve_held = d.get("VE").and_then(|ve| work.read(doc, ve));
         if let Some(ve) = d.get("VE")
-            && let Ok(Object::Array(expr)) = doc.resolve(ve)
+            && let Some(Object::Array(expr)) = ve_held.as_deref()
         {
             let mut nodes = MAX_VE_NODES;
             // An expression that is an object of its own may name itself: that counts for nothing.
             let mut path: Vec<ObjRef> = ve.as_obj_ref().into_iter().collect();
-            let value = self.expression(doc, &expr, 0, &mut nodes, &mut path, work);
+            let value = self.expression(doc, expr, 0, &mut nodes, &mut path, work);
             work.spend((MAX_VE_NODES - nodes) as f64 * cost::OC_NODE);
             return value.unwrap_or(true);
         }
         let states: Vec<bool> = match d.get("OCGs") {
             None => Vec::new(),
-            Some(o) => match doc.resolve(o) {
-                Ok(Object::Array(items)) => {
+            Some(o) => match work.read(doc, o).as_deref() {
+                Some(Object::Array(items)) => {
                     // The groups are paid for before they are looked at: a list of 200 thousand is dear however it ends.
                     if !work.charge(items.len().min(MAX_LIST) as f64 * cost::OC_NODE) {
                         return true;
                     }
                     items.iter().take(MAX_LIST).filter_map(|i| self.group_state(doc, i, work)).collect()
                 }
-                Ok(_) => self.group_state(doc, o, work).into_iter().collect(),
-                Err(_) => Vec::new(),
+                Some(_) => self.group_state(doc, o, work).into_iter().collect(),
+                None => Vec::new(),
             },
         };
         if states.is_empty() {
             return true;
         }
-        let policy = match d.get("P").map(|o| doc.resolve(o)) {
-            Some(Ok(Object::Name(n))) => n.as_bytes().to_vec(),
+        let policy = match d.get("P").and_then(|o| work.read(doc, o)).as_deref() {
+            Some(Object::Name(n)) => n.as_bytes().to_vec(),
             _ => b"AnyOn".to_vec(),
         };
         match policy.as_slice() {
@@ -282,23 +287,25 @@ impl OcConfig {
             return None;
         }
         *nodes = nodes.checked_sub(1)?;
-        let Ok(Object::Name(op)) = doc.resolve(items.first()?) else { return None };
+        let op_held = work.read(doc, items.first()?)?;
+        let Object::Name(op) = &*op_held else { return None };
         let mut operands = Vec::new();
         for item in items.iter().skip(1).take(MAX_LIST) {
             *nodes = nodes.checked_sub(1)?;
-            let value = match doc.resolve(item) {
-                Ok(Object::Array(inner)) => match item.as_obj_ref() {
+            let held = work.read(doc, item);
+            let value = match held.as_deref() {
+                Some(Object::Array(inner)) => match item.as_obj_ref() {
                     // An array that is being evaluated already: a loop.
                     Some(r) if path.contains(&r) => None,
                     Some(r) => {
                         path.push(r);
-                        let v = self.expression(doc, &inner, depth + 1, nodes, path, work);
+                        let v = self.expression(doc, inner, depth + 1, nodes, path, work);
                         path.pop();
                         v
                     }
-                    None => self.expression(doc, &inner, depth + 1, nodes, path, work),
+                    None => self.expression(doc, inner, depth + 1, nodes, path, work),
                 },
-                Ok(Object::Dict(_)) => self.group_state(doc, item, work),
+                Some(Object::Dict(_)) => self.group_state(doc, item, work),
                 _ => None,
             };
             operands.extend(value);

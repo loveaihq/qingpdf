@@ -116,8 +116,8 @@ fn run(request: Request) -> Result<(), Failure> {
         Request::Text { input, pages, output, force, password } => {
             text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
         }
-        Request::Render { input, pages, dpi, output, force, password } => {
-            render_command(&input, pages.as_deref(), dpi, &output, force, &password)
+        Request::Render { input, pages, dpi, annots, output, force, password } => {
+            render_command(&input, pages.as_deref(), dpi, annots, &output, force, &password)
         }
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
     }
@@ -313,7 +313,7 @@ fn text_command(
     Ok(())
 }
 
-fn render_command(input: &Path, pages: Option<&str>, dpi: f64, template: &str, force: bool, password: &str) -> Result<(), Failure> {
+fn render_command(input: &Path, pages: Option<&str>, dpi: f64, annots: bool, template: &str, force: bool, password: &str) -> Result<(), Failure> {
     let doc = open_unlocked(input, password)?;
     let wanted: Vec<usize> = match pages {
         Some(list) => page_list(&doc, input, list)?,
@@ -329,6 +329,7 @@ fn render_command(input: &Path, pages: Option<&str>, dpi: f64, template: &str, f
     }
     let all = doc.pages().map_err(|e| op_error(input, &e))?;
     let mut renderer = render::Renderer::new(&doc);
+    renderer.set_annotations(annots);
     // Each page is reported as soon as it is done, so that if a later page fails the pages written are known.
     for (&index, name) in wanted.iter().zip(&names) {
         let Some(page) = all.get(index) else { continue };

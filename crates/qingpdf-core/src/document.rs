@@ -281,7 +281,11 @@ pub(crate) fn rectangle(obj: Option<&Object>) -> Option<[f64; 4]> {
     let [a, b, c, d] = obj?.as_array()? else {
         return None;
     };
-    let (x0, y0, x1, y1) = (a.as_f64()?, b.as_f64()?, c.as_f64()?, d.as_f64()?);
+    normalized_rect([a.as_f64()?, b.as_f64()?, c.as_f64()?, d.as_f64()?])
+}
+
+/// The four numbers of a rectangle as lower left and upper right (7.9.5); none when one is not finite.
+pub(crate) fn normalized_rect([x0, y0, x1, y1]: [f64; 4]) -> Option<[f64; 4]> {
     if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
         return None;
     }

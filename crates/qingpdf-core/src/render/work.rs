@@ -8,8 +8,14 @@
 //! page gives one warning, and what is drawn so far is kept. The weights below were measured on the machine the
 //! tests run on (see `docs/decisions.md`, 3c); they need to be right to a factor of two, not exactly.
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::document::Document;
+use crate::error::{Error, Result};
+use crate::object::{Dict, ObjRef, Object};
 
 /// The work one page may do, in units of about a nanosecond: a hostile page stops after about two seconds.
 pub(crate) const PAGE_WORK: f64 = 2.0e9;
@@ -123,6 +129,75 @@ pub(crate) mod cost {
     pub const JPX_CLEAR_BYTE: f64 = 0.15;
     /// A code-block looked at when the blocks to decode are listed, and when its result is put in place.
     pub const JPX_BLOCK_VISIT: f64 = 4.0;
+
+    // Annotations (3c2-3). First guesses; the measured values are in `docs/decisions.md`.
+    /// An entry of `/Annots` looked at (its dictionary read, flags, `/Rect` and `/OC` checked), drawn or not, hidden or not,
+    /// on the page or off it.
+    pub const ANNOT_VISIT: f64 = 2000.0;
+    /// An annotation drawn: its matrix worked out and its appearance form set up (the content costs what any content costs).
+    pub const ANNOT_DRAW: f64 = 15000.0;
+    /// An entry of the `/Annots` array, copied.
+    pub const ANNOT_ENTRY: f64 = 40.0;
+    /// A byte of an appearance stream that is read again for every annotation because it could not be kept.
+    pub const ANNOT_LOAD_BYTE: f64 = 4.0;
+
+    // Objects the drawing code reads by reference, through `Work::resolve` (3c2-3 review). Measured on the machine the
+    // tests run on: 7 ns per byte of `approx_size` for an array of numbers or of references, 11 for a dictionary, 0.2
+    // for stream data.
+    /// A byte (by `approx_size`) of an object read from the file for the page's first time, apart from stream data; and
+    /// a byte of stream data.
+    pub const RESOLVE_BYTE: f64 = 10.0;
+    pub const RESOLVE_DATA_BYTE: f64 = 0.3;
+    /// An object the page read before and kept (a clone of an `Arc`), and each entry of it when it is a dictionary
+    /// (which whoever asked searches).
+    pub const RESOLVE_REPEAT: f64 = 60.0;
+    pub const RESOLVE_ENTRY: f64 = 40.0;
+}
+
+/// The most `approx_size` bytes of objects (with `KEPT_SLOT` for each) the page keeps for [`Work::resolve`]; when
+/// the next would not fit, those nobody asked for a second time are let go of (all of them if that is not enough).
+const KEPT_BYTES: usize = 8 << 20;
+const KEPT_SLOT: usize = 96;
+
+/// An object read through [`Work::resolve`]: one that was written in place is the very object that was asked about (not
+/// copied); one that was a reference is shared with the objects the page keeps.
+pub(crate) enum Held<'a> {
+    Direct(&'a Object),
+    Shared(Arc<Object>),
+}
+
+impl Deref for Held<'_> {
+    type Target = Object;
+
+    fn deref(&self) -> &Object {
+        match self {
+            Held::Direct(o) => o,
+            Held::Shared(o) => o,
+        }
+    }
+}
+
+/// What reading a reference came to the first time.
+#[derive(Clone)]
+enum Kept {
+    /// The object, and its number of entries if it is a dictionary (what a lookup in it goes through).
+    Object(Arc<Object>, usize),
+    /// A limit error (the same one each time), and any other error (the object is not there as far as drawing goes).
+    Limit(String),
+    Failed,
+}
+
+/// A kept reading, what it weighs, and whether it was asked for again since the objects kept were last let go of.
+struct Slot {
+    kept: Kept,
+    weight: usize,
+    asked_again: bool,
+}
+
+#[derive(Default)]
+struct KeptObjects {
+    map: HashMap<ObjRef, Slot>,
+    bytes: usize,
 }
 
 /// The page's allowance, spent as it is drawn. The meter can be shared by reference between threads: the image
@@ -131,17 +206,19 @@ pub(crate) struct Work {
     /// (units left, units used)
     state: Mutex<(f64, f64)>,
     over: AtomicBool,
+    /// The objects the page has read by reference, and the references that could not be read.
+    kept: Mutex<KeptObjects>,
 }
 
 impl Work {
     pub fn new() -> Work {
-        Work { state: Mutex::new((PAGE_WORK, 0.0)), over: AtomicBool::new(false) }
+        Work { state: Mutex::new((PAGE_WORK, 0.0)), over: AtomicBool::new(false), kept: Mutex::default() }
     }
 
     /// A meter with `units` to spend (tests of the decoders).
     #[cfg(test)]
     pub fn with_allowance(units: f64) -> Work {
-        Work { state: Mutex::new((units, 0.0)), over: AtomicBool::new(false) }
+        Work { state: Mutex::new((units, 0.0)), over: AtomicBool::new(false), kept: Mutex::default() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, (f64, f64)> {
@@ -178,6 +255,82 @@ impl Work {
         } else {
             st.0 -= units;
         }
+    }
+
+    /// The object `o` is or refers to, for the drawing code: the way to read anything the file points to. An object
+    /// written in place is handed back as it is (it was paid for with the object it is in). A reference is read from the
+    /// file once for the page and kept, and so are the failures, so that a bad reference does not cost a parse for each
+    /// annotation or operator that names it. The first read is charged by the size of what it brought, a repeat a little
+    /// and by the entries a dictionary has to be searched through. Once the page has no work left nothing more is read.
+    /// `Err` is a limit that ends the drawing; `None` is an object that cannot be read, or no work left.
+    pub fn resolve<'a>(&self, doc: &Document, o: &'a Object) -> Result<Option<Held<'a>>> {
+        let Object::Ref(r) = o else { return Ok(Some(Held::Direct(o))) };
+        if self.is_over() {
+            return Ok(None);
+        }
+        let hit = self.lock_kept().map.get_mut(r).map(|slot| {
+            slot.asked_again = true;
+            slot.kept.clone()
+        });
+        match hit {
+            Some(Kept::Object(obj, entries)) => {
+                return Ok(self.charge(cost::RESOLVE_REPEAT + entries as f64 * cost::RESOLVE_ENTRY).then_some(Held::Shared(obj)));
+            }
+            Some(Kept::Limit(m)) => return Err(Error::Limit(m)),
+            Some(Kept::Failed) => return Ok(None),
+            None => {}
+        }
+        let (slot, size, result) = match doc.resolve(o) {
+            Ok(obj) => {
+                let size = obj.approx_size();
+                let data = if let Object::Stream(s) = &obj { s.data.len() } else { 0 };
+                if !self.charge(size.saturating_sub(data) as f64 * cost::RESOLVE_BYTE + data as f64 * cost::RESOLVE_DATA_BYTE) {
+                    return Ok(None);
+                }
+                let entries = obj.as_dict().map_or(0, Dict::len);
+                let obj = Arc::new(obj);
+                (Kept::Object(obj.clone(), entries), size, Ok(Some(Held::Shared(obj))))
+            }
+            Err(Error::Limit(m)) => (Kept::Limit(m.clone()), 0, Err(Error::Limit(m))),
+            Err(_) => (Kept::Failed, 0, Ok(None)),
+        };
+        let mut store = self.lock_kept();
+        let weight = size.saturating_add(KEPT_SLOT);
+        if weight <= KEPT_BYTES {
+            if store.bytes.saturating_add(weight) > KEPT_BYTES {
+                // Full: what nobody asked for again (the annotations themselves, say) goes, what was asked for stays.
+                store.map.retain(|_, slot| slot.asked_again);
+                store.bytes = store.map.values().map(|slot| slot.weight).sum();
+                for slot in store.map.values_mut() {
+                    slot.asked_again = false;
+                }
+                if store.bytes.saturating_add(weight) > KEPT_BYTES {
+                    store.map.clear();
+                    store.bytes = 0;
+                }
+            }
+            store.bytes += weight;
+            store.map.insert(*r, Slot { kept: slot, weight, asked_again: false });
+        }
+        result
+    }
+
+    fn lock_kept(&self) -> std::sync::MutexGuard<'_, KeptObjects> {
+        self.kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`Work::resolve`] for the one who does not need to tell "not there" from "a limit".
+    pub fn read<'a>(&self, doc: &Document, o: &'a Object) -> Option<Held<'a>> {
+        self.resolve(doc, o).ok().flatten()
+    }
+
+    /// A rectangle (7.9.5): an array of four numbers, the array and each number written in place or by reference,
+    /// all read through [`Work::resolve`].
+    pub fn rectangle(&self, doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
+        let held = self.read(doc, o?)?;
+        let [a, b, c, d] = held.as_array()? else { return None };
+        let num = |o: &Object| self.read(doc, o).and_then(|v| v.as_f64());
+        crate::document::normalized_rect([num(a)?, num(b)?, num(c)?, num(d)?])
     }
 
     /// Has the page used up its work (or been refused some)?

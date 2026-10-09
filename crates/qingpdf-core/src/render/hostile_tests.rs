@@ -581,15 +581,15 @@ fn a_membership_dictionary_written_in_place_is_worked_out_once() {
     assert!(w.is_empty(), "{w:?}");
     // The group is off, so the squares are not there.
     assert_eq!(pixel(&b, 5, 95), WHITE);
-    // One reading of the array (200 thousand groups), not a hundred.
-    assert!(used < 40e6, "{used}");
+    // One reading of the array (200 thousand groups: 24 million for the groups, 32 million for the parse), not a hundred.
+    assert!(used < 100e6, "{used}");
     // The same written in the content stream.
     let content = "/OC << /Type /OCMD /OCGs 11 0 R >> BDC 1 0 0 rg 0 0 10 10 re f EMC\n".repeat(100);
     let doc = ocmd_array_doc(&content, "", 200_000);
     let (b, w, used) = quick_work(&doc, 72.0, 5);
     assert_eq!(pixel(&b.expect("renders"), 5, 95), WHITE);
     assert!(w.is_empty(), "{w:?}");
-    assert!(used < 40e6, "{used}");
+    assert!(used < 100e6, "{used}");
 }
 
 #[test]

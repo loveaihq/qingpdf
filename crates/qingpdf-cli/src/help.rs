@@ -176,7 +176,7 @@ Options:
 ";
 
 const RENDER: &str = "Usage:
-  qingpdf render <file.pdf> [--pages <list>] [--dpi <N>] -o <page_%d.png> [--force] [--password <password>]
+  qingpdf render <file.pdf> [--pages <list>] [--dpi <N>] [--no-annots] -o <page_%d.png> [--force] [--password <password>]
 
 Draw pages as PNG images. The page is its crop box, turned by its /Rotate; one
 file is written per page, and the output name must contain %d (which becomes the
@@ -192,12 +192,15 @@ gradients (all seven shading types), tiling and shading patterns, and optional
 content that is off (hidden layers). A page that asks for more work than is
 allowed stops there with a warning and keeps what it has drawn. A grey block
 stands in for a JPEG 2000 or JBIG2 image that cannot be decoded. Annotations
-are not drawn.
+(notes, stamps, highlights, filled form fields) are drawn from their appearance
+streams, on top of the page; hidden ones and pop-up windows are not. A form field
+without an appearance stream is skipped with a warning.
 
 Options:
   --pages <list>        The pages to draw (default: all)
   --dpi <N>             Resolution, 1 to 2400 (default 150); a page may have
                         at most 16 million pixels
+  --no-annots           Do not draw the annotations
   -o, --output <file>   The file name pattern to write (required)
   --force               Overwrite output files that exist
   --password <password> The password of an encrypted file
