@@ -122,6 +122,232 @@ fn text_case(program: &Path) -> Result<bool, String> {
     Ok(ok)
 }
 
+/// The MQ coder's probability states (T.88 Table E.1): Qe, next state after a more probable symbol, after a less
+/// probable one, and whether the latter switches which symbol is the more probable.
+const MQ_STATES: [(u32, u8, u8, bool); 47] = [
+    (0x5601, 1, 1, true), (0x3401, 2, 6, false), (0x1801, 3, 9, false), (0x0AC1, 4, 12, false), (0x0521, 5, 29, false), (0x0221, 38, 33, false),
+    (0x5601, 7, 6, true), (0x5401, 8, 14, false), (0x4801, 9, 14, false), (0x3801, 10, 14, false), (0x3001, 11, 17, false), (0x2401, 12, 18, false),
+    (0x1C01, 13, 20, false), (0x1601, 29, 21, false), (0x5601, 15, 14, true), (0x5401, 16, 14, false), (0x5101, 17, 15, false), (0x4801, 18, 16, false),
+    (0x3801, 19, 17, false), (0x3401, 20, 18, false), (0x3001, 21, 19, false), (0x2801, 22, 19, false), (0x2401, 23, 20, false), (0x2201, 24, 21, false),
+    (0x1C01, 25, 22, false), (0x1801, 26, 23, false), (0x1601, 27, 24, false), (0x1401, 28, 25, false), (0x1201, 29, 26, false), (0x1101, 30, 27, false),
+    (0x0AC1, 31, 28, false), (0x09C1, 32, 29, false), (0x08A1, 33, 30, false), (0x0521, 34, 31, false), (0x0441, 35, 32, false), (0x02A1, 36, 33, false),
+    (0x0221, 37, 34, false), (0x0141, 38, 35, false), (0x0111, 39, 36, false), (0x0085, 40, 37, false), (0x0049, 41, 38, false), (0x0025, 42, 39, false),
+    (0x0015, 43, 40, false), (0x0009, 44, 41, false), (0x0005, 45, 42, false), (0x0001, 45, 43, false), (0x5601, 46, 46, false),
+];
+
+/// The MQ encoder (T.88 E.2), enough to code a generic region: the product only decodes, so this lives here, where
+/// the fixture for the JBIG2 case is made.
+struct MqEncoder {
+    out: Vec<u8>,
+    a: u32,
+    c: u32,
+    ct: u32,
+}
+
+impl MqEncoder {
+    fn new() -> MqEncoder {
+        MqEncoder { out: vec![0], a: 0x8000, c: 0, ct: 12 }
+    }
+
+    fn byte_out(&mut self) {
+        let last = self.out.last().copied().unwrap_or(0);
+        if last == 0xFF {
+            self.out.push((self.c >> 20) as u8);
+            self.c &= 0xFFFFF;
+            self.ct = 7;
+        } else if self.c < 0x800_0000 {
+            self.out.push((self.c >> 19) as u8);
+            self.c &= 0x7FFFF;
+            self.ct = 8;
+        } else {
+            if let Some(b) = self.out.last_mut() {
+                *b += 1;
+            }
+            if self.out.last().copied() == Some(0xFF) {
+                self.c &= 0x7FF_FFFF;
+                self.out.push((self.c >> 20) as u8);
+                self.c &= 0xFFFFF;
+                self.ct = 7;
+            } else {
+                self.out.push((self.c >> 19) as u8);
+                self.c &= 0x7FFFF;
+                self.ct = 8;
+            }
+        }
+    }
+
+    fn renorm(&mut self) {
+        loop {
+            self.a <<= 1;
+            self.c <<= 1;
+            self.ct -= 1;
+            if self.ct == 0 {
+                self.byte_out();
+            }
+            if self.a & 0x8000 != 0 {
+                break;
+            }
+        }
+    }
+
+    fn encode(&mut self, bit: u32, cx: &mut u8) {
+        let Some(&(qe, nmps, nlps, switch)) = MQ_STATES.get(usize::from(*cx >> 1)) else { return };
+        let mut mps = u32::from(*cx & 1);
+        self.a -= qe;
+        if bit == mps {
+            if self.a & 0x8000 == 0 {
+                if self.a < qe {
+                    self.a = qe;
+                } else {
+                    self.c += qe;
+                }
+                *cx = (nmps << 1) | mps as u8;
+                self.renorm();
+            } else {
+                self.c += qe;
+            }
+        } else {
+            if self.a < qe {
+                self.c += qe;
+            } else {
+                self.a = qe;
+            }
+            if switch {
+                mps = 1 - mps;
+            }
+            *cx = (nlps << 1) | mps as u8;
+            self.renorm();
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let temp = self.c + self.a;
+        self.c |= 0xFFFF;
+        if self.c >= temp {
+            self.c -= 0x8000;
+        }
+        self.c <<= self.ct;
+        self.byte_out();
+        self.c <<= self.ct;
+        self.byte_out();
+        if self.out.last().copied() != Some(0xFF) {
+            self.out.push(0xFF);
+        }
+        self.out.push(0xAC);
+        self.out.remove(0);
+        self.out
+    }
+}
+
+/// A synthetic scanned page for the JBIG2 case: the text-like blocks of `tests/tools/make_scan_fixture.py` (A4 at
+/// 300 dpi, black on white), coded as one generic region (template 0, arithmetic coding, no typical prediction), the
+/// way a scanner codes a page it does not cut into symbols. Written to `path` as a one-page PDF.
+fn make_jbig2_scan(path: &Path) -> Result<(), String> {
+    const W: usize = 2480;
+    const H: usize = 3508;
+    let mut seed = 7u32;
+    let mut rnd = |lo: u32, hi: u32| -> u32 {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        lo + (seed >> 8) % (hi - lo + 1)
+    };
+    // One byte a pixel, with two rows and a few pixels of margin so that the context can be read without checks.
+    let stride = W + 8;
+    let mut ink = vec![0u8; stride * (H + 2)];
+    let at = |x: usize, y: usize| (y + 2) * stride + x + 4;
+    let mut y = 300;
+    while y < H - 300 {
+        let mut x = 250;
+        while x < W - 250 {
+            let w = rnd(20, 160) as usize;
+            if rnd(0, 99) < 85 {
+                for yy in y..y + 38 {
+                    for xx in x..(x + w).min(W) {
+                        if let Some(p) = ink.get_mut(at(xx, yy)) {
+                            *p = 1;
+                        }
+                    }
+                }
+                let mut g = x + 12;
+                while g + 6 < x + w {
+                    for yy in y..y + 38 {
+                        for xx in g..(g + 3).min(W) {
+                            if let Some(p) = ink.get_mut(at(xx, yy)) {
+                                *p = 0;
+                            }
+                        }
+                    }
+                    g += rnd(14, 30) as usize;
+                }
+            }
+            x += w + rnd(25, 45) as usize;
+        }
+        y += 70;
+    }
+    // Generic region, template 0, adaptive pixels where the standard puts them.
+    let mut mq = MqEncoder::new();
+    let mut contexts = vec![0u8; 1 << 16];
+    for y in 0..H {
+        for x in 0..W {
+            let px = |dx: isize, dy: isize| -> usize { ink.get((((y + 2) as isize + dy) as usize) * stride + (x as isize + 4 + dx) as usize).map_or(0, |&p| usize::from(p)) };
+            // The sixteen pixels of the template, the one nearest to the pixel being coded last.
+            let cx = (px(-2, -2) << 15) | (px(-1, -2) << 14) | (px(0, -2) << 13) | (px(1, -2) << 12) | (px(2, -2) << 11)
+                | (px(-3, -1) << 10) | (px(-2, -1) << 9) | (px(-1, -1) << 8) | (px(0, -1) << 7) | (px(1, -1) << 6) | (px(2, -1) << 5) | (px(3, -1) << 4)
+                | (px(-4, 0) << 3) | (px(-3, 0) << 2) | (px(-2, 0) << 1) | px(-1, 0);
+            if let Some(state) = contexts.get_mut(cx) {
+                mq.encode(u32::from(ink.get(at(x, y)).copied().unwrap_or(0)), state);
+            }
+        }
+    }
+    let coded = mq.finish();
+    let segment = |number: u32, kind: u8, data: &[u8]| -> Vec<u8> {
+        let mut v = number.to_be_bytes().to_vec();
+        v.extend([kind, 0, 1]);
+        v.extend((data.len() as u32).to_be_bytes());
+        v.extend_from_slice(data);
+        v
+    };
+    let mut page_info = (W as u32).to_be_bytes().to_vec();
+    page_info.extend((H as u32).to_be_bytes());
+    page_info.extend([0u8; 11]);
+    let mut region = (W as u32).to_be_bytes().to_vec();
+    region.extend((H as u32).to_be_bytes());
+    region.extend([0u8; 9]);
+    region.push(0);
+    region.extend([3, 0xFF, 0xFD, 0xFF, 2, 0xFE, 0xFE, 0xFE]);
+    region.extend(coded);
+    let mut stream = segment(0, 48, &page_info);
+    stream.extend(segment(1, 38, &region));
+    let content = b"q 595.28 0 0 841.89 0 0 cm /Im Do Q";
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595.28 841.89] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        [format!("<< /Length {} >>\nstream\n", content.len()).as_bytes(), content, b"\nendstream"].concat(),
+        [
+            format!("<< /Type /XObject /Subtype /Image /Width {W} /Height {H} /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Length {} >>\nstream\n", stream.len()).as_bytes(),
+            &stream,
+            b"\nendstream",
+        ]
+        .concat(),
+    ];
+    let mut out = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend(o);
+        out.extend(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+    std::fs::create_dir_all(path.parent().ok_or("no folder")?).map_err(|e| e.to_string())?;
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
+
 /// One page drawn at 150 dpi, inside this process (the drawing alone, and the first drawing of all, which reads
 /// the system fonts) and by the program (start, drawing, PNG file). Returns whether the targets were met.
 fn render_case(program: &Path) -> Result<bool, String> {
@@ -137,8 +363,14 @@ fn render_case(program: &Path) -> Result<bool, String> {
         ("text page, tricky TrueType font run with its instructions (3b2: DFKaiShu title and authors, a Word paper)", corpus.join("public").join("zh").join("lunwen").join("lunwen-arxiv-2403.14268-word-tc.pdf"), 1, 50.0),
         ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 1, 150.0),
         ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 1, 150.0),
+        ("scanned page, JBIG2 (3c2-1: one generic region), A4 at 300 dpi", out_dir.join("scan-jbig2-a4-300dpi.pdf"), 1, 150.0),
         ("flyer page, transparency and shading (3c: 48 groups at partial opacity, 4 soft-masked gradients, 5 shading fills, 40 pattern fills, 40 blended circles)", out_dir.join("transparency-heavy.pdf"), 1, 150.0),
     ];
+    // The JBIG2 fixture is made here (the product has no JBIG2 encoder, and there is none in Python at hand).
+    let jbig2_fixture = out_dir.join("scan-jbig2-a4-300dpi.pdf");
+    if !jbig2_fixture.is_file() {
+        make_jbig2_scan(&jbig2_fixture)?;
+    }
     let mut all_ok = true;
     // The drawing time of the first case (the Type 1 text page), to say how much slower the others are than ordinary text.
     let mut text_ms: Option<f64> = None;

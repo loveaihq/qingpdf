@@ -25,6 +25,8 @@ mod func;
 mod glyf;
 mod image;
 mod interp;
+mod jbig2;
+mod mq;
 mod oc;
 mod outline;
 mod shading;

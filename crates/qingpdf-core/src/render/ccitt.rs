@@ -22,6 +22,9 @@ pub(crate) struct Decoded {
     pub rows: usize,
     /// The data stopped at a code that does not exist, or in the middle of a row.
     pub damaged: bool,
+    /// Bytes of the data used, an end-of-block code (T.6: two EOLs) after the last row included (JBIG2 halftone
+    /// bitplanes follow each other in one stream).
+    pub used: usize,
 }
 
 /// T.4 Table 2 and 3: terminating and make-up codes, white then black, as bit strings.
@@ -369,7 +372,19 @@ pub(crate) fn decode(data: &[u8], p: &Params, max_bytes: usize) -> Decoded {
             next_is_2d = true;
         }
     }
-    Decoded { data: out, rows, damaged }
+    // T.6 EOFB: 000000000001 000000000001.
+    if !damaged && bits.peek(24) == 0x001001 {
+        bits.skip(24);
+    }
+    Decoded { data: out, rows, damaged, used: bits.pos.div_ceil(8).min(data.len()) }
+}
+
+/// The T.4 code of a run of one colour, as (bits, length), for the tests of JBIG2 (MMR) that encode fax data.
+#[cfg(test)]
+pub(crate) fn test_code(run: usize, black: bool) -> Option<(u64, u32)> {
+    let table = if black { BLACK } else { WHITE };
+    let (bits, _) = table.iter().chain(EXTENDED).find(|c| usize::from(c.1) == run)?;
+    Some((u64::from_str_radix(bits, 2).ok()?, bits.len() as u32))
 }
 
 #[cfg(test)]

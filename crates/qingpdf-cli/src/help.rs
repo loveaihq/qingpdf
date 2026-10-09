@@ -184,14 +184,15 @@ page number) unless a single page is drawn.
 
 What is drawn: paths (fill, stroke, dashes, clipping), colours (device, ICC
 and Cal spaces as the device space, Indexed, Separation, DeviceN, Lab), images
-(Flate, LZW, JPEG, CCITT fax; masks), forms, text (the font programs of the
+(Flate, LZW, JPEG, CCITT fax, JBIG2; masks), forms, text (the font programs of the
 PDF: TrueType, Type 1, CFF; fonts it does not carry come from the system fonts,
 Chinese, Japanese and Korean ones included; a character whose glyph cannot be
 had is drawn as an outline box), transparency (groups, soft masks, blend modes),
 gradients (all seven shading types), tiling and shading patterns, and optional
 content that is off (hidden layers). A page that asks for more work than is
-allowed stops there with a warning and keeps what it has drawn. Grey blocks
-stand in for JBIG2 and JPEG 2000 images. Annotations are not drawn.
+allowed stops there with a warning and keeps what it has drawn. A grey block
+stands in for a JPEG 2000 image, or for a JBIG2 one that cannot be decoded.
+Annotations are not drawn.
 
 Options:
   --pages <list>        The pages to draw (default: all)

@@ -8,6 +8,8 @@
 //! page gives one warning, and what is drawn so far is kept. The weights below were measured on the machine the
 //! tests run on (see `docs/decisions.md`, 3c); they need to be right to a factor of two, not exactly.
 
+use std::cell::Cell;
+
 /// The work one page may do, in units of about a nanosecond: a hostile page stops after about two seconds.
 pub(crate) const PAGE_WORK: f64 = 2.0e9;
 
@@ -45,55 +47,99 @@ pub(crate) mod cost {
     /// A membership dictionary (optional content) evaluated, and each group or expression node it visits.
     pub const OCMD: f64 = 400.0;
     pub const OC_NODE: f64 = 120.0;
+
+    // JBIG2 (3c2-1). Measured on the machine the tests run on, see `docs/decisions.md`.
+    /// A pixel of an arithmetic-coded generic region that is decoded on its own (context, decision, bit packing), one
+    /// that the slow loop decodes (adaptive pixels moved, or pixels skipped), a pixel that is one of a long run of the
+    /// same colour decoded in one go with its neighbours, and one of a row that is a copy of the row above (typical
+    /// prediction).
+    pub const JB2_GENERIC_PIXEL: f64 = 45.0;
+    pub const JB2_SLOW_PIXEL: f64 = 60.0;
+    pub const JB2_RUN_PIXEL: f64 = 1.5;
+    pub const JB2_COPY_PIXEL: f64 = 0.2;
+    /// A pixel of a refinement region (13 or 10 context pixels read through bounds checks).
+    pub const JB2_REFINE_PIXEL: f64 = 130.0;
+    /// A pixel of an MMR (fax) coded bitmap.
+    pub const JB2_MMR_PIXEL: f64 = 10.0;
+    /// A pixel put on a bitmap from another, and a row of that; a byte of a new bitmap cleared.
+    pub const JB2_BLIT_PIXEL: f64 = 0.3;
+    pub const JB2_BLIT_ROW: f64 = 40.0;
+    /// A row of a bitmap that is decoded, whatever its width (a bitmap of width 0 has as many rows as any other).
+    pub const JB2_ROW: f64 = 40.0;
+    /// A line of a custom Huffman table read (its prefix and range lengths, pushed), and the same line counted and
+    /// put in its place when the prefix codes are given out.
+    pub const JB2_TABLE_LINE: f64 = 40.0;
+    pub const JB2_TABLE_BUILD: f64 = 12.0;
+    pub const JB2_CLEAR_BYTE: f64 = 0.15;
+    /// An integer decoded arithmetically (up to about 40 decisions), one decoded from a Huffman table.
+    pub const JB2_INT: f64 = 220.0;
+    pub const JB2_HUFFMAN: f64 = 60.0;
+    /// The bookkeeping of one symbol (made, listed, exported) or one symbol instance of a text region, apart from
+    /// the pixels and integers it costs.
+    pub const JB2_SYMBOL: f64 = 200.0;
+    /// A shared symbol put in a list (a clone of an `Rc`) and let go of again: the list of the symbols a segment refers
+    /// to, the list a dictionary exports. About 12 ns a clone with its drop when the symbols are spread over memory
+    /// (a million of them: 34 ns for the two lists of a dictionary).
+    pub const JB2_RC: f64 = 20.0;
+    /// A segment looked at, and a cell of a halftone grid (its gray value and the position of its pattern).
+    pub const JB2_SEGMENT: f64 = 600.0;
+    pub const JB2_CELL: f64 = 60.0;
 }
 
-/// The page's allowance, spent as it is drawn.
+/// The page's allowance, spent as it is drawn. The counters are cells so that the image decoders, which hold the
+/// meter by shared reference while they work, can charge it too.
 pub(crate) struct Work {
-    left: f64,
-    used: f64,
-    over: bool,
+    left: Cell<f64>,
+    used: Cell<f64>,
+    over: Cell<bool>,
 }
 
 impl Work {
     pub fn new() -> Work {
-        Work { left: PAGE_WORK, used: 0.0, over: false }
+        Work { left: Cell::new(PAGE_WORK), used: Cell::new(0.0), over: Cell::new(false) }
+    }
+
+    /// A meter with `units` to spend (tests of the decoders).
+    #[cfg(test)]
+    pub fn with_allowance(units: f64) -> Work {
+        Work { left: Cell::new(units), used: Cell::new(0.0), over: Cell::new(false) }
     }
 
     /// Spend `units` on work about to be done. `false` (and nothing spent) when the page has not that much left; from
     /// then on every call says no.
-    pub fn charge(&mut self, units: f64) -> bool {
-        if self.over || units.is_nan() || units > self.left {
-            self.over = true;
+    pub fn charge(&self, units: f64) -> bool {
+        if self.over.get() || units.is_nan() || units > self.left.get() {
+            self.over.set(true);
             return false;
         }
-        self.left -= units;
-        self.used += units;
+        self.left.set(self.left.get() - units);
+        self.used.set(self.used.get() + units);
         true
     }
 
     /// Spend `units` on work that is done already, or must be finished to keep what is drawn (putting a layer on the
     /// page). The page may not start more when this takes what was left.
-    pub fn spend(&mut self, units: f64) {
+    pub fn spend(&self, units: f64) {
         if units.is_nan() || units < 0.0 {
             return;
         }
-        self.used += units;
-        if units >= self.left {
-            self.left = 0.0;
-            self.over = true;
+        self.used.set(self.used.get() + units);
+        if units >= self.left.get() {
+            self.left.set(0.0);
+            self.over.set(true);
         } else {
-            self.left -= units;
+            self.left.set(self.left.get() - units);
         }
     }
 
     /// Has the page used up its work (or been refused some)?
     pub fn is_over(&self) -> bool {
-        self.over
+        self.over.get()
     }
 
     /// Units spent so far.
     #[cfg(test)]
     pub fn used(&self) -> f64 {
-        self.used
+        self.used.get()
     }
 }

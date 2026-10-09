@@ -2,7 +2,7 @@
 //! into pixels, shrunk by a whole factor when the page shows them smaller than they are
 //! (a 300 dpi scan on a 150 dpi page is read once and drawn once, not resampled by the
 //! rasterizer). Filters: those of [`crate::filter`], `DCTDecode` (zune-jpeg) and
-//! `CCITTFaxDecode` ([`super::ccitt`]); `JBIG2Decode` and `JPXDecode` come back as
+//! `CCITTFaxDecode` ([`super::ccitt`]), `JBIG2Decode` ([`super::jbig2`]); `JPXDecode` comes back as
 //! [`Loaded::Placeholder`].
 
 use std::cell::Cell;
@@ -23,6 +23,8 @@ use crate::text::font::Warnings;
 use super::ccitt;
 use super::color::ColorSpace;
 use super::func::Meter;
+use super::jbig2;
+use super::work::Work;
 
 /// Most pixels one image may have.
 pub(crate) const MAX_IMAGE_PIXELS: u64 = 128 * 1024 * 1024;
@@ -40,7 +42,7 @@ const MAX_CCITT_COLUMNS: usize = 1 << 20;
 pub(crate) enum Loaded {
     /// Premultiplied RGBA, `w` by `h`; the image's whole unit square. `opaque`: no pixel is transparent.
     Image { pixmap: Pixmap, opaque: bool },
-    /// An image we cannot decode (JBIG2, JPEG 2000): drawn as a grey block.
+    /// An image we cannot decode (JPEG 2000, or a JBIG2 stream with nothing in it): drawn as a grey block.
     Placeholder,
 }
 
@@ -57,6 +59,10 @@ pub(crate) struct Env<'a> {
     pub meter: &'a Meter,
     /// Source pixels the page may still decode (images, and the masks of images, as they really are).
     pub pixels_left: &'a Cell<u64>,
+    /// The page's work meter, for the decoders whose cost tells nothing from the size of the image (JBIG2).
+    pub work: &'a Work,
+    /// The JBIG2 globals the page has decoded already (the images that share a stream decode it once).
+    pub globals: &'a jbig2::GlobalsCache,
 }
 
 impl Env<'_> {
@@ -377,6 +383,27 @@ fn read_samples(
                 fixed
             };
             Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: image_stride, data }))
+        }
+        b"JBIG2Decode" => {
+            let entry = parm.as_ref().and_then(|d| d.get("JBIG2Globals"));
+            // Read only when the page has not decoded this stream already.
+            let load = || entry.and_then(|o| doc.resolve(o).ok()).and_then(|o| if let Object::Stream(s) = o { doc.decode_stream_limited(&s, MAX_IMAGE_BYTES).ok() } else { None });
+            let globals = entry.map(|o| jbig2::GlobalsSource { key: o.as_obj_ref(), cache: env.globals, load: &load });
+            let page = match jbig2::decode_with_globals(&data, globals, (w, h), env.work) {
+                Ok(p) => p,
+                Err(Error::Limit(m)) => return Err(Error::Limit(m)),
+                Err(e) => {
+                    warnings.add(format!("a JBIG2 image cannot be decoded ({e}); shown as a grey block"));
+                    return Ok(None);
+                }
+            };
+            // The JBIG2 page may be bigger than the dictionary says: what it really has is charged as well.
+            env.charge_pixels(page.page_pixels.saturating_sub((w as u64).saturating_mul(h as u64)))?;
+            doc.charge_decoding(page.data.len())?;
+            if let Some(m) = page.warning {
+                warnings.add(format!("a JBIG2 image is damaged ({m}); what could be decoded is drawn"));
+            }
+            Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: w.div_ceil(8), data: page.data }))
         }
         other => {
             warnings.add(format!("{} images are not drawn yet; shown as a grey block", String::from_utf8_lossy(other).trim_end_matches("Decode")));
@@ -1000,7 +1027,7 @@ fn mask_alpha(env: &Env<'_>, mask: &Stream, stencil: bool, ow: usize, oh: usize,
         return Ok(None);
     }
     env.charge_pixels((mw as u64) * (mh as u64))?;
-    let inner = Env { doc, lookup: env.lookup, fill: [0.0; 3], target: (1, 1), meter: env.meter, pixels_left: env.pixels_left };
+    let inner = Env { doc, lookup: env.lookup, fill: [0.0; 3], target: (1, 1), meter: env.meter, pixels_left: env.pixels_left, work: env.work, globals: env.globals };
     let stencil = stencil || matches!(get(&mask.dict, doc, "ImageMask"), Some(Object::Bool(true)));
     let bpc = if stencil { 1 } else { int(doc, &mask.dict, "BitsPerComponent").unwrap_or(8) };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
@@ -1086,7 +1113,9 @@ mod tests {
         let lookup = |_: &[u8]| None;
         let meter = Meter::new(1000);
         let left = Cell::new(100);
-        let env = Env { doc: &doc, lookup: &lookup, fill: [0.0; 3], target: (8, 8), meter: &meter, pixels_left: &left };
+        let work = Work::new();
+        let globals = jbig2::GlobalsCache::default();
+        let env = Env { doc: &doc, lookup: &lookup, fill: [0.0; 3], target: (8, 8), meter: &meter, pixels_left: &left, work: &work, globals: &globals };
         let mut dict = Dict::new();
         dict.set("Width", Object::Integer(1));
         dict.set("Height", Object::Integer(1));

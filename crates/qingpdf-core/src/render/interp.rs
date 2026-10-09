@@ -25,6 +25,7 @@ use super::color::ColorSpace;
 use super::fonts::{Budget, GlyphSource};
 use super::func::Meter;
 use super::image::{self, Loaded};
+use super::jbig2;
 use super::oc::OcConfig;
 use super::shading::{self, Shading};
 use super::work::Work;
@@ -306,6 +307,8 @@ pub(crate) struct Shared {
     cache_bytes: usize,
     images: HashMap<ImageKey, Rc<Prepared>>,
     image_bytes: usize,
+    /// JBIG2 globals decoded, by their stream: the images that name one decode it once.
+    globals: jbig2::GlobalsCache,
     /// Bytes held by font programs and glyph outlines.
     budget: Budget,
     /// Coverage bitmaps of glyphs.
@@ -1866,7 +1869,7 @@ impl<'a> Interp<'a> {
         let lookup = |n: &[u8]| res.get(doc, Cat::ColorSpace, n);
         // The loader counts the pixels it decodes (the image's, its mask's, a JPEG's own size) against the page.
         let pixels_left = Cell::new(self.image_pixels_left);
-        let env = image::Env { doc, lookup: &lookup, fill: self.gs.fill.rgb, target: place.target, meter: &self.meter, pixels_left: &pixels_left };
+        let env = image::Env { doc, lookup: &lookup, fill: self.gs.fill.rgb, target: place.target, meter: &self.meter, pixels_left: &pixels_left, work: &self.work, globals: &self.shared.globals };
         let loaded = image::load(&env, stream, &mut self.shared.warnings);
         self.image_pixels_left = pixels_left.get();
         let loaded = match loaded {
