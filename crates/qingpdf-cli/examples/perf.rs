@@ -364,6 +364,7 @@ fn render_case(program: &Path) -> Result<bool, String> {
         ("scanned page, JPEG, 1242 x 1754 px", corpus.join("local").join("scanned").join("issue7229.pdf"), 1, 150.0),
         ("scanned page, CCITT G4, A4 at 300 dpi", out_dir.join("scan-ccitt-a4-300dpi.pdf"), 1, 150.0),
         ("scanned page, JBIG2 (3c2-1: one generic region), A4 at 300 dpi", out_dir.join("scan-jbig2-a4-300dpi.pdf"), 1, 150.0),
+        ("photo page, JPEG 2000 (3c2-2: 9/7, 6 levels, about 20:1, decoded a level down), A4 at 300 dpi", out_dir.join("photo-jpx-a4-300dpi.pdf"), 1, 150.0),
         ("flyer page, transparency and shading (3c: 48 groups at partial opacity, 4 soft-masked gradients, 5 shading fills, 40 pattern fills, 40 blended circles)", out_dir.join("transparency-heavy.pdf"), 1, 150.0),
     ];
     // The JBIG2 fixture is made here (the product has no JBIG2 encoder, and there is none in Python at hand).
@@ -378,7 +379,7 @@ fn render_case(program: &Path) -> Result<bool, String> {
 render, one page at 150 dpi:");
     for (label, file, page_number, target_ms) in cases {
         if !file.is_file() {
-            println!("  {label}: {} is not here, skipped (tests/tools/make_scan_fixture.py makes the CCITT one, make_transparency_fixtures.py --perf the flyer)", file.display());
+            println!("  {label}: {} is not here, skipped (tests/tools/make_scan_fixture.py makes the CCITT one, make_jpx_photo_fixture.py the JPEG 2000 one, make_transparency_fixtures.py --perf the flyer)", file.display());
             continue;
         }
         let doc = Document::open(&file).map_err(|e| e.to_string())?;

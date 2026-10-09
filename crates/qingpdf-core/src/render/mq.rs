@@ -1,6 +1,6 @@
 //! The MQ arithmetic decoder: ITU-T T.88 (JBIG2) Annex E, the same coder as ITU-T T.800 (JPEG 2000) Annex C.
 //! JBIG2 ([`super::jbig2`]) uses it for generic and refinement regions, symbol dictionaries and text regions;
-//! the JPEG 2000 decoder will use it for the code-block passes.
+//! the JPEG 2000 decoder ([`super::jpx`]) uses it for the code-block passes.
 //!
 //! A context is one byte: `state index << 1 | MPS`, so a fresh context is `0` (state 0, MPS 0); JPEG 2000 starts a
 //! few of its contexts in other states and says so with [`context`].
@@ -94,7 +94,6 @@ pub(crate) fn state_entry(index: u8) -> (u32, u8, u8, bool) {
 }
 
 /// The context byte for state `index` (0 to 46) with `mps` as the more probable symbol.
-#[allow(dead_code)] // for the JPEG 2000 decoder
 pub(crate) fn context(index: u8, mps: u8) -> u8 {
     (index.min(46) << 1) | (mps & 1)
 }

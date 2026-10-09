@@ -25,7 +25,7 @@ Every command that reads a PDF takes `--password <password>` for encrypted files
 
 Outputs are never written over an input, and an existing file is only replaced with `--force`. Run `qingpdf <command> --help` for details.
 
-`render` draws paths, colours, clipping, images (JPEG, CCITT fax, JBIG2, Flate and more), forms and text. Embedded TrueType, OpenType, CFF and Type 1 fonts are read by qingpdf's own code; fonts that are not embedded (common in Chinese government documents) are drawn with the system's fonts, such as SimSun, SimHei, KaiTi and FangSong on Windows. Transparency, gradients, patterns and hidden layers are drawn; annotations are not yet, and JPEG 2000 images show as grey blocks. On this PC at 150 dpi drawing a text page takes 15–39 ms, a JPEG scan 38 ms and a CCITT fax A4 scan 23 ms.
+`render` draws paths, colours, clipping, images (JPEG, JPEG 2000, CCITT fax, JBIG2, Flate and more), forms and text. Embedded TrueType, OpenType, CFF and Type 1 fonts are read by qingpdf's own code; fonts that are not embedded (common in Chinese government documents) are drawn with the system's fonts, such as SimSun, SimHei, KaiTi and FangSong on Windows. Transparency, gradients, patterns and hidden layers are drawn; annotations are not yet, and an image that cannot be decoded shows as a grey block. On this PC at 150 dpi drawing a text page takes 15–39 ms, a JPEG scan 38 ms and a CCITT fax A4 scan 23 ms.
 
 ## Hard rules
 

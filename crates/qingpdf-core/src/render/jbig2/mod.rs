@@ -22,6 +22,8 @@ mod text;
 #[cfg(test)]
 mod test_enc;
 #[cfg(test)]
+pub(crate) use test_enc::MqEnc;
+#[cfg(test)]
 mod test_enc_text;
 #[cfg(test)]
 mod tests;

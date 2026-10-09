@@ -2,8 +2,8 @@
 //! into pixels, shrunk by a whole factor when the page shows them smaller than they are
 //! (a 300 dpi scan on a 150 dpi page is read once and drawn once, not resampled by the
 //! rasterizer). Filters: those of [`crate::filter`], `DCTDecode` (zune-jpeg) and
-//! `CCITTFaxDecode` ([`super::ccitt`]), `JBIG2Decode` ([`super::jbig2`]); `JPXDecode` comes back as
-//! [`Loaded::Placeholder`].
+//! `CCITTFaxDecode` ([`super::ccitt`]), `JBIG2Decode` ([`super::jbig2`]), `JPXDecode` ([`super::jpx`], decoded
+//! only down to the size the page shows). What cannot be decoded comes back as [`Loaded::Placeholder`].
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -24,6 +24,7 @@ use super::ccitt;
 use super::color::ColorSpace;
 use super::func::Meter;
 use super::jbig2;
+use super::jpx;
 use super::work::Work;
 
 /// Most pixels one image may have.
@@ -42,7 +43,7 @@ const MAX_CCITT_COLUMNS: usize = 1 << 20;
 pub(crate) enum Loaded {
     /// Premultiplied RGBA, `w` by `h`; the image's whole unit square. `opaque`: no pixel is transparent.
     Image { pixmap: Pixmap, opaque: bool },
-    /// An image we cannot decode (JPEG 2000, or a JBIG2 stream with nothing in it): drawn as a grey block.
+    /// An image we cannot decode (a JBIG2 or JPEG 2000 stream with nothing in it): drawn as a grey block.
     Placeholder,
 }
 
@@ -151,6 +152,8 @@ struct Samples {
     ncomp: usize,
     stride: usize,
     data: Vec<u8>,
+    /// The opacity a JPEG 2000 file has for each pixel (one byte each, `w` by `h`), when the dictionary asks for it.
+    alpha: Option<Vec<u8>>,
 }
 
 fn get(dict: &Dict, doc: &Document, key: &str) -> Option<Object> {
@@ -180,7 +183,9 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     let (w, h) = (w as usize, h as usize);
     let is_mask = matches!(get(dict, doc, "ImageMask"), Some(Object::Bool(true)));
     let declared_bpc = int(doc, dict, "BitsPerComponent");
-    let bpc = if is_mask { 1 } else { declared_bpc.unwrap_or(8) };
+    // (A JPEG 2000 file has its own bits per sample: the dictionary's entry is ignored, 7.4.9.)
+    let is_jpx = filter_list(doc, dict).iter().any(|n| n.as_bytes() == b"JPXDecode");
+    let bpc = if is_mask { 1 } else if is_jpx { 8 } else { declared_bpc.unwrap_or(8) };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return Err(Error::Invalid(format!("image with {bpc} bits per component")));
     }
@@ -204,17 +209,20 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     // The mask is made first when the picture's size is known now (not so for a JPEG, which says how big it is itself):
     // its buffers are gone before the picture's are made, so the two are never held together.
     let mut alpha = None;
-    let alpha_made = has_mask && !filter_list(doc, dict).iter().any(|n| n.as_bytes() == b"DCTDecode");
+    let alpha_made = has_mask && !filter_list(doc, dict).iter().any(|n| matches!(n.as_bytes(), b"DCTDecode" | b"JPXDecode"));
     if alpha_made {
         let (out_w, out_h) = out_size(w, h);
         alpha = soft_alpha(env, dict, out_w, out_h, warnings)?;
     }
-    let Some(samples) = read_samples(env, stream, w, h, bpc as u32, space.as_ref().map(|s| s.components()), warnings)? else {
+    let indexed = matches!(space.as_deref(), Some(ColorSpace::Indexed { .. }));
+    let Some(mut samples) = read_samples(env, stream, w, h, bpc as u32, (space.as_ref().map(|s| s.components()), indexed), warnings)? else {
         return Ok(Loaded::Placeholder);
     };
-    // A JPEG says how big it is itself; that is what the samples are.
+    // A JPEG (or a JPEG 2000 picture) says how big it is itself; that is what the samples are.
     let (w, h) = (samples.w, samples.h);
-    let decode = get(dict, doc, "Decode").and_then(|o| number_list(doc, &o));
+    let file_alpha = samples.alpha.take();
+    // (A JPEG 2000 picture has its own range of samples: /Decode is ignored, unless the picture is a stencil mask, 7.4.9.)
+    let decode = get(dict, doc, "Decode").and_then(|o| number_list(doc, &o)).filter(|_| is_mask || !is_jpx);
     let space = if is_mask {
         None
     } else {
@@ -239,6 +247,14 @@ pub(crate) fn load(env: &Env<'_>, stream: &Stream, warnings: &mut Warnings) -> R
     drop(samples);
     if has_mask && !alpha_made {
         alpha = soft_alpha(env, dict, out_w, out_h, warnings)?;
+    }
+    // The opacity channel of a JPEG 2000 file (/SMaskInData), shrunk like the picture; an explicit mask comes first.
+    if alpha.is_none()
+        && let Some(plane) = file_alpha
+    {
+        let a = Samples { w, h, bpc: 8, ncomp: 1, stride: w, data: plane, alpha: None };
+        let px = resample(&a, &Plan::Gray, None, out_w, out_h);
+        alpha = Some(px.chunks_exact(4).map(|p| p.first().copied().unwrap_or(255)).collect());
     }
     if let Some(alpha) = alpha {
         for (px, &a) in pixels.chunks_exact_mut(4).zip(&alpha) {
@@ -301,7 +317,8 @@ fn read_samples(
     w: usize,
     h: usize,
     bpc: u32,
-    space_comps: Option<usize>,
+    // How many components the dictionary's colour space has, and whether it is an `Indexed` one.
+    (space_comps, indexed): (Option<usize>, bool),
     warnings: &mut Warnings,
 ) -> Result<Option<Samples>> {
     let doc = env.doc;
@@ -336,7 +353,7 @@ fn read_samples(
     let Some((codec, parm)) = codec else {
         let ncomp = space_comps.unwrap_or(1);
         let stride = (w * ncomp * bpc as usize).div_ceil(8);
-        return Ok(Some(Samples { w, h, bpc, ncomp, stride, data }));
+        return Ok(Some(Samples { w, h, bpc, ncomp, stride, data, alpha: None }));
     };
     match codec.as_bytes() {
         b"DCTDecode" => jpeg(env, &data, (w as u64).saturating_mul(h as u64)).map(Some),
@@ -382,7 +399,7 @@ fn read_samples(
                 }
                 fixed
             };
-            Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: image_stride, data }))
+            Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: image_stride, data, alpha: None }))
         }
         b"JBIG2Decode" => {
             let entry = parm.as_ref().and_then(|d| d.get("JBIG2Globals"));
@@ -403,11 +420,31 @@ fn read_samples(
             if let Some(m) = page.warning {
                 warnings.add(format!("a JBIG2 image is damaged ({m}); what could be decoded is drawn"));
             }
-            Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: w.div_ceil(8), data: page.data }))
+            Ok(Some(Samples { w, h, bpc: 1, ncomp: 1, stride: w.div_ceil(8), data: page.data, alpha: None }))
         }
-        other => {
-            warnings.add(format!("{} images are not drawn yet; shown as a grey block", String::from_utf8_lossy(other).trim_end_matches("Decode")));
-            Ok(None)
+        _ => {
+            // JPXDecode.
+            let alpha = match int(doc, dict, "SMaskInData") {
+                Some(1) => jpx::Alpha::Straight,
+                Some(2) => jpx::Alpha::Premultiplied,
+                _ => jpx::Alpha::Ignore,
+            };
+            let opts = jpx::Options { want: env.target, components: space_comps, indexed, alpha, threads: None };
+            let img = match jpx::decode(&data, &opts, env.work) {
+                Ok(img) => img,
+                Err(Error::Limit(m)) => return Err(Error::Limit(m)),
+                Err(e) => {
+                    warnings.add(format!("a JPX image cannot be decoded ({e}); shown as a grey block"));
+                    return Ok(None);
+                }
+            };
+            // What the file really has is charged as well, whatever the dictionary says.
+            env.charge_pixels(img.full.0.saturating_mul(img.full.1).saturating_sub((w as u64).saturating_mul(h as u64)))?;
+            doc.charge_decoding(img.data.len())?;
+            if let Some(m) = img.warning {
+                warnings.add(format!("a JPX image is damaged ({m}); what could be decoded is drawn"));
+            }
+            Ok(Some(Samples { w: img.w, h: img.h, bpc: 8, ncomp: img.ncomp, stride: img.w * img.ncomp, data: img.data, alpha: img.alpha }))
         }
     }
 }
@@ -458,7 +495,7 @@ fn jpeg(env: &Env<'_>, data: &[u8], declared: u64) -> Result<Samples> {
             }
         }
     }
-    Ok(Samples { w: jw, h: jh, bpc: 8, ncomp, stride: jw * ncomp, data: pixels })
+    Ok(Samples { w: jw, h: jh, bpc: 8, ncomp, stride: jw * ncomp, data: pixels, alpha: None })
 }
 
 /// One row of raw sample values, one byte each (16-bit samples: the high byte).
@@ -814,6 +851,32 @@ fn is_raw(plan: &Plan) -> bool {
 /// The picture's pixels shrunk to `ow` by `oh` (at most the size it has), as straight RGBA.
 fn resample(s: &Samples, plan: &Plan, key: Option<&[(u16, u16)]>, ow: usize, oh: usize) -> Vec<u8> {
     let mut out = vec![0u8; ow * oh * 4];
+    // Not shrunk at all (a picture shown at its own size, or decoded down to it), 8-bit grey or RGB as it comes: the
+    // samples are the pixels, no averaging.
+    if (ow, oh) == (s.w, s.h) && s.bpc == 8 && key.is_none() {
+        let ncomp = match plan {
+            Plan::Gray if s.ncomp == 1 => 1,
+            Plan::Rgb8 if s.ncomp == 3 => 3,
+            _ => 0,
+        };
+        if ncomp != 0 {
+            for (y, dst) in out.chunks_exact_mut(ow * 4).enumerate() {
+                let Some(row) = s.data.get(y * s.stride..y * s.stride + ow * ncomp) else { continue };
+                if ncomp == 1 {
+                    for (px, &g) in dst.chunks_exact_mut(4).zip(row) {
+                        px.copy_from_slice(&[g, g, g, 255]);
+                    }
+                } else {
+                    for (px, rgb) in dst.chunks_exact_mut(4).zip(row.chunks_exact(3)) {
+                        if let [r, g, b] = rgb {
+                            px.copy_from_slice(&[*r, *g, *b, 255]);
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+    }
     // A big picture is done in bands of output rows, a few at a time (each band reads the source rows it needs).
     let threads = if s.w * s.h >= 2_000_000 && oh >= 64 { std::thread::available_parallelism().map_or(1, |n| n.get()).min(4) } else { 1 };
     if threads <= 1 {
@@ -1027,13 +1090,13 @@ fn mask_alpha(env: &Env<'_>, mask: &Stream, stencil: bool, ow: usize, oh: usize,
         return Ok(None);
     }
     env.charge_pixels((mw as u64) * (mh as u64))?;
-    let inner = Env { doc, lookup: env.lookup, fill: [0.0; 3], target: (1, 1), meter: env.meter, pixels_left: env.pixels_left, work: env.work, globals: env.globals };
+    let inner = Env { doc, lookup: env.lookup, fill: [0.0; 3], target: (ow, oh), meter: env.meter, pixels_left: env.pixels_left, work: env.work, globals: env.globals };
     let stencil = stencil || matches!(get(&mask.dict, doc, "ImageMask"), Some(Object::Bool(true)));
     let bpc = if stencil { 1 } else { int(doc, &mask.dict, "BitsPerComponent").unwrap_or(8) };
     if !matches!(bpc, 1 | 2 | 4 | 8 | 16) {
         return Ok(None);
     }
-    let Some(samples) = read_samples(&inner, mask, mw as usize, mh as usize, bpc as u32, Some(1), warnings)? else { return Ok(None) };
+    let Some(samples) = read_samples(&inner, mask, mw as usize, mh as usize, bpc as u32, (Some(1), false), warnings)? else { return Ok(None) };
     let decode = get(&mask.dict, doc, "Decode").and_then(|o| number_list(doc, &o));
     // Shrunk to our size (or left as it is when smaller), then each pixel of ours takes the mask pixel at its middle.
     let (mut rw, mut rh) = (samples.w.min(ow), samples.h.min(oh));
@@ -1086,7 +1149,7 @@ mod tests {
                 (x >> 24) as u8
             })
             .collect();
-        Samples { w, h, bpc: 8, ncomp: 1, stride: w, data }
+        Samples { w, h, bpc: 8, ncomp: 1, stride: w, data, alpha: None }
     }
 
     #[test]
@@ -1131,6 +1194,141 @@ mod tests {
         assert_eq!(left.get(), 5000 - 64 * 64);
     }
 
+    /// An image stream of a JPEG 2000 fixture with the given extra dictionary entries, loaded for a `target` size.
+    fn load_jpx(name: &str, extra: &[(&str, Object)], target: (usize, usize), work: &Work) -> (Result<Loaded>, Warnings) {
+        let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/jpx_fixtures/").to_string() + name).expect("fixture");
+        let doc = Document::from_bytes(crate::testutil::sample_pdf()).expect("opens");
+        let lookup = |_: &[u8]| None;
+        let meter = Meter::new(1000);
+        let left = Cell::new(1 << 20);
+        let globals = jbig2::GlobalsCache::default();
+        let env = Env { doc: &doc, lookup: &lookup, fill: [0.0; 3], target, meter: &meter, pixels_left: &left, work, globals: &globals };
+        let mut dict = Dict::new();
+        dict.set("Width", Object::Integer(61));
+        dict.set("Height", Object::Integer(47));
+        dict.set("Filter", Object::from("JPXDecode"));
+        for (k, v) in extra {
+            dict.set(*k, v.clone());
+        }
+        let mut warnings = Warnings::default();
+        let r = load(&env, &Stream { dict, data }, &mut warnings);
+        (r, warnings)
+    }
+
+    fn raw_fixture(name: &str) -> Vec<u8> {
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/jpx_fixtures/").to_string() + name).expect("fixture")
+    }
+
+    #[test]
+    fn a_jpeg_2000_image_is_drawn_at_the_size_the_page_shows() {
+        let work = Work::new();
+        let raw = raw_fixture("rgb_lossless.raw");
+        // Full size: the picture as it is.
+        let (r, w) = load_jpx("rgb_lossless.jp2", &[], (61, 47), &work);
+        let Ok(Loaded::Image { pixmap, opaque }) = r else { panic!("not an image") };
+        assert!(opaque && w.list.is_empty());
+        assert_eq!((pixmap.width(), pixmap.height()), (61, 47));
+        for (px, rgb) in pixmap.data().chunks_exact(4).zip(raw.chunks_exact(3)) {
+            assert_eq!(&px[..3], rgb);
+        }
+        // A fifth of the size: decoded at a quarter (two levels fewer) and shrunk to fit; far less work.
+        let small = Work::new();
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[], (13, 10), &small);
+        let Ok(Loaded::Image { pixmap, .. }) = r else { panic!("not an image") };
+        assert_eq!((pixmap.width(), pixmap.height()), (13, 10));
+        assert!(small.used() * 2.0 < work.used(), "{} {}", small.used(), work.used());
+    }
+
+    #[test]
+    fn a_jpeg_2000_image_takes_its_colour_space_from_the_dictionary_first() {
+        let work = Work::new();
+        let raw = raw_fixture("rgb_lossless.raw");
+        // /DeviceGray over three channels: the first one is the grey level.
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[("ColorSpace", Object::from("DeviceGray"))], (61, 47), &work);
+        let Ok(Loaded::Image { pixmap, .. }) = r else { panic!("not an image") };
+        for (px, rgb) in pixmap.data().chunks_exact(4).zip(raw.chunks_exact(3)) {
+            assert_eq!(&px[..3], &[rgb[0]; 3]);
+        }
+        // The dictionary's bits per component are of no account (7.4.9).
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[("BitsPerComponent", Object::Integer(12))], (61, 47), &work);
+        assert!(matches!(r, Ok(Loaded::Image { .. })));
+    }
+
+    #[test]
+    fn decode_is_ignored_for_a_jpeg_2000_image() {
+        // 7.4.9: /Decode is ignored, whatever it says.
+        let work = Work::new();
+        let raw = raw_fixture("rgb_lossless.raw");
+        let inverted = Object::Array([1, 0, 1, 0, 1, 0].map(Object::Integer).to_vec());
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[("Decode", inverted)], (61, 47), &work);
+        let Ok(Loaded::Image { pixmap, .. }) = r else { panic!("not an image") };
+        for (px, rgb) in pixmap.data().chunks_exact(4).zip(raw.chunks_exact(3)) {
+            assert_eq!(&px[..3], rgb);
+        }
+    }
+
+    #[test]
+    fn a_jpeg_2000_soft_mask_is_decoded_as_big_as_the_picture_it_masks() {
+        // A grey picture of 61 by 47 with a JPEG 2000 grey soft mask of the same size: the mask must come out in full,
+        // not at the smallest size its levels allow.
+        let work = Work::new();
+        let mask = raw_fixture("gray_lossless.raw");
+        let mut mdict = Dict::new();
+        mdict.set("Width", Object::Integer(61));
+        mdict.set("Height", Object::Integer(47));
+        mdict.set("ColorSpace", Object::from("DeviceGray"));
+        mdict.set("Filter", Object::from("JPXDecode"));
+        let jp2 = raw_fixture("gray_lossless.jp2");
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[("SMask", Object::Stream(Stream { dict: mdict, data: jp2 })), ("ColorSpace", Object::from("DeviceGray"))], (61, 47), &work);
+        let Ok(Loaded::Image { pixmap, opaque }) = r else { panic!("not an image") };
+        assert!(!opaque);
+        for (px, &a) in pixmap.data().chunks_exact(4).zip(&mask) {
+            assert_eq!(px[3], a);
+        }
+    }
+
+    #[test]
+    fn the_opacity_channel_of_a_jpeg_2000_image_is_used_when_the_dictionary_asks() {
+        let work = Work::new();
+        let raw = raw_fixture("rgba_lossless.raw");
+        let (r, _) = load_jpx("rgba_lossless.jp2", &[("SMaskInData", Object::Integer(1))], (61, 47), &work);
+        let Ok(Loaded::Image { pixmap, opaque }) = r else { panic!("not an image") };
+        assert!(!opaque);
+        for (px, rgba) in pixmap.data().chunks_exact(4).zip(raw.chunks_exact(4)) {
+            let a = u32::from(rgba[3]);
+            assert_eq!(u32::from(px[3]), a);
+            // The pixmap holds the colour multiplied by the alpha.
+            assert_eq!(u32::from(px[0]), (u32::from(rgba[0]) * a + 127) / 255);
+        }
+        // Without /SMaskInData the channel is left alone.
+        let (r, _) = load_jpx("rgba_lossless.jp2", &[], (61, 47), &work);
+        let Ok(Loaded::Image { opaque, .. }) = r else { panic!("not an image") };
+        assert!(opaque);
+    }
+
+    #[test]
+    fn a_jpeg_2000_image_that_cannot_be_decoded_is_a_grey_block_with_a_warning() {
+        let doc = Document::from_bytes(crate::testutil::sample_pdf()).expect("opens");
+        let lookup = |_: &[u8]| None;
+        let meter = Meter::new(1000);
+        let left = Cell::new(1 << 20);
+        let work = Work::new();
+        let globals = jbig2::GlobalsCache::default();
+        let env = Env { doc: &doc, lookup: &lookup, fill: [0.0; 3], target: (8, 8), meter: &meter, pixels_left: &left, work: &work, globals: &globals };
+        let mut dict = Dict::new();
+        dict.set("Width", Object::Integer(8));
+        dict.set("Height", Object::Integer(8));
+        dict.set("Filter", Object::from("JPXDecode"));
+        let mut warnings = Warnings::default();
+        let r = load(&env, &Stream { dict, data: vec![0xFF, 0x4F, 0xFF, 0x51, 0, 3, 0] }, &mut warnings);
+        assert!(matches!(r, Ok(Loaded::Placeholder)));
+        assert!(!warnings.list.is_empty());
+        // And with no work left the page is told so.
+        let spent = Work::with_allowance(10.0);
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[], (61, 47), &spent);
+        assert!(matches!(r, Err(Error::Limit(_))));
+    }
+
     #[test]
     fn one_bit_rows_average_like_bytes() {
         // A 1-bit picture and the same picture as grey bytes shrink to the same thing (to a level).
@@ -1147,8 +1345,8 @@ mod tests {
                 bytes.push(if set { 255 } else { 0 });
             }
         }
-        let b = Samples { w, h, bpc: 1, ncomp: 1, stride, data: bits };
-        let g = Samples { w, h, bpc: 8, ncomp: 1, stride: w, data: bytes };
+        let b = Samples { w, h, bpc: 1, ncomp: 1, stride, data: bits, alpha: None };
+        let g = Samples { w, h, bpc: 8, ncomp: 1, stride: w, data: bytes, alpha: None };
         let space = Arc::new(ColorSpace::Gray);
         let (ob, og) = (resample(&b, &color_plan(&b, &space, None, None, &Meter::new(u64::MAX)), None, 40, 25), resample(&g, &color_plan(&g, &space, None, None, &Meter::new(u64::MAX)), None, 40, 25));
         for (p, q) in ob.chunks_exact(4).zip(og.chunks_exact(4)) {

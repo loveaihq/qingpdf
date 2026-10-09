@@ -1,8 +1,8 @@
 //! Rendering (layer 3): a page drawn to pixels. Paths, colours, clipping, images, form XObjects
 //! and text (embedded or system fonts) are drawn; a character whose glyph cannot be had is an outline
 //! box. Transparency (groups, soft masks, blend modes, knockout), shadings (types 1 to 7), tiling and
-//! shading patterns, and optional content (layers that are off) are drawn too (3c). Annotations and the
-//! JBIG2 and JPEG 2000 image formats are not (3c2).
+//! shading patterns, and optional content (layers that are off) are drawn too (3c), and so are the JBIG2 and
+//! JPEG 2000 image formats (3c2). Annotations are not (3c2).
 //!
 //! ```no_run
 //! # use qingpdf_core::{Document, render};
@@ -26,6 +26,7 @@ mod glyf;
 mod image;
 mod interp;
 mod jbig2;
+mod jpx;
 mod mq;
 mod oc;
 mod outline;

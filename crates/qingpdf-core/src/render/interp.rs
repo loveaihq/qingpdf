@@ -50,8 +50,8 @@ pub(crate) const MAX_PAINT_AREA: f64 = 6.0e9;
 pub(crate) const MAX_PAGE_IMAGE_PIXELS: u64 = 256 * 1024 * 1024;
 /// Decoded form contents and glyph procedures kept for reuse, in bytes.
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
-/// Images kept for reuse, in bytes. (With the page itself, 64 MB at most, and the buffers of an image
-/// being made, about 110 MB, a page stays under 200 MB.)
+/// Images kept for reuse, in bytes, one of them up to two thirds of it (a picture that fills an A4 page at 150 dpi is
+/// 9 MB). (The page itself is 64 MB at most, and the decoder of a JPEG 2000 picture holds 120 MB at most.)
 const MAX_IMAGE_CACHE_BYTES: usize = 24 * 1024 * 1024;
 /// Bytes of clip masks alive at once (the `q` stack keeps one per nested non-rectangular clip, a page's
 /// worth of bytes each); past it clips are made from their bounding boxes.
@@ -1886,7 +1886,7 @@ impl<'a> Interp<'a> {
                 let prepared = Rc::new(Prepared { pixmap, opaque });
                 let bytes = prepared.pixmap.data().len();
                 if let Some(r) = r
-                    && bytes <= MAX_IMAGE_CACHE_BYTES / 4
+                    && bytes <= MAX_IMAGE_CACHE_BYTES / 3 * 2
                 {
                     if self.shared.image_bytes + bytes > MAX_IMAGE_CACHE_BYTES {
                         self.shared.images.clear();

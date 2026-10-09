@@ -8,7 +8,8 @@
 //! page gives one warning, and what is drawn so far is kept. The weights below were measured on the machine the
 //! tests run on (see `docs/decisions.md`, 3c); they need to be right to a factor of two, not exactly.
 
-use std::cell::Cell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The work one page may do, in units of about a nanosecond: a hostile page stops after about two seconds.
 pub(crate) const PAGE_WORK: f64 = 2.0e9;
@@ -84,36 +85,82 @@ pub(crate) mod cost {
     /// A segment looked at, and a cell of a halftone grid (its gray value and the position of its pattern).
     pub const JB2_SEGMENT: f64 = 600.0;
     pub const JB2_CELL: f64 = 60.0;
+
+    // JPEG 2000 (3c2-2). First guesses; the measured values are in `docs/decisions.md`.
+    /// A byte of a marker segment, and a marker segment looked at; a tile-part found; a box of the JP2 file.
+    pub const JPX_HEADER_BYTE: f64 = 2.0;
+    pub const JPX_MARKER: f64 = 100.0;
+    pub const JPX_TILE_PART: f64 = 300.0;
+    pub const JPX_BOX: f64 = 200.0;
+    /// A tile started, one of its components, one of their resolutions.
+    pub const JPX_TILE: f64 = 3000.0;
+    pub const JPX_TILE_COMP: f64 = 2000.0;
+    pub const JPX_RES: f64 = 300.0;
+    /// A precinct, a precinct's part of one subband, a code-block, a node of a tag tree (built).
+    pub const JPX_PRECINCT: f64 = 120.0;
+    pub const JPX_PBAND: f64 = 150.0;
+    pub const JPX_BLOCK_INIT: f64 = 120.0;
+    pub const JPX_TREE_NODE: f64 = 10.0;
+    /// A packet looked at (also one that is skipped or empty), a bit of a packet header, a code-block named in a
+    /// header, a codeword segment of it, a precinct put in the order of a position-based progression.
+    pub const JPX_PACKET: f64 = 150.0;
+    pub const JPX_HEADER_BIT: f64 = 8.0;
+    pub const JPX_BLOCK_HDR: f64 = 200.0;
+    pub const JPX_SEG: f64 = 100.0;
+    pub const JPX_ORDER: f64 = 80.0;
+    /// A coding pass of a code-block (fixed part, and each sample of the block it passes over) and an MQ or raw decision.
+    pub const JPX_PASS: f64 = 100.0;
+    pub const JPX_PASS_SAMPLE: f64 = 1.2;
+    pub const JPX_DECISION: f64 = 10.0;
+    /// A byte of code-block data gathered; a coefficient dequantized and put in place.
+    pub const JPX_GATHER_BYTE: f64 = 0.5;
+    pub const JPX_COEF: f64 = 2.5;
+    /// A sample at a level of the inverse wavelet transform (rows and columns).
+    pub const JPX_DWT: f64 = 3.5;
+    /// A sample through the component transform and put on its plane; a pixel of the result per channel.
+    pub const JPX_SAMPLE: f64 = 2.0;
+    pub const JPX_PIXEL: f64 = 2.0;
+    pub const JPX_CLEAR_BYTE: f64 = 0.15;
+    /// A code-block looked at when the blocks to decode are listed, and when its result is put in place.
+    pub const JPX_BLOCK_VISIT: f64 = 4.0;
 }
 
-/// The page's allowance, spent as it is drawn. The counters are cells so that the image decoders, which hold the
-/// meter by shared reference while they work, can charge it too.
+/// The page's allowance, spent as it is drawn. The meter can be shared by reference between threads: the image
+/// decoders that decode in parallel (JPEG 2000) charge it from their workers.
 pub(crate) struct Work {
-    left: Cell<f64>,
-    used: Cell<f64>,
-    over: Cell<bool>,
+    /// (units left, units used)
+    state: Mutex<(f64, f64)>,
+    over: AtomicBool,
 }
 
 impl Work {
     pub fn new() -> Work {
-        Work { left: Cell::new(PAGE_WORK), used: Cell::new(0.0), over: Cell::new(false) }
+        Work { state: Mutex::new((PAGE_WORK, 0.0)), over: AtomicBool::new(false) }
     }
 
     /// A meter with `units` to spend (tests of the decoders).
     #[cfg(test)]
     pub fn with_allowance(units: f64) -> Work {
-        Work { left: Cell::new(units), used: Cell::new(0.0), over: Cell::new(false) }
+        Work { state: Mutex::new((units, 0.0)), over: AtomicBool::new(false) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, (f64, f64)> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Spend `units` on work about to be done. `false` (and nothing spent) when the page has not that much left; from
     /// then on every call says no.
     pub fn charge(&self, units: f64) -> bool {
-        if self.over.get() || units.is_nan() || units > self.left.get() {
-            self.over.set(true);
+        if self.over.load(Ordering::Relaxed) {
             return false;
         }
-        self.left.set(self.left.get() - units);
-        self.used.set(self.used.get() + units);
+        let mut st = self.lock();
+        if units.is_nan() || units > st.0 {
+            self.over.store(true, Ordering::Relaxed);
+            return false;
+        }
+        st.0 -= units;
+        st.1 += units;
         true
     }
 
@@ -123,23 +170,24 @@ impl Work {
         if units.is_nan() || units < 0.0 {
             return;
         }
-        self.used.set(self.used.get() + units);
-        if units >= self.left.get() {
-            self.left.set(0.0);
-            self.over.set(true);
+        let mut st = self.lock();
+        st.1 += units;
+        if units >= st.0 {
+            st.0 = 0.0;
+            self.over.store(true, Ordering::Relaxed);
         } else {
-            self.left.set(self.left.get() - units);
+            st.0 -= units;
         }
     }
 
     /// Has the page used up its work (or been refused some)?
     pub fn is_over(&self) -> bool {
-        self.over.get()
+        self.over.load(Ordering::Relaxed)
     }
 
     /// Units spent so far.
     #[cfg(test)]
     pub fn used(&self) -> f64 {
-        self.used.get()
+        self.lock().1
     }
 }
