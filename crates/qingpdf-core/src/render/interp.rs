@@ -22,7 +22,7 @@ use crate::text::interp::{FxMap, Matrix, mul};
 use crate::text::scan::{Item, Operand, Scanner};
 
 use super::color::ColorSpace;
-use super::fonts::{Budget, GlyphSource};
+use super::fonts::{self, Budget, GlyphSource};
 use super::func::Meter;
 use super::image::{self, Loaded};
 use super::jbig2;
@@ -305,8 +305,67 @@ enum FontKey {
     Direct(u32, Vec<u8>),
 }
 
+/// How much memory the caches (kept from page to page) and the layers, clip masks and image decoders (alive while a page
+/// is drawn) may take. The defaults are the limits of the command line tool; [`Renderer::set_memory_limits`] lowers them.
+#[derive(Clone, Copy)]
+pub(crate) struct Caps {
+    pub objects: usize,
+    pub images: usize,
+    pub programs: usize,
+    pub glyphs: usize,
+    pub glyph_bitmaps: usize,
+    pub layers: usize,
+    pub masks: usize,
+    pub decoders: u64,
+    /// Bytes for the one large image kept for the tiles of the page being drawn (0: none is kept).
+    pub image_slot: usize,
+    /// The most pixels of one piece drawn.
+    pub canvas: u64,
+}
+
+impl Default for Caps {
+    fn default() -> Caps {
+        Caps {
+            objects: MAX_CACHE_BYTES,
+            images: MAX_IMAGE_CACHE_BYTES,
+            programs: fonts::MAX_PROGRAM_BYTES,
+            glyphs: fonts::MAX_GLYPH_BYTES,
+            glyph_bitmaps: usize::MAX,
+            layers: layers::MAX_LIVE_LAYER_BYTES,
+            masks: MAX_LIVE_MASK_BYTES,
+            decoders: u64::MAX,
+            image_slot: 0,
+            canvas: u64::MAX,
+        }
+    }
+}
+
+impl Caps {
+    /// `caches` bytes shared out between the caches, and the other limits as they are given. No limit is more than
+    /// the default, and none is zero.
+    pub fn within(l: &super::MemoryLimits) -> Caps {
+        let d = Caps::default();
+        let part = |percent: usize, most: usize| (l.caches / 100 * percent).clamp(1, most);
+        Caps {
+            objects: part(25, d.objects),
+            images: part(15, d.images),
+            programs: part(40, d.programs),
+            glyphs: part(10, d.glyphs),
+            glyph_bitmaps: part(5, 8 << 20),
+            layers: l.layers.clamp(1, d.layers),
+            masks: l.masks.clamp(1, d.masks),
+            decoders: l.decoders as u64,
+            image_slot: l.image_slot,
+            canvas: l.canvas_pixels.max(1),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Shared {
+    pub caps: Caps,
+    /// Set from another thread to stop the page being drawn at its next operator ([`Error::Cancelled`]).
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     fonts: FxMap<FontKey, Option<Rc<FontEntry>>>,
     pub cmaps: HashMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
@@ -316,6 +375,12 @@ pub(crate) struct Shared {
     cache_bytes: usize,
     images: HashMap<ImageKey, Rc<Prepared>>,
     image_bytes: usize,
+    /// The last image too big for `images` (up to `caps.image_slot`): the tiles of one page, drawn one request after
+    /// another, find it here instead of decoding it again for each. A newer big image takes its place.
+    big_image: Option<(ImageKey, Rc<Prepared>)>,
+    /// Images decoded since the renderer was made (tests look at it).
+    #[cfg(test)]
+    pub(crate) images_decoded: usize,
     /// JBIG2 globals decoded, by their stream: the images that name one decode it once.
     globals: jbig2::GlobalsCache,
     /// Bytes held by font programs and glyph outlines.
@@ -338,6 +403,15 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    pub(crate) fn set_caps(&mut self, caps: Caps) {
+        self.caps = caps;
+        self.budget.set_program_cap(caps.programs);
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// (bytes of glyph bitmaps, of glyph outlines, of font programs) held now.
     #[cfg(test)]
     pub(crate) fn cache_bytes(&self) -> (usize, usize, usize) {
@@ -425,7 +499,7 @@ impl Clip {
 
     /// A mask of the whole page that is set inside the rectangle. One kept with the clip counts in `live`
     /// (and is kept only while that stays under the cap); past the cap it is made again for each use.
-    fn mask_for(&self, width: u32, height: u32, live: &Rc<Cell<usize>>) -> Option<Rc<MaskBuf>> {
+    fn mask_for(&self, width: u32, height: u32, live: &Rc<Cell<usize>>, cap: usize) -> Option<Rc<MaskBuf>> {
         if let Some(m) = &self.mask {
             return Some(m.clone());
         }
@@ -433,7 +507,7 @@ impl Clip {
             return Some(m.clone());
         }
         let mask = rect_mask(width, height, self.rect)?;
-        if live.get().saturating_add(mask.data().len()) > MAX_LIVE_MASK_BYTES {
+        if live.get().saturating_add(mask.data().len()) > cap {
             return Some(Rc::new(MaskBuf::new(mask, None)));
         }
         let rc = Rc::new(MaskBuf::new(mask, Some(live)));
@@ -621,6 +695,8 @@ impl<'a> Interp<'a> {
         let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
         // The page starts with all the font work it may do.
         shared.budget.start_page();
+        let shared_decoders = shared.caps.decoders;
+        let shared_cancel = shared.cancel.clone();
         let gray = Arc::new(ColorSpace::Gray);
         let oc = shared.oc.get_or_insert_with(|| Rc::new(OcConfig::load(doc)));
         oc.start_page();
@@ -666,7 +742,7 @@ impl<'a> Interp<'a> {
             mc_stack: Vec::new(),
             mc_floor: 0,
             shading_budget: shading::Budget::new(),
-            work: Work::new(),
+            work: Work::new().with_decoder_memory(shared_decoders).with_cancel(shared_cancel),
             form_depth: 0,
             page_shadings: FxMap::default(),
             shade_cache: Vec::new(),
@@ -714,7 +790,7 @@ impl<'a> Interp<'a> {
         let dict = self.work.read(self.doc, o).and_then(|h| h.as_dict().cloned()).unwrap_or_default();
         let size = dict.approx_size();
         let made = Resources::of(dict);
-        if self.shared.cache_bytes.saturating_add(size) <= MAX_CACHE_BYTES {
+        if self.shared.cache_bytes.saturating_add(size) <= self.shared.caps.objects {
             self.shared.cache_bytes += size;
             self.shared.resources.insert(*r, made.clone());
         } else {
@@ -734,6 +810,11 @@ impl<'a> Interp<'a> {
         self.work.is_over()
     }
 
+    /// Was the page stopped by the cancel flag in the middle of some work?
+    pub fn work_cancelled(&self) -> bool {
+        self.work.was_cancelled()
+    }
+
     /// Run one content stream.
     pub fn run(&mut self, content: &[u8], res: &Rc<Resources>, depth: usize) -> Result<()> {
         let outer = std::mem::replace(&mut self.form_depth, depth);
@@ -747,6 +828,10 @@ impl<'a> Interp<'a> {
         let mut ops: Vec<Operand> = Vec::new();
         loop {
             let Item::Operator(op) = sc.next(&mut ops) else { return Ok(()) };
+            // A stop (the flag is up) comes first: a page stopped inside a decoder reads as out of work.
+            if self.shared.cancelled() {
+                return Err(Error::Cancelled);
+            }
             // A page that has used up its work draws nothing more (what is drawn stays); `render_page` says so.
             if self.work.is_over() {
                 return Ok(());
@@ -1319,7 +1404,7 @@ impl<'a> Interp<'a> {
         let (w, h) = (self.pixmap.width(), self.pixmap.height());
         let bytes = w as usize * h as usize;
         // Every mask the `q` stack keeps is a page's worth of bytes: past the cap the clip is its bounding box.
-        let over_cap = self.live_masks.get().saturating_add(bytes) > MAX_LIVE_MASK_BYTES;
+        let over_cap = self.live_masks.get().saturating_add(bytes) > self.shared.caps.masks;
         if rect_like.is_some() {
             // A rectangle: only the bounds change; a mask the clip already has is cut to it.
             let mask = match &old.mask {
@@ -1766,7 +1851,8 @@ impl<'a> Interp<'a> {
         if let Some(r) = r {
             if let Some(place) = self.placement() {
                 let key = self.image_key(r, place.target);
-                if let Some(hit) = self.shared.images.get(&key).cloned() {
+                let hit = self.shared.images.get(&key).cloned().or_else(|| self.shared.big_image.as_ref().filter(|(k, _)| *k == key).map(|(_, p)| p.clone()));
+                if let Some(hit) = hit {
                     return self.draw_prepared(&hit, &place);
                 }
             }
@@ -1847,7 +1933,7 @@ impl<'a> Interp<'a> {
         };
         let form = Rc::new(Form { content, matrix, bbox, resources, group });
         if let Some(r) = r
-            && self.shared.cache_bytes.saturating_add(form.content.len()) <= MAX_CACHE_BYTES
+            && self.shared.cache_bytes.saturating_add(form.content.len()) <= self.shared.caps.objects
         {
             self.shared.cache_bytes += form.content.len();
             self.shared.forms.insert(r, Some(form.clone()));
@@ -1912,34 +1998,57 @@ impl<'a> Interp<'a> {
         let doc = self.doc;
         let Some(place) = self.placement() else { return Ok(()) };
         let lookup = |n: &[u8]| res.get(doc, Cat::ColorSpace, n);
+        // The large image kept for the tiles is let go of while the next one is decoded (and put back below unless it is
+        // replaced), so that the two are not in memory together.
+        let held_big = self.shared.big_image.take();
         // The loader counts the pixels it decodes (the image's, its mask's, a JPEG's own size) against the page.
         let pixels_left = Cell::new(self.image_pixels_left);
         let env = image::Env { doc, lookup: &lookup, fill: self.gs.fill.rgb, target: place.target, meter: &self.meter, pixels_left: &pixels_left, work: &self.work, globals: &self.shared.globals };
         let loaded = image::load(&env, stream, &mut self.shared.warnings);
+        #[cfg(test)]
+        {
+            self.shared.images_decoded += 1;
+        }
         self.image_pixels_left = pixels_left.get();
+        // Stopped part-way through the decoding: what came back may be only part of the image, so it is not used or kept.
+        if self.work.was_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let loaded = match loaded {
             Ok(l) => l,
             Err(Error::Limit(m)) => return Err(Error::Limit(m)),
             Err(e) => {
+                self.shared.big_image = held_big;
                 self.warn(format!("an image is skipped: {e}"));
                 return Ok(());
             }
         };
         match loaded {
-            Loaded::Placeholder => self.draw_placeholder(),
+            Loaded::Placeholder => {
+                self.shared.big_image = held_big;
+                self.draw_placeholder()
+            }
             Loaded::Image { pixmap, opaque } => {
                 let prepared = Rc::new(Prepared { pixmap, opaque });
                 let bytes = prepared.pixmap.data().len();
                 if let Some(r) = r
-                    && bytes <= MAX_IMAGE_CACHE_BYTES / 3 * 2
+                    && bytes <= self.shared.caps.images / 3 * 2
                 {
-                    if self.shared.image_bytes + bytes > MAX_IMAGE_CACHE_BYTES {
+                    if self.shared.image_bytes + bytes > self.shared.caps.images {
                         self.shared.images.clear();
                         self.shared.image_bytes = 0;
                     }
                     self.shared.image_bytes += bytes;
                     let key = self.image_key(r, place.target);
                     self.shared.images.insert(key, prepared.clone());
+                    self.shared.big_image = held_big;
+                } else if let Some(r) = r
+                    && bytes <= self.shared.caps.image_slot
+                {
+                    let key = self.image_key(r, place.target);
+                    self.shared.big_image = Some((key, prepared.clone()));
+                } else {
+                    self.shared.big_image = held_big;
                 }
                 self.draw_prepared(&prepared, &place)
             }

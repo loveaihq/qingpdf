@@ -69,11 +69,14 @@ const MAX_GLOBALS_CACHE: u64 = 32 * 1024 * 1024;
 struct Ctx<'a> {
     work: &'a Work,
     memory: Cell<u64>,
+    /// The most memory there is, [`MAX_MEMORY`] or what the page's work meter allows.
+    cap: u64,
 }
 
 impl<'a> Ctx<'a> {
     fn new(work: &'a Work) -> Ctx<'a> {
-        Ctx { work, memory: Cell::new(MAX_MEMORY) }
+        let cap = work.decoder_memory().min(MAX_MEMORY);
+        Ctx { work, memory: Cell::new(cap), cap }
     }
 
     /// Spend `units` of the page's work before doing it. [`Error::Limit`]: the page has no more.
@@ -100,7 +103,7 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn give_back(&self, bytes: u64) {
-        self.memory.set(self.memory.get().saturating_add(bytes).min(MAX_MEMORY));
+        self.memory.set(self.memory.get().saturating_add(bytes).min(self.cap));
     }
 
     /// Take `bytes` of the memory an image may hold.
@@ -277,12 +280,13 @@ impl GlobalsCache {
     }
 
     /// Keep `g` unless it is more than the cache may hold; when it does not fit beside the others, they go.
-    fn put(&self, key: ObjRef, g: Rc<Globals>) {
-        if g.held > MAX_GLOBALS_CACHE {
+    fn put(&self, key: ObjRef, g: Rc<Globals>, limit: u64) {
+        let limit = limit.min(MAX_GLOBALS_CACHE);
+        if g.held > limit {
             return;
         }
         let mut entries = self.entries.borrow_mut();
-        if self.bytes.get() + g.held > MAX_GLOBALS_CACHE {
+        if self.bytes.get() + g.held > limit {
             entries.clear();
             self.bytes.set(0);
         }
@@ -345,9 +349,9 @@ impl Decoder<'_> {
             && self.page.is_none()
             && self.stripe_end.is_none()
         {
-            let held = MAX_MEMORY.saturating_sub(self.ctx.memory.get());
+            let held = self.ctx.cap.saturating_sub(self.ctx.memory.get());
             let g = Rc::new(Globals { segments: std::mem::take(&mut self.segments), count: self.count, warnings: self.warnings.clone(), held });
-            source.cache.put(key, g.clone());
+            source.cache.put(key, g.clone(), self.ctx.cap / 4);
             self.globals = Some(g);
         }
         Ok(())

@@ -83,6 +83,8 @@ pub(crate) struct CharInfo {
 /// Shared counters of the bytes the caches hold, what the page being drawn may still spend, and the programs alive.
 #[derive(Clone, Default)]
 pub(crate) struct Budget {
+    /// Most bytes of font programs to hold at once, 0 for [`MAX_PROGRAM_BYTES`].
+    program_cap: Rc<Cell<usize>>,
     pub programs: Rc<Cell<usize>>,
     pub glyphs: Rc<Cell<usize>>,
     /// Outline work and bytes of programs the page may still use (set by [`Budget::start_page`]).
@@ -93,6 +95,17 @@ pub(crate) struct Budget {
 }
 
 impl Budget {
+    pub fn set_program_cap(&self, bytes: usize) {
+        self.program_cap.set(bytes);
+    }
+
+    fn program_cap(&self) -> usize {
+        match self.program_cap.get() {
+            0 => MAX_PROGRAM_BYTES,
+            cap => cap,
+        }
+    }
+
     pub fn start_page(&self) {
         self.work.set(MAX_PAGE_OUTLINE_WORK);
         self.read.set(MAX_PAGE_PROGRAM_READ);
@@ -398,7 +411,7 @@ impl Loaded {
                 let Some(Object::Stream(s)) = resolve(ctx.doc, Some(entry)) else { return Err("the font file is not a stream") };
                 let data = ctx.doc.decode_stream_limited(&s, MAX_PROGRAM).map_err(|_| "the font file cannot be decoded")?;
                 let bytes = data.len();
-                if ctx.budget.programs.get().saturating_add(bytes) > MAX_PROGRAM_BYTES {
+                if ctx.budget.programs.get().saturating_add(bytes) > ctx.budget.program_cap() {
                     return Err("too many font programs are open");
                 }
                 // Reading costs the page its bytes, a program that turns out to be broken too.

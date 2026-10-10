@@ -30,6 +30,8 @@ pub enum Error {
     PasswordRequired,
     /// A password was given and neither it nor the empty one opens the file.
     WrongPassword,
+    /// The caller asked for the work to be stopped (a page that is no longer wanted).
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -53,6 +55,7 @@ impl fmt::Display for Error {
             Error::Invalid(m) => write!(f, "{m}"),
             Error::PasswordRequired => f.write_str("the file is encrypted and needs a password"),
             Error::WrongPassword => f.write_str("wrong password"),
+            Error::Cancelled => f.write_str("cancelled"),
         }
     }
 }

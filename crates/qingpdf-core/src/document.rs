@@ -324,6 +324,7 @@ fn copy_error(e: &Error) -> Error {
         Error::Invalid(m) => Error::Invalid(m.clone()),
         Error::PasswordRequired => Error::PasswordRequired,
         Error::WrongPassword => Error::WrongPassword,
+        Error::Cancelled => Error::Cancelled,
     }
 }
 
@@ -402,6 +403,17 @@ impl ObjStmCache {
 
     fn clear(&mut self) {
         *self = ObjStmCache::with_capacity(self.capacity);
+    }
+
+    /// Hold at most `capacity` bytes from now on; what is held beyond it is dropped, oldest first.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        while self.bytes > capacity {
+            let Some((_, oldest)) = self.recency.pop_first() else { break };
+            if let Some(gone) = self.map.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(gone.weight);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -838,6 +850,24 @@ impl Document {
     pub fn cache_objects(&self, max_bytes: usize) {
         let mut cache = self.cache.borrow_mut();
         *cache = ObjectCache { budget: max_bytes, ..ObjectCache::default() };
+    }
+
+    /// Let the decoded object streams that are kept for reuse take at most `max_bytes` (the default is 96 MiB), and
+    /// let go of what is over it now. A reader that must stay within a memory budget sets it low; a file whose
+    /// objects are spread over object streams in an order that visits them all again and again may then end in a
+    /// limit error sooner.
+    pub fn set_object_stream_cache_limit(&self, max_bytes: usize) {
+        self.objstms.borrow_mut().set_capacity(max_bytes);
+    }
+
+    /// Bytes of decoded object streams that are kept for reuse now.
+    pub fn object_stream_cache_bytes(&self) -> usize {
+        self.objstms.borrow().bytes
+    }
+
+    /// Let go of the decoded object streams that are kept for reuse.
+    pub fn clear_object_stream_cache(&self) {
+        self.objstms.borrow_mut().clear();
     }
 
     fn load(&self, r: ObjRef) -> Result<Object> {

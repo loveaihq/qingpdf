@@ -46,6 +46,9 @@ mod hostile_tests;
 #[cfg(test)]
 mod transparency_tests;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use tiny_skia::{Color, Pixmap};
 
 use crate::document::{Document, Page};
@@ -94,6 +97,35 @@ impl Bitmap {
     }
 }
 
+/// What [`Renderer::render_partial`] drew: the page, and what stopped it before the end, if anything.
+pub struct Partial {
+    pub bitmap: Bitmap,
+    /// The error that stopped the content stream part-way (a limit, or a stream that cannot be read); the bitmap
+    /// has what was drawn before it.
+    pub error: Option<Error>,
+    /// The page used up its allowance of work and the rest of it is not drawn.
+    pub work_over: bool,
+}
+
+/// Limits on the memory a [`Renderer`] holds besides the page itself, for a program that must stay within a total
+/// (see [`Renderer::set_memory_limits`]). The page drawn is `width * height * 4` bytes on top of this.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryLimits {
+    /// Bytes kept from page to page: parsed forms, shadings, patterns, decoded images, font programs, glyphs.
+    pub caches: usize,
+    /// Bytes of off-screen layers (transparency groups, soft masks, pattern cells) alive at once.
+    pub layers: usize,
+    /// Bytes of clip masks alive at once.
+    pub masks: usize,
+    /// Bytes the JPEG 2000 and JBIG2 decoders may hold at once.
+    pub decoders: usize,
+    /// Bytes for one large image (one that does not fit the image cache) kept from request to request, so that the pieces
+    /// of one page drawn one after another decode it once. 0: none is kept.
+    pub image_slot: usize,
+    /// The most pixels one piece may have (never more than [`MAX_PAGE_PIXELS`]); a bigger request is an [`Error::Limit`].
+    pub canvas_pixels: u64,
+}
+
 /// Draws the pages of one document. Fonts, images and forms are kept between pages, so one
 /// renderer should do all the pages of a run.
 pub struct Renderer<'a> {
@@ -121,34 +153,66 @@ impl<'a> Renderer<'a> {
     /// the document's decoding budget). Whatever else is wrong in the page (an image or font that cannot be
     /// read, an unknown colour space) is skipped and reported by [`Renderer::take_warnings`].
     pub fn render_page(&mut self, page: &Page, dpi: f64) -> Result<Bitmap> {
+        let drawn = self.render_partial(page, dpi, 0, None)?;
+        match drawn.error {
+            Some(e) => Err(e),
+            None => Ok(drawn.bitmap),
+        }
+    }
+
+    /// [`Renderer::render_page`] for a reader: the page turned a further `rotation` degrees (a multiple of 90), and
+    /// only the `region` of it drawn, `[x, y, width, height]` in pixels of the whole page at `dpi` (cut to the page;
+    /// the region may have [`MAX_PAGE_PIXELS`] pixels although the whole page has more). A page that goes wrong
+    /// part-way is not an error here: what was drawn is returned with the error (and a page that used up its
+    /// allowance of work with `work_over`). [`Error::Cancelled`] when the flag of [`Renderer::set_cancel`] was set.
+    pub fn render_partial(&mut self, page: &Page, dpi: f64, rotation: u16, region: Option<[u32; 4]>) -> Result<Partial> {
         if self.doc.is_locked() {
             return Err(Error::PasswordRequired);
         }
         if !(MIN_DPI..=MAX_DPI).contains(&dpi) {
             return Err(Error::Invalid(format!("the resolution must be between {MIN_DPI} and {MAX_DPI} dpi")));
         }
+        if !rotation.is_multiple_of(90) {
+            return Err(Error::Invalid("the rotation must be a multiple of 90 degrees".to_string()));
+        }
         // 14.11.2: the page is its crop box; without usable boxes, US Letter.
         let [x0, y0, x1, y1] = text::visible_box(page).unwrap_or([0.0, 0.0, 612.0, 792.0]);
-        let rotate = page.rotate();
+        let rotate = (page.rotate().rem_euclid(360) + i64::from(rotation)).rem_euclid(360);
         let scale = dpi / 72.0;
         let (bw, bh) = ((x1 - x0) * scale, (y1 - y0) * scale);
         let (pw, ph) = if rotate == 90 || rotate == 270 { (bh, bw) } else { (bw, bh) };
-        let (width, height) = ((pw.round().max(1.0)) as u64, (ph.round().max(1.0)) as u64);
-        if width.saturating_mul(height) > MAX_PAGE_PIXELS {
+        let (full_w, full_h) = ((pw.round().max(1.0)) as u64, (ph.round().max(1.0)) as u64);
+        // The part to draw: all of the page, or the region cut to it.
+        let (rx, ry, width, height) = match region {
+            None => (0, 0, full_w, full_h),
+            Some([x, y, w, h]) => {
+                let (x, y) = (u64::from(x).min(full_w), u64::from(y).min(full_h));
+                let (w, h) = (u64::from(w).min(full_w - x), u64::from(h).min(full_h - y));
+                if w == 0 || h == 0 {
+                    return Err(Error::Invalid("the region is outside the page".to_string()));
+                }
+                (x, y, w, h)
+            }
+        };
+        let most = MAX_PAGE_PIXELS.min(self.shared.caps.canvas);
+        if width.saturating_mul(height) > most {
             return Err(Error::Limit(format!(
-                "the page would be {width} by {height} pixels at {dpi} dpi; the most is {MAX_PAGE_PIXELS} pixels (use a lower --dpi)"
+                "the page would be {width} by {height} pixels at {dpi} dpi; the most is {most} pixels (use a lower --dpi)"
             )));
         }
         let mut pixmap = Pixmap::new(width as u32, height as u32).ok_or_else(|| Error::Limit("the page is too large to draw".to_string()))?;
         pixmap.fill(Color::WHITE);
         // User space to device pixels (row vector convention, 8.3.4): turn, scale, flip.
         let s = scale;
-        let base = match rotate {
+        let mut base = match rotate {
             90 => [0.0, s, s, 0.0, -y0 * s, -x0 * s],
             180 => [-s, 0.0, 0.0, s, x1 * s, -y0 * s],
             270 => [0.0, -s, -s, 0.0, y1 * s, x1 * s],
             _ => [s, 0.0, 0.0, -s, -x0 * s, y1 * s],
         };
+        // The region's corner is the origin of the pixmap.
+        base[4] -= rx as f64;
+        base[5] -= ry as f64;
         // Every page has the decoding budget of a whole document (one for all of a long scan's pages would run out).
         let _budget = self.doc.page_decode_budget();
         let content = text::page_content(self.doc, page, &mut self.shared.warnings)?;
@@ -164,6 +228,7 @@ impl<'a> Renderer<'a> {
         let boxed_causes = interp.boxed_by;
         let absent_glyphs = interp.absent;
         let work_over = interp.work_over();
+        let cancelled = interp.work_cancelled();
         #[cfg(test)]
         let last_work = interp.work_used();
         let pixmap = interp.pixmap;
@@ -179,8 +244,24 @@ impl<'a> Renderer<'a> {
         if meter.was_refused() {
             self.shared.warnings.add("the page asks for more colour conversion work than is allowed; some spot colours are shown as greys");
         }
-        result?;
-        Ok(Bitmap { width: pixmap.width(), height: pixmap.height(), rgba: pixmap.take(), boxed_characters, boxed_causes, absent_glyphs })
+        // Stopped by the flag, either between two operators or in the middle of a decoder (which then reports a limit).
+        if matches!(result, Err(Error::Cancelled)) || cancelled {
+            return Err(Error::Cancelled);
+        }
+        let bitmap = Bitmap { width: pixmap.width(), height: pixmap.height(), rgba: pixmap.take(), boxed_characters, boxed_causes, absent_glyphs };
+        Ok(Partial { bitmap, error: result.err(), work_over })
+    }
+
+    /// Stop the page being drawn when `flag` is set (from another thread): [`Renderer::render_partial`] and
+    /// [`Renderer::render_page`] then return [`Error::Cancelled`] at the next operator of the content stream.
+    pub fn set_cancel(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.shared.cancel = flag;
+    }
+
+    /// Hold the caches and the work memory of this renderer to these limits (never more than the defaults). The
+    /// page being drawn is not counted: it is `width * height * 4` bytes.
+    pub fn set_memory_limits(&mut self, limits: MemoryLimits) {
+        self.shared.set_caps(interp::Caps::within(&limits));
     }
 
     #[cfg(test)]
@@ -594,5 +675,96 @@ mod tests {
         let info = reader.next_frame(&mut buf).expect("frame");
         assert_eq!((info.width, info.height), (100, 100));
         assert_eq!(&buf[..3], &[255, 0, 0]);
+    }
+
+    #[test]
+    fn a_page_can_be_stopped_and_drawn_in_pieces_and_turned() {
+        let doc = page_doc("", "<< >>", b"1 0 0 rg 10 10 30 30 re f 0 0 1 rg 60 60 20 20 re f", &[], &[]);
+        let pages = doc.pages().expect("pages");
+        let page = pages.first().expect("a page");
+        let mut r = Renderer::new(&doc);
+        let flag = Arc::new(AtomicBool::new(true));
+        r.set_cancel(Some(flag.clone()));
+        assert!(matches!(r.render_partial(page, 72.0, 0, None), Err(Error::Cancelled)));
+        assert!(matches!(r.render_page(page, 72.0), Err(Error::Cancelled)));
+        flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        // A piece of the page is the same piece of the whole page.
+        let whole = r.render_partial(page, 144.0, 0, None).expect("whole").bitmap;
+        let piece = r.render_partial(page, 144.0, 0, Some([30, 100, 80, 60])).expect("piece").bitmap;
+        assert_eq!((whole.width, whole.height, piece.width, piece.height), (200, 200, 80, 60));
+        for y in 0..60usize {
+            for x in 0..80usize {
+                let (a, b) = ((y * 80 + x) * 4, ((y + 100) * 200 + x + 30) * 4);
+                assert_eq!(piece.rgba[a..a + 4], whole.rgba[b..b + 4], "({x}, {y})");
+            }
+        }
+        // A region outside the page is refused, one that sticks out is cut.
+        assert!(matches!(r.render_partial(page, 72.0, 0, Some([500, 0, 10, 10])), Err(Error::Invalid(_))));
+        let cut = r.render_partial(page, 72.0, 0, Some([90, 90, 50, 50])).expect("cut").bitmap;
+        assert_eq!((cut.width, cut.height), (10, 10));
+        // Turned a further 90 degrees on a page that is not square.
+        let doc = page_doc("/CropBox [0 0 100 50]", "<< >>", b"1 0 0 rg 0 0 10 10 re f", &[], &[]);
+        let pages = doc.pages().expect("pages");
+        let mut r = Renderer::new(&doc);
+        let turned = r.render_partial(pages.first().expect("a page"), 72.0, 90, None).expect("turned").bitmap;
+        assert_eq!((turned.width, turned.height), (50, 100));
+    }
+
+    #[test]
+    fn memory_limits_only_ever_lower_the_defaults() {
+        let d = interp::Caps::default();
+        let c = interp::Caps::within(&MemoryLimits { caches: 48 << 20, layers: 16 << 20, masks: 8 << 20, decoders: 32 << 20, image_slot: 24 << 20, canvas_pixels: 4 << 20 });
+        assert!(c.objects + c.images + c.programs + c.glyphs + c.glyph_bitmaps <= 48 << 20);
+        assert_eq!((c.layers, c.masks, c.decoders), (16 << 20, 8 << 20, 32 << 20));
+        let big = interp::Caps::within(&MemoryLimits { caches: usize::MAX, layers: usize::MAX, masks: usize::MAX, decoders: usize::MAX, image_slot: 0, canvas_pixels: u64::MAX });
+        assert_eq!((big.objects, big.images, big.programs, big.glyphs, big.layers, big.masks), (d.objects, d.images, d.programs, d.glyphs, d.layers, d.masks));
+        let none = interp::Caps::within(&MemoryLimits { caches: 0, layers: 0, masks: 0, decoders: 0, image_slot: 0, canvas_pixels: 0 });
+        assert!(none.objects >= 1 && none.programs >= 1 && none.layers >= 1 && none.masks >= 1);
+    }
+
+    fn image_page() -> Document {
+        let data: Vec<u8> = (0..64 * 64 * 3).map(|i| (i % 251) as u8).collect();
+        page_doc(
+            "",
+            "<< /XObject << /Im 5 0 R >> >>",
+            b"q 100 0 0 100 0 0 cm /Im Do Q",
+            &[],
+            &[(5, "/Type /XObject /Subtype /Image /Width 64 /Height 64 /BitsPerComponent 8 /ColorSpace /DeviceRGB", &data)],
+        )
+    }
+
+    #[test]
+    fn the_pieces_of_a_page_share_one_large_image() {
+        let doc = image_page();
+        let pages = doc.pages().expect("pages");
+        let page = pages.first().expect("a page");
+        // An image cache too small for the image: with no slot every piece decodes the image again, with one it is decoded once.
+        let limits = |slot| MemoryLimits { caches: 100, layers: 1 << 20, masks: 1 << 20, decoders: 1 << 20, image_slot: slot, canvas_pixels: 1 << 20 };
+        let mut without = Renderer::new(&doc);
+        without.set_memory_limits(limits(0));
+        let mut with = Renderer::new(&doc);
+        with.set_memory_limits(limits(1 << 20));
+        let whole = without.render_partial(page, 144.0, 0, None).expect("whole").bitmap;
+        for r in [&mut without, &mut with] {
+            for region in [[0, 0, 200, 100], [0, 100, 200, 100]] {
+                let piece = r.render_partial(page, 144.0, 0, Some(region)).expect("piece").bitmap;
+                let at = region[1] as usize * 200 * 4;
+                assert_eq!(piece.rgba[..], whole.rgba[at..at + 200 * 100 * 4]);
+            }
+        }
+        assert_eq!(without.shared.images_decoded, 1 + 2);
+        assert_eq!(with.shared.images_decoded, 1, "the second piece found the image in the slot");
+    }
+
+    #[test]
+    fn a_piece_bigger_than_the_canvas_is_refused() {
+        let doc = page_doc("", "<< >>", b"1 0 0 rg 0 0 50 50 re f", &[], &[]);
+        let pages = doc.pages().expect("pages");
+        let page = pages.first().expect("a page");
+        let mut r = Renderer::new(&doc);
+        r.set_memory_limits(MemoryLimits { caches: 1 << 20, layers: 1 << 20, masks: 1 << 20, decoders: 1 << 20, image_slot: 0, canvas_pixels: 100 * 100 });
+        assert!(matches!(r.render_partial(page, 144.0, 0, None), Err(Error::Limit(_))));
+        assert!(matches!(r.render_partial(page, 144.0, 0, Some([0, 0, 101, 100])), Err(Error::Limit(_))));
+        assert_eq!(r.render_partial(page, 144.0, 0, Some([0, 0, 100, 100])).expect("fits").bitmap.width, 100);
     }
 }

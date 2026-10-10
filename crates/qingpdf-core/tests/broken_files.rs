@@ -47,6 +47,7 @@ fn kind(e: &Error) -> &'static str {
         Error::Invalid(_) => "invalid",
         Error::PasswordRequired => "password required",
         Error::WrongPassword => "wrong password",
+        Error::Cancelled => "cancelled",
     }
 }
 

@@ -208,17 +208,53 @@ pub(crate) struct Work {
     over: AtomicBool,
     /// The objects the page has read by reference, and the references that could not be read.
     kept: Mutex<KeptObjects>,
+    /// Most bytes the image decoders (JPEG 2000, JBIG2) may hold at once; they also have limits of their own.
+    decoder_memory: u64,
+    /// Set from another thread to stop the page: the next [`Work::charge`] says no, as if the allowance were gone.
+    cancel: Option<Arc<AtomicBool>>,
+    /// The page was stopped by that flag (not by running out of work).
+    cancelled: AtomicBool,
 }
 
 impl Work {
     pub fn new() -> Work {
-        Work { state: Mutex::new((PAGE_WORK, 0.0)), over: AtomicBool::new(false), kept: Mutex::default() }
+        Work {
+            state: Mutex::new((PAGE_WORK, 0.0)),
+            over: AtomicBool::new(false),
+            kept: Mutex::default(),
+            decoder_memory: u64::MAX,
+            cancel: None,
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    /// The same, stopped when `flag` is set. Every decoder and every shading, layer or pattern charges this meter as
+    /// it goes, so one long piece of work (a JPEG 2000 or JBIG2 image, a big shading) stops within a row or a block
+    /// instead of running to its end.
+    pub fn with_cancel(mut self, flag: Option<Arc<AtomicBool>>) -> Work {
+        self.cancel = flag;
+        self
+    }
+
+    /// Did the flag of [`Work::with_cancel`] stop this page?
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// The same, with the image decoders held to `bytes` of memory (when that is less than their own limits).
+    pub fn with_decoder_memory(mut self, bytes: u64) -> Work {
+        self.decoder_memory = bytes;
+        self
+    }
+
+    pub fn decoder_memory(&self) -> u64 {
+        self.decoder_memory
     }
 
     /// A meter with `units` to spend (tests of the decoders).
     #[cfg(test)]
     pub fn with_allowance(units: f64) -> Work {
-        Work { state: Mutex::new((units, 0.0)), over: AtomicBool::new(false), kept: Mutex::default() }
+        Work { state: Mutex::new((units, 0.0)), ..Work::new() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, (f64, f64)> {
@@ -229,6 +265,11 @@ impl Work {
     /// then on every call says no.
     pub fn charge(&self, units: f64) -> bool {
         if self.over.load(Ordering::Relaxed) {
+            return false;
+        }
+        if self.cancel.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)) {
+            self.cancelled.store(true, Ordering::Relaxed);
+            self.over.store(true, Ordering::Relaxed);
             return false;
         }
         let mut st = self.lock();
@@ -342,5 +383,49 @@ impl Work {
     #[cfg(test)]
     pub fn used(&self) -> f64 {
         self.lock().1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_stopped_in_the_middle_of_one_piece_of_work() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let work = Work::new().with_cancel(Some(flag.clone()));
+        // Work in many small steps, as a decoder charges it: the flag stops it at the next step, not at the end.
+        let mut steps = 0u64;
+        let stopper = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                flag.store(true, Ordering::Relaxed);
+            })
+        };
+        let started = std::time::Instant::now();
+        while work.charge(1.0) {
+            steps += 1;
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        stopper.join().expect("the stopper");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{steps} steps");
+        assert!(work.was_cancelled() && work.is_over());
+        // The meter has plenty left: it was the flag.
+        assert!(work.used() < 1.0e9);
+        // Without the flag, or with it down, nothing changes.
+        let calm = Work::new().with_cancel(Some(Arc::new(AtomicBool::new(false))));
+        assert!(calm.charge(1.0) && !calm.was_cancelled() && !calm.is_over());
+        assert!(Work::new().charge(1.0));
+    }
+
+    #[test]
+    fn a_flag_that_is_up_before_the_work_starts_refuses_all_of_it() {
+        let work = Work::new().with_cancel(Some(Arc::new(AtomicBool::new(true))));
+        assert!(!work.charge(0.0));
+        assert!(work.was_cancelled());
     }
 }

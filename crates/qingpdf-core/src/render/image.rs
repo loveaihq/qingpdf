@@ -1241,6 +1241,22 @@ mod tests {
     }
 
     #[test]
+    fn a_jpeg_2000_decode_stops_at_once_when_the_page_is_cancelled() {
+        // The flag is up before the decoder starts: its first charge is refused, so nothing is decoded or drawn from it.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let stopped = Work::new().with_cancel(Some(flag));
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[], (61, 47), &stopped);
+        assert!(!matches!(r, Ok(Loaded::Image { .. })));
+        assert!(stopped.was_cancelled() && stopped.is_over());
+        assert!(stopped.used() < 1.0e4, "{}", stopped.used());
+        // The same image with the flag down is decoded in full.
+        let calm = Work::new().with_cancel(Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))));
+        let (r, _) = load_jpx("rgb_lossless.jp2", &[], (61, 47), &calm);
+        assert!(matches!(r, Ok(Loaded::Image { .. })) && !calm.was_cancelled());
+        assert!(calm.used() > 1.0e5, "{}", calm.used());
+    }
+
+    #[test]
     fn a_jpeg_2000_image_takes_its_colour_space_from_the_dictionary_first() {
         let work = Work::new();
         let raw = raw_fixture("rgb_lossless.raw");

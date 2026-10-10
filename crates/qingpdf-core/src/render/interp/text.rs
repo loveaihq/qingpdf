@@ -11,7 +11,7 @@ use tiny_skia::{FillRule, Mask, Path, PathBuilder, PathSegment, Transform};
 
 use super::{FontEntry, Interp, Resources, Shown, apply, finite, is_blank, mul};
 use crate::error::Result;
-use crate::render::fonts::{self, CharInfo, Cause, Glyph, LoadCtx, Loaded, Lookup, MAX_GLYPH_BYTES, MAX_PROGRAM_BYTES};
+use crate::render::fonts::{self, CharInfo, Cause, Glyph, LoadCtx, Loaded, Lookup};
 use crate::text::interp::Matrix;
 
 /// Quarter pixel positions.
@@ -37,7 +37,7 @@ impl Interp<'_> {
     /// the programs held are many).
     fn glyph_reader(&mut self, entry: &Rc<FontEntry>) -> std::result::Result<Rc<Loaded>, Cause> {
         let Some(source) = &entry.glyphs else { return Err(Cause::NoFont) };
-        if !source.is_loaded() && self.shared.budget.programs.get() > MAX_PROGRAM_BYTES / 2 {
+        if !source.is_loaded() && self.shared.budget.programs.get() > self.shared.caps.programs / 2 {
             for other in self.shared.fonts.values().flatten() {
                 if !Rc::ptr_eq(other, entry)
                     && let Some(s) = &other.glyphs
@@ -51,7 +51,7 @@ impl Interp<'_> {
     }
 
     fn trim_glyph_caches(&mut self) {
-        if self.shared.budget.glyphs.get() > MAX_GLYPH_BYTES {
+        if self.shared.budget.glyphs.get() > self.shared.caps.glyphs {
             for e in self.shared.fonts.values().flatten() {
                 if let Some(s) = &e.glyphs {
                     s.trim_glyphs();
@@ -317,7 +317,7 @@ impl Interp<'_> {
                 let made = made.map(Rc::new);
                 // The cache is held to its size as it grows, not afterwards.
                 let size = made.as_ref().map_or(48, |b| b.alpha.len() + 64);
-                if self.shared.bitmap_bytes + size > MAX_BITMAP_BYTES {
+                if self.shared.bitmap_bytes + size > MAX_BITMAP_BYTES.min(self.shared.caps.glyph_bitmaps) {
                     self.shared.bitmaps.clear();
                     self.shared.bitmap_bytes = 0;
                 }

@@ -18,7 +18,7 @@ use tiny_skia::{Pattern, SpreadMode};
 /// Most layers nested (a group in a group, a soft mask group, a pattern cell).
 pub(super) const MAX_LAYER_DEPTH: usize = 12;
 /// Bytes of layers alive at once.
-pub(super) const MAX_LIVE_LAYER_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_LIVE_LAYER_BYTES: usize = 64 * 1024 * 1024;
 /// Pixels of layers (groups, soft masks) a page may make in all (about 45 full pages at 150 dpi).
 pub(super) const MAX_LAYER_PIXELS: u64 = 100_000_000;
 /// Pixels of a pattern cell, and of the cells a page may make in all.
@@ -208,7 +208,7 @@ impl Interp<'_> {
             self.warn(format!("transparency groups, soft masks and patterns are nested more than {MAX_LAYER_DEPTH} deep; the deeper ones are not drawn as layers"));
             return Ok(None);
         }
-        if self.live_layers.get().saturating_add(bytes) > MAX_LIVE_LAYER_BYTES {
+        if self.live_layers.get().saturating_add(bytes) > self.shared.caps.layers {
             self.warn("transparency layers use more memory than is allowed; some groups, soft masks and patterns are not drawn as layers");
             return Ok(None);
         }
@@ -429,7 +429,7 @@ impl Interp<'_> {
             if clip.mask.is_none() && inside {
                 return Ok(None);
             }
-            return Ok(clip.mask_for(w, h, &self.live_masks));
+            return Ok(clip.mask_for(w, h, &self.live_masks, self.shared.caps.masks));
         };
         if let Some((c, s, m)) = self.sm_cache.iter().find(|(c, s, _)| Rc::ptr_eq(c, &clip) && Rc::ptr_eq(s, &sm)).map(|(c, s, m)| (c.clone(), s.clone(), m.clone())) {
             // (The newest is found first next time.)
@@ -476,7 +476,7 @@ impl Interp<'_> {
             }
         }
         let bytes = width * h as usize;
-        if self.live_masks.get().saturating_add(bytes) > MAX_LIVE_MASK_BYTES {
+        if self.live_masks.get().saturating_add(bytes) > self.shared.caps.masks {
             return Ok(Some(Rc::new(MaskBuf::new(out, None))));
         }
         let rc = Rc::new(MaskBuf::new(out, Some(&self.live_masks)));
@@ -657,7 +657,7 @@ impl Interp<'_> {
         }
         if let Some(r) = key {
             let bytes = loaded.as_ref().map_or(0, |s| s.bytes);
-            if self.shared.cache_bytes.saturating_add(bytes) <= MAX_CACHE_BYTES {
+            if self.shared.cache_bytes.saturating_add(bytes) <= self.shared.caps.objects {
                 self.shared.cache_bytes += bytes;
                 self.shared.shadings.insert(r, loaded.clone());
             }
@@ -681,7 +681,7 @@ impl Interp<'_> {
         }
         let pixels = f64::from(area[2] - area[0]) * f64::from(area[3] - area[1]);
         let bytes = (area[2] - area[0]).max(0) as usize * (area[3] - area[1]).max(0) as usize * 4;
-        if self.live_layers.get().saturating_add(bytes) > MAX_LIVE_LAYER_BYTES {
+        if self.live_layers.get().saturating_add(bytes) > self.shared.caps.layers {
             self.warn("transparency layers use more memory than is allowed; a shading is not drawn");
             return Ok(None);
         }
@@ -775,7 +775,7 @@ impl Interp<'_> {
                 Some(PatternDef::Tiling(t)) => t.content.len() + 256,
                 _ => 256,
             };
-            if self.shared.cache_bytes.saturating_add(bytes) <= MAX_CACHE_BYTES {
+            if self.shared.cache_bytes.saturating_add(bytes) <= self.shared.caps.objects {
                 self.shared.cache_bytes += bytes;
                 self.shared.patterns.insert(r, loaded.clone());
             }

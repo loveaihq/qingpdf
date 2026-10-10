@@ -1,0 +1,29 @@
+[package]
+name = "qingpdf-view"
+description = "Windows reader for qingpdf: the window around the engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "qingpdf-view"
+path = "src/main.rs"
+
+[dependencies]
+qingpdf-core = { path = "../qingpdf-core" }
+
+[lints.rust]
+# `unsafe` is allowed in one module only, `win32.rs` (it calls Windows). `forbid` cannot be lifted for a module,
+# so the rule is `deny` here and `#[allow(unsafe_code)]` on that module alone.
+unsafe_code = "deny"
+
+[lints.clippy]
+# The same rules as the engine: nothing from a file, the command line or the window may panic.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+# Every `unsafe` block says why it is sound.
+undocumented_unsafe_blocks = "deny"

@@ -670,3 +670,19 @@ fn the_dictionarys_colour_space_comes_before_the_files_sycc() {
     // The dictionary has a colour space of three channels: the samples are in it, whatever the file says.
     assert_eq!(with(&sycc, Some(3)), with(&plain, Some(3)));
 }
+
+#[test]
+fn the_page_can_hold_the_decoder_to_less_memory() {
+    // The reader gives the decoder what is left of its total: less than the decoder's own limit.
+    let mut cfg = Cfg::new(120, 90, 3);
+    cfg.levels = 2;
+    cfg.cb = (3, 3);
+    cfg.mct = true;
+    let s = encode(&cfg).codestream;
+    assert!(decode(&s, &opts((0, 0)), &Work::new()).is_ok());
+    let tight = Work::new().with_decoder_memory(30_000);
+    assert!(is_limit(&decode(&s, &opts((0, 0)), &tight)));
+    let roomy = Work::new().with_decoder_memory(10_000_000);
+    let d = decode(&s, &opts((0, 0)), &roomy).expect("decodes");
+    assert!(d.memory_left <= 10_000_000, "{}", d.memory_left);
+}

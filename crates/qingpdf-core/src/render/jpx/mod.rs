@@ -118,6 +118,8 @@ impl Warnings {
 pub(super) struct Ctx<'a> {
     work: &'a Work,
     memory: AtomicU64,
+    /// The most memory there is, [`MAX_MEMORY`] or what the page's work meter allows.
+    cap: u64,
     /// The least memory there was left at any moment.
     #[cfg(test)]
     low: AtomicU64,
@@ -128,7 +130,8 @@ pub(super) struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     fn new(work: &'a Work, threads: Option<usize>) -> Ctx<'a> {
         let threads = threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |t| t.get()).min(MAX_THREADS));
-        Ctx { work, memory: AtomicU64::new(MAX_MEMORY), #[cfg(test)] low: AtomicU64::new(MAX_MEMORY), threads: threads.max(1) }
+        let cap = work.decoder_memory().min(MAX_MEMORY);
+        Ctx { work, memory: AtomicU64::new(cap), cap, #[cfg(test)] low: AtomicU64::new(cap), threads: threads.max(1) }
     }
 
     /// How many threads to use for jobs of `samples` samples in all: one when there are too few to be worth starting
@@ -159,7 +162,7 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn give_back(&self, bytes: u64) {
-        let _ = self.memory.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| Some(left.saturating_add(bytes).min(MAX_MEMORY)));
+        let _ = self.memory.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| Some(left.saturating_add(bytes).min(self.cap)));
     }
 
     #[cfg(test)]

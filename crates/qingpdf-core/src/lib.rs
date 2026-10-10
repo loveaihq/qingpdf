@@ -19,6 +19,7 @@ pub mod render;
 pub mod repair;
 pub mod security;
 pub mod text;
+pub mod view;
 pub mod writer;
 pub mod xref;
 
