@@ -49,6 +49,10 @@ impl App {
     pub(super) fn mouse_down(&mut self, x: i64, y: i64, _ctrl: bool, _shift: bool) -> Vec<Action> {
         self.mouse = (x, y);
         self.press = None;
+        // A drawing or a note takes the pointer for itself.
+        if let Some(actions) = self.edit_mouse_down(x, y) {
+            return actions;
+        }
         let mut actions = Vec::new();
         if self.selection.take().is_some() {
             actions.push(Action::Invalidate);
@@ -63,6 +67,9 @@ impl App {
 
     pub(super) fn mouse_move(&mut self, x: i64, y: i64) -> Vec<Action> {
         self.mouse = (x, y);
+        if let Some(actions) = self.edit_mouse_move(x, y) {
+            return actions;
+        }
         let threshold = self.px(DRAG_THRESHOLD);
         let Some(press) = self.press.as_mut() else { return Vec::new() };
         let mut actions = Vec::new();
@@ -81,17 +88,26 @@ impl App {
     pub(super) fn mouse_up(&mut self, x: i64, y: i64) -> Vec<Action> {
         self.mouse = (x, y);
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
-        if let Some(press) = self.press.take()
-            && !press.moved
-            && let Some(index) = press.link
-        {
-            actions.extend(self.activate_link(press.page, index));
+        if let Some(more) = self.edit_mouse_up(x, y) {
+            actions.extend(more);
+            return actions;
+        }
+        if let Some(press) = self.press.take() {
+            if press.moved {
+                // Text that was dragged over with a marking tool is marked.
+                actions.extend(self.drag_finished());
+            } else if let Some(index) = press.link {
+                actions.extend(self.activate_link(press.page, index));
+            } else if self.edit.tool == Tool::Select {
+                actions.extend(self.pick_annotation(press.page, press.x, press.y));
+            }
         }
         actions
     }
 
     pub(super) fn mouse_lost(&mut self) -> Vec<Action> {
         self.press = None;
+        self.edit.give_up_stroke();
         vec![Action::KillTimer(TIMER_DRAG)]
     }
 
@@ -139,7 +155,9 @@ impl App {
     /// asked for, and this is done again when it comes.
     pub(super) fn extend_selection(&mut self) -> Vec<Action> {
         let Some((press_page, press_x, press_y)) = self.press.as_ref().filter(|p| p.moved).map(|p| (p.page, p.x, p.y)) else { return Vec::new() };
-        if !self.rights.copy {
+        // A file that forbids copying but allows annotating still lets text be selected: for marking it (the engine gives the
+        // positions of the characters and no text; copying is refused where it is asked for).
+        if !self.rights.copy && !self.rights.annotate {
             let text = t(self.lang, Msg::NoteCopyDenied).to_string();
             return if self.note.as_deref() == Some(text.as_str()) { Vec::new() } else { self.say(text) };
         }

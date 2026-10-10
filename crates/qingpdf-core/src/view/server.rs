@@ -13,16 +13,20 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::document::{Document, Page};
+use crate::edit::{self, signature::Policy};
 use crate::error::Error;
+use crate::object::Object;
+use crate::ops;
 use crate::render::work::{Work, cost};
 use crate::render::{Bitmap, MAX_DPI, MIN_DPI, MemoryLimits, Renderer};
 use crate::text::{PageChars, TextExtractor};
 
+use super::editing::{EditStatus, SaveStatus, Session, write_atomic};
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
     BACKGROUND_PRIORITY, CharBoxes, Command, Event, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, RenderRequest,
-    RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, links, outline, page_info, search,
+    RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
 };
 use crate::view::geometry::line_rects;
 
@@ -79,6 +83,7 @@ enum Job {
     Outline { id: u64 },
     Links { id: u64, page: u32 },
     CharBoxes { id: u64, page: u32 },
+    Annotations { id: u64, page: u32 },
     Search(SearchJob),
     Copy(CopyJob),
     Print(PrintJob),
@@ -87,7 +92,7 @@ enum Job {
 impl Job {
     fn id(&self) -> u64 {
         match self {
-            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } => *id,
+            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } => *id,
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
             Job::Print(p) => p.id,
@@ -96,7 +101,7 @@ impl Job {
 
     /// A quick request that someone is waiting for.
     fn immediate(&self) -> bool {
-        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. })
+        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. })
     }
 
     /// Has something to do now (a print job whose band is not used yet waits).
@@ -109,6 +114,7 @@ impl Job {
             Request::Outline => Job::Outline { id },
             Request::Links(page) => Job::Links { id, page },
             Request::CharBoxes(page) => Job::CharBoxes { id, page },
+            Request::Annotations(page) => Job::Annotations { id, page },
             Request::Search { query, start } => Job::Search(SearchJob {
                 id,
                 needle: search::fold_query(&query),
@@ -139,10 +145,34 @@ enum Step {
     Cancelled,
 }
 
+/// What goes from one document to the edited one that replaces it: the requests that were waiting.
+struct Carry {
+    queue: Vec<RenderRequest>,
+    jobs: VecDeque<Job>,
+    edits: VecDeque<Command>,
+}
+
+/// How the document is to be replaced.
+enum Pending {
+    /// The file, written afresh (its cross-reference data was damaged), and the edit that waits for it.
+    Rewrite { bytes: Vec<u8>, then: Command },
+    /// The update that writes everything in front of the file (`edit::save_section`), to be appended to it; then the file is
+    /// written to `path`.
+    Save { section: Vec<u8>, doc: u64, id: u64, path: String },
+}
+
+/// Why the serving of one document ended.
+enum Exit {
+    Done(Option<Command>),
+    /// Go on with this document (the edited one, or the one before it if the change did not open) and the waiting requests.
+    Again { open: Box<OpenDoc>, carry: Carry },
+}
+
 struct Server<'a> {
     doc_id: u64,
     document: &'a Document,
-    pages: &'a [Page],
+    /// The pages; the dictionary of a page that an edit changed is read again.
+    pages: Vec<Page>,
     index: HashMap<u32, u32>,
     max_tile_pixels: u32,
     rights: Rights,
@@ -156,27 +186,51 @@ struct Server<'a> {
     commands: &'a Receiver<Command>,
     send: &'a dyn Fn(Event),
     shared: &'a Shared,
+    /// The editing state (what can be undone, whether the file was saved).
+    session: &'a mut Session,
+    /// Edits, undos, redos and saves, in the order they came: done before anything else, one at a time.
+    edits: VecDeque<Command>,
+    /// Set when the document is to be replaced (the loop then ends with [`Command::Swap`]).
+    swap: Option<Pending>,
 }
 
-/// Serve one open document until a command ends it; that command is returned for the caller to carry out.
-pub(super) fn serve(open: OpenDoc, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Option<Command> {
-    let OpenDoc { doc_id, document, plan, rights } = open;
+/// Serve one open document until a command ends it; that command is returned for the caller to carry out. An edit replaces the
+/// document by the changed one and goes on with the requests that were waiting.
+pub(super) fn serve(open: OpenDoc, session: &mut Session, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Option<Command> {
+    let mut open = open;
+    let mut carry: Option<Carry> = None;
+    loop {
+        match serve_once(open, carry.take(), session, commands, send, shared) {
+            Exit::Done(end) => return end,
+            Exit::Again { open: next, carry: waiting } => {
+                open = *next;
+                carry = Some(waiting);
+            }
+        }
+    }
+}
+
+fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Exit {
+    let OpenDoc { doc_id, mut document, plan, rights } = open;
     let pages = match document.pages() {
         Ok(p) => p,
         Err(e) => {
             send(Event::OpenFailed { doc: doc_id, failure: OpenFailure::Damaged, message: e.to_string() });
-            return None;
+            return Exit::Done(None);
         }
     };
-    let infos: Vec<PageInfo> = pages.iter().map(page_info).collect();
-    send(Event::Opened(Opened {
-        doc: doc_id,
-        pages: infos,
-        file_bytes: plan.file_bytes,
-        bitmap_cache_bytes: plan.bitmap_cache_bytes,
-        max_tile_pixels: plan.max_tile_pixels,
-        rights,
-    }));
+    if carry.is_none() {
+        let infos: Vec<PageInfo> = pages.iter().map(page_info).collect();
+        send(Event::Opened(Opened {
+            doc: doc_id,
+            pages: infos,
+            file_bytes: plan.file_bytes,
+            bitmap_cache_bytes: plan.bitmap_cache_bytes,
+            max_tile_pixels: plan.max_tile_pixels,
+            rights,
+        }));
+    }
+    let Carry { queue, jobs, edits } = carry.unwrap_or(Carry { queue: Vec::new(), jobs: VecDeque::new(), edits: VecDeque::new() });
     let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
     let mut renderer = Renderer::new(&document);
     renderer.set_memory_limits(MemoryLimits {
@@ -188,31 +242,81 @@ pub(super) fn serve(open: OpenDoc, commands: &Receiver<Command>, send: &dyn Fn(E
         canvas_pixels: u64::from(plan.max_tile_pixels),
     });
     renderer.set_cancel(Some(shared.stop.clone()));
+    let page_count = pages.len();
     let mut server = Server {
         doc_id,
         document: &document,
-        pages: &pages,
         index: page_index(&pages),
+        pages,
         max_tile_pixels: plan.max_tile_pixels,
         rights,
         renderer,
         text: TextExtractor::new(&document),
         chars: TextCache::new(plan.text_cache),
         names: Names::new(&document),
-        queue: Vec::new(),
-        jobs: VecDeque::new(),
+        queue,
+        jobs,
         commands,
         send,
         shared,
+        session: &mut *session,
+        edits,
+        swap: None,
     };
-    server.run()
+    let end = server.run();
+    let Some(pending) = server.swap.take() else { return Exit::Done(end) };
+    if !matches!(end, Some(Command::Swap)) {
+        return Exit::Done(end);
+    }
+    let mut carry = Carry { queue: std::mem::take(&mut server.queue), jobs: std::mem::take(&mut server.jobs), edits: std::mem::take(&mut server.edits) };
+    drop(server);
+
+    match pending {
+        // The file as it will be, made as a copy so that the document it replaces is still there if the new one does not open.
+        Pending::Rewrite { bytes, then } => match reopen(doc_id, plan, rights, bytes, session.password(), page_count) {
+            Ok(next) => {
+                session.rewritten();
+                // The edit that waited for the new file is done first of all.
+                carry.edits.push_front(then);
+                Exit::Again { open: Box::new(next), carry }
+            }
+            Err(message) => {
+                let message = format!("the changed file could not be opened again: {message}");
+                // The edit that waited for the rewrite is given up as well.
+                if let Command::Edit { doc, id, edit } = &then {
+                    send(Event::Edited(session.result(*doc, *id, EditStatus::Failed, &message, edit.page())));
+                }
+                Exit::Again { open: Box::new(OpenDoc { doc_id, document, plan, rights }), carry }
+            }
+        },
+        // The update is appended to the file in memory, which is read again from its new end (the document is then the saved
+        // file), and the file is written. If it cannot be written, the document is what it was meant to be written as and is
+        // still changed: saving again writes it.
+        Pending::Save { section, doc, id, path } => {
+            session.before_saving(&document);
+            match document.append_section(&section, page_count) {
+                Ok(()) => {
+                    let bytes = document.data();
+                    match write_atomic(&path, bytes) {
+                        Ok(()) => {
+                            session.mark_saved();
+                            send(Event::Saved { doc, id, status: SaveStatus::Done, message: String::new(), bytes: bytes.len() as u64 });
+                        }
+                        Err(e) => send(Event::Saved { doc, id, status: SaveStatus::Failed, message: e.to_string(), bytes: 0 }),
+                    }
+                }
+                Err(e) => send(Event::Saved { doc, id, status: SaveStatus::Failed, message: e.to_string(), bytes: 0 }),
+            }
+            Exit::Again { open: Box::new(OpenDoc { doc_id, document, plan, rights }), carry }
+        }
+    }
 }
 
 impl Server<'_> {
     fn run(&mut self) -> Option<Command> {
         loop {
             // Take what has been asked for: wait only when there is nothing to do.
-            if self.queue.is_empty() && !self.jobs.iter().any(Job::runnable) {
+            if self.queue.is_empty() && self.edits.is_empty() && !self.jobs.iter().any(Job::runnable) {
                 match self.commands.recv() {
                     Ok(c) => {
                         if let Some(end) = self.take(c) {
@@ -226,6 +330,14 @@ impl Server<'_> {
                 if let Some(end) = self.take(c) {
                     return Some(end);
                 }
+            }
+            // An edit, an undo or a save is done as soon as it is asked for, before the rest, one at a time: a person is waiting
+            // for the page to change. (No job is in hand here, so a swap of the document loses none of them.)
+            if let Some(command) = self.edits.pop_front() {
+                if let Some(end) = self.do_edit(command) {
+                    return Some(end);
+                }
+                continue;
             }
             // What is in view is drawn first, then the quick requests, then the rest of the drawing, and only when nothing
             // else is waiting a step of a long job. The quick requests do not hold up what is in view (3d-2 review).
@@ -272,6 +384,17 @@ impl Server<'_> {
                 }
                 None
             }
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. }) => {
+                let doc = match &c {
+                    Command::Edit { doc, .. } | Command::Undo { doc, .. } | Command::Redo { doc, .. } | Command::Save { doc, .. } => *doc,
+                    _ => 0,
+                };
+                if doc == self.doc_id {
+                    self.edits.push_back(c);
+                }
+                None
+            }
+            Command::Swap => None,
             Command::PrintNext(id) => {
                 for job in &mut self.jobs {
                     if let Job::Print(p) = job
@@ -339,7 +462,7 @@ impl Server<'_> {
             }
             Ok(true) => {}
         }
-        match draw(&mut self.renderer, self.pages, &request) {
+        match draw(&mut self.renderer, &self.pages, &request) {
             Some(result) => {
                 self.shared.current.store(0, Ordering::SeqCst);
                 (self.send)(Event::Rendered(result));
@@ -372,6 +495,7 @@ impl Server<'_> {
             Job::Outline { id } => self.outline(*id),
             Job::Links { id, page } => self.links(*id, *page),
             Job::CharBoxes { id, page } => self.char_boxes(*id, *page),
+            Job::Annotations { id, page } => self.annotations(*id, *page),
             Job::Search(s) => self.step_search(s),
             Job::Copy(c) => self.step_copy(c),
             Job::Print(p) => self.step_print(p),
@@ -416,7 +540,7 @@ impl Server<'_> {
 
     fn outline(&mut self, id: u64) -> Step {
         let work = self.meter();
-        let found = outline::read(self.document, self.pages, &self.index, &self.names, &work);
+        let found = outline::read(self.document, &self.pages, &self.index, &self.names, &work);
         if work.was_cancelled() {
             return Step::Cancelled;
         }
@@ -427,7 +551,7 @@ impl Server<'_> {
     fn links(&mut self, id: u64, page: u32) -> Step {
         let work = self.meter();
         let (links, truncated) = match self.pages.get(page as usize) {
-            Some(p) => links::read(self.document, p, self.pages, &self.index, &self.names, &work),
+            Some(p) => links::read(self.document, p, &self.pages, &self.index, &self.names, &work),
             None => (Vec::new(), false),
         };
         if work.was_cancelled() {
@@ -437,12 +561,158 @@ impl Server<'_> {
         Step::Done
     }
 
+    fn annotations(&mut self, id: u64, page: u32) -> Step {
+        let work = self.meter();
+        let (items, truncated) = match self.pages.get(page as usize) {
+            Some(p) => annots::read(self.document, p, &work),
+            None => (Vec::new(), false),
+        };
+        if work.was_cancelled() {
+            return Step::Cancelled;
+        }
+        self.tell(Event::Annotations { doc: self.doc_id, id, page, items, truncated });
+        Step::Done
+    }
+
+    // --- editing --------------------------------------------------------------------------------------------------
+
+    /// Read the dictionary of page `page_no` again, after an edit (or an undo) changed it, and forget what is kept of the page.
+    /// Nothing else is kept by page: what the renderer keeps is by object, and an edit only makes objects with numbers that were
+    /// never used before.
+    fn refresh_page(&mut self, page_no: u32) {
+        let Some(page_ref) = self.pages.get(page_no as usize).map(|p| p.obj_ref) else { return };
+        if let Ok(Object::Dict(mut dict)) = self.document.get(page_ref) {
+            dict.remove("Parent");
+            let dict = Rc::new(dict);
+            for p in self.pages.iter_mut().filter(|p| p.obj_ref == page_ref) {
+                p.dict = Rc::clone(&dict);
+            }
+        }
+        self.chars.forget(page_no);
+    }
+
+    /// Carry out an edit, an undo, a redo or a save. `Some(Command::Swap)`: the document is to be replaced (`self.swap` says how).
+    fn do_edit(&mut self, command: Command) -> Option<Command> {
+        let said = |this: &Self, doc: u64, id: u64, status: EditStatus, message: &str, page: u32| {
+            this.tell(Event::Edited(this.session.result(doc, id, status, message, page)));
+        };
+        let printing = self.jobs.iter().any(|j| matches!(j, Job::Print(_)));
+        const BUSY: &str = "a print job is running";
+        match command {
+            Command::Edit { doc, id, edit } => {
+                let page = edit.page();
+                if !self.rights.annotate {
+                    said(self, doc, id, EditStatus::Denied, DENIED_ANNOTATE, page);
+                    return None;
+                }
+                if printing {
+                    said(self, doc, id, EditStatus::Busy, BUSY, page);
+                    return None;
+                }
+                // A signed file is added to only as far as its signatures allow (12.8).
+                let policy = self.session.policy(self.document);
+                if let Policy::Refuse(why) = policy {
+                    said(self, doc, id, EditStatus::Failed, why, page);
+                    return None;
+                }
+                // A file whose cross-reference data was damaged cannot be added to: it is written afresh first, as a whole (not
+                // a signed one: that would break the signature).
+                if self.document.was_repaired() || self.document.leading_junk() > 0 {
+                    if policy != Policy::Free {
+                        said(self, doc, id, EditStatus::Failed, SIGNED_AND_DAMAGED, page);
+                        return None;
+                    }
+                    return match ops::copy_all(self.document) {
+                        Ok(out) => {
+                            self.swap = Some(Pending::Rewrite { bytes: out.data, then: Command::Edit { doc, id, edit } });
+                            Some(Command::Swap)
+                        }
+                        Err(e) => {
+                            said(self, doc, id, EditStatus::Failed, &format!("the file is damaged and cannot be written again: {e}"), page);
+                            None
+                        }
+                    };
+                }
+                let objects = match edit::apply(self.document, &self.pages, &edit, &edit::pdf_date_now()) {
+                    Ok(objects) => objects,
+                    Err(e) => {
+                        said(self, doc, id, EditStatus::Failed, &e.to_string(), page);
+                        return None;
+                    }
+                };
+                let extra = objects.iter().fold(0usize, |sum, (_, o)| sum.saturating_add(o.approx_size()).saturating_add(48));
+                if !self.session.make_room(self.document, extra) {
+                    said(self, doc, id, EditStatus::Failed, TOO_MANY_CHANGES, page);
+                    return None;
+                }
+                let changes = edit::commit(self.document, objects);
+                let page = self.session.push(page, changes);
+                self.refresh_page(page);
+                let message = if policy == Policy::Warn && self.session.take_warning() { SIGNED_WARNING } else { "" };
+                said(self, doc, id, EditStatus::Done, message, page);
+                None
+            }
+            Command::Undo { doc, id } | Command::Redo { doc, id } => {
+                let undo = matches!(command, Command::Undo { .. });
+                if printing {
+                    said(self, doc, id, EditStatus::Busy, BUSY, 0);
+                    return None;
+                }
+                let done = if undo { self.session.undo(self.document) } else { self.session.redo(self.document) };
+                match done {
+                    None => said(self, doc, id, EditStatus::Nothing, "", 0),
+                    Some(page) => {
+                        self.refresh_page(page);
+                        said(self, doc, id, EditStatus::Done, "", page);
+                    }
+                }
+                None
+            }
+            Command::Save { doc, id, path } => {
+                let failed = |this: &Self, message: &str| this.tell(Event::Saved { doc, id, status: SaveStatus::Failed, message: message.to_string(), bytes: 0 });
+                if !self.document.has_overlay() {
+                    // Nothing was changed since the file was read or saved: it is written as it is.
+                    let bytes = self.document.data();
+                    match write_atomic(&path, bytes) {
+                        Ok(()) => {
+                            self.session.mark_saved();
+                            self.tell(Event::Saved { doc, id, status: SaveStatus::Done, message: String::new(), bytes: bytes.len() as u64 });
+                        }
+                        Err(e) => failed(self, &e.to_string()),
+                    }
+                    return None;
+                }
+                if printing {
+                    failed(self, BUSY);
+                    return None;
+                }
+                if self.document.was_repaired() || self.document.leading_junk() > 0 {
+                    failed(self, "the file's structure is damaged; it cannot be added to");
+                    return None;
+                }
+                match edit::save_section(self.document) {
+                    Ok(section) => {
+                        self.swap = Some(Pending::Save { section, doc, id, path });
+                        Some(Command::Swap)
+                    }
+                    Err(e) => {
+                        failed(self, &e.to_string());
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn char_boxes(&mut self, id: u64, page: u32) -> Step {
         let doc = self.doc_id;
         let reply = move |status: TextStatus, message: &str, boxes: Vec<[f32; 4]>| {
             Event::CharBoxes(CharBoxes { doc, id, page, status, message: message.to_string(), boxes })
         };
-        if !self.rights.copy {
+        // Where the characters are, without what they are, is also what marking text needs: a file that forbids copying and allows
+        // annotating gives the positions (copying stays refused).
+        if !self.rights.copy && !self.rights.annotate {
             self.tell(reply(TextStatus::Denied, DENIED_COPY, Vec::new()));
             return Step::Done;
         }
@@ -641,7 +911,15 @@ fn print_dpi(asked: f64, rights: Rights) -> f64 {
     asked.clamp(MIN_DPI, cap.min(MAX_DPI))
 }
 
+const DENIED_ANNOTATE: &str = "the file's author did not allow adding annotations, and the file was not opened with the owner password";
+
 const DENIED_COPY: &str = "the file's author did not allow copying text, and the file was not opened with the owner password";
+
+const SIGNED_WARNING: &str = "this file is signed: after the annotations are saved, the signature will show the file as changed";
+
+const SIGNED_AND_DAMAGED: &str = "the file is signed and its structure is damaged: it cannot be written afresh without breaking the signature, so it is not edited";
+
+const TOO_MANY_CHANGES: &str = "there are too many unsaved changes: save the file first";
 
 /// RGBA to BGRA, in place.
 fn to_bgra(bitmap: Bitmap) -> Vec<u8> {
@@ -697,7 +975,7 @@ mod tests {
 
     #[test]
     fn a_file_that_allows_only_low_quality_printing_is_drawn_at_150_dpi_at_most() {
-        let high = Rights { copy: true, print: true, print_high_quality: true };
+        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true };
         let low = Rights { print_high_quality: false, ..high };
         assert_eq!((print_dpi(1000.0, high), print_dpi(1000.0, low)), (300.0, 150.0));
         assert_eq!((print_dpi(200.0, high), print_dpi(200.0, low)), (200.0, 150.0));

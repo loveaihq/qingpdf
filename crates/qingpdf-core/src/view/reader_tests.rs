@@ -189,8 +189,11 @@ fn a_file_that_does_not_allow_copying_gives_no_text_and_one_that_does_not_allow_
     let engine = Engine::start(Box::new(|| {}));
     // R2, "no modifying or extracting": opened with no password, it may be printed but not copied.
     let o = opened_file(&engine, 1, "two.r2-40-empty-modify-extract-none.pdf", "");
-    assert_eq!(o.rights, Rights { copy: false, print: true, print_high_quality: true });
-    assert_eq!(boxes_of(&engine, 1, 0).status, TextStatus::Denied);
+    // (That file's author took away modifying and extracting; the annotation bit is still on.)
+    assert_eq!(o.rights, Rights { copy: false, print: true, print_high_quality: true, annotate: true });
+    // The positions of the characters are given (marking text needs them: annotating is allowed), the text is not.
+    let boxes = boxes_of(&engine, 1, 0);
+    assert!(boxes.status == TextStatus::Ok && boxes.boxes.len() > 3, "{:?} {}", boxes.status, boxes.boxes.len());
     let (status, text, _) = copied(&engine, 2, (0, 0), (0, 100));
     assert_eq!((status, text.as_str()), (TextStatus::Denied, ""));
     // Looking for words is not taking the text out: it works.
@@ -209,9 +212,16 @@ fn a_file_that_does_not_allow_copying_gives_no_text_and_one_that_does_not_allow_
     }
     // Everything denied, opened with the user password; the owner password lifts it.
     let o = opened_file(&engine, 4, "two.r6-aes256-user-everything-denied.pdf", "user");
-    assert_eq!(o.rights, Rights { copy: false, print: false, print_high_quality: false });
+    assert_eq!(o.rights, Rights { copy: false, print: false, print_high_quality: false, annotate: false });
+    // Neither copying nor annotating: no positions either.
+    engine.char_boxes(4, 40, 0);
+    let denied = until(&engine, |e| match e {
+        Event::CharBoxes(b) if b.id == 40 => Some(b),
+        _ => None,
+    });
+    assert!(denied.status == TextStatus::Denied && denied.boxes.is_empty());
     let o = opened_file(&engine, 5, "two.r6-aes256-user-everything-denied.pdf", "owner");
-    assert_eq!(o.rights, Rights { copy: true, print: true, print_high_quality: true });
+    assert_eq!(o.rights, Rights { copy: true, print: true, print_high_quality: true, annotate: true });
 }
 
 #[test]
@@ -642,4 +652,89 @@ fn the_named_destinations_are_charged_by_their_entries_and_a_cancel_stops_the_re
     let work = Work::new().with_cancel(Some(flag));
     assert!(names.get(&work).is_none() && work.was_cancelled());
     assert_eq!(names.get(&Work::new()).map(|n| n.tree().len()), Some(5_000));
+}
+
+/// Edits through the engine, on a file that is only in memory: the answers, and the file written when saved.
+fn edited_result(engine: &Engine, id: u64) -> EditResult {
+    until(engine, |e| match e {
+        Event::Edited(r) if r.id == id => Some(r),
+        _ => None,
+    })
+}
+
+fn saved_result(engine: &Engine, id: u64) -> (SaveStatus, String, u64) {
+    until(engine, |e| match e {
+        Event::Saved { id: i, status, message, bytes, .. } if i == id => Some((status, message, bytes)),
+        _ => None,
+    })
+}
+
+#[test]
+fn an_encrypted_file_that_has_no_id_is_edited_saved_and_opened_again() {
+    let engine = Engine::start(Box::new(|| {}));
+    let original = crate::testutil::encrypted_rc4_without_id();
+    let o = super::tests::open(&engine, original.clone());
+    assert!(o.rights.annotate);
+    engine.add_note(1, 2, 0, [20.0, 20.0], "secret 机密", [255, 215, 0], "me");
+    let r = edited_result(&engine, 2);
+    assert_eq!(r.status, EditStatus::Done, "{}", r.message);
+    engine.add_ink(1, 3, 0, vec![vec![[5.0, 5.0], [60.0, 40.0], [90.0, 10.0]]], [255, 0, 0], 2.0, "me");
+    assert_eq!(edited_result(&engine, 3).status, EditStatus::Done);
+    let path = std::env::temp_dir().join(format!("qingpdf-noid-{}.pdf", std::process::id()));
+    engine.save(1, 4, &path.to_string_lossy());
+    let (status, message, _) = saved_result(&engine, 4);
+    assert_eq!(status, SaveStatus::Done, "{message}");
+    let saved = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(saved.starts_with(&original));
+    let doc = Document::from_bytes(saved).unwrap();
+    assert!(doc.is_encrypted() && !doc.is_locked() && doc.trailer().get("ID").is_none());
+    let page = &doc.pages().unwrap()[0];
+    let list = doc.resolve(doc.get(page.obj_ref).unwrap().as_dict().unwrap().get("Annots").unwrap()).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 3, "the note, its popup and the drawing");
+}
+
+#[test]
+fn a_second_save_adds_to_the_file_the_first_one_wrote() {
+    let engine = Engine::start(Box::new(|| {}));
+    let original = pdf(2, square);
+    super::tests::open(&engine, original.clone());
+    let path = std::env::temp_dir().join(format!("qingpdf-twice-{}.pdf", std::process::id()));
+    let p = path.to_string_lossy().into_owned();
+    engine.add_note(1, 2, 0, [20.0, 20.0], "one", [255, 215, 0], "me");
+    assert_eq!(edited_result(&engine, 2).status, EditStatus::Done);
+    engine.save(1, 3, &p);
+    assert_eq!(saved_result(&engine, 3).0, SaveStatus::Done);
+    let first = std::fs::read(&path).unwrap();
+    assert!(first.starts_with(&original) && first.len() > original.len());
+    // More edits, a second save: the file the first save wrote is the beginning of the second.
+    engine.add_note(1, 4, 1, [30.0, 30.0], "two", [255, 215, 0], "me");
+    let r = edited_result(&engine, 4);
+    assert_eq!((r.status, r.dirty), (EditStatus::Done, true));
+    engine.save(1, 5, &p);
+    assert_eq!(saved_result(&engine, 5).0, SaveStatus::Done);
+    let second = std::fs::read(&path).unwrap();
+    assert!(second.starts_with(&first) && second.len() > first.len(), "the first save is not the beginning of the second");
+    // A save with nothing changed writes the file as it is; the edits before the first save can still be undone.
+    engine.save(1, 6, &p);
+    assert_eq!(saved_result(&engine, 6).0, SaveStatus::Done);
+    assert_eq!(std::fs::read(&path).unwrap(), second);
+    engine.undo(1, 7);
+    let u = edited_result(&engine, 7);
+    assert!(u.dirty && u.can_undo, "{u:?}");
+    engine.undo(1, 8);
+    let u = edited_result(&engine, 8);
+    assert_eq!((u.status, u.can_undo, u.dirty), (EditStatus::Done, false, true));
+    engine.annotations(1, 9, 0);
+    let after = until(&engine, |e| match e {
+        Event::Annotations { id: 9, items, .. } => Some(items),
+        _ => None,
+    });
+    assert!(after.is_empty(), "both notes are taken back, also the one that was saved: {after:?}");
+    engine.save(1, 10, &p);
+    assert_eq!(saved_result(&engine, 10).0, SaveStatus::Done);
+    let third = std::fs::read(&path).unwrap();
+    let doc = Document::from_bytes(third).unwrap();
+    assert!(!doc.was_repaired());
+    std::fs::remove_file(&path).unwrap();
 }

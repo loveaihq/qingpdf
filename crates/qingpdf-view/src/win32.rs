@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, ScrollCode, ScrollInfo};
+use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -324,6 +324,8 @@ unsafe extern "system" {
     fn DrawMenuBar(hwnd: isize) -> i32;
     fn GetMenu(hwnd: isize) -> isize;
     fn MoveWindow(hwnd: isize, x: i32, y: i32, w: i32, h: i32, repaint: i32) -> i32;
+    fn ShutdownBlockReasonCreate(hwnd: isize, reason: *const u16) -> i32;
+    fn ShutdownBlockReasonDestroy(hwnd: isize) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -387,9 +389,15 @@ unsafe extern "system" {
     fn ShellExecuteW(hwnd: isize, verb: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
 }
 
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn GetUserNameW(buffer: *mut u16, size: *mut u32) -> i32;
+}
+
 #[link(name = "comdlg32")]
 unsafe extern "system" {
     fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
+    fn GetSaveFileNameW(ofn: *mut OpenFileNameW) -> i32;
     fn PrintDlgExW(dialog: *mut PrintDlgEx) -> i32;
 }
 
@@ -403,6 +411,10 @@ unsafe extern "system" {
 const WM_SIZE: u32 = 0x0005;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
+const WM_QUERYENDSESSION: u32 = 0x0011;
+const WM_ENDSESSION: u32 = 0x0016;
+/// lParam of WM_QUERYENDSESSION: the shutdown cannot be held up.
+const ENDSESSION_CRITICAL: isize = 0x4000_0000;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_SETFONT: u32 = 0x0030;
 const WM_GETMINMAXINFO: u32 = 0x0024;
@@ -466,6 +478,7 @@ const IDCANCEL: usize = 2;
 const SWP_NOZOMORDER: u32 = 0x4;
 const SWP_NOACTIVATE: u32 = 0x10;
 const SWP_NOMOVE: u32 = 0x2;
+const OFN_OVERWRITEPROMPT: u32 = 0x2;
 const OFN_PATHMUSTEXIST: u32 = 0x800;
 const OFN_FILEMUSTEXIST: u32 = 0x1000;
 const OFN_NOCHANGEDIR: u32 = 0x8;
@@ -519,6 +532,10 @@ const TVC_BYKEYBOARD: u32 = 2;
 const CF_UNICODETEXT: u32 = 13;
 const GMEM_MOVEABLE: u32 = 2;
 const MB_YESNO: u32 = 4;
+const MB_YESNOCANCEL: u32 = 3;
+const IDNO: i32 = 7;
+const IDC_CROSS: usize = 32515;
+const IDC_IBEAM: usize = 32513;
 const MB_ICONQUESTION: u32 = 0x20;
 const MB_DEFBUTTON2: u32 = 0x100;
 const IDYES: i32 = 6;
@@ -581,6 +598,20 @@ impl Waker {
 pub fn ui_language() -> u16 {
     // SAFETY: takes no arguments and only reads a system setting.
     unsafe { GetUserDefaultUILanguage() }
+}
+
+/// The name of the Windows user (empty if Windows will not say): the author of the annotations until the person says another.
+pub fn user_name() -> String {
+    let mut buf = vec![0u16; 257];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` has room for `len` UTF-16 units, which is what the call is told; Windows writes the name and its length (with
+    // the closing zero) into them and keeps nothing.
+    let ok = unsafe { GetUserNameW(buf.as_mut_ptr(), &mut len) } != 0;
+    if !ok {
+        return String::new();
+    }
+    let n = (len as usize).saturating_sub(1).min(buf.len());
+    String::from_utf16_lossy(buf.get(..n).unwrap_or(&[]))
 }
 
 /// The most memory this process has had in use, in bytes (0 if Windows will not say).
@@ -745,8 +776,24 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
                 unsafe { KillTimer(hwnd, id as usize) };
             }
             Action::PickFile { title, filters } => {
-                let picked = open_file_dialog(hwnd, &title, &filters);
+                let picked = file_dialog(hwnd, &title, &filters, None);
                 queue.extend(deliver(state, Event::FilePicked(picked)));
+            }
+            Action::PickSavePath { title, filters, name } => {
+                let picked = file_dialog(hwnd, &title, &filters, Some(&name));
+                queue.extend(deliver(state, Event::SavePicked(picked)));
+            }
+            Action::AskSave { tag, title, text } => {
+                let (t, c) = (wide(&text), wide(&title));
+                // SAFETY: both strings are zero-terminated UTF-16 that outlive the call; the box is modal and returns when it is
+                // closed. Yes is the button the Enter key presses; closing the box with the cross is Cancel.
+                let answer = unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_YESNOCANCEL | MB_ICONQUESTION) };
+                let choice = match answer {
+                    IDYES => SaveChoice::Save,
+                    IDNO => SaveChoice::Discard,
+                    _ => SaveChoice::Cancel,
+                };
+                queue.extend(deliver(state, Event::SaveChoice { tag, choice }));
             }
             Action::AskText { tag, title, prompt, secret, ok, cancel } => {
                 let text = input_dialog(hwnd, state.dpi.get(), state.font.get(), &title, &prompt, secret, &ok, &cancel);
@@ -955,9 +1002,15 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                     Ok(mut guard) => guard.as_mut().map_or(Cursor::Arrow, |h| h.cursor_at(p.x, p.y)),
                     Err(_) => Cursor::Arrow,
                 };
+                let id = match shape {
+                    Cursor::Hand => IDC_HAND,
+                    Cursor::Cross => IDC_CROSS,
+                    Cursor::Text => IDC_IBEAM,
+                    Cursor::Arrow => IDC_ARROW,
+                };
                 // SAFETY: LoadCursorW with a stock cursor id (a small integer in the pointer slot) gives a shared cursor that
                 // is never freed; SetCursor takes it.
-                unsafe { SetCursor(LoadCursorW(0, (if shape == Cursor::Hand { IDC_HAND } else { IDC_ARROW }) as *const u16)) };
+                unsafe { SetCursor(LoadCursorW(0, id as *const u16)) };
                 return 1;
             }
         }
@@ -974,8 +1027,37 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 0;
         }
         WM_CLOSE => {
-            // The reader keeps where it was before the window goes; then the default procedure closes it.
-            dispatch(state, Event::Closing);
+            // The reader decides: it answers with a Quit when the window may go (not at once if there are changes to save).
+            dispatch(state, Event::CloseRequested);
+            return 0;
+        }
+        WM_QUERYENDSESSION => {
+            // The system is about to log off, restart or shut down. With changes not saved the session is not ended yet: the system
+            // is given the reason (it shows it beside this program in the list of what is holding it up), and the question that
+            // closing the window asks is asked, after this message is answered. A shutdown that cannot be held up is let through.
+            if lparam & ENDSESSION_CRITICAL != 0 {
+                return 1;
+            }
+            let reason = match state.handler.try_borrow() {
+                Ok(guard) => guard.as_ref().and_then(|h| h.unsaved_reason()),
+                // The reader is in the middle of something: do not risk losing what it holds.
+                Err(_) => Some("Unsaved changes".to_string()),
+            };
+            let Some(text) = reason else { return 1 };
+            let text = wide(&text);
+            // SAFETY: `text` is a zero-terminated UTF-16 string that outlives the call (Windows copies it); the handle is this window's.
+            unsafe { ShutdownBlockReasonCreate(hwnd, text.as_ptr()) };
+            // SAFETY: posts WM_CLOSE to this window; plain numbers, nothing is borrowed.
+            unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+            return 0;
+        }
+        WM_ENDSESSION => {
+            // `wparam` is zero when the session was not ended after all: what held it up is let go of.
+            if wparam == 0 {
+                // SAFETY: takes this window's handle; does nothing if it has no reason.
+                unsafe { ShutdownBlockReasonDestroy(hwnd) };
+            }
+            return 0;
         }
         WM_TIMER => {
             dispatch(state, Event::Timer(wparam as u32));
@@ -1005,6 +1087,8 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         }
         WM_DESTROY => {
             state.closing.set(true);
+            // SAFETY: takes this window's handle; does nothing if it has no reason.
+            unsafe { ShutdownBlockReasonDestroy(hwnd) };
             // SAFETY: ends the message loop of this thread.
             unsafe { PostQuitMessage(0) };
             return 0;
@@ -1417,7 +1501,9 @@ fn line_height(dc: isize) -> i32 {
 
 // --- boxes -------------------------------------------------------------------------------------------------------
 
-fn open_file_dialog(owner: isize, title: &str, filters: &[(String, String)]) -> Option<PathBuf> {
+/// The box that picks a file: to open (`save_name` is `None`) or to write (`Some(name)`, the name the box starts with; it asks before
+/// it replaces a file, and a name without an extension gets `.pdf`).
+fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_name: Option<&str>) -> Option<PathBuf> {
     let mut filter: Vec<u16> = Vec::new();
     for (name, pattern) in filters {
         filter.extend(name.encode_utf16());
@@ -1428,6 +1514,13 @@ fn open_file_dialog(owner: isize, title: &str, filters: &[(String, String)]) -> 
     filter.push(0);
     let title = wide(title);
     let mut file = vec![0u16; 32_768];
+    if let Some(name) = save_name {
+        // The name it starts with (cut to leave room for the closing zero).
+        for (slot, unit) in file.iter_mut().zip(name.encode_utf16().take(32_000)) {
+            *slot = unit;
+        }
+    }
+    let def_ext = wide("pdf");
     let mut ofn = OpenFileNameW {
         struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
         owner,
@@ -1442,10 +1535,10 @@ fn open_file_dialog(owner: isize, title: &str, filters: &[(String, String)]) -> 
         max_file_title: 0,
         initial_dir: null(),
         title: title.as_ptr(),
-        flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER,
+        flags: if save_name.is_some() { OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER } else { OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER },
         file_offset: 0,
         file_extension: 0,
-        def_ext: null(),
+        def_ext: if save_name.is_some() { def_ext.as_ptr() } else { null() },
         cust_data: 0,
         hook: null(),
         template_name: null(),
@@ -1453,10 +1546,10 @@ fn open_file_dialog(owner: isize, title: &str, filters: &[(String, String)]) -> 
         reserved_dw: 0,
         flags_ex: 0,
     };
-    // SAFETY: `ofn` is a live OPENFILENAMEW of the size it declares; the strings it points to (`filter`, `title`)
+    // SAFETY: `ofn` is a live OPENFILENAMEW of the size it declares; the strings it points to (`filter`, `title`, `def_ext`)
     // and the buffer `file` (of the length declared in `max_file`) outlive the call; the box is modal and Windows
     // keeps none of the pointers after it returns.
-    let chosen = unsafe { GetOpenFileNameW(&mut ofn) } != 0;
+    let chosen = unsafe { if save_name.is_some() { GetSaveFileNameW(&mut ofn) } else { GetOpenFileNameW(&mut ofn) } } != 0;
     if !chosen {
         return None;
     }

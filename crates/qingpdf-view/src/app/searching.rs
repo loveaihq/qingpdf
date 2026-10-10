@@ -42,6 +42,9 @@ impl App {
         if self.find_open {
             return self.close_find();
         }
+        if let Some(actions) = self.escape_tool() {
+            return actions;
+        }
         if self.selection.take().is_some() {
             return vec![Action::Invalidate];
         }

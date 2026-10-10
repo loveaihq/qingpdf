@@ -169,3 +169,27 @@ pub fn sample_objstm_pdf() -> Vec<u8> {
     b.startxref(x);
     b.finish()
 }
+
+/// A one-page file encrypted with RC4 and a 40-bit key (revision 2) and with no `/ID` in the trailer, which the key is made
+/// without (7.6.3.3 takes the first string of the ID as empty). The user password is empty.
+pub fn encrypted_rc4_without_id() -> Vec<u8> {
+    const PAD: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01, 0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C,
+        0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
+    ];
+    let owner = [0x5Au8; 32];
+    let p: i32 = -4;
+    let mut input = PAD.to_vec();
+    input.extend_from_slice(&owner);
+    input.extend_from_slice(&p.to_le_bytes());
+    let key = crate::cipher::md5(&input)[..5].to_vec();
+    let mut user = PAD;
+    crate::cipher::rc4(&key, &mut user);
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<String>();
+    let mut b = PdfBuilder::new();
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << >> >>");
+    b.obj(10, &format!("<< /Filter /Standard /V 1 /R 2 /P -4 /O <{}> /U <{}> >>", hex(&owner), hex(&user)));
+    b.finish_classic(11, "/Root 1 0 R /Encrypt 10 0 R")
+}

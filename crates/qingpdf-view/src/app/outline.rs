@@ -160,6 +160,11 @@ impl App {
     }
 
     pub(super) fn cursor_over(&self, x: i64, y: i64) -> Cursor {
+        if let Some(shape) = self.annotation_cursor()
+            && self.page_at_point(x, y).is_some()
+        {
+            return shape;
+        }
         if let Some((page, px, py)) = self.page_at_point(x, y)
             && let Some(map) = self.doc.as_ref().and_then(|d| d.layout.page_map(page))
         {
@@ -203,6 +208,9 @@ impl App {
                 Vec::new()
             }
             EngineEvent::CharBoxes(b) if b.doc == self.doc_id => self.on_boxes(b),
+            EngineEvent::Annotations { doc, id, page, items, .. } if doc == self.doc_id => self.on_annotations(id, page, items),
+            EngineEvent::Edited(r) if r.doc == self.doc_id => self.on_edited(r),
+            EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
             EngineEvent::SearchHits { doc, id, page, hits } if doc == self.doc_id => self.on_search_hits(id, page, hits),
             EngineEvent::SearchProgress { doc, id, pages_done, pages_total, .. } if doc == self.doc_id => self.on_search_progress(id, pages_done, pages_total),
             EngineEvent::SearchDone { doc, id, status, pages_skipped, .. } if doc == self.doc_id => self.on_search_done(id, status, pages_skipped),

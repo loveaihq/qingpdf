@@ -5,6 +5,7 @@
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
 //! `menus` and `recents` (the menus; the files opened last).
 
+mod editing;
 mod menus;
 mod outline;
 mod printjob;
@@ -29,10 +30,12 @@ use crate::sched::{self, Scene, Want};
 use crate::select::Selection;
 use crate::tiles;
 use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, vk};
+use qingpdf_core::view::MarkupKind;
 use crate::zoom::{self, ZoomMode};
 
 pub use printjob::PrintTest;
 use printjob::PrintJob;
+use editing::{After, EditState, Tool};
 use selecting::{PageBoxes, Press};
 
 // Menu commands.
@@ -53,6 +56,23 @@ pub const CMD_FIND: u32 = 18;
 pub const CMD_FIND_NEXT: u32 = 19;
 pub const CMD_FIND_PREV: u32 = 20;
 pub const CMD_COPY: u32 = 21;
+pub const CMD_SAVE: u32 = 30;
+pub const CMD_SAVE_AS: u32 = 31;
+pub const CMD_UNDO: u32 = 32;
+pub const CMD_REDO: u32 = 33;
+pub const CMD_REMOVE: u32 = 34;
+pub const CMD_AUTHOR: u32 = 35;
+/// The tools of the Comment menu: select, the four markups, draw, note.
+pub const CMD_TOOL_SELECT: u32 = 40;
+pub const CMD_TOOL_HIGHLIGHT: u32 = 41;
+pub const CMD_TOOL_UNDERLINE: u32 = 42;
+pub const CMD_TOOL_STRIKE: u32 = 43;
+pub const CMD_TOOL_SQUIGGLY: u32 = 44;
+pub const CMD_TOOL_INK: u32 = 45;
+pub const CMD_TOOL_NOTE: u32 = 46;
+/// The colours (from here, one for each) and the line widths.
+pub const CMD_COLOR_BASE: u32 = 50;
+pub const CMD_WIDTH_BASE: u32 = 60;
 /// The files in the list of recent ones are commands from here, one for each.
 pub const CMD_RECENT_BASE: u32 = 100;
 
@@ -60,6 +80,9 @@ pub const CMD_RECENT_BASE: u32 = 100;
 const TAG_PASSWORD: u32 = 1;
 const TAG_GOTO: u32 = 2;
 const TAG_LINK: u32 = 3;
+const TAG_NOTE: u32 = 4;
+const TAG_AUTHOR: u32 = 5;
+const TAG_UNSAVED: u32 = 6;
 
 // Timers.
 /// The view has stopped moving.
@@ -201,10 +224,14 @@ pub struct App {
     menus_dirty: bool,
     /// The hidden `--print-test`: print to a printer that writes a file, with no box, and quit.
     print_test: Option<PrintTest>,
+
+    // --- 4a ---
+    /// The tool, the annotations, the history of the changes and the saving.
+    edit: EditState,
 }
 
 impl App {
-    pub fn new(lang: Lang, wake: Arc<dyn Fn() + Send + Sync>, started: Instant, max_view_pixels: u64) -> App {
+    pub fn new(lang: Lang, wake: Arc<dyn Fn() + Send + Sync>, started: Instant, max_view_pixels: u64, author: String) -> App {
         let for_engine = wake.clone();
         let recent_path = recent::file_path();
         let recent = recent_path.as_deref().map(recent::load).unwrap_or_default();
@@ -243,7 +270,7 @@ impl App {
             last_sharp: None,
             bench: None,
             started,
-            rights: Rights { copy: true, print: true, print_high_quality: true },
+            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true },
             outline: Vec::new(),
             show_outline: true,
             links: HashMap::new(),
@@ -265,6 +292,7 @@ impl App {
             pending_uri: None,
             menus_dirty: true,
             print_test: None,
+            edit: EditState::new(author),
         }
     }
 
@@ -289,8 +317,15 @@ impl App {
 
     // --- opening ---------------------------------------------------------------------------------------------
 
-    /// Open a file (the engine reads it; this does not wait).
+    /// Open a file (the engine reads it; this does not wait). With changes that are not saved, the person is asked first.
     pub fn open_path(&mut self, path: &Path, password: &str) -> Vec<Action> {
+        if let Some(actions) = self.ask_unsaved(After::Open(path.to_path_buf())) {
+            return actions;
+        }
+        self.open_path_now(path, password)
+    }
+
+    fn open_path_now(&mut self, path: &Path, password: &str) -> Vec<Action> {
         // Where the reader was in the file it leaves is kept.
         self.remember_position();
         let mut actions = self.drop_document();
@@ -333,6 +368,7 @@ impl App {
         if let Some(id) = self.copy_asked.take() {
             self.engine.cancel(id);
         }
+        self.edit.reset();
         let had_outline = !self.outline.is_empty();
         self.doc = None;
         self.cache.clear();
@@ -346,7 +382,7 @@ impl App {
         self.press = None;
         self.selection = None;
         self.note = None;
-        self.rights = Rights { copy: true, print: true, print_high_quality: true };
+        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.moving = false;
@@ -364,7 +400,7 @@ impl App {
 
     fn title(&self) -> String {
         match &self.path {
-            Some(p) => format!("{} - qingpdf", p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy())),
+            Some(p) => format!("{}{} - qingpdf", if self.edit.dirty { "* " } else { "" }, p.file_name().map_or_else(|| p.to_string_lossy(), |n| n.to_string_lossy())),
             None => "qingpdf".to_string(),
         }
     }
@@ -515,6 +551,7 @@ impl App {
         self.sync_bars(&mut actions);
         self.schedule();
         self.ask_for_links();
+        self.ask_for_annots();
         actions.push(Action::Invalidate);
         actions
     }
@@ -770,13 +807,25 @@ impl App {
                 let filters = vec![(t(self.lang, Msg::FilterPdf).to_string(), "*.pdf".to_string()), (t(self.lang, Msg::FilterAll).to_string(), "*.*".to_string())];
                 vec![Action::PickFile { title: t(self.lang, Msg::OpenTitle).to_string(), filters }]
             }
-            CMD_EXIT => {
-                // A print job that is going is stopped first (AbortDoc, and the printer is let go of).
-                let mut actions = self.cancel_print_for_new_document();
-                self.remember_position();
-                actions.push(Action::Quit);
-                actions
-            }
+            CMD_EXIT => match self.ask_unsaved(After::Quit) {
+                Some(actions) => actions,
+                None => self.exit_now(),
+            },
+            CMD_SAVE => self.save(),
+            CMD_SAVE_AS => self.save_as(),
+            CMD_UNDO => self.undo(),
+            CMD_REDO => self.redo(),
+            CMD_REMOVE => self.remove_picked(),
+            CMD_AUTHOR => self.ask_author(),
+            CMD_TOOL_SELECT => self.set_tool(Tool::Select),
+            CMD_TOOL_HIGHLIGHT => self.set_tool(Tool::Markup(MarkupKind::Highlight)),
+            CMD_TOOL_UNDERLINE => self.set_tool(Tool::Markup(MarkupKind::Underline)),
+            CMD_TOOL_STRIKE => self.set_tool(Tool::Markup(MarkupKind::StrikeOut)),
+            CMD_TOOL_SQUIGGLY => self.set_tool(Tool::Markup(MarkupKind::Squiggly)),
+            CMD_TOOL_INK => self.set_tool(Tool::Ink),
+            CMD_TOOL_NOTE => self.set_tool(Tool::Note),
+            c if (CMD_COLOR_BASE..CMD_COLOR_BASE + 6).contains(&c) => self.set_color((c - CMD_COLOR_BASE) as usize),
+            c if (CMD_WIDTH_BASE..CMD_WIDTH_BASE + 4).contains(&c) => self.set_width((c - CMD_WIDTH_BASE) as usize),
             CMD_PRINT => self.print_command(),
             CMD_CLEAR_RECENT => self.clear_recent(),
             CMD_ABOUT => vec![Action::Message { title: t(self.lang, Msg::AboutTitle).to_string(), text: i18n::about(self.lang) }],
@@ -812,6 +861,9 @@ impl App {
                 vk::F => self.command(CMD_FIND),
                 vk::P => self.command(CMD_PRINT),
                 vk::C => self.command(CMD_COPY),
+                vk::S => self.command(if shift { CMD_SAVE_AS } else { CMD_SAVE }),
+                vk::Z => self.command(CMD_UNDO),
+                vk::Y => self.command(CMD_REDO),
                 vk::R => {
                     if shift {
                         self.rotate(3)
@@ -832,6 +884,7 @@ impl App {
             vk::RETURN => self.find_enter(shift),
             vk::F3 => self.find_step(!shift),
             vk::F4 => self.command(CMD_BOOKMARKS),
+            vk::DELETE => self.command(CMD_REMOVE),
             vk::NEXT => self.scroll_by(0, page_step, false),
             vk::PRIOR => self.scroll_by(0, -page_step, false),
             vk::SPACE => self.scroll_by(0, if shift { -page_step } else { page_step }, false),
@@ -908,6 +961,7 @@ impl App {
         }
         // Found words and selected text lie over the page.
         self.draw_marks(p, page, left, top);
+        self.draw_edit_marks(p, page, left, top);
         match self.notices.get(&(page as u32)) {
             Some(Notice::Incomplete) => {
                 let strip = i64::from(p.line_height()) + 8;
@@ -1038,6 +1092,8 @@ impl Handler for App {
                     vec![Action::SetTitle(self.title()), Action::Invalidate]
                 }
             },
+            Event::Text { tag: TAG_NOTE, text } => self.note_answered(text),
+            Event::Text { tag: TAG_AUTHOR, text } => self.author_answered(text),
             Event::Text { tag: TAG_GOTO, text } => match text.and_then(|s| s.trim().parse::<usize>().ok()) {
                 Some(n) if n >= 1 => self.go_to_page(n - 1),
                 _ => Vec::new(),
@@ -1047,10 +1103,13 @@ impl Handler for App {
             Event::MouseMove { x, y } => self.mouse_move(i64::from(x), i64::from(y)),
             Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
             Event::MouseLost => self.mouse_lost(),
-            Event::Closing => {
-                self.remember_position();
-                self.cancel_print_for_new_document()
-            }
+            Event::CloseRequested => match self.ask_unsaved(After::Quit) {
+                Some(actions) => actions,
+                None => self.exit_now(),
+            },
+            Event::SavePicked(path) => self.save_picked(path),
+            Event::SaveChoice { tag: TAG_UNSAVED, choice } => self.unsaved_answered(choice),
+            Event::SaveChoice { .. } => Vec::new(),
             Event::OutlineClick(i) => self.outline_click(i),
             Event::FindText(text) => self.find_text_changed(text),
             Event::Confirmed { tag: TAG_LINK, yes } => self.link_confirmed(yes),
@@ -1109,5 +1168,9 @@ impl Handler for App {
 
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
         self.cursor_over(i64::from(x), i64::from(y))
+    }
+
+    fn unsaved_reason(&self) -> Option<String> {
+        (self.edit.dirty && self.doc.is_some()).then(|| t(self.lang, Msg::ShutdownReason).to_string())
     }
 }

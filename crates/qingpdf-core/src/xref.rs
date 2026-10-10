@@ -257,6 +257,20 @@ pub fn find_startxref(data: &[u8]) -> Result<usize> {
     }
 }
 
+/// Where the newest cross-reference section starts (the offset after the last `startxref`), and whether it is a
+/// cross-reference stream (7.5.8) and not a classic table (7.5.4): what an incremental update continues with.
+pub fn newest_section(data: &[u8]) -> Result<(usize, bool)> {
+    let start = find_startxref(data)?;
+    if start >= data.len() {
+        return Err(Error::syntax(offset_u64(start), "cross-reference offset is past the end of the file"));
+    }
+    match Lexer::new(data, start).next_token()? {
+        Some(Token::Keyword(b"xref")) => Ok((start, false)),
+        Some(Token::Integer(_)) => Ok((start, true)),
+        _ => Err(Error::syntax(offset_u64(start), "no cross-reference section at this offset")),
+    }
+}
+
 /// The rows still allowed for the whole file (all sections together).
 struct RowBudget(usize);
 

@@ -117,6 +117,21 @@ pub struct Document {
     /// The encryption (7.6) of the file, if it has any: set when the file is
     /// opened and never changed after. Locked until a password has opened it.
     security: Option<Security>,
+    /// Bytes before the `%PDF-` header that were dropped when the file was read (the offsets are counted from the header).
+    leading_junk: usize,
+    /// Objects made or changed in memory on top of the file (an edit, 4a): read before the file is, written out as one
+    /// incremental update by `edit::incremental`.
+    overlay: RefCell<Overlay>,
+}
+
+/// The objects that stand in front of the file's own: by number, in the form the reader sees (decrypted, not yet written).
+#[derive(Default)]
+struct Overlay {
+    objects: BTreeMap<u32, Rc<Object>>,
+    bytes: usize,
+    /// One more than the highest number ever put here: a number is not given out twice in a session, so that what the
+    /// renderer keeps by object number is never taken for another object.
+    floor: u32,
 }
 
 /// One inheritable value as written, and with the references in it followed
@@ -506,8 +521,10 @@ impl Document {
         // 7.5.2: the header is at the start of the file. Junk before it is
         // tolerated; offsets are then counted from the header.
         let window = data.get(..HEADER_WINDOW.min(data.len())).unwrap_or(&[]);
+        let mut junk = 0;
         if let Some(p) = find_bytes(window, b"%PDF-", 0) {
             data.drain(..p);
+            junk = p;
         }
         let version = header_version(&data);
         // One budget for everything the document makes the decoder do, from
@@ -518,6 +535,7 @@ impl Document {
             Ok(x) => {
                 let mut doc =
                     Document::assemble(data, version, x.entries, x.trailer, x.uses_xref_streams, false, budget);
+                doc.leading_junk = junk;
                 doc.repair_allowed.set(false);
                 let checked = match doc.init_security(password) {
                     // The encryption dictionary asks for more than is safe: scanning the
@@ -534,13 +552,13 @@ impl Document {
                     Err(e @ (Error::Unsupported(_) | Error::PasswordRequired | Error::WrongPassword)) => return Err(e),
                     Err(e) => {
                         data = doc.data;
-                        return Document::open_after_rebuild(data, version, doc.budget, e, password);
+                        return Document::open_after_rebuild(data, version, doc.budget, e, password, junk);
                     }
                 }
             }
             Err(e) => e,
         };
-        Document::open_after_rebuild(data, version, budget, first_error, password)
+        Document::open_after_rebuild(data, version, budget, first_error, password, junk)
     }
 
     /// The cross-reference data could not be used (`first_error` says why):
@@ -551,12 +569,14 @@ impl Document {
         budget: DecodeBudget,
         first_error: Error,
         password: &str,
+        junk: usize,
     ) -> Result<Document> {
         match repair::rebuild_budgeted(&data, &budget, None) {
             Ok(r) => {
                 let unopened = r.unopened;
                 let mut doc =
                     Document::assemble(data, version, r.entries, r.trailer, r.uses_xref_streams, true, budget);
+                doc.leading_junk = junk;
                 *doc.unreadable.borrow_mut() = unopened.clone();
                 let secured = doc.init_security(password);
                 if let Err(e @ Error::Limit(_)) = secured {
@@ -625,6 +645,8 @@ impl Document {
             strings_kept: RefCell::new(BTreeMap::new()),
             strings_kept_unlisted: Cell::new(0),
             security: None,
+            leading_junk: 0,
+            overlay: RefCell::new(Overlay::default()),
         }
     }
 
@@ -827,6 +849,14 @@ impl Document {
     /// compressed object missing from its stream. A reference whose generation
     /// differs from the file's is still honoured.
     pub fn get(&self, r: ObjRef) -> Result<Object> {
+        if let Some(made) = self.overlay.borrow().objects.get(&r.num) {
+            return Ok(Object::clone(made));
+        }
+        self.get_from_file(r)
+    }
+
+    /// [`Document::get`] for the object as the file has it, whatever an edit has put in front of it.
+    pub(crate) fn get_from_file(&self, r: ObjRef) -> Result<Object> {
         if let Some(hit) = self.cache.borrow().map.get(&r.num) {
             return Ok(hit.clone());
         }
@@ -1122,6 +1152,109 @@ impl Document {
     /// How many bytes the file takes (as held in memory, from its header).
     pub fn file_size(&self) -> usize {
         self.data.len()
+    }
+
+    /// The file as held in memory (from its header on).
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// How many bytes before the `%PDF-` header were dropped when the file was read.
+    pub(crate) fn leading_junk(&self) -> usize {
+        self.leading_junk
+    }
+
+    /// The cross-reference entry of object `num` (what the file says, not what is cached).
+    pub(crate) fn xref_entry(&self, num: u32) -> Option<XrefEntry> {
+        self.xref.borrow().get(num)
+    }
+
+    /// The first object number that no object of the file has, and that a new object may take: one more than the highest
+    /// number of the cross-reference data and than the trailer's `/Size` (a `/Size` that is too small is a common fault).
+    pub(crate) fn next_free_number(&self) -> u32 {
+        let from_table = self.xref.borrow().max_num().map_or(1, |m| m.saturating_add(1));
+        let from_trailer = self.trailer.get_int("Size").and_then(|s| u32::try_from(s).ok()).unwrap_or(0);
+        from_table.max(from_trailer).max(self.overlay.borrow().floor).max(1)
+    }
+
+    /// Put `object` in front of the file's own object number `num` (`None`: take what was put there away, the file's own shows
+    /// again). Returns what was there. Nothing is written; see `edit::incremental`.
+    pub(crate) fn overlay_set(&self, num: u32, object: Option<Rc<Object>>) -> Option<Rc<Object>> {
+        let weigh = |o: &Rc<Object>| o.approx_size().saturating_add(48);
+        let mut overlay = self.overlay.borrow_mut();
+        let old = match object {
+            Some(new) => {
+                overlay.bytes = overlay.bytes.saturating_add(weigh(&new));
+                overlay.floor = overlay.floor.max(num.saturating_add(1));
+                overlay.objects.insert(num, new)
+            }
+            None => overlay.objects.remove(&num),
+        };
+        if let Some(old) = &old {
+            overlay.bytes = overlay.bytes.saturating_sub(weigh(old));
+        }
+        old
+    }
+
+    /// The objects in front of the file's own, by number.
+    pub(crate) fn overlay_entries(&self) -> Vec<(u32, Rc<Object>)> {
+        self.overlay.borrow().objects.iter().map(|(n, o)| (*n, Rc::clone(o))).collect()
+    }
+
+    /// About how many bytes the objects in front of the file's own take.
+    pub(crate) fn overlay_bytes(&self) -> usize {
+        self.overlay.borrow().bytes
+    }
+
+    /// Is there an object in front of the file's own with this number?
+    pub(crate) fn overlay_has(&self, num: u32) -> bool {
+        self.overlay.borrow().objects.contains_key(&num)
+    }
+
+    /// Does the document differ from its file (has an edit put objects in front of it)?
+    pub(crate) fn has_overlay(&self) -> bool {
+        !self.overlay.borrow().objects.is_empty()
+    }
+
+    /// Append the incremental update `section` (written by `edit::incremental` for the objects in front of the file) to the
+    /// file in memory and read the file again from its new end: what was in front of the file is now in it. `pages` is how many
+    /// pages the document must still have. On an error the document is as it was.
+    pub(crate) fn append_section(&mut self, section: &[u8], pages: usize) -> Result<()> {
+        let old_len = self.data.len();
+        self.data.extend_from_slice(section);
+        let x = match xref::read_xref_budgeted(&self.data, &self.budget) {
+            Ok(x) => x,
+            Err(e) => {
+                self.data.truncate(old_len);
+                return Err(e);
+            }
+        };
+        let was_repaired = self.repaired.get();
+        let old_xref = std::mem::replace(&mut *self.xref.borrow_mut(), x.entries);
+        let old_trailer = std::mem::replace(&mut self.trailer, x.trailer);
+        let old_overlay = std::mem::take(&mut *self.overlay.borrow_mut());
+        let cache_budget = self.cache.borrow().budget;
+        let old_cache = std::mem::replace(&mut *self.cache.borrow_mut(), ObjectCache { budget: cache_budget, ..ObjectCache::default() });
+        let old_streams = self.uses_xref_streams.replace(x.uses_xref_streams);
+        self.objstms.borrow_mut().clear();
+        self.endstreams = EndstreamIndex::default();
+        // What was written has to be read as it was written: a document that needs its table rebuilt after the change was broken
+        // by it.
+        if !self.repaired.get() && self.page_count().is_ok_and(|n| n == pages) {
+            // The floor of new numbers stays: what was given out is not given out again.
+            self.overlay.borrow_mut().floor = old_overlay.floor;
+            return Ok(());
+        }
+        *self.xref.borrow_mut() = old_xref;
+        self.trailer = old_trailer;
+        *self.overlay.borrow_mut() = old_overlay;
+        *self.cache.borrow_mut() = old_cache;
+        self.uses_xref_streams.set(old_streams);
+        self.repaired.set(was_repaired);
+        self.objstms.borrow_mut().clear();
+        self.endstreams = EndstreamIndex::default();
+        self.data.truncate(old_len);
+        Err(Error::Invalid("the changed file cannot be read again".to_string()))
     }
 
     /// Does the trailer have an `/Encrypt` entry (7.5.5)?

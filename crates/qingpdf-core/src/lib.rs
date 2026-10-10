@@ -6,6 +6,7 @@ mod cipher;
 mod codecs;
 mod dests;
 pub mod document;
+pub mod edit;
 pub mod error;
 pub mod filter;
 pub mod image;

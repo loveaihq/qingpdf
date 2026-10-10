@@ -268,8 +268,21 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict, skip: Option<&str>, depth: usize, enc
 /// replaced by the real length of the data as a direct integer, and the data
 /// is written as it is: still encoded, `Filter` and `DecodeParms` untouched.
 fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object, enc: Option<&ObjectCrypt<'_>>) -> Result<()> {
+    write_indirect_gen(out, num, 0, obj, enc)
+}
+
+/// [`write_indirect`] for an object with a generation number (an object of an incremental update keeps its own).
+pub(crate) fn write_indirect_gen(
+    out: &mut Vec<u8>,
+    num: u32,
+    generation: u16,
+    obj: &Object,
+    enc: Option<&ObjectCrypt<'_>>,
+) -> Result<()> {
     push_number(out, u64::from(num));
-    out.extend_from_slice(b" 0 obj\n");
+    out.push(b' ');
+    push_number(out, u64::from(generation));
+    out.extend_from_slice(b" obj\n");
     match obj {
         Object::Stream(Stream { dict, data }) => {
             out.extend_from_slice(b"<<");
@@ -896,7 +909,7 @@ impl<'a> Builder<'a> {
 /// Two SipHash runs with different starting words give 128 bits; the same
 /// output always gets the same identifier, and a different one almost surely a
 /// different one.
-fn file_id(body: &[u8]) -> [u8; 16] {
+pub(crate) fn file_id(body: &[u8]) -> [u8; 16] {
     let mut first = std::hash::DefaultHasher::new();
     let mut second = std::hash::DefaultHasher::new();
     first.write(b"qingpdf-id-1");

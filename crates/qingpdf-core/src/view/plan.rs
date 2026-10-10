@@ -27,6 +27,11 @@ const DECODERS: u64 = 32 * MIB;
 /// The text of the pages read lately, with the box of every character, kept for the search, the selection and the copy to
 /// share (3d-2: a page of 3,000 characters is about 50 KB).
 const TEXT_CACHE: u64 = 16 * MIB;
+/// What the objects an edit puts in front of the file (annotations, their appearance streams, the pages that changed) and the
+/// history that undoes them may take together, until the file is saved (4a). Counted in the plan, so that the file, the edits and
+/// the rest stay within the total. A save appends them to the file in memory (the file is read with room after it for that,
+/// `view::SPARE_AFTER_FILE`, 1 MiB, which an update rarely uses up).
+const EDIT_BYTES: u64 = 16 * MIB;
 /// The most pixels of one piece of a page drawn at once (16 MiB of canvas).
 const TILE_PIXELS: u64 = 4 * MIB;
 /// The window needs room for at least a few screens of bitmaps, or there is no plan.
@@ -60,6 +65,8 @@ pub struct MemoryPlan {
     pub decoders: u64,
     /// What the engine keeps of the text of pages it has read.
     pub text_cache: u64,
+    /// What the unsaved edits and the history that undoes them may take.
+    pub edit_bytes: u64,
 }
 
 impl MemoryPlan {
@@ -72,6 +79,7 @@ impl MemoryPlan {
             + self.masks
             + self.decoders
             + self.text_cache
+            + self.edit_bytes
             + u64::from(self.max_tile_pixels) * 4
     }
 }
@@ -104,6 +112,7 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
             masks: part(MASKS),
             decoders: part(DECODERS),
             text_cache: part(TEXT_CACHE),
+            edit_bytes: part(EDIT_BYTES),
         };
         p.bitmap_cache_bytes = total.saturating_sub(file_bytes).saturating_sub(p.engine_bytes());
         p

@@ -129,6 +129,14 @@ impl BitmapCache {
         }
     }
 
+    /// Drop every piece of a page (it has changed: what was drawn is out of date).
+    pub fn remove_page(&mut self, page: u32) {
+        let gone: Vec<Key> = self.map.values().filter(|e| e.key.page == page).map(|e| e.key).collect();
+        for k in gone {
+            self.remove(&k);
+        }
+    }
+
     pub fn remove(&mut self, key: &Key) {
         if let Some(old) = self.map.remove(key) {
             self.bytes = self.bytes.saturating_sub(old.bytes());

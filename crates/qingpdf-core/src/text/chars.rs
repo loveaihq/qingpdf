@@ -45,6 +45,22 @@ impl Shown {
         }
     }
 
+    /// The inverse of [`Shown::map`]: a point of the page as it is shown (points from the top left) to user space.
+    pub(crate) fn unmap(&self, px: f64, py: f64) -> (f64, f64) {
+        match self.rotate {
+            90 => (py + self.x0, px + self.y0),
+            180 => (self.x1 - px, py + self.y0),
+            270 => (self.x1 - py, self.y1 - px),
+            _ => (px + self.x0, self.y1 - py),
+        }
+    }
+
+    /// The size of the page as it is shown, in points (width, height).
+    pub(crate) fn size(&self) -> (f64, f64) {
+        let (w, h) = (self.x1 - self.x0, self.y1 - self.y0);
+        if self.rotate % 180 == 90 { (h, w) } else { (w, h) }
+    }
+
     /// Where a destination's `left` (the left edge of the crop box when there is none) and `top` are on the page as shown.
     pub(crate) fn point(&self, left: Option<f64>, top: f64) -> (f64, f64) {
         self.map(left.unwrap_or(self.x0), top)

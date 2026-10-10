@@ -62,6 +62,7 @@ pub mod vk {
     pub const RETURN: u32 = 0x0D;
     pub const ESCAPE: u32 = 0x1B;
     pub const SPACE: u32 = 0x20;
+    pub const DELETE: u32 = 0x2E;
     pub const PRIOR: u32 = 0x21;
     pub const NEXT: u32 = 0x22;
     pub const END: u32 = 0x23;
@@ -79,6 +80,9 @@ pub mod vk {
     pub const O: u32 = 0x4F;
     pub const P: u32 = 0x50;
     pub const R: u32 = 0x52;
+    pub const S: u32 = 0x53;
+    pub const Y: u32 = 0x59;
+    pub const Z: u32 = 0x5A;
     pub const NUMPAD0: u32 = 0x60;
     pub const ADD: u32 = 0x6B;
     pub const SUBTRACT: u32 = 0x6D;
@@ -118,8 +122,13 @@ pub enum Event {
     MouseUp { x: i32, y: i32 },
     /// The window lost the mouse while the button was down (another window took it).
     MouseLost,
-    /// The window is being closed.
-    Closing,
+    /// The person asked to close the window (the close button, Alt+F4): it stays open unless the reader answers with
+    /// [`Action::Quit`] (it may ask first whether to save).
+    CloseRequested,
+    /// The answer to [`Action::PickSavePath`]: the file to write, or none if it was cancelled.
+    SavePicked(Option<PathBuf>),
+    /// The answer to [`Action::AskSave`].
+    SaveChoice { tag: u32, choice: SaveChoice },
     /// An item of the bookmarks was clicked (its number in the list given with [`Action::Outline`]).
     OutlineClick(usize),
     /// The text in the find box changed.
@@ -134,6 +143,14 @@ pub enum Event {
     PrintError(String),
     /// The answer to [`Action::SetClipboard`]: the text is on the clipboard (`true`), or it could not be put there.
     ClipboardSet(bool),
+}
+
+/// What a person answered to "save the changes?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveChoice {
+    Save,
+    Discard,
+    Cancel,
 }
 
 /// One bookmark for the tree beside the pages.
@@ -189,6 +206,10 @@ pub enum Cursor {
     Arrow,
     /// Over a link.
     Hand,
+    /// Drawing or putting a note.
+    Cross,
+    /// Marking text.
+    Text,
 }
 
 /// What the reader asks the window to do (after it has finished with an event).
@@ -202,6 +223,12 @@ pub enum Action {
     KillTimer(u32),
     /// Show the open-file box; the answer comes as [`Event::FilePicked`]. `filters`: (name, pattern) pairs.
     PickFile { title: String, filters: Vec<(String, String)> },
+    /// Show the save-as box (asking before it replaces a file); the answer comes as [`Event::SavePicked`]. `name` is the file name it
+    /// starts with.
+    PickSavePath { title: String, filters: Vec<(String, String)>, name: String },
+    /// Ask "save the changes?" with Yes, No and Cancel; the answer is [`Event::SaveChoice`] with the same `tag` (Cancel unless the
+    /// person says otherwise).
+    AskSave { tag: u32, title: String, text: String },
     /// Ask for a line of text in a box of its own; the answer comes as [`Event::Text`] with the same `tag`. A
     /// `secret` is shown as dots, and what is typed is wiped from the window's memory once it has been handed over.
     AskText { tag: u32, title: String, prompt: String, secret: bool, ok: String, cancel: String },
@@ -249,4 +276,9 @@ pub trait Handler {
     fn paint(&mut self, painter: &mut dyn Painter) -> bool;
     /// The shape of the pointer over this place of the client area.
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor;
+    /// Why the system should not end the session (log off, restart, shut down) while this window has something unsaved, worded for
+    /// the person; `None` when it may end. The window then holds the shutdown up and asks, as it does when it is closed.
+    fn unsaved_reason(&self) -> Option<String> {
+        None
+    }
 }

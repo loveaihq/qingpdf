@@ -1067,9 +1067,22 @@ impl OutputCrypt {
     /// The encryption of what object number `num` of the new file holds.
     /// `is_metadata` says it is the catalog's metadata stream.
     pub fn object(&self, num: u32, is_metadata: bool) -> ObjectCrypt<'_> {
-        let r = ObjRef::new(num, 0);
+        self.object_with_generation(num, 0, is_metadata)
+    }
+
+    /// [`OutputCrypt::object`] for an object that keeps the generation it has in the file (an object of an
+    /// incremental update: the key of the older methods depends on it, 7.6.2 Algorithm 1).
+    pub fn object_with_generation(&self, num: u32, generation: u16, is_metadata: bool) -> ObjectCrypt<'_> {
+        let r = ObjRef::new(num, generation);
         let method = self.sec.params.string;
-        ObjectCrypt { owner: self, num, is_metadata, string_method: method, string_key: self.sec.object_key(method, r) }
+        ObjectCrypt {
+            owner: self,
+            num,
+            generation,
+            is_metadata,
+            string_method: method,
+            string_key: self.sec.object_key(method, r),
+        }
     }
 }
 
@@ -1077,6 +1090,7 @@ impl OutputCrypt {
 pub(crate) struct ObjectCrypt<'a> {
     owner: &'a OutputCrypt,
     num: u32,
+    generation: u16,
     is_metadata: bool,
     string_method: Method,
     string_key: Vec<u8>,
@@ -1101,7 +1115,7 @@ impl ObjectCrypt<'_> {
         if method == Method::None {
             return Ok(None);
         }
-        Ok(Some(StreamPlan { method, key: self.owner.sec.object_key(method, ObjRef::new(self.num, 0)) }))
+        Ok(Some(StreamPlan { method, key: self.owner.sec.object_key(method, ObjRef::new(self.num, self.generation)) }))
     }
 
     /// How many bytes `len` bytes of stream data come to once encrypted.

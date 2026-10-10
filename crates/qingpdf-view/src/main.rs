@@ -21,6 +21,7 @@ mod layout;
 mod printing;
 mod recent;
 mod sched;
+mod settings;
 mod select;
 mod tiles;
 mod ui;
@@ -97,7 +98,9 @@ fn main() {
     let max_view_pixels = u64::try_from(screen.0.max(0)).unwrap_or(0) * u64::try_from(screen.1.max(0)).unwrap_or(0);
     let code = win32::run("qingpdf", &menus, bench_size, move |waker| {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker.wake());
-        let mut app = App::new(lang, wake, started, max_view_pixels);
+        // Who the annotations are by: the name that was chosen, else the Windows user's.
+        let author = settings::load().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
+        let mut app = App::new(lang, wake, started, max_view_pixels, author);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));
             app.open_when_ready(file);

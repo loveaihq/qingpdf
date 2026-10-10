@@ -26,6 +26,7 @@ const MAX_PARENTS: usize = 32;
 const FLAG_INVISIBLE: i64 = 1;
 const FLAG_HIDDEN: i64 = 1 << 1;
 const FLAG_NO_VIEW: i64 = 1 << 5;
+const FLAG_NO_ROTATE: i64 = 1 << 4;
 
 /// The standard annotation types (12.5.6, Table 169): the `Invisible` flag is about the others.
 const STANDARD: [&[u8]; 26] = [
@@ -218,8 +219,23 @@ impl Interp<'_> {
         }
         self.gs = self.annotation_state();
         self.gs.ctm = a;
+        // 12.5.3, NoRotate: the appearance is not turned with the page, and the upper left corner of the rectangle (of user space)
+        // stays where it is: the form is drawn upright from the place that corner has on the page as it is shown.
+        let saved = (self.base, self.pattern_base);
+        if flags & FLAG_NO_ROTATE != 0 {
+            let s = self.base[0].hypot(self.base[1]);
+            let (ux, uy) = (rect[0], rect[3]);
+            let (dx, dy) = apply(&self.base, ux, uy);
+            let upright = [s, 0.0, 0.0, -s, dx - s * ux, dy + s * uy];
+            if s > 0.0 && finite(&upright) {
+                self.base = upright;
+                self.pattern_base = upright;
+            }
+        }
         // (A stream that has no resources of its own is given the page's, as the other viewers do.)
-        self.run_form(r, &form, res, 0)
+        let drawn = self.run_form(r, &form, res, 0);
+        (self.base, self.pattern_base) = saved;
+        drawn
     }
 
     /// The appearance stream an annotation shows (12.5.5): `/AP /N`, or, when that is a dictionary of states, the

@@ -16,6 +16,8 @@
 //! }
 //! ```
 
+mod annots;
+mod editing;
 mod geometry;
 mod links;
 mod outline;
@@ -39,9 +41,12 @@ use crate::error::Error;
 use crate::ops::has_owner_rights;
 use crate::text;
 
+pub use annots::{AnnotInfo, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_PARTS};
+pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
+pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind};
 pub use plan::{MAX_FILE_BYTES, MemoryPlan, TOTAL_BYTES, plan};
 pub use search::MAX_QUERY_CHARS;
 pub use server::{MAX_COPY_CHARS, MAX_COPY_PAGES, MAX_HITS_PER_PAGE, MAX_PRINT_DPI, MAX_PRINT_PAGES, MAX_SEARCH_HITS};
@@ -139,6 +144,8 @@ pub struct Rights {
     pub print: bool,
     /// ... at the best quality. Without it, printing is limited to [`LOW_QUALITY_PRINT_DPI`] dots per inch.
     pub print_high_quality: bool,
+    /// Annotations may be added and taken out (permission bit 6, Table 22; the owner password lifts it).
+    pub annotate: bool,
 }
 
 /// The most dots per inch a page is printed at when the file allows only low-quality printing (Table 22, bit 12).
@@ -162,7 +169,8 @@ pub struct Opened {
 #[repr(u8)]
 pub enum TextStatus {
     Ok = 0,
-    /// The file's author did not allow copying text, and the file was not opened with the owner password.
+    /// The file's author did not allow copying text, and the file was not opened with the owner password. (For the boxes of the
+    /// characters this is told only when annotating is not allowed either; see [`Engine::char_boxes`].)
     Denied = 1,
     /// The page could not be read for its text (`message` says why: the page asks for more work than is allowed, there is
     /// no such page).
@@ -263,6 +271,13 @@ pub enum Event {
     Copied { doc: u64, id: u64, status: TextStatus, message: String, text: String, truncated: bool },
     PrintBand(PrintBand),
     PrintDone { doc: u64, id: u64, status: PrintStatus, pages_done: u32, message: String },
+    /// The annotations of a page that can be picked (the answer to [`Engine::annotations`]), in the order of the page's list.
+    Annotations { doc: u64, id: u64, page: u32, items: Vec<AnnotInfo>, truncated: bool },
+    /// The answer to an edit, an undo or a redo. After [`EditStatus::Done`] what was drawn of the page is out of date (the other
+    /// pages are as they were), and the queued requests go on. The file is not changed until it is saved.
+    Edited(EditResult),
+    /// The answer to [`Engine::save`].
+    Saved { doc: u64, id: u64, status: SaveStatus, message: String, bytes: u64 },
 }
 
 /// What can be asked of the open document besides drawing.
@@ -273,12 +288,19 @@ pub(crate) enum Request {
     Search { query: String, start: u32 },
     Copy { from: (u32, u32), to: (u32, u32) },
     Print(Vec<PrintPage>),
+    Annotations(u32),
 }
 
 pub(crate) enum Command {
     Open { doc: u64, source: Source, password: String, total: u64, view_pixels: u64 },
     Render(RenderRequest),
     Request { doc: u64, id: u64, what: Request },
+    Edit { doc: u64, id: u64, edit: crate::edit::Edit },
+    Undo { doc: u64, id: u64 },
+    Redo { doc: u64, id: u64 },
+    Save { doc: u64, id: u64, path: String },
+    /// Inside the serving loop only: the document is to be replaced by an edited one.
+    Swap,
     PrintNext(u64),
     Cancel(u64),
     Close,
@@ -363,8 +385,9 @@ impl Engine {
         self.request(doc, id, Request::Links(page));
     }
 
-    /// Ask for the boxes of the characters of a page, for selecting text: answered by [`Event::CharBoxes`]. A file that does
-    /// not allow copying answers [`TextStatus::Denied`].
+    /// Ask for the boxes of the characters of a page, for selecting text: answered by [`Event::CharBoxes`]. A file that allows
+    /// neither copying nor annotating answers [`TextStatus::Denied`]; one that allows annotating but not copying gives the boxes (the
+    /// positions, not the text: selecting text to mark it works, [`Engine::copy_text`] still answers [`TextStatus::Denied`]).
     pub fn char_boxes(&self, doc: u64, id: u64, page: u32) {
         self.request(doc, id, Request::CharBoxes(page));
     }
@@ -396,6 +419,60 @@ impl Engine {
     /// The band last sent for print job `id` has been used: draw the next.
     pub fn print_next(&self, id: u64) {
         let _ = self.commands.send(Command::PrintNext(id));
+    }
+
+    /// Ask for the annotations of a page that can be picked and taken out (everything but links, form fields and popups):
+    /// answered by [`Event::Annotations`].
+    pub fn annotations(&self, doc: u64, id: u64, page: u32) {
+        self.request(doc, id, Request::Annotations(page));
+    }
+
+    /// Mark text: one `[left, top, right, bottom]` for each line, in the points of [`CharBoxes`] (the rectangles of
+    /// [`line_rects`] for the selected characters). Answered by [`Event::Edited`]. `author` is who is told to have made it
+    /// (at most [`MAX_AUTHOR_CHARS`] characters). Edits are done in the order they are asked for; none while a print job runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_markup(&self, doc: u64, id: u64, page: u32, kind: MarkupKind, rects: Vec<[f32; 4]>, color: [u8; 3], author: &str) {
+        let edit = crate::edit::Edit::Markup { page, kind, rects, color, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Draw freehand: strokes of points in the points of [`CharBoxes`], `width` points wide (between [`MIN_INK_WIDTH`] and
+    /// [`MAX_INK_WIDTH`]). At most [`MAX_INK_STROKES`] strokes; more than [`MAX_INK_POINTS`] points in all are thinned out.
+    /// Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_ink(&self, doc: u64, id: u64, page: u32, strokes: Vec<Vec<[f32; 2]>>, color: [u8; 3], width: f32, author: &str) {
+        let edit = crate::edit::Edit::Ink { page, strokes, color, width, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Put a note (an icon that opens `text`, at most [`MAX_NOTE_CHARS`] characters) with its top left corner at `at`.
+    /// Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_note(&self, doc: u64, id: u64, page: u32, at: [f32; 2], text: &str, color: [u8; 3], author: &str) {
+        let edit = crate::edit::Edit::Note { page, at, text: text.to_string(), color, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by
+    /// [`Event::Edited`].
+    pub fn delete_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Delete { page, index, num } });
+    }
+
+    /// Undo the last edit (up to [`MAX_UNDO_STEPS`] of them are kept): answered by [`Event::Edited`].
+    pub fn undo(&self, doc: u64, id: u64) {
+        let _ = self.commands.send(Command::Undo { doc, id });
+    }
+
+    /// Do again what was undone: answered by [`Event::Edited`].
+    pub fn redo(&self, doc: u64, id: u64) {
+        let _ = self.commands.send(Command::Redo { doc, id });
+    }
+
+    /// Write the file, with all the edits, to `path` (the file it was opened from, or a new one): into a file of its own that
+    /// replaces `path` only when it is whole. Answered by [`Event::Saved`]. A file that was not changed is written as it is.
+    pub fn save(&self, doc: u64, id: u64, path: &str) {
+        let _ = self.commands.send(Command::Save { doc, id, path: path.to_string() });
     }
 
     /// Withdraw a request: dropped if it has not started, stopped at its next operator if it is being worked on. A
@@ -452,11 +529,20 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
         match command {
             Command::Quit => return,
             Command::Open { doc, source, password, total, view_pixels } => match open(doc, source, password, total, view_pixels) {
-                Ok(opened) => next = server::serve(opened, commands, &send, shared),
+                Ok((opened, mut session)) => next = server::serve(opened, &mut session, commands, &send, shared),
                 Err((failure, message)) => send(Event::OpenFailed { doc, failure, message }),
             },
             // Requests with no document open.
-            Command::Render(_) | Command::Request { .. } | Command::PrintNext(_) | Command::Cancel(_) | Command::Close => {}
+            Command::Render(_)
+            | Command::Request { .. }
+            | Command::Edit { .. }
+            | Command::Undo { .. }
+            | Command::Redo { .. }
+            | Command::Save { .. }
+            | Command::Swap
+            | Command::PrintNext(_)
+            | Command::Cancel(_)
+            | Command::Close => {}
         }
     }
 }
@@ -468,22 +554,49 @@ pub(crate) struct OpenDoc {
     pub(crate) rights: Rights,
 }
 
-fn open(doc_id: u64, source: Source, mut password: String, total: u64, view_pixels: u64) -> Result<OpenDoc, (OpenFailure, String)> {
+fn open(doc_id: u64, source: Source, mut password: String, total: u64, view_pixels: u64) -> Result<(OpenDoc, editing::Session), (OpenFailure, String)> {
     let result = open_inner(doc_id, source, &password, total, view_pixels);
-    // The password is used and gone: overwrite it before it is freed.
+    // The editing session keeps the password for as long as the file is open (to open the edited file again), and wipes it
+    // when it ends; this copy is used and gone: overwrite it before it is freed.
+    let budget = result.as_ref().map_or(0, |o| o.plan.edit_bytes);
+    let session = editing::Session::new(&password, budget);
     wipe(&mut password);
-    result
+    result.map(|opened| (opened, session))
+}
+
+/// Open the bytes of an edited file (the same document with changes appended or cut off) again. `pages` is how many pages it
+/// must have. The error is the reason, in English.
+pub(crate) fn reopen(doc_id: u64, plan: MemoryPlan, rights: Rights, bytes: Vec<u8>, password: &str, pages: usize) -> Result<OpenDoc, String> {
+    let document = Document::from_bytes_with_password(bytes, password).map_err(|e| e.to_string())?;
+    if document.is_locked() {
+        return Err("the changed file cannot be opened".to_string());
+    }
+    // What was appended has to be read as it is written: a file that needs its table rebuilt after the change was broken by it.
+    if document.was_repaired() {
+        return Err("its cross-reference data cannot be read".to_string());
+    }
+    if document.page_count().map_err(|e| e.to_string())? != pages {
+        return Err("the changed file has other pages".to_string());
+    }
+    document.set_object_stream_cache_limit(usize::try_from(plan.object_streams).unwrap_or(usize::MAX));
+    Ok(OpenDoc { doc_id, document, plan, rights })
 }
 
 fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixels: u64) -> Result<OpenDoc, (OpenFailure, String)> {
     let too_large = || (OpenFailure::TooLarge, format!("the file is bigger than {} MB, the most this reader opens", MAX_FILE_BYTES / 1_000_000));
     let bytes = match source {
         Source::Path(path) => {
-            let size = std::fs::metadata(&path).map_err(|e| (OpenFailure::Unreadable, e.to_string()))?.len();
+            let unreadable = |e: std::io::Error| (OpenFailure::Unreadable, e.to_string());
+            let size = std::fs::metadata(&path).map_err(unreadable)?.len();
             if plan(total, size, view_pixels).is_none() {
                 return Err(too_large());
             }
-            std::fs::read(&path).map_err(|e| (OpenFailure::Unreadable, e.to_string()))?
+            // With room after the file for the update that saving appends, so that appending does not copy the file.
+            let mut file = std::fs::File::open(&path).map_err(unreadable)?;
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(usize::try_from(size).unwrap_or(0).saturating_add(SPARE_AFTER_FILE)).map_err(|e| (OpenFailure::Unreadable, e.to_string()))?;
+            std::io::Read::read_to_end(&mut file, &mut bytes).map_err(unreadable)?;
+            bytes
         }
         Source::Bytes(b) => b,
     };
@@ -505,12 +618,17 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
 fn rights_of(document: &Document, password: &str) -> Rights {
     let copy = text::check_extraction_allowed(document, password).is_ok();
     let Some(encryption) = document.encryption() else {
-        return Rights { copy, print: true, print_high_quality: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true };
     };
     if has_owner_rights(document, &encryption, password) {
-        return Rights { copy, print: true, print_high_quality: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true };
     }
-    Rights { copy, print: encryption.permissions.print, print_high_quality: encryption.permissions.print_high_quality }
+    Rights {
+        copy,
+        print: encryption.permissions.print,
+        print_high_quality: encryption.permissions.print_high_quality,
+        annotate: encryption.permissions.annotate,
+    }
 }
 
 /// Overwrite a string's bytes with zeros.
@@ -519,6 +637,9 @@ fn wipe(s: &mut String) {
     bytes.fill(0);
     std::hint::black_box(&bytes);
 }
+
+/// Room left after a file read from the disk for what saving appends to it (an incremental update is mostly a few kilobytes).
+const SPARE_AFTER_FILE: usize = 1 << 20;
 
 /// The most a side of a page is told to be, in points (Annex C of the spec: implementation limit of 14,400 units; `/UserUnit`
 /// is not applied by this engine). A page with a bigger box is shown cut at this size, from its top left corner; a box of

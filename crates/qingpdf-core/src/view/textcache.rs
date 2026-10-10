@@ -75,7 +75,7 @@ impl TextCache {
         self.bytes += w;
     }
 
-    fn forget(&mut self, page: u32) {
+    pub(super) fn forget(&mut self, page: u32) {
         if let Some(slot) = self.map.remove(&page) {
             self.order.remove(&slot.used);
             self.bytes -= slot.weight;
