@@ -47,6 +47,9 @@ const MAX_DEST_ARRAY: usize = 16;
 /// A name tree leaf holds at most this many entries when a tree is written.
 const LEAF_SIZE: usize = 64;
 
+/// What a node of a name tree counts for beside its entries, in [`NamedDests::load_with`]'s steps.
+const NODE_STEPS: usize = 16;
+
 /// What an entry of the lists costs besides its key and value: the pair and the
 /// key's vector.
 const ENTRY_OVERHEAD: usize = 48;
@@ -56,15 +59,15 @@ const ENTRY_OVERHEAD: usize = 48;
 pub(crate) struct Spend {
     left: Cell<usize>,
     total: usize,
-    /// The indirect objects that have been resolved: the first time one is paid
-    /// for in full, as a distinct object; again only if it is bigger than
-    /// [`FREE_COPY`].
-    seen: RefCell<HashSet<u32>>,
+    /// The indirect objects that have been resolved, with their sizes: the first
+    /// time one is paid for in full, as a distinct object; again only if it is
+    /// bigger than [`FREE_COPY`].
+    seen: RefCell<HashMap<u32, usize>>,
 }
 
 impl Spend {
     pub(crate) fn new(total: usize) -> Spend {
-        Spend { left: Cell::new(total), total, seen: RefCell::new(HashSet::new()) }
+        Spend { left: Cell::new(total), total, seen: RefCell::new(HashMap::new()) }
     }
 
     /// Pay for `bytes` of copying; `Limit` when there is not enough left.
@@ -92,14 +95,27 @@ impl Spend {
     /// `doc.resolve(obj)` for a value of the destinations. A distinct indirect
     /// object is paid for once, by its size; a repeated one, and a direct one
     /// (which is copied each time), only if it is more than [`FREE_COPY`] bytes.
-    /// What cannot be resolved is `None`.
+    /// What cannot be resolved is `None`. A repeated reference whose copy the
+    /// budget can no longer pay for is not read at all (3d-2 review: twenty
+    /// thousand items naming one megabyte were each parsed before being refused).
     pub(crate) fn resolved(&self, doc: &Document, obj: &Object) -> Result<Option<Object>> {
+        if let Object::Ref(r) = obj {
+            let known = self.seen.borrow().get(&r.num).copied();
+            if let Some(size) = known {
+                self.take_copy(size)?;
+            }
+        }
         let Ok(o) = doc.resolve(obj) else {
             return Ok(None);
         };
         let size = o.approx_size();
         match obj {
-            Object::Ref(r) if self.seen.borrow_mut().insert(r.num) => self.take(size)?,
+            Object::Ref(r) => {
+                let first = self.seen.borrow_mut().insert(r.num, size).is_none();
+                if first {
+                    self.take(size)?;
+                }
+            }
             _ => self.take_copy(size)?,
         }
         Ok(Some(o))
@@ -131,6 +147,12 @@ impl NamedDests {
     /// left out; a file that makes this cost more than the budget is a
     /// [`Error::Limit`].
     pub(crate) fn load(doc: &Document) -> Result<NamedDests> {
+        NamedDests::load_with(doc, &|_| true)
+    }
+
+    /// [`NamedDests::load`] that asks `charge` for the steps it is about to take (an entry is one step, a node of the tree
+    /// [`NODE_STEPS`]) and stops with [`Error::Cancelled`] when it says no, so that the work can be metered and cancelled.
+    pub(crate) fn load_with(doc: &Document, charge: &dyn Fn(usize) -> bool) -> Result<NamedDests> {
         let mut out = NamedDests {
             tree: Vec::new(),
             dict: Vec::new(),
@@ -146,9 +168,12 @@ impl NamedDests {
             && let Object::Dict(names) = names
             && let Some(root) = names.get("Dests")
         {
-            out.tree = read_tree(doc, root, &out.spend)?;
+            out.tree = read_tree(doc, root, &out.spend, charge)?;
         }
         if let Some(Object::Dict(dests)) = catalog.get("Dests").and_then(|d| doc.resolve(d).ok()) {
+            if !charge(dests.len().min(MAX_NAMED_DESTS)) {
+                return Err(Error::Cancelled);
+            }
             for (key, value) in dests.iter() {
                 if out.dict.len() >= MAX_NAMED_DESTS {
                     break;
@@ -212,7 +237,7 @@ impl NamedDests {
 /// value, found through `/Kids`. Every node and every array that is an
 /// indirect object is read once however many times it is named; cycles and
 /// absurd sizes are cut, and what is copied is paid for by its bytes.
-fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8>, Object)>> {
+fn read_tree(doc: &Document, root: &Object, spend: &Spend, charge: &dyn Fn(usize) -> bool) -> Result<Vec<(Vec<u8>, Object)>> {
     let mut out: Vec<(Vec<u8>, Object)> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     let mut once = |obj: &Object| -> bool {
@@ -231,6 +256,9 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8
         if nodes > MAX_TREE_NODES {
             break;
         }
+        if !charge(NODE_STEPS) {
+            return Err(Error::Cancelled);
+        }
         // Each distinct node and array is read once (above), so reading them
         // is work in proportion to the file; only what is kept is paid for.
         let Ok(Object::Dict(dict)) = doc.resolve(&node) else {
@@ -240,6 +268,9 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8
             && once(names)
             && let Ok(Object::Array(items)) = doc.resolve(names)
         {
+            if !charge(items.len() / 2) {
+                return Err(Error::Cancelled);
+            }
             for [key, value] in items.as_chunks::<2>().0 {
                 if out.len() >= MAX_NAMED_DESTS {
                     return Ok(out);
@@ -255,6 +286,9 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend) -> Result<Vec<(Vec<u8
             && once(kids)
             && let Ok(Object::Array(kids)) = doc.resolve(kids)
         {
+            if !charge(kids.len()) {
+                return Err(Error::Cancelled);
+            }
             for kid in kids.into_iter().rev() {
                 spend.take(kid.approx_size())?;
                 stack.push((kid, depth + 1));
@@ -291,35 +325,24 @@ pub(crate) fn array_page(array: &[Object], pages: &HashSet<u32>) -> Option<u32> 
     }
 }
 
-/// The page a destination value points at: an explicit array, a named
-/// destination (looked up in `names`), or a dictionary with a `/D`.
-pub(crate) fn dest_page(
-    doc: &Document,
-    value: &Object,
-    names: &NamedDests,
-    pages: &HashSet<u32>,
-) -> Result<Option<u32>> {
+/// The explicit destination array a destination value stands for: the array itself, a named destination (looked up in
+/// `names`), or a dictionary with a `/D`.
+pub(crate) fn dest_array(doc: &Document, value: &Object, names: &NamedDests) -> Result<Option<Vec<Object>>> {
     let Some(resolved) = names.spend().resolved(doc, value)? else {
         return Ok(None);
     };
-    let array = match &resolved {
-        Object::Name(n) => names.lookup(doc, n.as_bytes(), true)?,
-        Object::String(s) => names.lookup(doc, &s.bytes, false)?,
-        other => explicit(doc, other, names.spend())?,
-    };
-    Ok(array.and_then(|a| array_page(&a, pages)))
+    match &resolved {
+        Object::Name(n) => names.lookup(doc, n.as_bytes(), true),
+        Object::String(s) => names.lookup(doc, &s.bytes, false),
+        other => explicit(doc, other, names.spend()),
+    }
 }
 
-/// The page an outline item or link points at, through its `/Dest` or, failing
-/// that, a go-to action in `/A` (12.3.2, 12.6.4.2).
-pub(crate) fn item_page(
-    doc: &Document,
-    item: &Dict,
-    names: &NamedDests,
-    pages: &HashSet<u32>,
-) -> Result<Option<u32>> {
+/// The explicit destination an outline item or link points at, through its `/Dest` or, failing that, a go-to action in
+/// `/A` (12.3.2, 12.6.4.2).
+pub(crate) fn item_array(doc: &Document, item: &Dict, names: &NamedDests) -> Result<Option<Vec<Object>>> {
     if let Some(dest) = item.get("Dest") {
-        return dest_page(doc, dest, names, pages);
+        return dest_array(doc, dest, names);
     }
     let Some(action) = item.get("A") else {
         return Ok(None);
@@ -331,9 +354,20 @@ pub(crate) fn item_page(
         return Ok(None);
     }
     match action.get("D") {
-        Some(d) => dest_page(doc, d, names, pages),
+        Some(d) => dest_array(doc, d, names),
         None => Ok(None),
     }
+}
+
+/// The page an outline item or link points at, through its `/Dest` or, failing that, a go-to action in `/A` (12.3.2,
+/// 12.6.4.2).
+pub(crate) fn item_page(
+    doc: &Document,
+    item: &Dict,
+    names: &NamedDests,
+    pages: &HashSet<u32>,
+) -> Result<Option<u32>> {
+    Ok(item_array(doc, item, names)?.and_then(|a| array_page(&a, pages)))
 }
 
 /// A name tree (7.9.6) for these entries: sorted by key, leaves of at most

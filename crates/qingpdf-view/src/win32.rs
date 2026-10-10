@@ -14,12 +14,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::{OsString, c_void};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ui::{Action, Bar, Event, Handler, Menu, MenuEntry, Painter, Rect, Rgb, ScrollCode, ScrollInfo};
+use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, ScrollCode, ScrollInfo};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -166,6 +166,105 @@ struct ProcessMemoryCounters {
     peak_pagefile: usize,
 }
 
+/// TVITEMW.
+#[repr(C)]
+struct TvItem {
+    mask: u32,
+    item: isize,
+    state: u32,
+    state_mask: u32,
+    text: *mut u16,
+    text_max: i32,
+    image: i32,
+    selected_image: i32,
+    children: i32,
+    param: isize,
+}
+
+/// TVITEMEXW (the item of a TVINSERTSTRUCTW is the extended form, the bigger of the two, so the control never reads past it).
+#[repr(C)]
+struct TvItemEx {
+    item: TvItem,
+    integral: i32,
+    state_ex: u32,
+    window: isize,
+    expanded_image: i32,
+    reserved: i32,
+}
+
+#[repr(C)]
+struct TvInsert {
+    parent: isize,
+    after: isize,
+    item: TvItemEx,
+}
+
+#[repr(C)]
+struct TvHitTest {
+    pt: Point,
+    flags: u32,
+    item: isize,
+}
+
+#[repr(C)]
+struct NmHdr {
+    from: isize,
+    id: usize,
+    code: u32,
+}
+
+#[repr(C)]
+struct NmTreeView {
+    hdr: NmHdr,
+    action: u32,
+    old: TvItem,
+    new: TvItem,
+    pt: Point,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PrintPageRange {
+    from: u32,
+    to: u32,
+}
+
+/// PRINTDLGEXW.
+#[repr(C)]
+struct PrintDlgEx {
+    size: u32,
+    owner: isize,
+    devmode: isize,
+    devnames: isize,
+    dc: isize,
+    flags: u32,
+    flags2: u32,
+    exclusion_flags: u32,
+    page_range_count: u32,
+    page_range_max: u32,
+    page_ranges: *mut PrintPageRange,
+    min_page: u32,
+    max_page: u32,
+    copies: u32,
+    instance: isize,
+    template_name: *const u16,
+    callback: *const c_void,
+    property_page_count: u32,
+    property_pages: *const isize,
+    start_page: u32,
+    result_action: u32,
+}
+
+/// DOCINFOW.
+#[repr(C)]
+struct DocInfo {
+    size: i32,
+    doc_name: *const u16,
+    output: *const u16,
+    datatype: *const u16,
+    kind: u32,
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn RegisterClassExW(class: *const WndClassExW) -> u16;
@@ -212,6 +311,19 @@ unsafe extern "system" {
     fn FillRect(hdc: isize, rect: *const WinRect, brush: isize) -> i32;
     fn ScreenToClient(hwnd: isize, point: *mut Point) -> i32;
     fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void, flags: u32) -> i32;
+    fn GetFocus() -> isize;
+    fn GetCursorPos(point: *mut Point) -> i32;
+    fn SetCursor(cursor: isize) -> isize;
+    fn SetCapture(hwnd: isize) -> isize;
+    fn ReleaseCapture() -> i32;
+    fn OpenClipboard(hwnd: isize) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn SetClipboardData(format: u32, mem: isize) -> isize;
+    fn DestroyMenu(menu: isize) -> i32;
+    fn DrawMenuBar(hwnd: isize) -> i32;
+    fn GetMenu(hwnd: isize) -> isize;
+    fn MoveWindow(hwnd: isize, x: i32, y: i32, w: i32, h: i32, repaint: i32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -231,6 +343,19 @@ unsafe extern "system" {
     fn TextOutW(hdc: isize, x: i32, y: i32, text: *const u16, len: i32) -> i32;
     fn GetTextExtentPoint32W(hdc: isize, text: *const u16, len: i32, size: *mut Size) -> i32;
     fn CreateSolidBrush(color: u32) -> isize;
+    fn GetDeviceCaps(hdc: isize, index: i32) -> i32;
+    fn CreateDCW(driver: *const u16, device: *const u16, port: *const u16, devmode: *const c_void) -> isize;
+    fn StartDocW(hdc: isize, info: *const DocInfo) -> i32;
+    fn EndDoc(hdc: isize) -> i32;
+    fn AbortDoc(hdc: isize) -> i32;
+    fn StartPage(hdc: isize) -> i32;
+    fn EndPage(hdc: isize) -> i32;
+}
+
+#[link(name = "msimg32")]
+unsafe extern "system" {
+    #[allow(clippy::too_many_arguments)]
+    fn AlphaBlend(dest: isize, xd: i32, yd: i32, wd: i32, hd: i32, src: isize, xs: i32, ys: i32, ws: i32, hs: i32, blend: u32) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -243,6 +368,15 @@ unsafe extern "system" {
     fn GetCurrentProcess() -> isize;
     fn K32GetProcessMemoryInfo(process: isize, counters: *mut ProcessMemoryCounters, cb: u32) -> i32;
     fn GetUserDefaultUILanguage() -> u16;
+    fn GlobalAlloc(flags: u32, bytes: usize) -> isize;
+    fn GlobalLock(mem: isize) -> *mut c_void;
+    fn GlobalUnlock(mem: isize) -> i32;
+    fn GlobalFree(mem: isize) -> isize;
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *const c_void, flags: u32) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -250,11 +384,13 @@ unsafe extern "system" {
     fn DragAcceptFiles(hwnd: isize, accept: i32);
     fn DragQueryFileW(drop: isize, index: u32, buffer: *mut u16, len: u32) -> u32;
     fn DragFinish(drop: isize);
+    fn ShellExecuteW(hwnd: isize, verb: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
 }
 
 #[link(name = "comdlg32")]
 unsafe extern "system" {
     fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
+    fn PrintDlgExW(dialog: *mut PrintDlgEx) -> i32;
 }
 
 #[link(name = "comctl32")]
@@ -273,6 +409,8 @@ const WM_GETMINMAXINFO: u32 = 0x0024;
 const WM_NCDESTROY: u32 = 0x0082;
 const WM_KEYDOWN: u32 = 0x0100;
 const WM_COMMAND: u32 = 0x0111;
+const WM_ENTERMENULOOP: u32 = 0x0211;
+const WM_EXITMENULOOP: u32 = 0x0212;
 const WM_TIMER: u32 = 0x0113;
 const WM_HSCROLL: u32 = 0x0114;
 const WM_VSCROLL: u32 = 0x0115;
@@ -313,6 +451,8 @@ const GWLP_USERDATA: i32 = -21;
 const MF_STRING: u32 = 0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_POPUP: u32 = 0x10;
+const MF_CHECKED: u32 = 0x8;
+const MF_GRAYED: u32 = 0x1;
 const MB_OK: u32 = 0;
 const MB_ICONINFORMATION: u32 = 0x40;
 const MB_ICONERROR: u32 = 0x10;
@@ -337,6 +477,65 @@ const INVALID_HANDLE_VALUE: isize = -1;
 const IDC_ARROW: usize = 32512;
 const ICC_STANDARD_CLASSES: u32 = 0x4000;
 const SPI_GETWORKAREA: u32 = 0x0030;
+const WM_SETREDRAW: u32 = 0x000B;
+const WM_SETCURSOR: u32 = 0x0020;
+const WM_NOTIFY: u32 = 0x004E;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_CAPTURECHANGED: u32 = 0x0215;
+const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+const MK_LBUTTON: usize = 1;
+const HTCLIENT: u32 = 1;
+const IDC_HAND: usize = 32649;
+const EN_CHANGE: u32 = 0x0300;
+const EM_SETSEL: u32 = 0x00B1;
+const ICC_TREEVIEW_CLASSES: u32 = 0x2;
+const SW_HIDE: i32 = 0;
+/// Child windows: the bookmarks tree and the find box.
+const ID_TREE: isize = 101;
+const ID_FIND: isize = 102;
+const TVS_HASBUTTONS: u32 = 0x1;
+const TVS_HASLINES: u32 = 0x2;
+const TVS_LINESATROOT: u32 = 0x4;
+const TVS_SHOWSELALWAYS: u32 = 0x20;
+const TVM_DELETEITEM: u32 = 0x1101;
+const TVM_EXPAND: u32 = 0x1102;
+const TVM_HITTEST: u32 = 0x1111;
+const TVM_ENSUREVISIBLE: u32 = 0x1114;
+const TVM_INSERTITEMW: u32 = 0x1132;
+const TVM_GETITEMW: u32 = 0x113E;
+const TVIF_TEXT: u32 = 0x1;
+const TVIF_PARAM: u32 = 0x4;
+const TVIF_HANDLE: u32 = 0x10;
+const TVE_EXPAND: usize = 2;
+const TVI_ROOT: isize = -0x10000;
+const TVI_LAST: isize = -0xFFFE;
+const TVHT_ON_ITEM: u32 = 0x2 | 0x4;
+const NM_CLICK: u32 = -2i32 as u32;
+const TVN_SELCHANGEDW: u32 = -451i32 as u32;
+const TVC_BYMOUSE: u32 = 1;
+const TVC_BYKEYBOARD: u32 = 2;
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 2;
+const MB_YESNO: u32 = 4;
+const MB_ICONQUESTION: u32 = 0x20;
+const MB_DEFBUTTON2: u32 = 0x100;
+const IDYES: i32 = 6;
+const PD_PAGENUMS: u32 = 0x2;
+const PD_NOSELECTION: u32 = 0x4;
+const PD_RETURNDC: u32 = 0x100;
+const PD_USEDEVMODECOPIESANDCOLLATE: u32 = 0x4_0000;
+const PD_NOCURRENTPAGE: u32 = 0x80_0000;
+const PD_RESULT_PRINT: u32 = 1;
+const START_PAGE_GENERAL: u32 = 0xFFFF_FFFF;
+const MAX_PRINT_RANGES: usize = 16;
+const HORZRES: i32 = 8;
+const VERTRES: i32 = 10;
+const LOGPIXELSX: i32 = 88;
+const COINIT_APARTMENTTHREADED: u32 = 2;
+/// The most characters of the find box that are read.
+const MAX_FIND_CHARS: usize = 2000;
 const DEFAULT_WIDTH: i32 = 1000;
 const DEFAULT_HEIGHT: i32 = 800;
 
@@ -475,6 +674,21 @@ struct WindowState {
     back: RefCell<Back>,
     font: Cell<isize>,
     dpi: Cell<u32>,
+    /// The bookmarks tree and the find box, children of the window (0 if Windows would not make them).
+    tree: Cell<isize>,
+    find: Cell<isize>,
+    /// The printer a job is going to (from the print box, or named by the hidden test), until the job ends.
+    printer: RefCell<Option<Printer>>,
+    /// A menu is open (between WM_ENTERMENULOOP and WM_EXITMENULOOP), and the menus that came meanwhile, to be put when it closes:
+    /// destroying the menu bar under an open menu would close it under the person's hand.
+    menu_open: Cell<bool>,
+    menus_waiting: RefCell<Option<Vec<Menu>>>,
+}
+
+/// A printer's device context, and the file it writes if it was told to write one (zero-terminated UTF-16).
+struct Printer {
+    dc: isize,
+    output: Option<Vec<u16>>,
 }
 
 fn state_of<'a>(hwnd: isize) -> Option<&'a WindowState> {
@@ -544,6 +758,45 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
                 // returns when it is closed.
                 unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONINFORMATION) };
             }
+            Action::Confirm { tag, title, text } => {
+                let (t, c) = (wide(&text), wide(&title));
+                // SAFETY: both strings are zero-terminated UTF-16 that outlive the call; the box is modal and returns when it
+                // is closed. "No" is the button the Enter key presses.
+                let answer = unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) };
+                queue.extend(deliver(state, Event::Confirmed { tag, yes: answer == IDYES }));
+            }
+            Action::SetMenus(menus) => set_menus(state, hwnd, menus),
+            Action::Outline(nodes) => fill_tree(state.tree.get(), &nodes),
+            Action::Sidebar(r) => place_child(state.tree.get(), r),
+            Action::Find(rect) => show_find(state, hwnd, rect),
+            Action::OpenUri(uri) => {
+                // The reader has checked the address; it is checked again here, the last place before the system, so that nothing
+                // that is not a plain http, https or mailto address (an environment variable like %USERNAME%, say) reaches it.
+                if qingpdf_core::view::safe_uri(uri.as_bytes()).is_some() {
+                    let (verb, file) = (wide("open"), wide(&uri));
+                    // SAFETY: both strings are zero-terminated UTF-16 that outlive the call; no parameters or folder (null); the
+                    // system opens the address with the program the user has chosen for its kind. ShellExecuteW takes no flags (it
+                    // is not given SEE_MASK_DOENVSUBST, which ShellExecuteExW would need to expand environment variables), and the
+                    // address has no '%' that does not begin a percent-escape.
+                    unsafe { ShellExecuteW(hwnd, verb.as_ptr(), file.as_ptr(), null(), null(), SW_SHOWNORMAL) };
+                }
+            }
+            Action::SetClipboard(text) => {
+                let ok = set_clipboard(hwnd, &text);
+                queue.extend(deliver(state, Event::ClipboardSet(ok)));
+            }
+            Action::ChoosePrinter { max_page, preset } => {
+                match choose_printer(state, hwnd, max_page, preset) {
+                    Ok(setup) => queue.extend(deliver(state, Event::Printer(setup))),
+                    // No printer, or the box would not open: the reader says so.
+                    Err(()) => queue.extend(deliver(state, Event::PrintError(String::new()))),
+                }
+            }
+            Action::Print(op) => match print_op(state, op) {
+                Ok(true) => queue.extend(deliver(state, Event::PrintStepDone)),
+                Ok(false) => {}
+                Err(message) => queue.extend(deliver(state, Event::PrintError(message))),
+            },
             Action::Quit => {
                 // SAFETY: destroys the window made by `run`; posts WM_DESTROY, which ends the loop. The window state is not
                 // freed by this (that is done after the loop), so `state` stays valid for the rest of this function.
@@ -652,8 +905,77 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         WM_COMMAND => {
             if lparam == 0 {
                 dispatch(state, Event::Command(loword(wparam)));
+            } else if lparam == state.find.get() && hiword(wparam) == EN_CHANGE {
+                let text = window_text(lparam, MAX_FIND_CHARS);
+                dispatch(state, Event::FindText(text));
             }
             return 0;
+        }
+        WM_LBUTTONDOWN => {
+            // SAFETY: plain handle of this window; the pointer is captured so that a drag outside the window is still heard.
+            unsafe {
+                SetFocus(hwnd);
+                SetCapture(hwnd);
+            }
+            let (x, y) = mouse_place(lparam);
+            dispatch(state, Event::MouseDown { x, y, ctrl: modifier(0x11), shift: modifier(0x10) });
+            return 0;
+        }
+        WM_MOUSEMOVE => {
+            if wparam & MK_LBUTTON != 0 {
+                let (x, y) = mouse_place(lparam);
+                dispatch(state, Event::MouseMove { x, y });
+            }
+            return 0;
+        }
+        WM_LBUTTONUP => {
+            // The reader hears the button come up first: giving the mouse back makes Windows say that the window lost it
+            // (WM_CAPTURECHANGED), and the reader would take that for a drag cut short.
+            let (x, y) = mouse_place(lparam);
+            dispatch(state, Event::MouseUp { x, y });
+            // SAFETY: gives the mouse back; fine to call when it was not captured.
+            unsafe { ReleaseCapture() };
+            return 0;
+        }
+        WM_CAPTURECHANGED => {
+            // Another window took the mouse while the button was down: the drag is over.
+            dispatch(state, Event::MouseLost);
+            return 0;
+        }
+        WM_SETCURSOR => {
+            // Only over the pages themselves (the children have cursors of their own, and so has the frame).
+            if wparam as isize == hwnd && loword(lparam as usize) == HTCLIENT {
+                let mut p = Point::default();
+                // SAFETY: `p` is a live POINT that Windows fills in and rewrites; both calls only read the pointer's place.
+                unsafe {
+                    GetCursorPos(&mut p);
+                    ScreenToClient(hwnd, &mut p);
+                }
+                let shape = match state.handler.try_borrow_mut() {
+                    Ok(mut guard) => guard.as_mut().map_or(Cursor::Arrow, |h| h.cursor_at(p.x, p.y)),
+                    Err(_) => Cursor::Arrow,
+                };
+                // SAFETY: LoadCursorW with a stock cursor id (a small integer in the pointer slot) gives a shared cursor that
+                // is never freed; SetCursor takes it.
+                unsafe { SetCursor(LoadCursorW(0, (if shape == Cursor::Hand { IDC_HAND } else { IDC_ARROW }) as *const u16)) };
+                return 1;
+            }
+        }
+        WM_NOTIFY => {
+            // SAFETY: for WM_NOTIFY, lparam points to the NMHDR (or the bigger notification that starts with one) of the
+            // notification, valid for the duration of this message; it is only read here.
+            let hdr = unsafe { (lparam as *const NmHdr).as_ref() };
+            if let Some(hdr) = hdr
+                && hdr.from != 0
+                && hdr.from == state.tree.get()
+            {
+                tree_notified(state, hwnd, hdr, lparam);
+            }
+            return 0;
+        }
+        WM_CLOSE => {
+            // The reader keeps where it was before the window goes; then the default procedure closes it.
+            dispatch(state, Event::Closing);
         }
         WM_TIMER => {
             dispatch(state, Event::Timer(wparam as u32));
@@ -687,6 +1009,18 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             unsafe { PostQuitMessage(0) };
             return 0;
         }
+        WM_ENTERMENULOOP => {
+            state.menu_open.set(true);
+            return 0;
+        }
+        WM_EXITMENULOOP => {
+            state.menu_open.set(false);
+            let waiting = state.menus_waiting.borrow_mut().take();
+            if let Some(menus) = waiting {
+                set_menus(state, hwnd, menus);
+            }
+            return 0;
+        }
         WM_NCDESTROY => {
             // The state is not freed here: this message can arrive inside a call that still holds a reference to it (a
             // box that was up when the window was closed). `run` frees it once the message loop has ended. The slot is
@@ -718,6 +1052,118 @@ fn dropped_files(drop: isize) -> Vec<PathBuf> {
     files
 }
 
+/// The place of the pointer in a mouse message (the low and high words of `lparam` are signed 16-bit numbers).
+fn mouse_place(lparam: isize) -> (i32, i32) {
+    (i32::from(loword(lparam as usize) as u16 as i16), i32::from(hiword(lparam as usize) as u16 as i16))
+}
+
+/// The text of a window (an edit box), at most `max` characters of it.
+fn window_text(hwnd: isize, max: usize) -> String {
+    // SAFETY: reads the length of the text of a window; a bad handle makes it 0.
+    let n = unsafe { GetWindowTextLengthW(hwnd) }.max(0) as usize;
+    let n = n.min(max);
+    let mut buf = vec![0u16; n + 1];
+    // SAFETY: `buf` has room for `n + 1` characters, which is what the call is told (it cuts the text there and ends it with a zero).
+    let got = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) }.max(0) as usize;
+    buf.truncate(got);
+    String::from_utf16_lossy(&buf)
+}
+
+/// A notification from the bookmarks tree: a click on an item (a new item is selected by the click, and the same one can be clicked again),
+/// or the selection moved by the keyboard.
+fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) {
+    let tree = state.tree.get();
+    match hdr.code {
+        NM_CLICK => {
+            let mut hit = TvHitTest { pt: Point::default(), flags: 0, item: 0 };
+            // SAFETY: `hit.pt` is a live POINT filled in and rewritten in place.
+            unsafe {
+                GetCursorPos(&mut hit.pt);
+                ScreenToClient(tree, &mut hit.pt);
+            }
+            // SAFETY: TVM_HITTEST takes a pointer to a live TVHITTESTINFO, which it fills in and does not keep.
+            unsafe { SendMessageW(tree, TVM_HITTEST, 0, (&raw mut hit) as isize) };
+            if hit.item != 0 && hit.flags & TVHT_ON_ITEM != 0 {
+                let mut item = tv_item(TVIF_PARAM | TVIF_HANDLE, null_mut(), -1);
+                item.item = hit.item;
+                // SAFETY: TVM_GETITEMW takes a pointer to a live TVITEMW and fills in the fields the mask names; nothing is kept.
+                unsafe { SendMessageW(tree, TVM_GETITEMW, 0, (&raw mut item) as isize) };
+                if let Ok(index) = usize::try_from(item.param) {
+                    dispatch(state, Event::OutlineClick(index));
+                    // The pages get the keyboard back, so that the keys scroll them.
+                    // SAFETY: plain handle of the main window.
+                    unsafe { SetFocus(hwnd) };
+                }
+            }
+        }
+        TVN_SELCHANGEDW => {
+            // SAFETY: for TVN_SELCHANGEDW, lparam points to an NMTREEVIEWW valid for the duration of this message; it is only read.
+            let nm = unsafe { (lparam as *const NmTreeView).as_ref() };
+            if let Some(nm) = nm
+                && (nm.action == TVC_BYKEYBOARD || nm.action == TVC_BYMOUSE)
+                && let Ok(index) = usize::try_from(nm.new.param)
+            {
+                dispatch(state, Event::OutlineClick(index));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tv_item(mask: u32, text: *mut u16, param: isize) -> TvItem {
+    TvItem { mask, item: 0, state: 0, state_mask: 0, text, text_max: 0, image: 0, selected_image: 0, children: 0, param }
+}
+
+/// Fill the tree with the bookmarks (what was in it goes).
+fn fill_tree(tree: isize, nodes: &[OutlineNode]) {
+    if tree == 0 {
+        return;
+    }
+    // SAFETY: plain messages to the tree control: no redraw while it is filled, and all its items deleted.
+    unsafe {
+        SendMessageW(tree, WM_SETREDRAW, 0, 0);
+        SendMessageW(tree, TVM_DELETEITEM, 0, TVI_ROOT);
+    }
+    // The handle of the latest item at each depth of the branch being filled; an item goes under the latest one a level up,
+    // and after the latest one of its own level (that is quick, where "last" would walk the whole row).
+    let mut path: Vec<isize> = Vec::new();
+    let mut to_open: Vec<isize> = Vec::new();
+    let mut first: isize = 0;
+    for (i, node) in nodes.iter().enumerate() {
+        let depth = (node.depth as usize).min(path.len());
+        let parent = if depth == 0 { TVI_ROOT } else { path.get(depth - 1).copied().unwrap_or(TVI_ROOT) };
+        let after = path.get(depth).copied().unwrap_or(TVI_LAST);
+        let mut text = wide(&node.title);
+        let mut insert = TvInsert { parent, after, item: TvItemEx { item: tv_item(TVIF_TEXT | TVIF_PARAM, text.as_mut_ptr(), i as isize), integral: 0, state_ex: 0, window: 0, expanded_image: 0, reserved: 0 } };
+        // SAFETY: TVM_INSERTITEMW takes a pointer to a live TVINSERTSTRUCTW (here with the bigger extended item) whose text
+        // pointer is to a zero-terminated string that outlives the call; the control copies what it needs. 0 means failure.
+        let handle = unsafe { SendMessageW(tree, TVM_INSERTITEMW, 0, (&raw mut insert) as isize) };
+        if handle == 0 {
+            continue;
+        }
+        if first == 0 {
+            first = handle;
+        }
+        path.truncate(depth);
+        path.push(handle);
+        if node.open && node.depth < 2 {
+            to_open.push(handle);
+        }
+    }
+    // SAFETY: plain messages to the tree control with handles it gave: open the items the file shows open, show the first one,
+    // and let it draw again.
+    unsafe {
+        for h in to_open {
+            SendMessageW(tree, TVM_EXPAND, TVE_EXPAND, h);
+        }
+        if first != 0 {
+            SendMessageW(tree, TVM_ENSUREVISIBLE, 0, first);
+        }
+        SendMessageW(tree, WM_SETREDRAW, 1, 0);
+    }
+    invalidate(tree);
+}
+
 fn new_dpi(state: &WindowState, dpi: u32) {
     state.dpi.set(dpi);
     let old = state.font.replace(make_font(dpi));
@@ -727,8 +1173,14 @@ fn new_dpi(state: &WindowState, dpi: u32) {
         // deleted only after the new one is selected in its place.
         unsafe { SelectObject(back.dc, state.font.get()) };
     }
+    for child in [state.tree.get(), state.find.get()] {
+        if child != 0 && state.font.get() != 0 {
+            // SAFETY: WM_SETFONT takes a font handle (the one just made) and a redraw flag; `child` is a window of ours.
+            unsafe { SendMessageW(child, WM_SETFONT, state.font.get() as usize, 1) };
+        }
+    }
     if old != 0 {
-        // SAFETY: `old` was a font made by `make_font` and is no longer selected into any device context.
+        // SAFETY: `old` was a font made by `make_font`; it is no longer selected into a device context or set as a control's font.
         unsafe { DeleteObject(old) };
     }
 }
@@ -747,13 +1199,79 @@ fn free_back(state: &WindowState) {
     *b = Back::default();
 }
 
+/// A memory device context of one pixel, to lay a colour over the picture with (made the first time it is needed).
+struct Tint {
+    dc: isize,
+    bitmap: isize,
+    old: isize,
+}
+
 /// Draws on a memory device context.
 struct Gdi {
     dc: isize,
     line: i32,
+    tint: Option<Tint>,
+}
+
+impl Drop for Gdi {
+    fn drop(&mut self) {
+        if let Some(t) = self.tint.take() {
+            // SAFETY: the DC and bitmap were made by `fill_rect_alpha` and are only here; the bitmap is taken out of the DC
+            // (the old one selected back) before it is deleted, and the DC after.
+            unsafe {
+                SelectObject(t.dc, t.old);
+                DeleteObject(t.bitmap);
+                DeleteDC(t.dc);
+            }
+        }
+    }
 }
 
 impl Painter for Gdi {
+    fn fill_rect_alpha(&mut self, r: Rect, color: Rgb, alpha: u8) {
+        if r.w <= 0 || r.h <= 0 || alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(r, color);
+            return;
+        }
+        if self.tint.is_none() {
+            // SAFETY: makes a DC and a one-pixel bitmap compatible with the back buffer's; each handle is checked, and what
+            // was made is freed at once if the other failed.
+            unsafe {
+                let dc = CreateCompatibleDC(self.dc);
+                let bitmap = if dc != 0 { CreateCompatibleBitmap(self.dc, 1, 1) } else { 0 };
+                if dc != 0 && bitmap != 0 {
+                    let old = SelectObject(dc, bitmap);
+                    self.tint = Some(Tint { dc, bitmap, old });
+                } else {
+                    if bitmap != 0 {
+                        DeleteObject(bitmap);
+                    }
+                    if dc != 0 {
+                        DeleteDC(dc);
+                    }
+                }
+            }
+        }
+        let Some(t) = &self.tint else {
+            return;
+        };
+        let one = WinRect { left: 0, top: 0, right: 1, bottom: 1 };
+        // SAFETY: `t.dc` holds the one-pixel bitmap; the brush is made, checked and deleted here; AlphaBlend stretches that pixel
+        // over the rectangle with the constant alpha asked for (the blend function is packed: operation 0 = AC_SRC_OVER, no flags,
+        // the alpha in the third byte, no per-pixel alpha). Windows keeps nothing.
+        unsafe {
+            let brush = CreateSolidBrush(colorref(color));
+            if brush != 0 {
+                FillRect(t.dc, &one, brush);
+                DeleteObject(brush);
+                AlphaBlend(self.dc, r.x, r.y, r.w, r.h, t.dc, 0, 0, 1, 1, u32::from(alpha) << 16);
+            }
+        }
+    }
+
     fn fill_rect(&mut self, r: Rect, color: Rgb) {
         if r.w <= 0 || r.h <= 0 {
             return;
@@ -847,7 +1365,7 @@ fn paint_to(state: &WindowState, hwnd: isize, hdc: isize) {
     if back.dc == 0 || back.bitmap == 0 {
         return;
     }
-    let mut gdi = Gdi { dc: back.dc, line: line_height(back.dc) };
+    let mut gdi = Gdi { dc: back.dc, line: line_height(back.dc), tint: None };
     let mut present = true;
     if let Ok(mut guard) = state.handler.try_borrow_mut()
         && let Some(handler) = guard.as_mut()
@@ -1096,7 +1614,39 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
     text
 }
 
-// --- starting up -------------------------------------------------------------------------------------------------
+// --- menus, child windows, the clipboard ------------------------------------------------------------------------
+
+/// A popup menu with these entries (submenus inside it are made too), or 0.
+fn build_popup(entries: &[MenuEntry]) -> isize {
+    // SAFETY: creates an empty popup menu; the handle is checked.
+    let popup = unsafe { CreatePopupMenu() };
+    if popup == 0 {
+        return 0;
+    }
+    for entry in entries {
+        match entry {
+            MenuEntry::Item { id, label, checked, enabled } => {
+                let w = wide(label);
+                let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 } | if *enabled { 0 } else { MF_GRAYED };
+                // SAFETY: `w` is a zero-terminated UTF-16 string that outlives the call (Windows copies it).
+                unsafe { AppendMenuW(popup, flags, *id as usize, w.as_ptr()) };
+            }
+            MenuEntry::Submenu { title, entries } => {
+                let sub = build_popup(entries);
+                if sub != 0 {
+                    let w = wide(title);
+                    // SAFETY: `sub` becomes a submenu of `popup` (and is destroyed with it); `w` outlives the call.
+                    unsafe { AppendMenuW(popup, MF_POPUP, sub as usize, w.as_ptr()) };
+                }
+            }
+            // SAFETY: a separator takes no text; the arguments are plain.
+            MenuEntry::Separator => unsafe {
+                AppendMenuW(popup, MF_SEPARATOR, 0, null());
+            },
+        }
+    }
+    popup
+}
 
 fn build_menu(menus: &[Menu]) -> isize {
     // SAFETY: creates an empty menu bar; the handle is checked below.
@@ -1105,23 +1655,9 @@ fn build_menu(menus: &[Menu]) -> isize {
         return 0;
     }
     for menu in menus {
-        // SAFETY: creates an empty popup menu; the handle is checked.
-        let popup = unsafe { CreatePopupMenu() };
+        let popup = build_popup(&menu.entries);
         if popup == 0 {
             continue;
-        }
-        for entry in &menu.entries {
-            match entry {
-                MenuEntry::Item { id, label } => {
-                    let w = wide(label);
-                    // SAFETY: `w` is a zero-terminated UTF-16 string that outlives the call (Windows copies it).
-                    unsafe { AppendMenuW(popup, MF_STRING, *id as usize, w.as_ptr()) };
-                }
-                // SAFETY: a separator takes no text; the arguments are plain.
-                MenuEntry::Separator => unsafe {
-                    AppendMenuW(popup, MF_SEPARATOR, 0, null());
-                },
-            }
         }
         let w = wide(&menu.title);
         // SAFETY: `popup` becomes a submenu of `bar` (and is destroyed with it); `w` outlives the call.
@@ -1130,13 +1666,301 @@ fn build_menu(menus: &[Menu]) -> isize {
     bar
 }
 
+/// Put these menus on the window in place of the ones it has; while a menu is open, menus that have changed wait until it is
+/// closed (the newest wins).
+fn set_menus(state: &WindowState, hwnd: isize, menus: Vec<Menu>) {
+    if state.menu_open.get() {
+        *state.menus_waiting.borrow_mut() = Some(menus);
+        return;
+    }
+    let menu = build_menu(&menus);
+    if menu == 0 {
+        return;
+    }
+    // SAFETY: `menu` is a menu bar just made; the window takes it over, and the one it had (a menu of ours) is destroyed after
+    // it is replaced, with everything under it.
+    unsafe {
+        let old = GetMenu(hwnd);
+        SetMenu(hwnd, menu);
+        if old != 0 {
+            DestroyMenu(old);
+        }
+        DrawMenuBar(hwnd);
+    }
+}
+
+/// Move a child window to a rectangle of the client area and show it, or hide it when the rectangle has no area.
+fn place_child(child: isize, r: Rect) {
+    if child == 0 {
+        return;
+    }
+    // SAFETY: plain handle of a child window of ours and plain numbers.
+    unsafe {
+        if r.w > 0 && r.h > 0 {
+            MoveWindow(child, r.x, r.y, r.w, r.h, 1);
+            ShowWindow(child, SW_SHOW);
+        } else {
+            ShowWindow(child, SW_HIDE);
+        }
+    }
+}
+
+/// Show the find box at a place and give it the keyboard (with its text selected), or hide it and take the keyboard back.
+fn show_find(state: &WindowState, hwnd: isize, rect: Option<Rect>) {
+    let edit = state.find.get();
+    if edit == 0 {
+        return;
+    }
+    match rect {
+        Some(r) => {
+            let had_focus = {
+                // SAFETY: reads which window has the keyboard.
+                unsafe { GetFocus() == edit }
+            };
+            place_child(edit, r);
+            if !had_focus {
+                // SAFETY: plain handle of the edit box; the whole text is selected (a start of 0 and an end of -1).
+                unsafe {
+                    SetFocus(edit);
+                    SendMessageW(edit, EM_SETSEL, 0, -1);
+                }
+            }
+        }
+        None => {
+            // SAFETY: reads which window has the keyboard, and gives it to the main window if it was the edit box.
+            unsafe {
+                if GetFocus() == edit {
+                    SetFocus(hwnd);
+                }
+            }
+            place_child(edit, Rect { x: 0, y: 0, w: 0, h: 0 });
+        }
+    }
+}
+
+/// Put text on the clipboard (as UTF-16, the line ends as the system writes them). `false`: it could not be done (the memory
+/// could not be had, or another program holds the clipboard); what was on the clipboard before stays then.
+fn set_clipboard(hwnd: isize, text: &str) -> bool {
+    let mut w: Vec<u16> = Vec::with_capacity(text.len() + 1);
+    for c in text.replace("\r\n", "\n").replace('\n', "\r\n").encode_utf16() {
+        w.push(c);
+    }
+    w.push(0);
+    let bytes = w.len() * 2;
+    // SAFETY: the memory block is allocated moveable, locked for the copy of exactly `w.len()` characters it was sized for, and
+    // unlocked, all before the clipboard is touched, so that a failure to get memory leaves the old contents alone. The clipboard
+    // is opened for this window and closed on every path after it was opened. If the clipboard takes the block (SetClipboardData
+    // succeeds) it belongs to the system, otherwise it is freed here. Every handle and pointer is checked.
+    unsafe {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if mem == 0 {
+            return false;
+        }
+        let p = GlobalLock(mem).cast::<u16>();
+        if p.is_null() {
+            GlobalFree(mem);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+        GlobalUnlock(mem);
+        if OpenClipboard(hwnd) == 0 {
+            GlobalFree(mem);
+            return false;
+        }
+        EmptyClipboard();
+        let taken = SetClipboardData(CF_UNICODETEXT, mem) != 0;
+        if !taken {
+            GlobalFree(mem);
+        }
+        CloseClipboard();
+        taken
+    }
+}
+
+// --- printing ----------------------------------------------------------------------------------------------------
+
+/// What a printer's device context can print on, and the pages asked for.
+fn printer_setup(dc: isize, name: String, ranges: Vec<(u32, u32)>) -> PrinterSetup {
+    // SAFETY: reads three capabilities of a printer device context that is valid (made by the caller and checked).
+    let (dpi, width, height) = unsafe { (GetDeviceCaps(dc, LOGPIXELSX), GetDeviceCaps(dc, HORZRES), GetDeviceCaps(dc, VERTRES)) };
+    PrinterSetup { name, dpi, width, height, ranges }
+}
+
+/// End the job that is going (if any) and let go of the printer: stopped (`abort`) or finished.
+fn end_printer(state: &WindowState, abort: bool) {
+    let Some(p) = state.printer.borrow_mut().take() else { return };
+    // SAFETY: `p.dc` is a printer device context made by `choose_printer` and used nowhere else; the job is ended or stopped
+    // (both are harmless when none was started) and the context deleted once.
+    unsafe {
+        if abort {
+            AbortDoc(p.dc);
+        } else {
+            EndDoc(p.dc);
+        }
+        DeleteDC(p.dc);
+    }
+}
+
+/// Which printer to print to: the one named by the hidden test (no box), or the one the person chooses in the system's print
+/// box (with the pages and copies). `None` if there is none, or the person cancelled.
+fn choose_printer(state: &WindowState, hwnd: isize, max_page: u32, preset: Option<PrinterPreset>) -> Result<Option<PrinterSetup>, ()> {
+    end_printer(state, true);
+    if let Some(preset) = preset {
+        let (driver, name) = (wide("WINSPOOL"), wide(&preset.name));
+        // SAFETY: both strings are zero-terminated UTF-16 that outlive the call; no port and no device mode (null). 0 is failure.
+        let dc = unsafe { CreateDCW(driver.as_ptr(), name.as_ptr(), null(), null()) };
+        if dc == 0 {
+            return Err(());
+        }
+        let mut output: Vec<u16> = preset.output.as_os_str().encode_wide().collect();
+        output.push(0);
+        *state.printer.borrow_mut() = Some(Printer { dc, output: Some(output) });
+        return Ok(Some(printer_setup(dc, preset.name, preset.ranges)));
+    }
+    let mut ranges = [PrintPageRange { from: 1, to: max_page.max(1) }; MAX_PRINT_RANGES];
+    let mut pd = PrintDlgEx {
+        size: std::mem::size_of::<PrintDlgEx>() as u32,
+        owner: hwnd,
+        devmode: 0,
+        devnames: 0,
+        dc: 0,
+        flags: PD_RETURNDC | PD_USEDEVMODECOPIESANDCOLLATE | PD_NOSELECTION | PD_NOCURRENTPAGE,
+        flags2: 0,
+        exclusion_flags: 0,
+        page_range_count: 1,
+        page_range_max: MAX_PRINT_RANGES as u32,
+        page_ranges: ranges.as_mut_ptr(),
+        min_page: 1,
+        max_page: max_page.max(1),
+        copies: 1,
+        instance: 0,
+        template_name: null(),
+        callback: null(),
+        property_page_count: 0,
+        property_pages: null(),
+        start_page: START_PAGE_GENERAL,
+        result_action: 0,
+    };
+    // SAFETY: `pd` is a live PRINTDLGEXW of the size it declares; the page range array it points to has the room it says and
+    // outlives the call; the box is modal and returns when closed (0 is S_OK). Windows keeps none of the pointers.
+    let hr = unsafe { PrintDlgExW(&mut pd) };
+    // SAFETY: the device mode and device names the box returns are global memory blocks we own and no longer need.
+    unsafe {
+        if pd.devmode != 0 {
+            GlobalFree(pd.devmode);
+        }
+        if pd.devnames != 0 {
+            GlobalFree(pd.devnames);
+        }
+    }
+    if hr != 0 {
+        // The box did not open (there is no printer, say).
+        return Err(());
+    }
+    if pd.result_action != PD_RESULT_PRINT || pd.dc == 0 {
+        if pd.dc != 0 {
+            // SAFETY: the context the box made and returned is ours to delete.
+            unsafe { DeleteDC(pd.dc) };
+        }
+        return Ok(None);
+    }
+    let chosen: Vec<(u32, u32)> = if pd.flags & PD_PAGENUMS != 0 {
+        let n = (pd.page_range_count as usize).min(MAX_PRINT_RANGES);
+        ranges.iter().take(n).map(|r| (r.from, r.to)).collect()
+    } else {
+        Vec::new()
+    };
+    *state.printer.borrow_mut() = Some(Printer { dc: pd.dc, output: None });
+    Ok(Some(printer_setup(pd.dc, String::new(), chosen)))
+}
+
+/// One step of a print job. `Ok(true)`: a band was put on the page. `Err`: the printer refused.
+fn print_op(state: &WindowState, op: PrintOp) -> Result<bool, String> {
+    if let PrintOp::End | PrintOp::Abort = op {
+        end_printer(state, matches!(op, PrintOp::Abort));
+        return Ok(false);
+    }
+    let slot = state.printer.borrow();
+    // A job that was stopped is not carried on.
+    let Some(printer) = slot.as_ref() else { return Ok(false) };
+    let dc = printer.dc;
+    match op {
+        PrintOp::Start { name } => {
+            let doc = wide(&name);
+            let info = DocInfo {
+                size: std::mem::size_of::<DocInfo>() as i32,
+                doc_name: doc.as_ptr(),
+                output: printer.output.as_ref().map_or(null(), |o| o.as_ptr()),
+                datatype: null(),
+                kind: 0,
+            };
+            // SAFETY: `info` is a live DOCINFOW of the size it declares; the strings it points to (the name, and the output file of
+            // a printer that writes one) are zero-terminated UTF-16 that outlive the call; `dc` is the valid printer context.
+            // A result of 0 or less is failure.
+            if unsafe { StartDocW(dc, &info) } <= 0 {
+                return Err("the printer would not start the job".to_string());
+            }
+            Ok(false)
+        }
+        PrintOp::StartPage => {
+            // SAFETY: `dc` is the valid printer context of a job that was started.
+            if unsafe { StartPage(dc) } <= 0 {
+                return Err("the printer would not start a page".to_string());
+            }
+            Ok(false)
+        }
+        PrintOp::Band { x, y, w, h, src_w, src_h, bgra } => {
+            let needed = (src_w.max(0) as usize).saturating_mul(src_h.max(0) as usize).saturating_mul(4);
+            if src_w <= 0 || src_h <= 0 || w <= 0 || h <= 0 || bgra.len() < needed {
+                return Ok(true);
+            }
+            let header = BitmapInfoHeader {
+                size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                width: src_w,
+                height: -src_h,
+                planes: 1,
+                bit_count: 32,
+                compression: 0,
+                size_image: 0,
+                x_pels: 0,
+                y_pels: 0,
+                clr_used: 0,
+                clr_important: 0,
+            };
+            // SAFETY: `bgra` has at least `src_w * src_h * 4` bytes (checked above), all the call reads of the pixels; `header` is a
+            // live BITMAPINFOHEADER for a 32-bit uncompressed top-down picture, which needs no colour table; `dc` is the valid
+            // printer context. Windows keeps neither pointer. A result of 0 is failure.
+            let lines = unsafe {
+                SetStretchBltMode(dc, COLORONCOLOR);
+                StretchDIBits(dc, x, y, w, h, 0, 0, src_w, src_h, bgra.as_ptr().cast(), &header, 0, SRCCOPY)
+            };
+            if lines == 0 {
+                return Err("the printer would not take a part of the page".to_string());
+            }
+            Ok(true)
+        }
+        PrintOp::EndPage => {
+            // SAFETY: `dc` is the valid printer context with a page started.
+            if unsafe { EndPage(dc) } <= 0 {
+                return Err("the printer would not end a page".to_string());
+            }
+            Ok(false)
+        }
+        PrintOp::End | PrintOp::Abort => Ok(false),
+    }
+}
+
+// --- starting up -------------------------------------------------------------------------------------------------
+
 /// Make the window and run it until it is closed. `make` is given the means to wake the window from another thread
 /// and builds the reader. `client`: a size for the window's client area, in pixels (the speed test uses it; it may be bigger
 /// than the screen); otherwise the window is most of the work area.
 pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl FnOnce(Waker) -> Box<dyn Handler>) -> i32 {
-    let icc = InitCommonControlsEx { size: std::mem::size_of::<InitCommonControlsEx>() as u32, icc: ICC_STANDARD_CLASSES };
+    let icc = InitCommonControlsEx { size: std::mem::size_of::<InitCommonControlsEx>() as u32, icc: ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES };
     // SAFETY: `icc` is a live struct of the size it declares; this makes the buttons and boxes use the new look.
     unsafe { InitCommonControlsEx(&icc) };
+    // SAFETY: the print box needs COM on its thread (a single-threaded apartment); a failure only means the box may not open.
+    unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED) };
     let class = wide("QingpdfView");
     // SAFETY: a null module name means the module of this program.
     let instance = unsafe { GetModuleHandleW(null()) };
@@ -1161,7 +1985,7 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     }
     // SAFETY: no arguments; reads a system setting.
     let system_dpi = unsafe { GetDpiForSystem() }.max(96);
-    let style = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL;
+    let style = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN;
     let mut frame = WinRect { left: 0, top: 0, right: DEFAULT_WIDTH * system_dpi as i32 / 96, bottom: DEFAULT_HEIGHT * system_dpi as i32 / 96 };
     // SAFETY: `frame` is a live RECT that is rewritten in place.
     unsafe { AdjustWindowRectExForDpi(&mut frame, style, 1, WS_EX_ACCEPTFILES, system_dpi) };
@@ -1193,11 +2017,14 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     if hwnd == 0 {
         return 1;
     }
-    let state = Box::new(WindowState { hwnd: Cell::new(hwnd), closing: Cell::new(false), handler: RefCell::new(None), back: RefCell::new(Back::default()), font: Cell::new(0), dpi: Cell::new(96) });
+    let state = Box::new(WindowState { hwnd: Cell::new(hwnd), closing: Cell::new(false), handler: RefCell::new(None), back: RefCell::new(Back::default()), font: Cell::new(0), dpi: Cell::new(96), tree: Cell::new(0), find: Cell::new(0), printer: RefCell::new(None), menu_open: Cell::new(false), menus_waiting: RefCell::new(None) });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize) };
     let Some(state) = state_of(hwnd) else { return 1 };
+    // The bookmarks tree and the find box: children of the window, hidden until the reader says where to put them.
+    state.tree.set(make_child(hwnd, instance, "SysTreeView32", WS_EX_CLIENTEDGE, WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS, ID_TREE));
+    state.find.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIND));
     if let Some((cw, ch)) = client {
         // The scroll bars and the like take some of the window: make the client area the size asked for.
         let (have_w, have_h) = client_size(hwnd);
@@ -1235,6 +2062,10 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
         if got <= 0 {
             break;
         }
+        // Some keys pressed in the find box or the tree are for the reader (Enter and Esc in the box, F3, Ctrl+F ...).
+        if msg.message == WM_KEYDOWN && forward_key(state, &msg) {
+            continue;
+        }
         // SAFETY: `msg` was filled in by GetMessageW and is passed on unchanged.
         unsafe {
             TranslateMessage(&msg);
@@ -1247,12 +2078,45 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     code
 }
 
+/// A child window (a control) of the main window, not shown, or 0 if Windows would not make it.
+fn make_child(parent: isize, instance: isize, class: &str, ex_style: u32, style: u32, id: isize) -> isize {
+    let (c, t) = (wide(class), wide(""));
+    // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; `parent` is the main window; the control's id goes in the
+    // menu slot as Windows defines for child windows; no creation parameter. 0 means failure and is checked by the caller.
+    unsafe { CreateWindowExW(ex_style, c.as_ptr(), t.as_ptr(), WS_CHILD | style, 0, 0, 0, 0, parent, id, instance, null_mut()) }
+}
+
+/// A key pressed while the find box or the tree had the keyboard: is it one the reader wants? Then it is given to the reader
+/// (and the box or tree never sees it). Enter and Esc in the box, Esc and F3 and F4 anywhere, and Ctrl with a letter or digit
+/// the reader uses (not the editing keys of the box: Ctrl+C, V, X, A, Z).
+fn forward_key(state: &WindowState, msg: &Msg) -> bool {
+    let (tree, find) = (state.tree.get(), state.find.get());
+    if msg.hwnd == 0 || (msg.hwnd != tree && msg.hwnd != find) {
+        return false;
+    }
+    let in_find = msg.hwnd == find;
+    let vk = msg.wparam as u32;
+    let (ctrl, shift) = (modifier(0x11), modifier(0x10));
+    let wanted = match vk {
+        0x0D => in_find,
+        0x1B | 0x72 | 0x73 => true,
+        _ if ctrl => !(in_find && matches!(vk, 0x43 | 0x56 | 0x58 | 0x41 | 0x5A)),
+        _ => false,
+    };
+    if wanted {
+        dispatch(state, Event::Key { vk, ctrl, shift });
+    }
+    wanted
+}
+
 /// Free the window state made by `run`: the reader (and with it the engine), the back buffer and the font.
 fn free_state(raw: *mut WindowState) {
     // SAFETY: `raw` is the pointer from `Box::into_raw` in `run`; this is the only place it is turned back into a box, called
     // once, after the message loop (the only thing that gives the state to window procedures) has ended. The user-data slot
     // was cleared at WM_NCDESTROY, or the window is destroyed with the process.
     let state = unsafe { Box::from_raw(raw) };
+    // A print job that is still going (the window was closed during it) is stopped and the printer let go of.
+    end_printer(&state, true);
     free_back(&state);
     if state.font.get() != 0 {
         // SAFETY: the font was made by `make_font` and the device context that had it selected is gone.

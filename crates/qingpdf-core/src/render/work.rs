@@ -141,6 +141,26 @@ pub(crate) mod cost {
     /// A byte of an appearance stream that is read again for every annotation because it could not be kept.
     pub const ANNOT_LOAD_BYTE: f64 = 4.0;
 
+    // Text for a reader's search and selection (3d-2). The content stream interpreter of `text` charges an operator
+    // and a character as it goes, a font when it is loaded for the first time, a form when it is read, and the
+    // layout and the matching charge what they do per character. See `docs/decisions.md`, 3d-2, for how they were
+    // measured.
+    pub const TEXT_OP: f64 = 60.0;
+    pub const TEXT_GLYPH: f64 = 250.0;
+    pub const TEXT_FONT_LOAD: f64 = 50_000.0;
+    pub const TEXT_FORM: f64 = 5_000.0;
+    /// A byte of a content stream decoded (or of a form's), and a character laid out into a line and given its box.
+    pub const TEXT_BYTE: f64 = 2.0;
+    pub const TEXT_LAYOUT: f64 = 300.0;
+    /// A character of a page's text turned into what is searched, and a step of looking for the words in it.
+    pub const SEARCH_CHAR: f64 = 25.0;
+    pub const SEARCH_STEP: f64 = 3.0;
+
+    /// An outline item read (its dictionary and the title, apart from what resolving its destination costs), and an entry of
+    /// the named destinations read from the file.
+    pub const OUTLINE_ITEM: f64 = 20_000.0;
+    pub const NAMED_DEST: f64 = 400.0;
+
     // Objects the drawing code reads by reference, through `Work::resolve` (3c2-3 review). Measured on the machine the
     // tests run on: 7 ns per byte of `approx_size` for an array of numbers or of references, 11 for a dictionary, 0.2
     // for stream data.
@@ -263,6 +283,12 @@ impl Work {
 
     /// Spend `units` on work about to be done. `false` (and nothing spent) when the page has not that much left; from
     /// then on every call says no.
+    /// The units spent so far (for the tests that check the meter against the clock).
+    #[cfg(test)]
+    pub fn spent(&self) -> f64 {
+        self.lock().1
+    }
+
     pub fn charge(&self, units: f64) -> bool {
         if self.over.load(Ordering::Relaxed) {
             return false;

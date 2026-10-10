@@ -5,7 +5,7 @@ use super::*;
 use crate::testutil::PdfBuilder;
 
 /// A document of `pages` pages, 200 by 100 points; page `i` has a red square at (10 * i, 0) and a rotated page 2.
-fn pdf(pages: u32, content_of: impl Fn(u32) -> String) -> Vec<u8> {
+pub(super) fn pdf(pages: u32, content_of: impl Fn(u32) -> String) -> Vec<u8> {
     let mut b = PdfBuilder::new();
     b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
     let kids: Vec<String> = (0..pages).map(|i| format!("{} 0 R", 10 + 2 * i)).collect();
@@ -18,15 +18,15 @@ fn pdf(pages: u32, content_of: impl Fn(u32) -> String) -> Vec<u8> {
     b.finish_classic(10 + 2 * pages, "/Root 1 0 R")
 }
 
-fn square(i: u32) -> String {
+pub(super) fn square(i: u32) -> String {
     format!("1 0 0 rg {} 0 20 20 re f", 10 * i)
 }
 
-fn request(id: u64, page: u32, priority: u32) -> RenderRequest {
+pub(super) fn request(id: u64, page: u32, priority: u32) -> RenderRequest {
     RenderRequest { doc: 1, id, page, dpi: 72.0, rotation: 0, x: 0, y: 0, width: 0, height: 0, priority }
 }
 
-fn open(engine: &Engine, bytes: Vec<u8>) -> Opened {
+pub(super) fn open(engine: &Engine, bytes: Vec<u8>) -> Opened {
     engine.open_bytes(1, bytes, "", TOTAL_BYTES, 1920 * 1080);
     match engine.wait(10_000) {
         Some(Event::Opened(o)) => o,

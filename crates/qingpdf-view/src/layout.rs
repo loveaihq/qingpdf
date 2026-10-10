@@ -82,6 +82,11 @@ impl Layout {
         Some(if self.rotation % 180 == 90 { (h, w) } else { (w, h) })
     }
 
+    /// A page's size in points as the engine tells it (not turned by the view).
+    pub fn page_size_pt(&self, page: usize) -> Option<(f64, f64)> {
+        self.sizes.get(page).copied()
+    }
+
     /// The width in points of the widest page as it is laid out (turned).
     pub fn widest_pt(&self) -> f64 {
         let turned = self.rotation % 180 == 90;
@@ -157,6 +162,60 @@ impl Layout {
     /// The inverse of [`Layout::locate`].
     pub fn y_of(&self, page: usize, fraction: f64) -> i64 {
         self.top(page).saturating_add((fraction * self.size_px(page).1 as f64).round() as i64)
+    }
+
+    /// How points of page `page` (as the engine tells them) are put in its rectangle of pixels.
+    pub fn page_map(&self, page: usize) -> Option<PageMap> {
+        let &(w, h) = self.sizes.get(page)?;
+        let (pw, ph) = self.size_px(page);
+        let turned = self.rotation % 180 == 90;
+        let (shown_w, shown_h) = if turned { (h, w) } else { (w, h) };
+        Some(PageMap { w, h, rotation: self.rotation, sx: pw as f64 / shown_w, sy: ph as f64 / shown_h })
+    }
+}
+
+/// The places on a page, in points as the engine tells them (the page turned by its own `/Rotate`, the origin at the top left,
+/// y down), and the same places in the pixels of the page's rectangle on the screen, where the view is turned a further
+/// `rotation` degrees clockwise and the page is drawn at some size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PageMap {
+    /// The size of the page in points before the view's own turn.
+    w: f64,
+    h: f64,
+    rotation: u16,
+    /// Pixels to a point, across and down the page as it is shown.
+    sx: f64,
+    sy: f64,
+}
+
+impl PageMap {
+    /// A point of the page in pixels from the top left of the page's rectangle.
+    pub fn to_px(self, x: f64, y: f64) -> (f64, f64) {
+        let (u, v) = match self.rotation {
+            90 => (self.h - y, x),
+            180 => (self.w - x, self.h - y),
+            270 => (y, self.w - x),
+            _ => (x, y),
+        };
+        (u * self.sx, v * self.sy)
+    }
+
+    /// The point of the page at a place `(px, py)` pixels from the top left of the page's rectangle.
+    pub fn to_pt(self, px: f64, py: f64) -> (f64, f64) {
+        let (u, v) = (px / self.sx, py / self.sy);
+        match self.rotation {
+            90 => (v, self.h - u),
+            180 => (self.w - u, self.h - v),
+            270 => (self.w - v, u),
+            _ => (u, v),
+        }
+    }
+
+    /// A rectangle `[left, top, right, bottom]` of the page in pixels: `(left, top, right, bottom)`.
+    pub fn rect_to_px(self, r: [f32; 4]) -> (f64, f64, f64, f64) {
+        let (a, b) = self.to_px(f64::from(r[0]), f64::from(r[1]));
+        let (c, d) = self.to_px(f64::from(r[2]), f64::from(r[3]));
+        (a.min(c), b.min(d), a.max(c), b.max(d))
     }
 }
 
@@ -272,6 +331,37 @@ mod tests {
         l.set(64.0 * 96.0 / 72.0, 0, 10, 12);
         assert_eq!(l.size_px(0), (1_228_800, 1_228_800));
         assert_eq!(l.content_height(), 1000 * 1_228_800 + 999 * 10 + 24);
+    }
+
+    #[test]
+    fn points_of_a_page_and_pixels_of_its_rectangle_go_both_ways_whatever_the_turn() {
+        let mut l = Layout::new(vec![(200.0, 100.0)]);
+        for rotation in [0u16, 90, 180, 270] {
+            l.set(2.0, rotation, 0, 0);
+            let m = l.page_map(0).expect("a map");
+            // The corners of the page: the top left of the page as the engine tells it goes where the view's turn puts it.
+            let (w, h) = l.size_px(0);
+            let corner = m.to_px(0.0, 0.0);
+            let expect = match rotation {
+                0 => (0.0, 0.0),
+                90 => (w as f64, 0.0),
+                180 => (w as f64, h as f64),
+                _ => (0.0, h as f64),
+            };
+            assert_eq!(corner, expect, "{rotation}");
+            // And back, for places all over the page.
+            for (x, y) in [(0.0, 0.0), (200.0, 100.0), (37.5, 81.25), (150.0, 3.0)] {
+                let (px, py) = m.to_px(x, y);
+                let (bx, by) = m.to_pt(px, py);
+                assert!((bx - x).abs() < 1e-9 && (by - y).abs() < 1e-9, "{rotation}: ({x}, {y}) -> ({px}, {py}) -> ({bx}, {by})");
+                assert!(px >= -1e-9 && px <= w as f64 + 1e-9 && py >= -1e-9 && py <= h as f64 + 1e-9);
+            }
+        }
+        // A rectangle comes out with its corners in order.
+        l.set(1.0, 90, 0, 0);
+        let m = l.page_map(0).expect("a map");
+        assert_eq!(m.rect_to_px([10.0, 20.0, 30.0, 40.0]), (60.0, 10.0, 80.0, 30.0));
+        assert!(l.page_map(5).is_none());
     }
 
     #[test]

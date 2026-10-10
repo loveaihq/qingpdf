@@ -1,25 +1,46 @@
 //! The reader: what is open, where the view is, what has been drawn and what is asked of the engine. It hears
 //! [`Event`]s and answers with [`Action`]s; it never calls Windows, and it never waits for the engine.
+//!
+//! The parts of it that came with 3d-2 are in the modules below, each an `impl App` of its own: `outline` (the bookmarks, links
+//! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
+//! `menus` and `recents` (the menus; the files opened last).
+
+mod menus;
+mod outline;
+mod printjob;
+mod recents;
+mod searching;
+mod selecting;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use qingpdf_core::view::{Engine, Event as EngineEvent, OpenFailure, Opened, RenderRequest, RenderStatus, Rendered, TOTAL_BYTES};
+use qingpdf_core::view::{Engine, Event as EngineEvent, Link, OpenFailure, Opened, OutlineItem, RenderRequest, RenderStatus, Rendered, Rights, TOTAL_BYTES};
 
 use crate::bench::Bench;
 use crate::cache::{BitmapCache, Entry, Focus, Key};
+use crate::find::SearchState;
 use crate::i18n::{self, Lang, Msg, t};
 use crate::layout::Layout;
+use crate::recent;
 use crate::sched::{self, Scene, Want};
+use crate::select::Selection;
 use crate::tiles;
-use crate::ui::{Action, Bar, Event, Handler, Menu, MenuEntry, Painter, Rect, ScrollCode, ScrollInfo, vk};
+use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, vk};
 use crate::zoom::{self, ZoomMode};
+
+pub use printjob::PrintTest;
+use printjob::PrintJob;
+use selecting::{PageBoxes, Press};
 
 // Menu commands.
 pub const CMD_OPEN: u32 = 1;
 pub const CMD_EXIT: u32 = 2;
+pub const CMD_PRINT: u32 = 3;
+pub const CMD_CLEAR_RECENT: u32 = 4;
+pub const CMD_ABOUT: u32 = 5;
 pub const CMD_ZOOM_IN: u32 = 10;
 pub const CMD_ZOOM_OUT: u32 = 11;
 pub const CMD_FIT_WIDTH: u32 = 12;
@@ -27,14 +48,32 @@ pub const CMD_FIT_PAGE: u32 = 13;
 pub const CMD_ACTUAL: u32 = 14;
 pub const CMD_ROTATE: u32 = 15;
 pub const CMD_GOTO: u32 = 16;
+pub const CMD_BOOKMARKS: u32 = 17;
+pub const CMD_FIND: u32 = 18;
+pub const CMD_FIND_NEXT: u32 = 19;
+pub const CMD_FIND_PREV: u32 = 20;
+pub const CMD_COPY: u32 = 21;
+/// The files in the list of recent ones are commands from here, one for each.
+pub const CMD_RECENT_BASE: u32 = 100;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
 const TAG_GOTO: u32 = 2;
+const TAG_LINK: u32 = 3;
 
-/// The timer that says the view has stopped moving.
+// Timers.
+/// The view has stopped moving.
 const TIMER_SETTLE: u32 = 1;
 const SETTLE_MS: u32 = 30;
+/// The words in the find box have been left alone for a moment: look for them.
+const TIMER_FIND: u32 = 2;
+const FIND_MS: u32 = 250;
+/// The note in the status line has been there long enough.
+const TIMER_NOTE: u32 = 3;
+const NOTE_MS: u32 = 6000;
+/// The pointer is dragging a selection: scroll if it is outside the pages.
+const TIMER_DRAG: u32 = 4;
+const DRAG_MS: u32 = 50;
 
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
@@ -42,6 +81,13 @@ const MARGIN: i64 = 12;
 const STATUS_HEIGHT: i64 = 26;
 const WHEEL_STEP: i64 = 96;
 const LINE_STEP: i64 = 48;
+/// The width of the bookmarks beside the pages.
+const SIDEBAR_WIDTH: i64 = 260;
+/// The find box: the edit box, the room for the count to its left, the gap to the top and right edges.
+const FIND_EDIT_W: i64 = 220;
+const FIND_EDIT_H: i64 = 24;
+const FIND_LABEL_W: i64 = 190;
+const FIND_MARGIN: i64 = 10;
 
 // Colours.
 const BACKGROUND: u32 = 0xC8C8C8;
@@ -52,6 +98,13 @@ const STATUS_FG: u32 = 0x202020;
 const NOTICE_BG: u32 = 0xFFF1B8;
 const NOTICE_FG: u32 = 0x6B4E00;
 const HINT_FG: u32 = 0x505050;
+const NOTE_FG: u32 = 0x7A2E00;
+const HIT_COLOR: u32 = 0xFFD400;
+const HIT_ALPHA: u8 = 120;
+const CURRENT_HIT_COLOR: u32 = 0xFF7A00;
+const CURRENT_HIT_ALPHA: u8 = 150;
+const SELECTION_COLOR: u32 = 0x3390FF;
+const SELECTION_ALPHA: u8 = 100;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Notice {
@@ -72,6 +125,9 @@ pub struct App {
     max_view_pixels: u64,
     /// The scale the pieces in view are drawn at: the zoom's own, or a smaller one when they would not fit the cache.
     draw_scale: u64,
+    /// The whole client area's width; the pages are `view_w` wide, from `view_x` (the bookmarks are to their left).
+    client_w: i64,
+    view_x: i64,
     view_w: i64,
     view_h: i64,
     dpi: u32,
@@ -108,16 +164,57 @@ pub struct App {
     last_sharp: Option<Instant>,
     pub(crate) bench: Option<Bench>,
     pub(crate) started: Instant,
+
+    // --- 3d-2 ---
+    /// What the file allows (all of it when none is open).
+    rights: Rights,
+    /// The bookmarks of the open file, and whether they are shown (when there are any).
+    outline: Vec<OutlineItem>,
+    show_outline: bool,
+    /// The links of the pages near the window, and the engine's requests for them (request, page).
+    links: HashMap<u32, Vec<Link>>,
+    links_asked: HashMap<u64, u32>,
+    /// The boxes of the characters of the pages the pointer has been on, and the requests for them.
+    boxes: HashMap<u32, PageBoxes>,
+    boxes_asked: HashMap<u64, u32>,
+    /// The left button is down: where, and on what.
+    press: Option<Press>,
+    /// Where the pointer was last, in the client area.
+    mouse: (i64, i64),
+    selection: Option<Selection>,
+    /// The request for the text of the selection that is being copied.
+    copy_asked: Option<u64>,
+    /// What to say when the clipboard has taken the text that was copied.
+    copy_note: Option<String>,
+    find_open: bool,
+    /// What is in the find box now.
+    find_text: String,
+    search: Option<SearchState>,
+    print: Option<PrintJob>,
+    /// A line for the status bar, between the page number and the zoom.
+    note: Option<String>,
+    recent: Vec<recent::Entry>,
+    recent_path: Option<PathBuf>,
+    /// An address of a link, waiting for the person to say yes.
+    pending_uri: Option<String>,
+    /// The menus have to be put again (what is greyed, checked or listed has changed).
+    menus_dirty: bool,
+    /// The hidden `--print-test`: print to a printer that writes a file, with no box, and quit.
+    print_test: Option<PrintTest>,
 }
 
 impl App {
     pub fn new(lang: Lang, wake: Arc<dyn Fn() + Send + Sync>, started: Instant, max_view_pixels: u64) -> App {
         let for_engine = wake.clone();
+        let recent_path = recent::file_path();
+        let recent = recent_path.as_deref().map(recent::load).unwrap_or_default();
         App {
             lang,
             engine: Engine::start(Box::new(move || for_engine())),
             max_view_pixels,
             draw_scale: sched::scale_key(zoom::ACTUAL_SIZE, 96),
+            client_w: 0,
+            view_x: 0,
             view_w: 0,
             view_h: 0,
             dpi: 96,
@@ -146,33 +243,34 @@ impl App {
             last_sharp: None,
             bench: None,
             started,
+            rights: Rights { copy: true, print: true, print_high_quality: true },
+            outline: Vec::new(),
+            show_outline: true,
+            links: HashMap::new(),
+            links_asked: HashMap::new(),
+            boxes: HashMap::new(),
+            boxes_asked: HashMap::new(),
+            press: None,
+            mouse: (0, 0),
+            selection: None,
+            copy_asked: None,
+            copy_note: None,
+            find_open: false,
+            find_text: String::new(),
+            search: None,
+            print: None,
+            note: None,
+            recent,
+            recent_path,
+            pending_uri: None,
+            menus_dirty: true,
+            print_test: None,
         }
     }
 
     /// Open this file once the window has its size.
     pub fn open_when_ready(&mut self, path: PathBuf) {
         self.pending_open = Some(path);
-    }
-
-    pub fn menus(lang: Lang) -> Vec<Menu> {
-        let item = |id, m| MenuEntry::Item { id, label: t(lang, m).to_string() };
-        vec![
-            Menu { title: t(lang, Msg::File).to_string(), entries: vec![item(CMD_OPEN, Msg::Open), MenuEntry::Separator, item(CMD_EXIT, Msg::Exit)] },
-            Menu {
-                title: t(lang, Msg::View).to_string(),
-                entries: vec![
-                    item(CMD_ZOOM_IN, Msg::ZoomIn),
-                    item(CMD_ZOOM_OUT, Msg::ZoomOut),
-                    MenuEntry::Separator,
-                    item(CMD_FIT_WIDTH, Msg::FitWidth),
-                    item(CMD_FIT_PAGE, Msg::FitPage),
-                    item(CMD_ACTUAL, Msg::ActualSize),
-                    MenuEntry::Separator,
-                    item(CMD_ROTATE, Msg::Rotate),
-                    item(CMD_GOTO, Msg::GoToPage),
-                ],
-            },
-        ]
     }
 
     fn px(&self, at96: i64) -> i64 {
@@ -183,42 +281,85 @@ impl App {
         self.px(STATUS_HEIGHT)
     }
 
+    fn new_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     // --- opening ---------------------------------------------------------------------------------------------
 
     /// Open a file (the engine reads it; this does not wait).
     pub fn open_path(&mut self, path: &Path, password: &str) -> Vec<Action> {
-        self.drop_document();
+        // Where the reader was in the file it leaves is kept.
+        self.remember_position();
+        let mut actions = self.drop_document();
         if self.engine.start_error().is_some() {
             // No drawing thread: nothing would ever answer, so say so instead of showing "Opening..." for ever.
             self.opening = false;
             self.path = None;
             let lang = self.lang;
-            return vec![Action::SetTitle(self.title()), Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::EngineFailed).to_string() }, Action::Invalidate];
+            actions.extend([Action::SetTitle(self.title()), Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::EngineFailed).to_string() }, Action::Invalidate]);
+            return actions;
         }
         self.doc_id += 1;
-        self.path = Some(path.to_path_buf());
+        // The full path, so that the same file opened by another route is the same file in the list of recent ones.
+        self.path = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
         self.opening = true;
         let view = u64::try_from(self.view_w.max(0)).unwrap_or(0).saturating_mul(u64::try_from(self.view_h.max(0)).unwrap_or(0));
-        self.engine.open_file(self.doc_id, &path.to_string_lossy(), password, TOTAL_BYTES, view.max(self.max_view_pixels));
-        vec![Action::SetTitle(self.title()), Action::Invalidate]
+        self.engine.open_file(self.doc_id, &self.path_text(), password, TOTAL_BYTES, view.max(self.max_view_pixels));
+        actions.extend([Action::SetTitle(self.title()), Action::Invalidate]);
+        actions
     }
 
-    fn drop_document(&mut self) {
+    fn path_text(&self) -> String {
+        self.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// Let go of the open document and everything that belongs to it. The actions that undo what the window shows of it.
+    fn drop_document(&mut self) -> Vec<Action> {
         // What is being drawn for the old file is not wanted: stop it (opening another file stops it too, but the
         // file may fail to open, and the old requests are not to go on).
         for (id, _) in self.asked.drain() {
             self.engine.cancel(id);
         }
+        let mut actions = self.cancel_print_for_new_document();
+        for id in self.links_asked.drain().map(|(id, _)| id).chain(self.boxes_asked.drain().map(|(id, _)| id)) {
+            self.engine.cancel(id);
+        }
+        if let Some(s) = self.search.take() {
+            self.engine.cancel(s.id);
+        }
+        if let Some(id) = self.copy_asked.take() {
+            self.engine.cancel(id);
+        }
+        let had_outline = !self.outline.is_empty();
         self.doc = None;
         self.cache.clear();
         self.in_flight.clear();
         self.asked.clear();
         self.failed.clear();
         self.notices.clear();
+        self.links.clear();
+        self.boxes.clear();
+        self.outline.clear();
+        self.press = None;
+        self.selection = None;
+        self.note = None;
+        self.rights = Rights { copy: true, print: true, print_high_quality: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.moving = false;
         self.sharp_on_screen = false;
+        self.menus_dirty = true;
+        if had_outline {
+            actions.push(Action::Outline(Vec::new()));
+        }
+        // The pages have the width of the window again.
+        self.view_x = 0;
+        self.view_w = self.client_w;
+        actions.extend(self.chrome());
+        actions
     }
 
     fn title(&self) -> String {
@@ -233,6 +374,7 @@ impl App {
             return Vec::new();
         }
         self.opening = false;
+        self.rights = o.rights;
         let sizes = o.pages.iter().map(|p| (p.width, p.height)).collect();
         self.doc = Some(Doc { layout: Layout::new(sizes), max_tile_pixels: o.max_tile_pixels });
         self.cache = BitmapCache::new(o.bitmap_cache_bytes);
@@ -242,7 +384,27 @@ impl App {
         self.scroll_y = 0;
         let mut actions = vec![Action::SetTitle(self.title())];
         self.relayout(0, 0, None);
+        // Where the reader was in this file last time.
+        let mut go_to = None;
+        if let Some(e) = recent::find(&self.recent, &self.path_text()).cloned() {
+            let mode = match e.mode {
+                recent::MODE_FIT_PAGE => ZoomMode::FitPage,
+                recent::MODE_CUSTOM => ZoomMode::Custom,
+                _ => ZoomMode::FitWidth,
+            };
+            self.relayout(0, 0, Some((mode, e.zoom)));
+            go_to = Some(e.page as usize);
+        }
         actions.extend(self.after_view_change(false));
+        if let Some(page) = go_to {
+            actions.extend(self.go_to_page(page));
+        }
+        self.remember_position();
+        self.menus_dirty = true;
+        if self.bench.is_none() {
+            actions.extend(self.ask_for_outline());
+        }
+        actions.extend(self.start_print_test());
         actions
     }
 
@@ -270,6 +432,11 @@ impl App {
             OpenFailure::TooLarge => actions.push(Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::TooLarge).to_string() }),
             OpenFailure::Unreadable => {
                 actions.push(Action::Message { title: t(lang, Msg::Error).to_string(), text: format!("{}\n{message}", t(lang, Msg::CannotRead)) });
+                // A file that is gone is not kept in the list.
+                let key = self.path_text();
+                recent::forget(&mut self.recent, &key);
+                self.save_recent();
+                self.menus_dirty = true;
             }
             OpenFailure::Damaged => actions.push(Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::NotPdf).to_string() }),
         }
@@ -347,6 +514,7 @@ impl App {
         }
         self.sync_bars(&mut actions);
         self.schedule();
+        self.ask_for_links();
         actions.push(Action::Invalidate);
         actions
     }
@@ -413,8 +581,7 @@ impl App {
             }
         }
         for w in plan.issue {
-            let id = self.next_id;
-            self.next_id += 1;
+            let id = self.new_id();
             self.engine.render(RenderRequest {
                 doc: self.doc_id,
                 id,
@@ -442,6 +609,7 @@ impl App {
                 EngineEvent::Opened(o) => actions.extend(self.on_opened(o)),
                 EngineEvent::OpenFailed { doc, failure, message } => actions.extend(self.on_open_failed(doc, failure, &message)),
                 EngineEvent::Rendered(r) => redraw |= self.on_rendered(r),
+                other => actions.extend(self.on_other_event(other)),
             }
         }
         if redraw {
@@ -602,19 +770,34 @@ impl App {
                 let filters = vec![(t(self.lang, Msg::FilterPdf).to_string(), "*.pdf".to_string()), (t(self.lang, Msg::FilterAll).to_string(), "*.*".to_string())];
                 vec![Action::PickFile { title: t(self.lang, Msg::OpenTitle).to_string(), filters }]
             }
-            CMD_EXIT => vec![Action::Quit],
+            CMD_EXIT => {
+                // A print job that is going is stopped first (AbortDoc, and the printer is let go of).
+                let mut actions = self.cancel_print_for_new_document();
+                self.remember_position();
+                actions.push(Action::Quit);
+                actions
+            }
+            CMD_PRINT => self.print_command(),
+            CMD_CLEAR_RECENT => self.clear_recent(),
+            CMD_ABOUT => vec![Action::Message { title: t(self.lang, Msg::AboutTitle).to_string(), text: i18n::about(self.lang) }],
             CMD_ZOOM_IN => self.set_zoom(ZoomMode::Custom, zoom::step_in(self.zoom), None),
             CMD_ZOOM_OUT => self.set_zoom(ZoomMode::Custom, zoom::step_out(self.zoom), None),
             CMD_FIT_WIDTH => self.set_zoom(ZoomMode::FitWidth, self.zoom, None),
             CMD_FIT_PAGE => self.set_zoom(ZoomMode::FitPage, self.zoom, None),
             CMD_ACTUAL => self.set_zoom(ZoomMode::Custom, zoom::ACTUAL_SIZE, None),
             CMD_ROTATE => self.rotate(1),
+            CMD_BOOKMARKS => self.toggle_outline(),
+            CMD_COPY => self.copy_selection(),
             CMD_GOTO if self.doc.is_some() => {
                 let title = t(self.lang, Msg::GoToTitle).to_string();
                 let prompt = format!("{} (1-{})", t(self.lang, Msg::GoToTitle), self.page_count());
                 let (ok, cancel) = (t(self.lang, Msg::Ok).to_string(), t(self.lang, Msg::Cancel).to_string());
                 vec![Action::AskText { tag: TAG_GOTO, title, prompt, secret: false, ok, cancel }]
             }
+            CMD_FIND => self.open_find(),
+            CMD_FIND_NEXT => self.find_step(true),
+            CMD_FIND_PREV => self.find_step(false),
+            c if (CMD_RECENT_BASE..CMD_RECENT_BASE + recent::MAX_RECENT as u32).contains(&c) => self.open_recent((c - CMD_RECENT_BASE) as usize),
             _ => Vec::new(),
         }
     }
@@ -626,6 +809,9 @@ impl App {
             return match key {
                 vk::O => self.command(CMD_OPEN),
                 vk::G => self.command(CMD_GOTO),
+                vk::F => self.command(CMD_FIND),
+                vk::P => self.command(CMD_PRINT),
+                vk::C => self.command(CMD_COPY),
                 vk::R => {
                     if shift {
                         self.rotate(3)
@@ -642,6 +828,10 @@ impl App {
             };
         }
         match key {
+            vk::ESCAPE => self.escape(),
+            vk::RETURN => self.find_enter(shift),
+            vk::F3 => self.find_step(!shift),
+            vk::F4 => self.command(CMD_BOOKMARKS),
             vk::NEXT => self.scroll_by(0, page_step, false),
             vk::PRIOR => self.scroll_by(0, -page_step, false),
             vk::SPACE => self.scroll_by(0, if shift { -page_step } else { page_step }, false),
@@ -678,6 +868,14 @@ impl App {
         }
     }
 
+    // --- a line in the status bar ------------------------------------------------------------------------------
+
+    /// Say something in the status bar for a few seconds.
+    fn say(&mut self, text: String) -> Vec<Action> {
+        self.note = Some(text);
+        vec![Action::SetTimer { id: TIMER_NOTE, ms: NOTE_MS }, Action::Invalidate]
+    }
+
     // --- drawing ---------------------------------------------------------------------------------------------
 
     /// Draw a page; `true` if some of its bitmaps are on it.
@@ -685,7 +883,7 @@ impl App {
         let Some(doc) = &self.doc else { return false };
         let l = &doc.layout;
         let (pw, ph) = l.size_px(page);
-        let (left, top) = (l.left(page, self.view_w, self.scroll_x), l.top(page) - self.scroll_y);
+        let (left, top) = (l.left(page, self.view_w, self.scroll_x) + self.view_x, l.top(page) - self.scroll_y);
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
         p.fill_rect(rect(left - 1, top - 1, pw + 2, ph + 2), BORDER);
         p.fill_rect(rect(left, top, pw, ph), PAPER);
@@ -708,6 +906,8 @@ impl App {
             let (x1, y1) = (((e.x + i64::from(e.width)) as f64 * sx).ceil() as i64, ((e.y + i64::from(e.height)) as f64 * sy).ceil() as i64);
             p.draw_bgra(rect(left + x0, top + y0, x1 - x0, y1 - y0), e.width as i32, e.height as i32, &e.bgra);
         }
+        // Found words and selected text lie over the page.
+        self.draw_marks(p, page, left, top);
         match self.notices.get(&(page as u32)) {
             Some(Notice::Incomplete) => {
                 let strip = i64::from(p.line_height()) + 8;
@@ -722,6 +922,26 @@ impl App {
             None => {}
         }
         drew
+    }
+
+    /// The status bar: the page, a note, the zoom.
+    fn draw_status(&self, p: &mut dyn Painter, full_w: i32) {
+        let bar = clamp32(self.status_height());
+        p.fill_rect(Rect { x: 0, y: clamp32(self.view_h), w: full_w, h: bar }, STATUS_BG);
+        if self.doc.is_none() {
+            return;
+        }
+        let y = clamp32(self.view_h) + (bar - p.line_height()) / 2;
+        let page_text = i18n::page_of(self.lang, self.current_page() + 1, self.page_count());
+        let x = clamp32(self.px(10));
+        p.text(x, y, &page_text, STATUS_FG);
+        let z = format!("{}%", (f64::from(self.zoom) / 10.0).round() as u32);
+        let w = p.text_width(&z);
+        p.text(full_w - w - clamp32(self.px(10)), y, &z, STATUS_FG);
+        if let Some(note) = &self.note {
+            let from = x + p.text_width(&page_text) + clamp32(self.px(24));
+            p.text(from, y, note, NOTE_FG);
+        }
     }
 }
 
@@ -746,11 +966,14 @@ impl Handler for App {
     fn event(&mut self, event: Event) -> Vec<Action> {
         let mut actions = match event {
             Event::Size { w, h } => {
-                self.view_w = i64::from(w);
+                self.client_w = i64::from(w);
+                self.view_x = self.sidebar_width();
+                self.view_w = (i64::from(w) - self.view_x).max(0);
                 self.view_h = (i64::from(h) - self.status_height()).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
                 let mut actions = self.after_view_change(false);
+                actions.extend(self.chrome());
                 if let Some(path) = self.pending_open.take() {
                     actions.extend(self.open_path(&path, ""));
                 }
@@ -760,15 +983,19 @@ impl Handler for App {
                 self.dpi = dpi.clamp(48, 960);
                 // The pages are the same size in inches, the pixels change: draw them all again.
                 self.forget_bitmaps();
+                self.view_x = self.sidebar_width();
+                self.view_w = (self.client_w - self.view_x).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
-                self.after_view_change(false)
+                let mut actions = self.after_view_change(false);
+                actions.extend(self.chrome());
+                actions
             }
             Event::Key { vk, ctrl, shift } => self.key(vk, ctrl, shift),
             Event::Wheel { delta, ctrl, shift, x, y } => {
                 if ctrl {
                     let z = zoom::wheel(self.zoom, f64::from(delta) / 120.0);
-                    self.set_zoom(ZoomMode::Custom, z, Some((i64::from(x), i64::from(y))))
+                    self.set_zoom(ZoomMode::Custom, z, Some((i64::from(x) - self.view_x, i64::from(y))))
                 } else if shift {
                     self.scroll_by(-i64::from(delta) * self.px(WHEEL_STEP) / 120, 0, true)
                 } else {
@@ -788,6 +1015,12 @@ impl Handler for App {
                 self.schedule();
                 vec![Action::KillTimer(TIMER_SETTLE)]
             }
+            Event::Timer(TIMER_FIND) => self.find_timer(),
+            Event::Timer(TIMER_NOTE) => {
+                self.note = None;
+                vec![Action::KillTimer(TIMER_NOTE), Action::Invalidate]
+            }
+            Event::Timer(TIMER_DRAG) => self.drag_timer(),
             Event::Timer(_) => Vec::new(),
             Event::FilePicked(Some(path)) => self.open_path(&path, ""),
             Event::FilePicked(None) => Vec::new(),
@@ -810,8 +1043,28 @@ impl Handler for App {
                 _ => Vec::new(),
             },
             Event::Text { .. } => Vec::new(),
+            Event::MouseDown { x, y, ctrl, shift } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift),
+            Event::MouseMove { x, y } => self.mouse_move(i64::from(x), i64::from(y)),
+            Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
+            Event::MouseLost => self.mouse_lost(),
+            Event::Closing => {
+                self.remember_position();
+                self.cancel_print_for_new_document()
+            }
+            Event::OutlineClick(i) => self.outline_click(i),
+            Event::FindText(text) => self.find_text_changed(text),
+            Event::Confirmed { tag: TAG_LINK, yes } => self.link_confirmed(yes),
+            Event::Confirmed { .. } => Vec::new(),
+            Event::Printer(setup) => self.printer_chosen(setup),
+            Event::PrintStepDone => self.print_step_done(),
+            Event::PrintError(message) => self.print_error(&message),
+            Event::ClipboardSet(ok) => self.on_clipboard(ok),
         };
         // Whatever the event was, the engine may have something waiting; the speed test may have its next step.
+        if self.menus_dirty {
+            self.menus_dirty = false;
+            actions.push(Action::SetMenus(self.menus()));
+        }
         if let Some(mut bench) = self.bench.take() {
             actions.extend(bench.step(self));
             self.bench = Some(bench);
@@ -820,7 +1073,7 @@ impl Handler for App {
     }
 
     fn paint(&mut self, p: &mut dyn Painter) -> bool {
-        let (full_w, full_h) = (clamp32(self.view_w), clamp32(self.view_h + self.status_height()));
+        let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h + self.status_height()));
         p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, BACKGROUND);
         let mut drew = false;
         match &self.doc {
@@ -832,9 +1085,10 @@ impl Handler for App {
             None => {
                 let s = t(self.lang, if self.opening { Msg::Opening } else { Msg::Hint });
                 let w = p.text_width(s);
-                p.text((full_w - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, HINT_FG);
+                p.text(clamp32(self.view_x) + (clamp32(self.view_w) - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, HINT_FG);
             }
         }
+        self.draw_find_panel(p);
         let now = Instant::now();
         if drew && self.first_bitmap.is_none() {
             self.first_bitmap = Some(now);
@@ -847,18 +1101,13 @@ impl Handler for App {
             // The speed test looks at what was drawn after this picture is on the screen.
             (self.wake)();
         }
-        // The status line.
-        let bar = clamp32(self.status_height());
-        p.fill_rect(Rect { x: 0, y: clamp32(self.view_h), w: full_w, h: bar }, STATUS_BG);
-        if self.doc.is_some() {
-            let y = clamp32(self.view_h) + (bar - p.line_height()) / 2;
-            p.text(clamp32(self.px(10)), y, &i18n::page_of(self.lang, self.current_page() + 1, self.page_count()), STATUS_FG);
-            let z = format!("{}%", (f64::from(self.zoom) / 10.0).round() as u32);
-            let w = p.text_width(&z);
-            p.text(full_w - w - clamp32(self.px(10)), y, &z, STATUS_FG);
-        }
+        self.draw_status(p, full_w);
         // The speed test stops its clock when the page is drawn; it does not put the pictures before that on the
         // screen (Windows sometimes holds a BitBlt to the screen for half a second, whatever is in it).
         self.bench.is_none() || self.sharp_on_screen
+    }
+
+    fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
+        self.cursor_over(i64::from(x), i64::from(y))
     }
 }

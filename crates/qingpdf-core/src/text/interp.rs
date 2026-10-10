@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::object::{ObjRef, Object};
+use crate::render::work::{Work, cost};
 
 use super::cmap::{CMap, Uni};
 use super::font::{Font, Warnings};
@@ -135,6 +136,8 @@ pub(crate) struct Glyph {
     /// Advance along the direction, including character and word spacing.
     pub adv: f64,
     pub size: f64,
+    /// The character was shown in vertical writing mode (the position is the top centre of its cell).
+    pub vertical: bool,
 }
 
 /// Resources of a page or form that text needs: the font and XObject entries by name
@@ -241,6 +244,15 @@ impl Basis {
     }
 }
 
+/// The error for a work meter that refused a charge.
+pub(crate) fn spent(w: &Work) -> Error {
+    if w.was_cancelled() {
+        Error::Cancelled
+    } else {
+        Error::Limit("the page asks for more work than a reader's text search allows".to_string())
+    }
+}
+
 pub(crate) struct Interp<'a> {
     doc: &'a Document,
     shared: &'a mut Shared,
@@ -254,6 +266,9 @@ pub(crate) struct Interp<'a> {
     basis: Option<Basis>,
     /// Characters shown that have no Unicode value, per font name.
     pub unmapped: HashMap<String, usize>,
+    /// The work meter of the page, when the caller keeps one (a reader's search and selection do): operators,
+    /// characters, fonts and forms are charged to it, and it stops the run when it is spent or cancelled.
+    work: Option<&'a Work>,
 }
 
 impl<'a> Interp<'a> {
@@ -270,6 +285,22 @@ impl<'a> Interp<'a> {
             tlm: IDENTITY,
             basis: None,
             unmapped: HashMap::new(),
+            work: None,
+        }
+    }
+
+    /// Charge the work of this run to `work` (see [`Interp::work`]).
+    pub fn with_work(mut self, work: &'a Work) -> Interp<'a> {
+        self.work = Some(work);
+        self
+    }
+
+    /// Pay `units` of work to the page's meter, if there is one: `Cancelled` when the meter was cancelled, `Limit` when
+    /// it is spent.
+    fn charge(&self, units: f64) -> Result<()> {
+        match self.work {
+            Some(w) if !w.charge(units) => Err(spent(w)),
+            _ => Ok(()),
         }
     }
 
@@ -284,6 +315,7 @@ impl<'a> Interp<'a> {
                 return Err(Error::Limit(format!("more than {MAX_OPERATORS} content stream operators on one page")));
             }
             self.ops_left -= 1;
+            self.charge(cost::TEXT_OP)?;
             if op == b"BI" {
                 // 8.9.7: the image's dictionary entries, `ID`, binary data, `EI`: nothing for text.
                 for _ in 0..4096 {
@@ -461,6 +493,10 @@ impl<'a> Interp<'a> {
             if let Some(hit) = self.shared.fonts.get(r) {
                 return hit.clone();
             }
+            if self.charge(cost::TEXT_FONT_LOAD).is_err() {
+                // The meter is spent: the font is not loaded now (and is not remembered as unloadable).
+                return None;
+            }
             let loaded = match self.doc.get(*r) {
                 Ok(Object::Dict(d)) => Some(Rc::new(Font::load(self.doc, &d, &mut self.shared.cmaps, &mut self.shared.warnings))),
                 Ok(_) => None,
@@ -494,8 +530,15 @@ impl<'a> Interp<'a> {
             }
         };
         let mut failed: Option<Error> = None;
+        let work = self.work;
         font.show(s, |ch| {
             if failed.is_some() {
+                return;
+            }
+            if let Some(w) = work
+                && !w.charge(cost::TEXT_GLYPH)
+            {
+                failed = Some(spent(w));
                 return;
             }
             // The text space origin of the glyph, through the text matrix and the CTM (8.3.4).
@@ -541,6 +584,7 @@ impl<'a> Interp<'a> {
                 dy: glyph_dir.1,
                 adv: if adv.is_finite() { adv } else { 0.0 },
                 size: if glyph_size.is_finite() { glyph_size } else { 0.0 },
+                vertical: ch.vertical.is_some(),
             };
             self.glyphs.push(glyph);
             tm[4] += step.0;
@@ -569,6 +613,7 @@ impl<'a> Interp<'a> {
             None => {
                 let Some(form) = self.load_form(r)? else { return Ok(()) };
                 let form = Rc::new(form);
+                self.charge(cost::TEXT_FORM + form.content.len() as f64 * cost::TEXT_BYTE)?;
                 if self.shared.form_bytes.saturating_add(form.content.len()) <= MAX_FORM_CACHE_BYTES {
                     self.shared.form_bytes += form.content.len();
                     self.shared.forms.insert(r, form.clone());

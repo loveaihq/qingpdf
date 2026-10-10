@@ -24,6 +24,9 @@ const LAYERS: u64 = 16 * MIB;
 const MASKS: u64 = 8 * MIB;
 /// What the JPEG 2000 and JBIG2 decoders hold at once while a page is drawn.
 const DECODERS: u64 = 32 * MIB;
+/// The text of the pages read lately, with the box of every character, kept for the search, the selection and the copy to
+/// share (3d-2: a page of 3,000 characters is about 50 KB).
+const TEXT_CACHE: u64 = 16 * MIB;
 /// The most pixels of one piece of a page drawn at once (16 MiB of canvas).
 const TILE_PIXELS: u64 = 4 * MIB;
 /// The window needs room for at least a few screens of bitmaps, or there is no plan.
@@ -55,6 +58,8 @@ pub struct MemoryPlan {
     pub layers: u64,
     pub masks: u64,
     pub decoders: u64,
+    /// What the engine keeps of the text of pages it has read.
+    pub text_cache: u64,
 }
 
 impl MemoryPlan {
@@ -66,6 +71,7 @@ impl MemoryPlan {
             + self.layers
             + self.masks
             + self.decoders
+            + self.text_cache
             + u64::from(self.max_tile_pixels) * 4
     }
 }
@@ -97,6 +103,7 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
             layers: part(LAYERS),
             masks: part(MASKS),
             decoders: part(DECODERS),
+            text_cache: part(TEXT_CACHE),
         };
         p.bitmap_cache_bytes = total.saturating_sub(file_bytes).saturating_sub(p.engine_bytes());
         p
@@ -145,8 +152,8 @@ mod tests {
         let big = plan(TOTAL_BYTES, 90_000_000, HD).expect("a plan");
         // Nearly all of it (a page turn needs room for two and a half pieces of a page and the pictures, which the engine gives up
         // a little for).
-        assert!(small.render_caches > RENDER_CACHES * 9 / 10 && small.render_caches <= RENDER_CACHES, "{small:?}");
-        assert!(u64::from(small.max_tile_pixels) > TILE_PIXELS * 9 / 10 && u64::from(small.max_tile_pixels) <= TILE_PIXELS, "{small:?}");
+        assert!(small.render_caches > RENDER_CACHES * 8 / 10 && small.render_caches <= RENDER_CACHES, "{small:?}");
+        assert!(u64::from(small.max_tile_pixels) > TILE_PIXELS * 8 / 10 && u64::from(small.max_tile_pixels) <= TILE_PIXELS, "{small:?}");
         assert!(big.render_caches < small.render_caches && big.decoders < small.decoders);
         assert!(big.max_tile_pixels >= MIN_TILE_PIXELS as u32);
     }
@@ -157,7 +164,7 @@ mod tests {
         // the engine gives up only a little for it.
         let hd = plan(TOTAL_BYTES, 5_000_000, HD).expect("a plan");
         assert!(hd.bitmap_cache_bytes >= HD * 12 && hd.bitmap_cache_bytes >= u64::from(hd.max_tile_pixels) * 4 * 5 / 2 + PREVIEWS, "{hd:?}");
-        assert!(hd.render_caches > RENDER_CACHES * 9 / 10, "{hd:?}");
+        assert!(hd.render_caches > RENDER_CACHES * 8 / 10, "{hd:?}");
         // A 4K window wants more than is left: the bitmaps get what they want and the engine's parts are cut.
         let uhd = plan(TOTAL_BYTES, 5_000_000, UHD).expect("a plan");
         assert!(uhd.bitmap_cache_bytes >= UHD * 12, "{uhd:?}");

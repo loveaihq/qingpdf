@@ -35,7 +35,7 @@ mod shading;
 mod sysfont;
 mod ttvm;
 mod type1;
-mod work;
+pub(crate) mod work;
 
 #[cfg(test)]
 mod annot_tests;
@@ -160,6 +160,17 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// The size in pixels of the whole page as [`Renderer::render_partial`] draws it at `dpi`, turned a further `rotation`
+    /// degrees (at least 1 by 1).
+    pub fn page_pixels(page: &Page, dpi: f64, rotation: u16) -> (u64, u64) {
+        let [x0, y0, x1, y1] = text::visible_box(page).unwrap_or([0.0, 0.0, 612.0, 792.0]);
+        let rotate = (page.rotate().rem_euclid(360) + i64::from(rotation)).rem_euclid(360);
+        let scale = dpi / 72.0;
+        let (bw, bh) = ((x1 - x0) * scale, (y1 - y0) * scale);
+        let (pw, ph) = if rotate == 90 || rotate == 270 { (bh, bw) } else { (bw, bh) };
+        ((pw.round().max(1.0)) as u64, (ph.round().max(1.0)) as u64)
+    }
+
     /// [`Renderer::render_page`] for a reader: the page turned a further `rotation` degrees (a multiple of 90), and
     /// only the `region` of it drawn, `[x, y, width, height]` in pixels of the whole page at `dpi` (cut to the page;
     /// the region may have [`MAX_PAGE_PIXELS`] pixels although the whole page has more). A page that goes wrong
@@ -179,9 +190,7 @@ impl<'a> Renderer<'a> {
         let [x0, y0, x1, y1] = text::visible_box(page).unwrap_or([0.0, 0.0, 612.0, 792.0]);
         let rotate = (page.rotate().rem_euclid(360) + i64::from(rotation)).rem_euclid(360);
         let scale = dpi / 72.0;
-        let (bw, bh) = ((x1 - x0) * scale, (y1 - y0) * scale);
-        let (pw, ph) = if rotate == 90 || rotate == 270 { (bh, bw) } else { (bw, bh) };
-        let (full_w, full_h) = ((pw.round().max(1.0)) as u64, (ph.round().max(1.0)) as u64);
+        let (full_w, full_h) = Renderer::page_pixels(page, dpi, rotation);
         // The part to draw: all of the page, or the region cut to it.
         let (rx, ry, width, height) = match region {
             None => (0, 0, full_w, full_h),

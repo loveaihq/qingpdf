@@ -149,8 +149,19 @@ fn repeats(glyphs: &[Glyph], line: &Line, order: &[usize]) -> Option<Vec<bool>> 
     any.then_some(gone)
 }
 
-/// The text of one line: runs in position order, spaces where the gaps are wide.
-fn line_text(glyphs: &[Glyph], line: &Line, out: &mut String) {
+/// Where the text of one glyph lies in the page's text: bytes `start..end` come from `glyph` (spaces the layout puts
+/// between glyphs and the line ends belong to no glyph).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mark {
+    pub start: usize,
+    pub end: usize,
+    pub glyph: usize,
+}
+
+/// The text of one line: runs in position order, spaces where the gaps are wide. When `marks` is given, a [`Mark`] is
+/// added for every glyph whose text is in the output.
+fn line_text(glyphs: &[Glyph], line: &Line, out: &mut String, mut marks: Option<&mut Vec<Mark>>) {
+    let first_mark = marks.as_ref().map_or(0, |m| m.len());
     let mut runs: Vec<(f64, usize, usize)> = Vec::with_capacity(line.runs.len());
     for (k, &start) in line.runs.iter().enumerate() {
         let end = line.runs.get(k + 1).copied().unwrap_or(line.end);
@@ -182,7 +193,13 @@ fn line_text(glyphs: &[Glyph], line: &Line, out: &mut String) {
                 out.push(' ');
             }
         }
+        let start = out.len();
         g.uni.push_to(out);
+        if let Some(m) = marks.as_mut()
+            && out.len() > start
+        {
+            m.push(Mark { start, end: out.len(), glyph: i });
+        }
         prev = Some(g);
     }
     let written = out.get(begin..).unwrap_or("");
@@ -190,20 +207,48 @@ fn line_text(glyphs: &[Glyph], line: &Line, out: &mut String) {
     let kept = written.trim_matches(' ').len();
     if kept == 0 {
         out.truncate(begin);
+        if let Some(m) = marks {
+            m.truncate(first_mark);
+        }
         return;
     }
     out.truncate(begin + leading + kept);
     out.drain(begin..begin + leading);
     out.push('\n');
+    if let Some(m) = marks {
+        // The spaces cut off at either end took their glyphs' marks with them (a glyph that is a space); the rest move up.
+        let (from, to) = (begin + leading, begin + leading + kept);
+        let mut write = first_mark;
+        for read in first_mark..m.len() {
+            let Some(mark) = m.get(read).copied() else { break };
+            if mark.end > from && mark.start < to
+                && let Some(slot) = m.get_mut(write)
+            {
+                *slot = Mark { start: mark.start.max(from) - leading, end: mark.end.min(to) - leading, glyph: mark.glyph };
+                write += 1;
+            }
+        }
+        m.truncate(write);
+    }
 }
 
 /// All the text of a page, one line per `\n`.
 pub(crate) fn render(glyphs: &[Glyph]) -> String {
     let mut out = String::new();
     for line in build_lines(glyphs) {
-        line_text(glyphs, &line, &mut out);
+        line_text(glyphs, &line, &mut out, None);
     }
     out
+}
+
+/// [`render`], and where every glyph's text is in it.
+pub(crate) fn render_marked(glyphs: &[Glyph]) -> (String, Vec<Mark>) {
+    let mut out = String::new();
+    let mut marks = Vec::new();
+    for line in build_lines(glyphs) {
+        line_text(glyphs, &line, &mut out, Some(&mut marks));
+    }
+    (out, marks)
 }
 
 #[cfg(test)]
@@ -212,11 +257,11 @@ mod tests {
     use crate::text::cmap::Uni;
 
     fn g(c: char, x: f64, y: f64) -> Glyph {
-        Glyph { uni: Uni::One(c), x, y, dx: 1.0, dy: 0.0, adv: 10.0, size: 10.0 }
+        Glyph { uni: Uni::One(c), x, y, dx: 1.0, dy: 0.0, adv: 10.0, size: 10.0, vertical: false }
     }
 
     fn v(c: char, x: f64, y: f64) -> Glyph {
-        Glyph { uni: Uni::One(c), x, y, dx: 0.0, dy: -1.0, adv: 10.0, size: 10.0 }
+        Glyph { uni: Uni::One(c), x, y, dx: 0.0, dy: -1.0, adv: 10.0, size: 10.0, vertical: true }
     }
 
     fn word(s: &str, x: f64, y: f64) -> Vec<Glyph> {

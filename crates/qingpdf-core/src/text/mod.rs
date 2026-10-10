@@ -12,6 +12,7 @@
 //! # Ok::<(), qingpdf_core::Error>(())
 //! ```
 
+mod chars;
 pub(crate) mod cmap;
 pub(crate) mod data;
 mod encodings;
@@ -28,6 +29,10 @@ use crate::error::{Error, Result};
 use crate::object::{Object, Stream};
 use crate::ops::has_owner_rights;
 
+use crate::render::work::{Work, cost};
+
+pub use chars::{MAX_PAGE_CHARS, PageChars};
+pub(crate) use chars::Shown;
 use interp::{Interp, Scope, Shared};
 
 /// Most decoded content stream bytes one page may have, all its streams together.
@@ -54,12 +59,72 @@ impl<'a> TextExtractor<'a> {
     /// CMap, forms that contain themselves) is skipped and reported by
     /// [`TextExtractor::take_warnings`].
     pub fn page_text(&mut self, page: &Page) -> Result<String> {
+        let glyphs = self.page_glyphs(page, None)?;
+        Ok(layout::render(&glyphs))
+    }
+
+    /// The characters of a page in the order of [`TextExtractor::page_text`], each with the box it covers on the page as it
+    /// is shown, for a reader's selection and search highlights. Everything is charged to `work` (the page's work meter);
+    /// when it is spent or cancelled the page ends in [`Error::Limit`] or [`Error::Cancelled`].
+    pub(crate) fn page_chars(&mut self, page: &Page, work: &Work) -> Result<PageChars> {
+        let glyphs = self.page_glyphs(page, Some(work))?;
+        if !work.charge(glyphs.len() as f64 * cost::TEXT_LAYOUT) {
+            return Err(interp::spent(work));
+        }
+        let (mut text, marks) = layout::render_marked(&glyphs);
+        let shown = Shown::of(page);
+        let mut boxes: Vec<[f32; 4]> = Vec::with_capacity(text.len().min(MAX_PAGE_CHARS));
+        // The mark being walked: its index, how many characters it has, how many have been given a box.
+        let (mut mi, mut count, mut done) = (0usize, 0usize, 0usize);
+        let mut cut: Option<usize> = None;
+        for (n, (byte, _)) in text.char_indices().enumerate() {
+            if n >= MAX_PAGE_CHARS {
+                cut = Some(byte);
+                break;
+            }
+            while marks.get(mi).is_some_and(|m| m.end <= byte) {
+                mi += 1;
+                count = 0;
+                done = 0;
+            }
+            let found = marks.get(mi).filter(|m| m.start <= byte).and_then(|m| glyphs.get(m.glyph).map(|g| (m, g)));
+            let b = match found {
+                Some((m, g)) => {
+                    if count == 0 {
+                        count = text.get(m.start..m.end).map_or(1, |t| t.chars().count().max(1));
+                    }
+                    let b = shown.glyph_box(g, done as f64 / count as f64, (done + 1) as f64 / count as f64);
+                    done += 1;
+                    b
+                }
+                // A space the layout put between glyphs, or the end of a line: no box of its own, a point at the end of
+                // the one before.
+                None => boxes.last().map_or([0.0; 4], |l| [l[2], l[3], l[2], l[3]]),
+            };
+            boxes.push(b);
+        }
+        if let Some(byte) = cut {
+            text.truncate(byte);
+        }
+        Ok(PageChars { text, boxes })
+    }
+
+    /// The page's characters in drawing order (what [`layout`] builds lines from), with the ones off the page left out.
+    fn page_glyphs(&mut self, page: &Page, work: Option<&Work>) -> Result<Vec<interp::Glyph>> {
         if self.doc.is_locked() {
             return Err(Error::PasswordRequired);
         }
         let content = page_content(self.doc, page, &mut self.shared.warnings)?;
+        if let Some(w) = work
+            && !w.charge(content.len() as f64 * cost::TEXT_BYTE)
+        {
+            return Err(interp::spent(w));
+        }
         let scope = Rc::new(Scope::new(self.doc, page.resources()));
         let mut interp = Interp::new(self.doc, &mut self.shared);
+        if let Some(w) = work {
+            interp = interp.with_work(w);
+        }
         interp.run(&content, &scope, 0)?;
         let mut glyphs = std::mem::take(&mut interp.glyphs);
         let unmapped = std::mem::take(&mut interp.unmapped);
@@ -76,7 +141,7 @@ impl<'a> TextExtractor<'a> {
                 g.x >= x0 - margin && g.x <= x1 + margin && g.y >= y0 - margin && g.y <= y1 + margin
             });
         }
-        Ok(layout::render(&glyphs))
+        Ok(glyphs)
     }
 
     /// What went wrong without stopping the extraction so far (each kind once, at most 50),
