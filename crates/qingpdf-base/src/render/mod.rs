@@ -22,6 +22,7 @@ mod ccitt;
 mod cff;
 mod color;
 mod fonts;
+pub use fonts::GlyphProbe;
 mod func;
 pub mod glyf;
 mod image;

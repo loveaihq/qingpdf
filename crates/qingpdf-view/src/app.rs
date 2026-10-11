@@ -84,6 +84,7 @@ pub const CMD_TOOL_SQUIGGLY: u32 = 44;
 pub const CMD_TOOL_INK: u32 = 45;
 pub const CMD_TOOL_NOTE: u32 = 46;
 pub const CMD_TOOL_TEXTBOX: u32 = 47;
+pub const CMD_TOOL_EDITTEXT: u32 = 48;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
@@ -847,6 +848,7 @@ impl App {
             CMD_TOOL_SQUIGGLY => self.set_tool(Tool::Markup(MarkupKind::Squiggly)),
             CMD_TOOL_INK => self.set_tool(Tool::Ink),
             CMD_TOOL_NOTE => self.set_tool(Tool::Note),
+            CMD_TOOL_EDITTEXT => self.set_tool(Tool::EditText),
             c if (CMD_COLOR_BASE..CMD_COLOR_BASE + 6).contains(&c) => self.set_color((c - CMD_COLOR_BASE) as usize),
             c if (CMD_WIDTH_BASE..CMD_WIDTH_BASE + 4).contains(&c) => self.set_width((c - CMD_WIDTH_BASE) as usize),
             CMD_PRINT => self.print_command(),

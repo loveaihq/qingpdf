@@ -68,7 +68,7 @@ impl Shown {
 
     /// The box of the part of the glyph's cell from `from` to `to` (fractions of its advance, for a glyph that stands for
     /// several characters, like a ligature).
-    pub(super) fn glyph_box(&self, g: &Glyph, from: f64, to: f64) -> [f32; 4] {
+    pub fn glyph_box(&self, g: &Glyph, from: f64, to: f64) -> [f32; 4] {
         // The cell runs along the writing direction from the origin; across it, a horizontal glyph sits on its baseline
         // (a little below it for the descenders, most of the size above), a vertical one is centred on its column.
         let (across0, across1) = if g.vertical { (-0.5 * g.size, 0.5 * g.size) } else { (-0.2 * g.size, 0.8 * g.size) };

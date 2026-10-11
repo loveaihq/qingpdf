@@ -4,7 +4,7 @@ A small, fast, offline PDF tool with its own engine, written in Rust. *Qīng* (�
 
 Most PDF tools today are hundreds of megabytes. qingpdf is one 2.2 MB executable that needs nothing installed, never goes online, and is built to do Chinese PDFs right.
 
-**Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`. There is no viewer, conversion or editing yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
+**Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`, and putting and changing text on pages. There is no conversion yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
 
 ## What it does now
 
@@ -22,9 +22,12 @@ qingpdf render a.pdf --pages 1-3 --dpi 150 -o page_%d.png  draw pages to PNG
 qingpdf watermark a.pdf --text "机密" --opacity 0.3 --angle 45 --tile -o out.pdf   text or picture watermark (--under the content, --pages 1-3)
 qingpdf stamp a.pdf --image sig.png --page 3 --at 72,100 --width 120 -o out.pdf  put a picture on a page (a PNG's transparency is kept)
 qingpdf addtext a.pdf --page 1 --at 72,720 --size 12 --text "你好" -o out.pdf     put text on a page (Chinese too)
+qingpdf replace a.pdf --find "旧词" --replace "新词" --pages 1-3 -o out.pdf        change text that is already on the pages
 ```
 
 `watermark`, `stamp` and `addtext` write into the pages' own content, so every other program and a printer show it too; the text is embedded as a font subset, so Chinese is shown everywhere. The output is the input with the change appended as an incremental update (the input's bytes stay exactly as they are; the input itself is never touched). Places are points from the lower left corner of the page as it is shown, and a watermark stays upright and centred on a turned page. A signed or certified file is refused, and so is an encrypted file whose author did not allow changing it (give the owner password).
+
+`replace` changes text that is already on the pages, one line at a time (a line is what `text` and the viewer's search and selection call one). The old letters are taken out of the page's drawing instructions (they are not covered over, so copying and searching give the new text only) and the new ones are drawn where they were, in the same size, colour and spacing, with the font of the old text when it has every letter and with a matching system font subset (Song, Hei, Kai, Fang for Chinese) when it has not. Nothing is moved to make room, and a warning says when the new text is wider. The old text stays in the earlier bytes of the output (write the result again with `split --pages 1-` to drop it). Text in a form that a page draws more than once is not changed. In the viewer, *Insert > Edit text on the page* clicks a line and types it again (Enter confirms, Ctrl+Z undoes).
 
 Every command that reads a PDF takes `--password <password>` for encrypted files (a password that is given is tried first, then the empty one); the results are encrypted the way the input was, with the same passwords and permissions. A file that restricts what may be done with it (it was not opened with its owner password and its author did not allow everything) can only be the first input of a merge, whose output then carries its protection, unless its owner password is given. `info` shows how a file is protected and what its author allows.
 
@@ -72,7 +75,7 @@ Third-party software and data, with their licence texts, are listed in [THIRD-PA
 
 ## 中文简介
 
-qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。`watermark`、`stamp`、`addtext` 三个命令可以给页面加水印（文字或图片，平铺、旋转、半透明）、图片和中文文字，写进页面自己的内容，用增量方式追加，原文件的字节不动。阅读界面（含批注、填表和"插入"菜单）在 Windows 版里，转换还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
+qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。`watermark`、`stamp`、`addtext` 三个命令可以给页面加水印（文字或图片，平铺、旋转、半透明）、图片和中文文字，写进页面自己的内容，用增量方式追加，原文件的字节不动。`replace` 命令可以改页面上已有的文字（旧字真的从内容里去掉，新字用原字体，缺字时用相近的系统字体子集）。阅读界面（含批注、填表和"插入"菜单，菜单里有"改页面上的文字"）在 Windows 版里，转换还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
 
 ## 许可证
 

@@ -150,12 +150,17 @@ pub enum Msg {
     WmUnder,
     WmPage,
     NoteModifyDenied,
+    ToolEditText,
+    NoteEditTextHint,
+    NoteNoTextHere,
+    NoteLineChanged,
+    NoteLineNo,
     ShutdownReason,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 136] = [
+pub const ALL: [Msg; 141] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -291,6 +296,11 @@ pub const ALL: [Msg; 136] = [
     Msg::WmUnder,
     Msg::WmPage,
     Msg::NoteModifyDenied,
+    Msg::ToolEditText,
+    Msg::NoteEditTextHint,
+    Msg::NoteNoTextHere,
+    Msg::NoteLineChanged,
+    Msg::NoteLineNo,
     Msg::ShutdownReason,
 ];
 
@@ -383,7 +393,7 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::WidthBold => ("Extra thick (8 pt)", "特粗（8 磅）"),
         Msg::AuthorItem => ("&Author name...", "作者名(&A)..."),
         Msg::RemoveAnnot => ("&Remove annotation	Del", "删除批注(&R)	Del"),
-        Msg::SaveTitle => ("Save as", "另存为"),
+        Msg::SaveTitle => ("Save as (the whole file is written again)", "另存为（整个文件重写，改掉的旧字不留）"),
         Msg::AuthorTitle => ("Author name", "作者名"),
         Msg::AuthorPrompt => ("The name put on the annotations you make:", "你加的批注上署的名字："),
         Msg::NoteTitle => ("Note", "便签"),
@@ -419,6 +429,11 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteRemoved => ("Annotation removed (Ctrl+Z undoes it).", "已删除批注（Ctrl+Z 撤销）。"),
         Msg::NoteSigned => ("This file is signed: after the changes are saved, the signature will show the file as changed.", "这个文件有签名：保存改动后，签名会显示文件被修改过。"),
         Msg::InsertMenu => ("&Insert", "插入(&I)"),
+        Msg::ToolEditText => ("&Edit text on the page", "改页面上的文字(&E)"),
+        Msg::NoteEditTextHint => ("Click a line of text, type what it is to say, press Enter (Esc cancels). The old letters are taken out of the page.", "点一行文字，输入新的内容，按回车确认（Esc 取消）。原来的字会从页面里去掉。"),
+        Msg::NoteNoTextHere => ("There is no text there.", "这里没有文字。"),
+        Msg::NoteLineChanged => ("Text changed (Ctrl+Z undoes it). The old text stays in the earlier part of the saved file.", "文字已改（Ctrl+Z 撤销）。旧文字仍在保存后文件的旧版本部分里。"),
+        Msg::NoteLineNo => ("This text cannot be changed:", "这行文字不能改："),
         Msg::InsertText => ("Add &text", "加文字(&T)"),
         Msg::InsertImage => ("Add &picture...", "加图片(&P)..."),
         Msg::InsertWatermark => ("Add &watermark...", "加水印(&W)..."),
@@ -502,7 +517,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 136);
+        assert_eq!(ALL.len(), 141);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

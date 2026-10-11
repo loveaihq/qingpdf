@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use crate::document::Document;
 use crate::object::{Dict, ObjRef, Object};
 use crate::text::data::{self, Ordering};
-use crate::text::font::{Font, Warnings};
+use crate::text::font::{Font, Shown, Warnings};
 use crate::text::fontprog;
 use crate::text::interp::FxMap;
 
@@ -677,6 +677,40 @@ impl Loaded {
                 Lookup::Blank(0.0)
             }
         }
+    }
+}
+
+/// Whether a font has the glyph of a character (5a): the text put into a page is shown in the page's own font when it can be, and
+/// the font of a page is often a subset that has the glyphs the page uses and no others.
+pub struct GlyphProbe {
+    source: GlyphSource,
+    budget: Budget,
+    warnings: Warnings,
+}
+
+impl GlyphProbe {
+    pub fn new(doc: &Document, dict: &Dict, font: &Font) -> GlyphProbe {
+        let budget = Budget::default();
+        budget.start_page();
+        GlyphProbe { source: GlyphSource::new(doc, dict, font), budget, warnings: Warnings::default() }
+    }
+
+    /// Does the font draw `shown` (a character read out of a string, `c` the character it is to stand for)? A glyph with no outline is
+    /// only right for a space: a subset keeps the numbers of the glyphs it does not hold, with nothing in them.
+    pub fn has(&mut self, doc: &Document, shown: &Shown, c: char) -> bool {
+        let mut ctx = LoadCtx { doc, warnings: &mut self.warnings, budget: &self.budget };
+        let Ok(loaded) = self.source.loaded(&mut ctx) else { return false };
+        match loaded.lookup(&CharInfo { code: shown.code, cid: shown.cid, glyph_uni: shown.glyph_uni }) {
+            Lookup::Draw(_) => true,
+            Lookup::Blank(_) => c.is_whitespace(),
+            _ => false,
+        }
+    }
+
+    /// What a font like this one is, for choosing a system font to stand in for it.
+    pub fn request(&self) -> sysfont::Request {
+        let p = &self.source.plan;
+        sysfont::request_for(&p.raw_name, p.flags, p.weight, p.italic_angle, p.ordering)
     }
 }
 

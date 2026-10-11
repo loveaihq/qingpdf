@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use crate::document::Document;
 use crate::error::{Error, Result};
-use crate::object::{ObjRef, Object};
+use crate::object::{Dict, ObjRef, Object};
 use crate::render::work::{Work, cost};
 
 use super::cmap::{CMap, Uni};
 use super::font::{Font, Warnings};
+use super::editscan::{ActualSpan, CharRec, Part, Recorder, Show, ShowItem, ShowOp};
 use super::scan::{Item, Operand, Scanner};
 
 /// Most operators one page may run, forms included (a form shown many times counts every time).
@@ -62,6 +63,7 @@ impl std::hash::Hasher for Fx {
 }
 
 pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
+pub(crate) type FxSet<K> = HashSet<K, std::hash::BuildHasherDefault<Fx>>;
 
 // Operators as numbers (their bytes and length), so that `operator` is a jump and not a
 // chain of comparisons: it runs for every operator of every page.
@@ -134,7 +136,7 @@ fn finite(m: &Matrix) -> bool {
 /// One shown character: where it starts, which way the line runs, how far it
 /// advances (all in default user space) and how big it is.
 #[derive(Clone, Debug)]
-pub(crate) struct Glyph {
+pub struct Glyph {
     pub uni: Uni,
     pub x: f64,
     pub y: f64,
@@ -180,7 +182,9 @@ impl Scope {
 }
 
 pub(crate) struct Form {
-    content: Vec<u8>,
+    content: Rc<Vec<u8>>,
+    /// The form's stream dictionary, kept when the page is read for editing (the copy that is changed starts from it).
+    dict: Option<Dict>,
     matrix: Matrix,
     /// `None`: the form has no `/Resources` and uses its caller's (7.8.3).
     scope: Option<Rc<Scope>>,
@@ -192,7 +196,7 @@ pub(crate) struct Shared {
     pub fonts: FxMap<ObjRef, Option<Rc<Font>>>,
     pub forms: FxMap<ObjRef, Rc<Form>>,
     pub form_bytes: usize,
-    pub not_forms: HashSet<ObjRef, std::hash::BuildHasherDefault<Fx>>,
+    pub not_forms: FxSet<ObjRef>,
     pub cmaps: HashMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
 }
@@ -201,6 +205,8 @@ pub(crate) struct Shared {
 struct GState {
     ctm: Matrix,
     font: Option<Rc<Font>>,
+    /// For editing: the font as the page's record of fonts has it (`u32::MAX`: none).
+    rec_font: u32,
     size: f64,
     tc: f64,
     tw: f64,
@@ -283,6 +289,11 @@ pub(crate) struct Interp<'a> {
     /// The work meter of the page, when the caller keeps one (a reader's search and selection do): operators,
     /// characters, fonts and forms are charged to it, and it stops the run when it is spent or cancelled.
     work: Option<&'a Work>,
+    /// Where the text is in the content streams, when the page is read for editing (`editscan`).
+    pub(super) rec: Option<Box<Recorder>>,
+    /// The content stream being run (an index of the recorder's sources) and the bytes of the operator being run in it.
+    cur_src: u32,
+    stmt: (u32, u32),
 }
 
 impl<'a> Interp<'a> {
@@ -293,7 +304,7 @@ impl<'a> Interp<'a> {
             glyphs: Vec::new(),
             ops_left: MAX_OPERATORS,
             in_progress: Vec::new(),
-            gs: GState { ctm: IDENTITY, font: None, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0 },
+            gs: GState { ctm: IDENTITY, font: None, rec_font: u32::MAX, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0 },
             stack: Vec::new(),
             tm: IDENTITY,
             tlm: IDENTITY,
@@ -303,6 +314,9 @@ impl<'a> Interp<'a> {
             hidden: 0,
             marks_past: 0,
             work: None,
+            rec: None,
+            cur_src: 0,
+            stmt: (0, 0),
         }
     }
 
@@ -347,6 +361,9 @@ impl<'a> Interp<'a> {
                 }
                 continue;
             }
+            if self.rec.is_some() {
+                self.stmt = (u32::try_from(sc.statement_start()).unwrap_or(u32::MAX), u32::try_from(sc.pos()).unwrap_or(u32::MAX));
+            }
             self.operator(op, &ops, &sc, scope, depth)?;
         }
     }
@@ -355,17 +372,29 @@ impl<'a> Interp<'a> {
         match op_key(op) {
             OP_TJ => {
                 if let Some(Operand::Str(s)) = ops.last() {
-                    self.show(sc.bytes(*s))?;
+                    self.begin_show(ShowOp::Tj, None)?;
+                    self.show_part(sc.bytes(*s))?;
+                    self.end_show();
                 }
             }
             OP_TJ_ARRAY => {
+                self.begin_show(ShowOp::TJ, None)?;
                 for item in ops {
                     match item {
-                        Operand::Str(s) => self.show(sc.bytes(*s))?,
-                        Operand::Num(n) => self.adjust(*n),
+                        Operand::Str(s) => self.show_part(sc.bytes(*s))?,
+                        Operand::Num(n) => {
+                            self.adjust(*n);
+                            if let Some(rec) = self.rec.as_mut() {
+                                rec.add_pieces(1)?;
+                                if let Some(show) = rec.shows.last_mut() {
+                                    show.items.push(ShowItem::Num(*n));
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
+                self.end_show();
             }
             OP_TD => {
                 if let Some([tx, ty]) = numbers::<2>(ops) {
@@ -423,6 +452,9 @@ impl<'a> Interp<'a> {
                 if let [.., Operand::Name(name), Operand::Num(size)] = ops {
                     self.gs.size = *size;
                     self.gs.font = self.font(sc.bytes(*name), scope);
+                    if self.rec.is_some() {
+                        self.gs.rec_font = self.record_font(sc.bytes(*name), scope);
+                    }
                 }
             }
             OP_TD_UPPER => {
@@ -443,7 +475,9 @@ impl<'a> Interp<'a> {
             OP_QUOTE => {
                 self.move_line(0.0, -self.gs.tl);
                 if let Some(Operand::Str(s)) = ops.last() {
-                    self.show(sc.bytes(*s))?;
+                    self.begin_show(ShowOp::Quote, None)?;
+                    self.show_part(sc.bytes(*s))?;
+                    self.end_show();
                 }
             }
             OP_DQUOTE => {
@@ -451,7 +485,9 @@ impl<'a> Interp<'a> {
                     self.gs.tw = *aw;
                     self.gs.tc = *ac;
                     self.move_line(0.0, -self.gs.tl);
-                    self.show(sc.bytes(*s))?;
+                    self.begin_show(ShowOp::DoubleQuote, Some((*aw, *ac)))?;
+                    self.show_part(sc.bytes(*s))?;
+                    self.end_show();
                 }
             }
             OP_DO => {
@@ -459,11 +495,12 @@ impl<'a> Interp<'a> {
                     self.do_xobject(sc.bytes(*name), scope, depth)?;
                 }
             }
-            OP_BMC => self.begin_marked(false),
+            OP_BMC => self.begin_marked(false, None)?,
             OP_BDC => {
                 // Only a watermark written in the operator itself is known; one named in `/Properties` is shown as text.
                 let watermark = matches!(ops, [.., Operand::Name(tag), Operand::Dict(d)] if sc.bytes(*tag) == b"Artifact" && is_watermark(sc.bytes(*d)));
-                self.begin_marked(watermark);
+                let span = if self.rec.is_some() { self.actual_text(ops, sc) } else { None };
+                self.begin_marked(watermark, span)?;
             }
             OP_EMC => self.end_marked(),
             _ => {}
@@ -471,13 +508,87 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn begin_marked(&mut self, watermark: bool) {
+    // --- reading a page for editing (`editscan`) -----------------------------------------------------------------------
+
+    fn begin_show(&mut self, op: ShowOp, spacing: Option<(f64, f64)>) -> Result<()> {
+        let (src, stmt, font, size, tc, tw, th) = (self.cur_src, self.stmt, self.gs.rec_font, self.gs.size, self.gs.tc, self.gs.tw, self.gs.th);
+        if self.rec.is_some() {
+            // (Keeping what is read costs about as much as reading it.)
+            self.charge(cost::TEXT_OP)?;
+        }
+        if let Some(rec) = self.rec.as_mut() {
+            rec.add_pieces(1)?;
+            rec.mark = (rec.parts.len(), rec.chars.len());
+            rec.shows.push(Show { src, start: stmt.0, end: stmt.1, op, font, size, tc, tw, th, spacing, items: Vec::new(), scale: 1.0 });
+        }
+        Ok(())
+    }
+
+    /// Show a string operand (and note it down when the page is read for editing; an empty one is not kept).
+    fn show_part(&mut self, s: &[u8]) -> Result<()> {
+        if !s.is_empty()
+            && let Some(rec) = self.rec.as_mut()
+        {
+            rec.add_pieces(1)?;
+            let show = u32::try_from(rec.shows.len().saturating_sub(1)).unwrap_or(0);
+            let part = u32::try_from(rec.parts.len()).unwrap_or(0);
+            rec.parts.push(Part { show, bytes: s.to_vec() });
+            if let Some(sh) = rec.shows.last_mut() {
+                sh.items.push(ShowItem::Str(part));
+            }
+        }
+        self.show(s)
+    }
+
+    /// The operator that was just run showed no character the page has: it is not kept.
+    fn end_show(&mut self) {
+        if let Some(rec) = self.rec.as_mut()
+            && rec.chars.len() == rec.mark.1
+        {
+            let gone = rec.shows.pop().map_or(0, |sh| 1 + sh.items.len());
+            rec.parts.truncate(rec.mark.0);
+            rec.drop_pieces(gone);
+        }
+    }
+
+    /// The `/ActualText` of a `BDC` (14.9.4), when it has one in the property list written in the operator. (One named in the
+    /// resources, `/Properties`, is not looked at.)
+    fn actual_text(&self, ops: &[Operand], sc: &Scanner<'_>) -> Option<ActualSpan> {
+        let [.., Operand::Name(_), Operand::Dict(d)] = ops else { return None };
+        // (The word may be in a string: whoever changes the statement reads the list.)
+        sc.bytes(*d).windows(10).any(|w| w == b"ActualText").then_some(ActualSpan { src: self.cur_src, start: self.stmt.0, end: self.stmt.1, first: 0, last: u32::MAX, parent: u32::MAX })
+    }
+
+    fn record_font(&mut self, name: &[u8], scope: &Rc<Scope>) -> u32 {
+        let (Some(font), src) = (self.gs.font.clone(), self.cur_src) else { return u32::MAX };
+        let entry = scope.fonts.get(name).cloned().unwrap_or(Object::Null);
+        match self.rec.as_mut() {
+            Some(rec) => rec.font(src, name, entry, font),
+            None => u32::MAX,
+        }
+    }
+
+    fn begin_marked(&mut self, watermark: bool, span: Option<ActualSpan>) -> Result<()> {
         if self.marks.len() >= MAX_MARKED_DEPTH {
             self.marks_past += 1;
-        } else {
-            self.marks.push(watermark);
-            self.hidden += usize::from(watermark);
+            return Ok(());
         }
+        self.marks.push(watermark);
+        self.hidden += usize::from(watermark);
+        let at = u32::try_from(self.glyphs.len()).unwrap_or(u32::MAX);
+        if let Some(rec) = self.rec.as_mut() {
+            let mut id = u32::MAX;
+            if let Some(mut span) = span {
+                rec.add_pieces(4)?;
+                span.first = at;
+                span.parent = rec.open.iter().rev().copied().find(|&i| i != u32::MAX).unwrap_or(u32::MAX);
+                id = u32::try_from(rec.spans.len()).unwrap_or(u32::MAX);
+                rec.spans.push(span);
+                rec.runs.push((at, id));
+            }
+            rec.open.push(id);
+        }
+        Ok(())
     }
 
     fn end_marked(&mut self) {
@@ -485,6 +596,15 @@ impl<'a> Interp<'a> {
             self.marks_past -= 1;
         } else if let Some(watermark) = self.marks.pop() {
             self.hidden -= usize::from(watermark);
+            let at = u32::try_from(self.glyphs.len()).unwrap_or(u32::MAX);
+            if let Some(rec) = self.rec.as_mut()
+                && let Some(id) = rec.open.pop()
+                && let Some(span) = rec.spans.get_mut(id as usize)
+            {
+                span.last = at;
+                let parent = span.parent;
+                rec.runs.push((at, parent));
+            }
         }
     }
 
@@ -581,7 +701,10 @@ impl<'a> Interp<'a> {
         };
         let mut failed: Option<Error> = None;
         let work = self.work;
+        let mut offset = 0u32;
         font.show(s, |ch| {
+            let at = offset;
+            offset = offset.saturating_add(u32::from(ch.len));
             if failed.is_some() {
                 return;
             }
@@ -643,6 +766,12 @@ impl<'a> Interp<'a> {
                 vertical: ch.vertical.is_some(),
             };
             self.glyphs.push(glyph);
+            if let Some(rec) = self.rec.as_mut() {
+                rec.chars.push(CharRec { part: u32::try_from(rec.parts.len().saturating_sub(1)).unwrap_or(0), off: at, len: ch.len });
+                if let Some(show) = rec.shows.last_mut() {
+                    show.scale = if ch.vertical.is_some() { basis.norm_cd } else { basis.norm_ab };
+                }
+            }
             tm[4] += step.0;
             tm[5] += step.1;
         });
@@ -689,6 +818,10 @@ impl<'a> Interp<'a> {
         let saved_depth = self.stack.len();
         let saved_marks = self.marks.len();
         let (saved_tm, saved_tlm) = (self.tm, self.tlm);
+        let saved_src = self.cur_src;
+        if let Some(rec) = self.rec.as_mut() {
+            self.cur_src = rec.enter_form(r, name, saved_src, &form.content, form.dict.as_ref());
+        }
         let m = mul(&form.matrix, &self.gs.ctm);
         if finite(&m) {
             self.gs.ctm = m;
@@ -697,6 +830,7 @@ impl<'a> Interp<'a> {
         let inner = form.scope.clone().unwrap_or_else(|| scope.clone());
         let result = self.run(&form.content, &inner, depth + 1);
         self.in_progress.pop();
+        self.cur_src = saved_src;
         self.stack.truncate(saved_depth);
         self.close_marked_to(saved_marks);
         self.gs = saved_gs;
@@ -748,7 +882,8 @@ impl<'a> Interp<'a> {
             _ => IDENTITY,
         };
         let scope = s.dict.get("Resources").map(|res| Rc::new(Scope::new(self.doc, Some(res))));
-        Ok(Some(Form { content, matrix, scope }))
+        let dict = self.rec.is_some().then(|| s.dict.clone());
+        Ok(Some(Form { content: Rc::new(content), dict, matrix, scope }))
     }
 }
 

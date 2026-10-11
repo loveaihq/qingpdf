@@ -2,6 +2,7 @@
 //! (predefined, embedded, `/UseCMap` chains) and the code-to-Unicode maps of
 //! `/ToUnicode` (bfchar and bfrange).
 
+use std::cell::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use super::data::{self, Ordering};
 /// The text one character code stands for: nothing known, one character, or
 /// several (a ligature or a multi-character ToUnicode value).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Uni {
+pub enum Uni {
     None,
     One(char),
     Many(Rc<str>),
@@ -53,6 +54,7 @@ impl Uni {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Uni {
         let mut it = s.chars();
         if let (Some(c), None) = (it.next(), it.clone().next()) {
@@ -348,7 +350,13 @@ pub(crate) struct ToUni {
     sorted: Vec<UEntry>,
     /// The entries in file order, kept only when some overlap: the later one wins.
     in_file_order: Option<Vec<UEntry>>,
+    /// Every (character, code) the table has, as `character << 32 | code` in order, made on the first use of
+    /// [`ToUni::codes_for`] (editing only).
+    by_char: OnceCell<Vec<u64>>,
 }
+
+/// Most codes the table of characters to codes is made from (a range that is wider than what is left is cut short).
+const MAX_REVERSE: usize = 300_000;
 
 /// With more entries than this and overlaps, the exact "later wins" scan is skipped
 /// (it is linear per lookup) and the sorted table answers.
@@ -360,7 +368,7 @@ impl ToUni {
         sorted.sort_by_key(|e| e.lo);
         let overlap = sorted.windows(2).any(|w| matches!(w, [a, b] if b.lo <= a.hi));
         let in_file_order = (overlap && entries.len() <= MAX_OVERLAP_SCAN).then_some(entries);
-        ToUni { sorted, in_file_order }
+        ToUni { sorted, in_file_order, by_char: OnceCell::new() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -374,6 +382,41 @@ impl ToUni {
         let at = self.sorted.partition_point(|e| e.lo <= code);
         let e = self.sorted.get(at.checked_sub(1)?)?;
         (code <= e.hi).then_some(e)
+    }
+
+    /// Add to `out` the codes that stand for `c` (the exact character, or the one the table would clean up into it).
+    pub fn codes_for(&self, c: char, out: &mut Vec<u32>) {
+        let by_char = self.by_char.get_or_init(|| {
+            let mut pairs: Vec<u64> = Vec::new();
+            for e in &self.sorted {
+                if pairs.len() >= MAX_REVERSE {
+                    break;
+                }
+                match &e.dst {
+                    Dst::Cp(cp) => {
+                        for k in 0..=e.hi.saturating_sub(e.lo).min((MAX_REVERSE - pairs.len().min(MAX_REVERSE)) as u32) {
+                            pairs.push(u64::from(cp.saturating_add(k)) << 32 | u64::from(e.lo.saturating_add(k)));
+                        }
+                    }
+                    Dst::Str(s) => {
+                        let mut chars = s.chars();
+                        if let (Some(ch), None) = (chars.next(), chars.next()) {
+                            pairs.push(u64::from(ch) << 32 | u64::from(e.lo));
+                        }
+                    }
+                }
+            }
+            pairs.sort_unstable();
+            pairs
+        });
+        let want = u64::from(c) << 32;
+        let from = by_char.partition_point(|&p| p < want);
+        for &p in by_char.get(from..).unwrap_or(&[]).iter().take_while(|&&p| p >> 32 == u64::from(c)).take(16) {
+            let code = p as u32;
+            if self.get(code).first() == Some(c) && out.len() < 16 {
+                out.push(code);
+            }
+        }
     }
 
     pub fn get(&self, code: u32) -> Uni {

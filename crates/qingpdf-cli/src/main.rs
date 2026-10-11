@@ -142,12 +142,41 @@ fn run(request: Request) -> Result<(), Failure> {
             let image = read_picture(&image)?;
             add_command(&doc, &password, &input, &output, &ContentOp::Image { page: page - 1, at, width, image })
         }
+        Request::Replace { input, find, with, pages, output, force, password } => replace_command(&input, &find, &with, pages.as_deref(), &output, force, &password),
         Request::Addtext { input, page, at, size, text, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
             check_output(&output, std::slice::from_ref(&input), force)?;
             add_command(&doc, &password, &input, &output, &ContentOp::Text { page: page - 1, at, size, text: text.replace("\\n", "\n"), color: [0, 0, 0] })
         }
     }
+}
+
+/// Replace text in the pages and write the file: the input as it was, with the change appended to it.
+fn replace_command(input: &Path, find: &str, with: &str, pages: Option<&str>, output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    let wanted = match pages {
+        Some(list) => Some(page_list(&doc, input, list)?),
+        None => None,
+    };
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let found = edit::replace_text(&doc, password, find, with, wanted.as_deref()).map_err(|e| op_error(input, &e))?;
+    for warning in &found.warnings {
+        eprintln!("warning: {warning}");
+    }
+    let skipped: usize = found.skipped.iter().map(|(_, n)| n).sum();
+    for (why, n) in &found.skipped {
+        eprintln!("warning: {n} place{} not changed: {why}", plural(*n));
+    }
+    if found.count == 0 {
+        return Err(if skipped == 0 { format!("'{find}' was not found in {}", input.display()) } else { format!("'{find}' was found {skipped} time{} but could not be changed", plural(skipped)) });
+    }
+    write_file(output, &found.data)?;
+    if found.rewritten {
+        eprintln!("warning: {} had damaged structure data, so it was written afresh as a whole; its original bytes are not kept", input.display());
+    }
+    say(&format!("replaced {} place{} on {} page{}; wrote {}
+", found.count, plural(found.count), found.pages, plural(found.pages), output.display()));
+    Ok(())
 }
 
 /// Read a picture file for a page (a size over the limit is refused before it is read).

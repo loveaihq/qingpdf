@@ -1,7 +1,10 @@
 //! What the glyph readers draw into: a path in em units (1.0 is the font size), with a cap on
 //! its size, so that no font file can ask for an endless outline.
 
-use tiny_skia::{Path, PathBuilder};
+use tiny_skia::{Path, PathBuilder, PathSegment};
+
+use super::glyf::TtFont;
+use crate::layout::num;
 
 /// Most segments (moves, lines, curves, closes) one glyph may have.
 pub(crate) const MAX_SEGMENTS: usize = 40_000;
@@ -100,4 +103,55 @@ impl Builder {
 /// Bytes a path takes in a cache (its points and verbs, and a little for the rest).
 pub(crate) fn path_bytes(path: &Path) -> usize {
     64 + path.points().len() * 8 + path.verbs().len()
+}
+
+/// The glyph `gid` of `font` as the character procedure of a Type 3 glyph (9.6.5): `to_glyph` carries font units onto the glyph
+/// space of the Type 3 font, `wx` is the advance there. A glyph with no outline (a space) is a procedure that draws nothing. The
+/// bounding box (in glyph space) is given for the font's own.
+pub fn charproc(font: &TtFont, gid: u32, to_glyph: [f64; 6], wx: f64) -> Option<(String, [f32; 4])> {
+    let mut b = Builder::new(to_glyph);
+    font.outline(gid, &mut b).ok()?;
+    let mut ops = String::new();
+    let mut bbox = [0.0f32; 4];
+    if let Some(path) = b.finish() {
+        let r = path.bounds();
+        bbox = [r.left(), r.top().min(r.bottom()), r.right(), r.top().max(r.bottom())];
+        let point = |p: tiny_skia::Point| format!("{} {}", num(f64::from(p.x)), num(f64::from(p.y)));
+        let (mut start, mut cur) = (tiny_skia::Point::zero(), tiny_skia::Point::zero());
+        for segment in path.segments() {
+            match segment {
+                PathSegment::MoveTo(p) => {
+                    ops.push_str(&format!("{} m
+", point(p)));
+                    (start, cur) = (p, p);
+                }
+                PathSegment::LineTo(p) => {
+                    ops.push_str(&format!("{} l
+", point(p)));
+                    cur = p;
+                }
+                PathSegment::QuadTo(q, p) => {
+                    // A quadratic curve as the cubic with the same shape: its control points are two thirds of the way to `q`.
+                    let third = |from: tiny_skia::Point| tiny_skia::Point::from_xy(from.x + (q.x - from.x) * 2.0 / 3.0, from.y + (q.y - from.y) * 2.0 / 3.0);
+                    ops.push_str(&format!("{} {} {} c
+", point(third(cur)), point(third(p)), point(p)));
+                    cur = p;
+                }
+                PathSegment::CubicTo(c1, c2, p) => {
+                    ops.push_str(&format!("{} {} {} c
+", point(c1), point(c2), point(p)));
+                    cur = p;
+                }
+                PathSegment::Close => {
+                    ops.push_str("h
+");
+                    cur = start;
+                }
+            }
+        }
+        ops.push_str("f
+");
+    }
+    Some((format!("{} 0 {} {} {} {} d1
+{ops}", num(wx), num(f64::from(bbox[0])), num(f64::from(bbox[1])), num(f64::from(bbox[2])), num(f64::from(bbox[3]))), bbox))
 }

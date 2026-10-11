@@ -248,7 +248,7 @@ fn stream(ctx: &mut Ctx<'_>, shared: &mut Shared, bytes: Vec<u8>) -> Result<ObjR
 
 /// The streams of a page's `/Contents` (7.7.3.3: one stream or an array of them, or nothing). A reference is looked at only far
 /// enough to tell a stream from an array: the data of a page can be megabytes, and in an encrypted file reading it means decrypting it.
-fn contents_list(doc: &Document, contents: Option<&Object>) -> Vec<Object> {
+pub(super) fn contents_list(doc: &Document, contents: Option<&Object>) -> Vec<Object> {
     let Some(mut at) = contents.cloned() else { return Vec::new() };
     for _ in 0..8 {
         match at {

@@ -42,6 +42,8 @@ pub(super) enum Tool {
     TextBox,
     /// The frame of a picture is being placed (4b); the tool is set by choosing the picture.
     Stamp,
+    /// Click a line of the page's text and type what it is to read instead (5a).
+    EditText,
 }
 
 /// What is to be done once the changes are saved (or given up).
@@ -65,6 +67,8 @@ pub(super) enum Asked {
     Remove,
     Undo,
     Redo,
+    /// A line of the page's text was changed (5a).
+    Line,
 }
 
 pub(super) struct EditState {
@@ -86,7 +90,7 @@ pub(super) struct EditState {
     /// The structure of the file was damaged: it is written afresh, as a whole.
     rewrote: bool,
     /// The save that is going on (its request) and where it writes; what to do when it is done.
-    pub(super) saving: Option<(u64, PathBuf)>,
+    pub(super) saving: Option<(u64, PathBuf, bool)>,
     after: Option<After>,
     /// The place where the pointer went down for a note, and where the note is to go while its text is asked for.
     note_press: Option<(u32, f32, f32, i64, i64)>,
@@ -151,7 +155,7 @@ impl EditState {
     pub(super) fn current_color(&self) -> usize {
         self.color.unwrap_or(match self.tool {
             Tool::Markup(MarkupKind::Highlight) | Tool::Note | Tool::Select => 0,
-            Tool::TextBox | Tool::Stamp => 5,
+            Tool::TextBox | Tool::Stamp | Tool::EditText => 5,
             _ => 4,
         })
     }
@@ -169,7 +173,7 @@ impl App {
             return Vec::new();
         }
         if tool != Tool::TextBox {
-            self.edit.forms.content = false;
+            self.edit.forms.content = tool == Tool::EditText;
         }
         if tool != Tool::Select && !self.can_make() {
             return self.say(t(self.lang, if self.edit.forms.content { Msg::NoteModifyDenied } else { Msg::NoteAnnotDenied }).to_string());
@@ -192,6 +196,7 @@ impl App {
             Tool::Ink => Some(Msg::NoteInkHint),
             Tool::Note => Some(Msg::NoteNoteHint),
             Tool::TextBox => Some(Msg::NoteTextBoxHint),
+            Tool::EditText => Some(Msg::NoteEditTextHint),
         };
         match hint {
             Some(m) => self.say(t(self.lang, m).to_string()),
@@ -446,7 +451,7 @@ impl App {
     pub(super) fn annotation_cursor(&self) -> Option<Cursor> {
         match self.edit.tool {
             Tool::Ink | Tool::Note | Tool::TextBox => Some(Cursor::Cross),
-            Tool::Markup(_) => Some(Cursor::Text),
+            Tool::Markup(_) | Tool::EditText => Some(Cursor::Text),
             Tool::Select | Tool::Stamp => None,
         }
     }
@@ -516,7 +521,11 @@ impl App {
                 self.ask_for_links();
                 self.ask_for_annots();
                 // The engine tells once, with a message, that the file is signed and the signature will show it as changed.
-                let note = if !r.message.is_empty() {
+                let mut extra = String::new();
+                let note = if what == Asked::Line {
+                    extra = r.message.clone();
+                    Some(Msg::NoteLineChanged)
+                } else if !r.message.is_empty() {
                     Some(Msg::NoteSigned)
                 } else if r.rewrote && !self.edit.rewrote {
                     self.edit.rewrote = true;
@@ -526,11 +535,11 @@ impl App {
                         Asked::Add => Some(Msg::NoteAdded),
                         Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
-                        Asked::Undo | Asked::Redo => None,
+                        Asked::Undo | Asked::Redo | Asked::Line => None,
                     }
                 };
                 if let Some(m) = note {
-                    actions.extend(self.say(t(lang, m).to_string()));
+                    actions.extend(self.say(format!("{} {extra}", t(lang, m)).trim_end().to_string()));
                 }
             }
             EditStatus::Denied => actions.extend(self.say(t(lang, if what == Asked::Fill { Msg::NoteFillDenied } else { Msg::NoteAnnotDenied }).to_string())),
@@ -549,7 +558,7 @@ impl App {
     /// Save to the file the document was opened from.
     pub(super) fn save(&mut self) -> Vec<Action> {
         match self.path.clone() {
-            Some(path) if self.doc.is_some() => self.start_save(path),
+            Some(path) if self.doc.is_some() => self.start_save(path, false),
             _ => Vec::new(),
         }
     }
@@ -563,28 +572,34 @@ impl App {
 
     pub(super) fn save_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
         match path {
-            Some(p) if self.doc.is_some() => self.start_save(std::path::absolute(&p).unwrap_or(p)),
+            Some(p) if self.doc.is_some() => self.start_save(std::path::absolute(&p).unwrap_or(p), true),
             _ => Vec::new(),
         }
     }
 
-    fn start_save(&mut self, path: PathBuf) -> Vec<Action> {
+    fn start_save(&mut self, path: PathBuf, whole: bool) -> Vec<Action> {
         if self.edit.saving.is_some() {
             return Vec::new();
         }
         let id = self.new_id();
-        self.engine.save(self.doc_id, id, &path.to_string_lossy());
-        self.edit.saving = Some((id, path));
+        if whole {
+            self.engine.save_as(self.doc_id, id, &path.to_string_lossy());
+        } else {
+            self.engine.save(self.doc_id, id, &path.to_string_lossy());
+        }
+        self.edit.saving = Some((id, path, whole));
         Vec::new()
     }
 
     pub(super) fn on_saved(&mut self, id: u64, status: SaveStatus, message: &str) -> Vec<Action> {
-        let Some((_, path)) = self.edit.saving.take().filter(|(i, _)| *i == id) else { return Vec::new() };
+        let Some((_, path, whole)) = self.edit.saving.take().filter(|(i, ..)| *i == id) else { return Vec::new() };
         let lang = self.lang;
         match status {
             SaveStatus::Done => {
                 self.edit.dirty = false;
                 self.menus_dirty = true;
+                // (A file written again as a whole has no history to go back through.)
+                (self.edit.can_undo, self.edit.can_redo) = (self.edit.can_undo && !whole, self.edit.can_redo && !whole);
                 let renamed = self.path.as_ref() != Some(&path);
                 self.path = Some(path);
                 if renamed {

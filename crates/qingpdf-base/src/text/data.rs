@@ -20,7 +20,7 @@ fn inflate(blob: &[u8], limit: usize) -> Vec<u8> {
 
 /// The Adobe character collections (9.7.3 `/Ordering`) we have tables for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum Ordering {
+pub enum Ordering {
     Gb1,
     Cns1,
     Japan1,
@@ -113,7 +113,7 @@ impl Ordering {
     }
 
     /// The legacy predefined CMap of this collection with that name (`-H` names only).
-    pub fn predefined(self, name: &str) -> Option<Arc<CMap>> {
+    pub(crate) fn predefined(self, name: &str) -> Option<Arc<CMap>> {
         let i = self.index();
         let set = CMAP_SETS.get(i)?.get_or_init(|| decode_cmaps(CMAP_BLOBS.get(i).copied().unwrap_or(&[]), self));
         set.iter().find(|c| c.name == name).cloned()

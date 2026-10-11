@@ -46,6 +46,7 @@ pub use annots::{AnnotInfo, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_PARTS};
 pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
 pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
+pub use crate::edit::{LineView, MAX_TEXT_CHARS};
 pub use crate::edit::{ALL_PAGES, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
@@ -284,6 +285,10 @@ pub enum Event {
     Annotations { doc: u64, id: u64, page: u32, items: Vec<AnnotInfo>, truncated: bool },
     /// The form fields of a page (the answer to [`Engine::fields`]), in the order of the page's list (the order Tab goes in).
     Fields { doc: u64, id: u64, page: u32, items: Vec<FieldInfo>, truncated: bool },
+    /// The line of text at a place (the answer to [`Engine::text_line`]): `line` is `None` when there is no text near it; `status`
+    /// is [`TextStatus::Denied`] when the file does not allow changing its content, [`TextStatus::Failed`] when it is signed or the
+    /// page could not be read (`message` says).
+    TextLine { doc: u64, id: u64, page: u32, status: TextStatus, message: String, line: Option<LineView> },
     /// The options of a combo box or list (the answer to [`Engine::options`]): (export value, shown text), at most
     /// [`MAX_OPTION_BYTES`] of text; `truncated`: some were left out. Empty when the field is not there any more or is no choice.
     Options { doc: u64, id: u64, page: u32, index: u32, num: u32, items: Vec<(String, String)>, truncated: bool },
@@ -305,6 +310,7 @@ pub(crate) enum Request {
     Annotations(u32),
     Fields(u32),
     Options { page: u32, index: u32, num: u32 },
+    TextLine { page: u32, at: [f32; 2] },
 }
 
 pub(crate) enum Command {
@@ -314,7 +320,7 @@ pub(crate) enum Command {
     Edit { doc: u64, id: u64, edit: crate::edit::Edit },
     Undo { doc: u64, id: u64 },
     Redo { doc: u64, id: u64 },
-    Save { doc: u64, id: u64, path: String },
+    Save { doc: u64, id: u64, path: String, whole: bool },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
@@ -474,6 +480,22 @@ impl Engine {
         self.request(doc, id, Request::Fields(page));
     }
 
+    /// Ask for the line of text at `at` (points of the page as shown), to edit it: answered by [`Event::TextLine`]. A line is what the
+    /// reader selects and searches as one: the characters drawn one after the other along one baseline.
+    pub fn text_line(&self, doc: u64, id: u64, page: u32, at: [f32; 2]) {
+        self.request(doc, id, Request::TextLine { page, at });
+    }
+
+    /// Change the line of text at `at` on the page, which reads `old` (what [`Engine::text_line`] said; if the page says something
+    /// else now the change is refused), into `text`: the old letters are taken out of the page's content and the new ones drawn where
+    /// they were, in the same size, colour and spacing (the font of the old text where it has the glyphs, else a system font that
+    /// looks like it). At most [`MAX_TEXT_CHARS`] characters, no line end. Needs [`Rights::modify`] and a file without signatures.
+    /// Answered by [`Event::Edited`]; its `message` says when the new text is wider than the old.
+    pub fn replace_line(&self, doc: u64, id: u64, page: u32, at: [f32; 2], old: &str, text: &str) {
+        let edit = crate::edit::Edit::ReplaceLine { page, at, old: old.to_string(), text: text.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
     /// Ask for the options of a combo box or list, when a person is about to choose from them: the field that [`Event::Fields`] told
     /// as `index` and `num` of the page. Answered by [`Event::Options`]. (The lists of fields do not carry options: a form whose
     /// fields share one long list would be sent that list for every field.)
@@ -546,7 +568,15 @@ impl Engine {
     /// Write the file, with all the edits, to `path` (the file it was opened from, or a new one): into a file of its own that
     /// replaces `path` only when it is whole. Answered by [`Event::Saved`]. A file that was not changed is written as it is.
     pub fn save(&self, doc: u64, id: u64, path: &str) {
-        let _ = self.commands.send(Command::Save { doc, id, path: path.to_string() });
+        let _ = self.commands.send(Command::Save { doc, id, path: path.to_string(), whole: false });
+    }
+
+    /// [`Engine::save`] for "save as": the file is written afresh as a whole (a file with only what is reachable from the page
+    /// tree, renumbered, with the same encryption), not as the original bytes and an update: what was taken out of a page (the old
+    /// text of a line that was changed) is not in it, in any object or stream. The document is then that new file (what was
+    /// changed cannot be undone any more). A signed file is saved as `save` does, so as not to break its signature.
+    pub fn save_as(&self, doc: u64, id: u64, path: &str) {
+        let _ = self.commands.send(Command::Save { doc, id, path: path.to_string(), whole: true });
     }
 
     /// Withdraw a request: dropped if it has not started, stopped at its next operator if it is being worked on. A

@@ -87,6 +87,7 @@ enum Job {
     Annotations { id: u64, page: u32 },
     Fields { id: u64, page: u32 },
     Options { id: u64, page: u32, index: u32, num: u32 },
+    TextLine { id: u64, page: u32, at: [f32; 2] },
     Search(SearchJob),
     Copy(CopyJob),
     Print(PrintJob),
@@ -95,7 +96,7 @@ enum Job {
 impl Job {
     fn id(&self) -> u64 {
         match self {
-            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } => *id,
+            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } | Job::TextLine { id, .. } => *id,
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
             Job::Print(p) => p.id,
@@ -104,7 +105,7 @@ impl Job {
 
     /// A quick request that someone is waiting for.
     fn immediate(&self) -> bool {
-        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::Fields { .. } | Job::Options { .. })
+        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::Fields { .. } | Job::Options { .. } | Job::TextLine { .. })
     }
 
     /// Has something to do now (a print job whose band is not used yet waits).
@@ -120,6 +121,7 @@ impl Job {
             Request::Annotations(page) => Job::Annotations { id, page },
             Request::Fields(page) => Job::Fields { id, page },
             Request::Options { page, index, num } => Job::Options { id, page, index, num },
+            Request::TextLine { page, at } => Job::TextLine { id, page, at },
             Request::Search { query, start } => Job::Search(SearchJob {
                 id,
                 needle: search::fold_query(&query),
@@ -288,8 +290,10 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
             Err(message) => {
                 let message = format!("the changed file could not be opened again: {message}");
                 // The edit that waited for the rewrite is given up as well.
-                if let Command::Edit { doc, id, edit } = &then {
-                    send(Event::Edited(session.result(*doc, *id, EditStatus::Failed, &message, edit.page())));
+                match &then {
+                    Command::Edit { doc, id, edit } => send(Event::Edited(session.result(*doc, *id, EditStatus::Failed, &message, edit.page()))),
+                    Command::Save { doc, id, .. } => send(Event::Saved { doc: *doc, id: *id, status: SaveStatus::Failed, message, bytes: 0 }),
+                    _ => {}
                 }
                 Exit::Again { open: Box::new(OpenDoc { doc_id, document, plan, rights }), carry }
             }
@@ -503,6 +507,7 @@ impl Server<'_> {
             Job::Annotations { id, page } => self.annotations(*id, *page),
             Job::Fields { id, page } => self.fields(*id, *page),
             Job::Options { id, page, index, num } => self.options(*id, *page, *index, *num),
+            Job::TextLine { id, page, at } => self.text_line(*id, *page, *at),
             Job::Search(s) => self.step_search(s),
             Job::Copy(c) => self.step_copy(c),
             Job::Print(p) => self.step_print(p),
@@ -591,6 +596,33 @@ impl Server<'_> {
             return Step::Cancelled;
         }
         self.tell(Event::Fields { doc: self.doc_id, id, page, items, truncated });
+        Step::Done
+    }
+
+    /// The line of text under a click, for editing it (5a): its text, where it is, and why it cannot be changed if it cannot.
+    fn text_line(&mut self, id: u64, page: u32, at: [f32; 2]) -> Step {
+        let doc = self.doc_id;
+        let says = |this: &Self, status: TextStatus, message: &str, line: Option<edit::LineView>| {
+            this.tell(Event::TextLine { doc, id, page, status, message: message.to_string(), line });
+        };
+        if !self.rights.modify {
+            says(self, TextStatus::Denied, DENIED_MODIFY, None);
+            return Step::Done;
+        }
+        if let Policy::Refuse(why) = self.session.policy(self.document, EditClass::Content) {
+            says(self, TextStatus::Failed, why, None);
+            return Step::Done;
+        }
+        let work = self.meter();
+        let Some(p) = self.pages.get(page as usize) else {
+            says(self, TextStatus::Failed, "there is no such page", None);
+            return Step::Done;
+        };
+        match edit::text_line(self.document, p, at, &work) {
+            Ok(line) => says(self, TextStatus::Ok, "", line),
+            Err(Error::Cancelled) => return Step::Cancelled,
+            Err(e) => says(self, TextStatus::Failed, &e.to_string(), None),
+        }
         Step::Done
     }
 
@@ -687,10 +719,10 @@ impl Server<'_> {
                 let work = Work::with_allowance(self.session.work_left().min(crate::render::work::PAGE_WORK));
                 // (What the edit may take is what is left of the memory set aside, after what is in front of the file already.)
                 let room = self.session.budget().saturating_sub(self.document.overlay_bytes());
-                let made = edit::apply_metered(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work, room);
+                let made = edit::apply_noted(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work, room);
                 self.session.add_work(work.used());
-                let objects = match made {
-                    Ok(objects) => objects,
+                let (objects, notes) = match made {
+                    Ok(done) => done,
                     Err(Error::Limit(m)) if m == edit::TOO_BIG => {
                         let advice = if self.document.has_overlay() { "save the file first, or do it in parts" } else { "do it in parts (fewer pages at a time)" };
                         said(self, doc, id, EditStatus::Failed, &format!("{m}: {advice}"), page);
@@ -709,8 +741,9 @@ impl Server<'_> {
                 let changes = edit::commit(self.document, objects);
                 let page = self.session.push(page, changes);
                 self.refresh_page(page);
-                let message = if policy == Policy::Warn && self.session.take_warning() { SIGNED_WARNING } else { "" };
-                said(self, doc, id, EditStatus::Done, message, page);
+                let signed = if policy == Policy::Warn && self.session.take_warning() { SIGNED_WARNING } else { "" };
+                let message = std::iter::once(signed.to_string()).chain(notes).filter(|m| !m.is_empty()).collect::<Vec<_>>().join(" ");
+                said(self, doc, id, EditStatus::Done, &message, page);
                 None
             }
             Command::Undo { doc, id } | Command::Redo { doc, id } => {
@@ -729,8 +762,26 @@ impl Server<'_> {
                 }
                 None
             }
-            Command::Save { doc, id, path } => {
+            Command::Save { doc, id, path, whole } => {
                 let failed = |this: &Self, message: &str| this.tell(Event::Saved { doc, id, status: SaveStatus::Failed, message: message.to_string(), bytes: 0 });
+                // Save as: the whole file again (a signed file is saved as it is, an update: written afresh it would not be signed).
+                if whole && self.session.policy(self.document, EditClass::Annotate) == Policy::Free {
+                    if printing {
+                        failed(self, BUSY);
+                        return None;
+                    }
+                    // (The document becomes the new file, which is then written as it is.)
+                    return match ops::copy_all(self.document) {
+                        Ok(out) => {
+                            self.swap = Some(Pending::Rewrite { bytes: out.data, then: Command::Save { doc, id, path, whole: false } });
+                            Some(Command::Swap)
+                        }
+                        Err(e) => {
+                            failed(self, &e.to_string());
+                            None
+                        }
+                    };
+                }
                 if !self.document.has_overlay() {
                     // Nothing was changed since the file was read or saved: it is written as it is.
                     let bytes = self.document.data();

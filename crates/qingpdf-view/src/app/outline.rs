@@ -214,6 +214,7 @@ impl App {
             EngineEvent::Annotations { doc, id, page, items, .. } if doc == self.doc_id => self.on_annotations(id, page, items),
             EngineEvent::Fields { doc, id, page, items, .. } if doc == self.doc_id => self.on_fields(id, page, items),
             EngineEvent::Options { doc, id, items, .. } if doc == self.doc_id => self.on_options(id, items),
+            EngineEvent::TextLine { doc, id, status, message, line, .. } if doc == self.doc_id => self.on_text_line(id, status, &message, line),
             EngineEvent::Edited(r) if r.doc == self.doc_id => self.on_edited(r),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
             EngineEvent::SearchHits { doc, id, page, hits } if doc == self.doc_id => self.on_search_hits(id, page, hits),

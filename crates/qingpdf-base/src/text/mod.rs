@@ -13,10 +13,11 @@
 //! ```
 
 mod chars;
-pub(crate) mod cmap;
+pub mod cmap;
 pub mod data;
+mod editscan;
 mod encodings;
-pub(crate) mod font;
+pub mod font;
 pub mod fontprog;
 pub(crate) mod interp;
 mod layout;
@@ -32,6 +33,9 @@ use crate::ops::has_owner_rights;
 use crate::render::work::{Work, cost};
 
 pub use chars::{MAX_PAGE_CHARS, PageChars};
+pub use editscan::{ActualSpan, CharRec, EditScanner, FontRec, Part, Scan, Show, ShowItem, ShowOp, Source, StreamSpan};
+pub use interp::Glyph;
+pub use layout::Mark;
 pub use chars::Shown;
 use interp::{Interp, Scope, Shared};
 
@@ -153,13 +157,22 @@ impl<'a> TextExtractor<'a> {
 
 /// The page's `/Contents` decoded and joined (7.8.2: several streams are one program, split at token borders).
 pub(crate) fn page_content(doc: &Document, page: &Page, warnings: &mut font::Warnings) -> Result<Vec<u8>> {
-    let mut streams: Vec<Stream> = Vec::new();
+    page_content_parts(doc, page, warnings).map(|(content, _)| content)
+}
+
+/// [`page_content`], and for each stream where it is in the result (start, end) and which object it is.
+pub(crate) fn page_content_parts(
+    doc: &Document,
+    page: &Page,
+    warnings: &mut font::Warnings,
+) -> Result<(Vec<u8>, Vec<editscan::StreamSpan>)> {
+    let mut streams: Vec<(Stream, Option<crate::object::ObjRef>)> = Vec::new();
     match page.dict.get("Contents").map(|o| doc.resolve(o)) {
-        Some(Ok(Object::Stream(s))) => streams.push(s),
+        Some(Ok(Object::Stream(s))) => streams.push((s, page.dict.get("Contents").and_then(Object::as_obj_ref))),
         Some(Ok(Object::Array(items))) => {
             for item in &items {
                 if let Ok(Object::Stream(s)) = doc.resolve(item) {
-                    streams.push(s);
+                    streams.push((s, item.as_obj_ref()));
                 }
             }
         }
@@ -168,12 +181,14 @@ pub(crate) fn page_content(doc: &Document, page: &Page, warnings: &mut font::War
         _ => {}
     }
     let mut out = Vec::new();
-    for s in &streams {
+    let mut parts = Vec::with_capacity(streams.len());
+    for (s, r) in &streams {
         match doc.decode_stream(s) {
             Ok(data) => {
                 if out.len().saturating_add(data.len()) > MAX_PAGE_CONTENT {
                     return Err(Error::Limit("a page's content streams decode to more than 256 MiB".to_string()));
                 }
+                parts.push((out.len(), out.len() + data.len(), *r));
                 out.extend_from_slice(&data);
                 out.push(b'\n');
             }
@@ -181,7 +196,7 @@ pub(crate) fn page_content(doc: &Document, page: &Page, warnings: &mut font::War
             Err(e) => warnings.add(format!("a content stream is skipped: {e}")),
         }
     }
-    Ok(out)
+    Ok((out, parts))
 }
 
 /// The part of the page that is shown: the crop box inside the media box (14.11.2), in default user

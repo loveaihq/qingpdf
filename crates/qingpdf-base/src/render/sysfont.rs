@@ -18,7 +18,7 @@ use super::glyf::TtFont;
 const MAX_BYTES: usize = 96 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Script {
+pub enum Script {
     Gb1,
     Cns1,
     Japan1,
@@ -26,7 +26,7 @@ pub(crate) enum Script {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Cjk {
+pub enum Cjk {
     Song,
     Hei,
     Kai,
@@ -34,7 +34,7 @@ pub(crate) enum Cjk {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) enum Kind {
+pub enum Kind {
     Sans,
     Serif,
     Mono,
@@ -51,7 +51,7 @@ pub(crate) enum Kind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub(crate) struct Request {
+pub struct Request {
     pub kind: Kind,
     pub bold: bool,
     pub italic: bool,
@@ -128,7 +128,7 @@ pub(crate) fn is_gbk_font_name(raw: &[u8]) -> bool {
 
 /// What a font that is not embedded asks for: its name (the raw bytes of `/BaseFont`, subset tag
 /// removed), the descriptor's flags (9.8.2), weight and italic angle, and the character collection.
-pub(crate) fn request_for(raw_name: &[u8], flags: i64, weight: f64, italic_angle: f64, ordering: Option<Ordering>) -> Request {
+pub fn request_for(raw_name: &[u8], flags: i64, weight: f64, italic_angle: f64, ordering: Option<Ordering>) -> Request {
     let squashed = squash(raw_name);
     let any = |keys: &[&str]| keys.iter().any(|k| squashed.contains(k));
     let bold = any(&["bold", "black", "heavy", "demi", "semibold"]) || flags & (1 << 18) != 0 || weight >= 700.0;
@@ -312,7 +312,7 @@ pub fn is_cff_file(file: &str) -> bool {
 }
 
 /// The system font for a request, `None` when the system has none that fits.
-pub(crate) fn load(req: Request) -> Option<Arc<TtFont>> {
+pub fn load(req: Request) -> Option<Arc<TtFont>> {
     let mut cache = CACHE.get_or_init(|| Mutex::new(Cache::default())).lock().ok()?;
     if let Some(hit) = cache.found.get(&req) {
         return hit.clone();

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use qingpdf_core::view::{FieldInfo, FieldKind, FillValue, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, Watermark};
+use qingpdf_core::view::{FieldInfo, FieldKind, FillValue, LineView, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_TEXT_CHARS, TextStatus, Watermark};
 
 use super::editing::{Asked, Tool};
 use super::*;
@@ -33,6 +33,8 @@ enum Editing {
     Field { page: u32, index: usize },
     /// A text box that will be where `rect` is (points of the page).
     TextBox { page: u32, rect: [f32; 4] },
+    /// A line of the page's own text (5a): where it was clicked, what it said and where it is.
+    Line { page: u32, at: [f32; 2], old: String, rect: [f32; 4] },
 }
 
 /// A combo box or list that is being chosen from. Its options are not in the list of fields: they are asked for when it is clicked
@@ -72,6 +74,8 @@ pub(super) struct FormState {
     /// A box being dragged out for a text box: the page and the two corners (points).
     dragging: Option<(u32, [f32; 2], [f32; 2])>,
     stamp: Option<StampDraft>,
+    /// The line of text that was clicked and is being asked for: the request, the page and the place.
+    line_ask: Option<(u64, u32, [f32; 2])>,
     /// What the pointer holds of the stamp frame, where it went down (points) and what the frame was then.
     grab: Option<(Grab, [f32; 2], [f32; 4])>,
     /// The file box that is open is for a picture, not for a document.
@@ -99,7 +103,7 @@ pub(super) const WM_ANGLE: [i32; 3] = [0, 45, 90];
 impl FormState {
     pub(super) fn new() -> FormState {
         let wm = Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false };
-        FormState { fields: HashMap::new(), asked: HashMap::new(), editing: None, choosing: None, dragging: None, stamp: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE, content: false, wm }
+        FormState { fields: HashMap::new(), asked: HashMap::new(), editing: None, choosing: None, dragging: None, stamp: None, line_ask: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE, content: false, wm }
     }
 
     pub(super) fn drop_page(&mut self, page: u32) {
@@ -120,6 +124,7 @@ impl FormState {
         self.stamp = None;
         self.dragging = None;
         self.grab = None;
+        self.line_ask = None;
         had
     }
 
@@ -266,6 +271,11 @@ impl App {
         Some(Rect { x: clamp32(x0), y: clamp32(y0), w: clamp32((x1 - x0).max(1)), h: clamp32((y1 - y0).max(1)) })
     }
 
+    /// The box a line of the page's text is typed in: over the line, but big enough to type in (a column of vertical text is narrow).
+    fn line_box(&self, r: Rect) -> Rect {
+        Rect { x: r.x, y: r.y, w: r.w.max(clamp32(self.px(180))), h: r.h.max(clamp32(self.px(24))) }
+    }
+
     fn open_editor(&mut self, page: u32, index: usize) -> Vec<Action> {
         let Some(f) = self.edit.forms.fields.get(&page).and_then(|l| l.get(index)).cloned() else { return Vec::new() };
         let Some(rect) = self.window_rect(page, f.rect) else { return Vec::new() };
@@ -278,6 +288,7 @@ impl App {
         let rect = match self.edit.forms.editing.as_ref() {
             Some(Editing::Field { page, index }) => self.edit.forms.fields.get(page).and_then(|l| l.get(*index)).and_then(|f| self.window_rect(*page, f.rect)),
             Some(Editing::TextBox { page, rect }) => self.window_rect(*page, *rect),
+            Some(Editing::Line { page, rect, .. }) => self.window_rect(*page, *rect).map(|r| self.line_box(r)),
             None => None,
         };
         rect.map(|r| vec![Action::FieldMove(r)]).unwrap_or_default()
@@ -297,6 +308,14 @@ impl App {
                     && let Some(next) = self.next_editable(page, index, exit == FieldExit::Next)
                 {
                     actions.extend(self.open_editor(page, next));
+                }
+            }
+            Editing::Line { page, at, old, .. } => {
+                if exit != FieldExit::Cancel && text != old {
+                    let id = self.new_id();
+                    let text: String = text.chars().take(MAX_TEXT_CHARS).collect();
+                    self.engine.replace_line(self.doc_id, id, page, at, &old, &text);
+                    self.edit.asked.insert(id, Asked::Line);
                 }
             }
             Editing::TextBox { page, rect } => {
@@ -342,6 +361,15 @@ impl App {
                 let (page, ..) = self.page_at_point(x, y)?;
                 let (xp, yp) = self.page_point(page as u32, x, y)?;
                 self.edit.forms.dragging = Some((page as u32, [xp, yp], [xp, yp]));
+                self.selection = None;
+                Some(Vec::new())
+            }
+            Tool::EditText => {
+                let (page, ..) = self.page_at_point(x, y)?;
+                let (xp, yp) = self.page_point(page as u32, x, y)?;
+                let id = self.new_id();
+                self.engine.text_line(self.doc_id, id, page as u32, [xp, yp]);
+                self.edit.forms.line_ask = Some((id, page as u32, [xp, yp]));
                 self.selection = None;
                 Some(Vec::new())
             }
@@ -419,6 +447,21 @@ impl App {
         let Some(window) = self.window_rect(page, rect) else { return Some(Vec::new()) };
         self.edit.forms.editing = Some(Editing::TextBox { page, rect });
         Some(vec![Action::FieldEdit(Some(FieldBox { rect: window, text: String::new(), multiline: true, max_len: MAX_FREETEXT_CHARS as u32 })), Action::Invalidate])
+    }
+
+    /// The line of text that was clicked has come: its box opens over it, with its text, or the person is told why not.
+    pub(super) fn on_text_line(&mut self, id: u64, status: TextStatus, message: &str, line: Option<LineView>) -> Vec<Action> {
+        let Some((_, page, at)) = self.edit.forms.line_ask.take_if(|a| a.0 == id) else { return Vec::new() };
+        match (status, line) {
+            (TextStatus::Ok, Some(line)) if line.why.is_empty() => {
+                let Some(window) = self.window_rect(page, line.rect).map(|r| self.line_box(r)) else { return Vec::new() };
+                self.edit.forms.editing = Some(Editing::Line { page, at, old: line.text.clone(), rect: line.rect });
+                vec![Action::FieldEdit(Some(FieldBox { rect: window, text: line.text, multiline: false, max_len: MAX_TEXT_CHARS as u32 }))]
+            }
+            (TextStatus::Ok, Some(line)) => self.say(format!("{} {}", t(self.lang, Msg::NoteLineNo), line.why)),
+            (TextStatus::Ok, None) => self.say(t(self.lang, Msg::NoteNoTextHere).to_string()),
+            _ => self.say(message.to_string()),
+        }
     }
 
     // --- picture stamps --------------------------------------------------------------------------------------------
@@ -897,6 +940,75 @@ mod tests {
         app.menus_dirty = true;
         assert!(menu_items(&app.menus()).iter().all(|i| ![CMD_INS_TEXT, CMD_INS_WM].contains(&i.0) || !i.2));
         assert!(app.event(Event::Command(CMD_INS_WM)).iter().all(|a| !matches!(a, Action::AskText { .. })));
+        assert!(app.note.as_deref().is_some_and(|n| n.contains("content")), "{:?}", app.note);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_edit_text_tool_opens_a_box_over_the_clicked_line_and_the_typed_text_takes_its_place() {
+        if !["arial.ttf", "LiberationSans-Regular.ttf", "DejaVuSans.ttf"].iter().any(|f| std::path::Path::new("C:/Windows/Fonts").join(f).is_file()) {
+            println!("SKIPPED: no Latin TrueType font on this machine");
+            return;
+        }
+        let content = "BT /F1 14 Tf 30 250 Td (Hello World) Tj ET";
+        let objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /Resources << /Font << /F1 6 0 R >> >> >>".to_string()),
+            (5, format!("<< /Length {} >>
+stream
+{content}
+endstream", content.len())),
+            (6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string()),
+        ];
+        let dir = std::env::temp_dir().join(format!("qingpdf-view-edittext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.pdf");
+        std::fs::write(&file, pdf(&objects)).unwrap();
+        let mut app = App::new(Lang::En, Arc::new(|| {}), Instant::now(), 1920 * 1080, "Tester".to_string());
+        app.event(Event::Size { w: 900, h: 700 });
+        app.open_path(&file, "");
+        pump(&mut app, "the file to open", |a| a.has_document());
+        let items = menu_items(&app.menus());
+        assert!(items.iter().any(|i| i.0 == CMD_TOOL_EDITTEXT && i.2), "the tool is in the Insert menu and enabled");
+        app.event(Event::Command(CMD_TOOL_EDITTEXT));
+        assert!(menu_items(&app.menus()).iter().any(|i| i.0 == CMD_TOOL_EDITTEXT && i.1), "and checked");
+        // A click where there is no text says so; a click on the line opens one box with its text.
+        let waits = |app: &mut App, until: &dyn Fn(&[Action]) -> bool| {
+            let mut got = Vec::new();
+            for _ in 0..1000 {
+                got.extend(app.event(Event::Wake));
+                if until(&got) {
+                    return got;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("nothing came: {got:?}");
+        };
+        let empty = app.window_rect(0, [200.0, 200.0, 200.0, 200.0]).unwrap();
+        click(&mut app, (empty.x, empty.y));
+        pump(&mut app, "the note", |a| a.note.as_deref().is_some_and(|n| n.contains("no text")));
+        let spot = app.window_rect(0, [50.0, 46.0, 50.0, 46.0]).unwrap();
+        click(&mut app, (spot.x, spot.y));
+        let opened = waits(&mut app, &|a| a.iter().any(|x| matches!(x, Action::FieldEdit(Some(_)))));
+        assert!(opened.iter().any(|a| matches!(a, Action::FieldEdit(Some(b)) if !b.multiline && b.text == "Hello World" && b.rect.w > 40)), "{opened:?}");
+        // Escape changes nothing; Enter makes the change, one step to undo, told once.
+        app.event(Event::FieldDone { text: "never".to_string(), exit: FieldExit::Cancel });
+        assert!(!app.edit.dirty);
+        click(&mut app, (spot.x, spot.y));
+        waits(&mut app, &|a| a.iter().any(|x| matches!(x, Action::FieldEdit(Some(_)))));
+        app.event(Event::FieldDone { text: "Hello there, 你好".to_string(), exit: FieldExit::Commit });
+        pump(&mut app, "the change", |a| a.edit.can_undo);
+        assert!(app.edit.dirty && app.note.as_deref().is_some_and(|n| n.contains("Text changed")), "{:?}", app.note);
+        app.event(Event::Command(CMD_SAVE));
+        pump(&mut app, "the save", |a| !a.edit.dirty && a.edit.saving.is_none());
+        let doc = qingpdf_core::Document::open(&file).unwrap();
+        let text = qingpdf_core::text::TextExtractor::new(&doc).page_text(&doc.pages().unwrap()[0]).unwrap();
+        assert!(text.starts_with("Hello there,") && !text.contains("World"), "{text:?}");
+        // A file that does not allow it: the tool is told why.
+        app.event(Event::Command(CMD_TOOL_SELECT));
+        app.rights.modify = false;
+        app.event(Event::Command(CMD_TOOL_EDITTEXT));
         assert!(app.note.as_deref().is_some_and(|n| n.contains("content")), "{:?}", app.note);
         std::fs::remove_dir_all(&dir).unwrap();
     }

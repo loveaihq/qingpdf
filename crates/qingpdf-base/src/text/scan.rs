@@ -33,6 +33,8 @@ pub struct Scanner<'a> {
     data: &'a [u8],
     pos: usize,
     buf: Vec<u8>,
+    /// Where the first token of the operator last read (its first operand, or the operator itself) starts.
+    first: usize,
 }
 
 /// 0: regular, 1: white space, 2: delimiter (7.2.2, Table 1).
@@ -80,7 +82,17 @@ enum Tok<'a> {
 
 impl<'a> Scanner<'a> {
     pub fn new(data: &'a [u8]) -> Scanner<'a> {
-        Scanner { data, pos: 0, buf: Vec::new() }
+        Scanner { data, pos: 0, buf: Vec::new(), first: 0 }
+    }
+
+    /// Where the data read so far ends (after the operator `next` last gave).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Where the operator `next` last gave begins, operands included (the bytes from here to [`Scanner::pos`] are the statement).
+    pub fn statement_start(&self) -> usize {
+        self.first
     }
 
     /// The bytes a span stands for.
@@ -129,6 +141,9 @@ impl<'a> Scanner<'a> {
             }
             self.pos = pos;
             let Some(&b) = data.get(pos) else { return Item::End };
+            if ops.is_empty() && b != b'%' {
+                self.first = pos;
+            }
             let operand = match b {
                 b'+' | b'-' | b'.' | b'0'..=b'9' => match self.number_or_keyword() {
                     Tok::Num(v) => Operand::Num(v),

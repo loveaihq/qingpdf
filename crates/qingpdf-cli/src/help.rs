@@ -21,6 +21,7 @@ Commands:
   watermark Put a text or picture watermark on pages
   stamp     Put a picture (a signature, a logo) on a page
   addtext   Put text on a page
+  replace   Find text in the pages and replace it with other text
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -35,7 +36,7 @@ copying ...) opens without a password. For one that needs a password, add
 one; a password that is given is tried first, then the empty one). Results keep
 the encryption of the input; only 'decrypt' removes it.
 
-watermark, stamp and addtext write into the pages' own content, so every other
+watermark, stamp, addtext and replace write into the pages' own content, so every other
 program and a printer show it too. The output is the input with the change
 appended (the input's bytes are kept as they are, and signatures stay valid for
 what they covered); they refuse a file that is signed, and an encrypted file whose
@@ -299,6 +300,35 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const REPLACE: &str = "Usage:
+  qingpdf replace <file.pdf> --find <text> --replace <text> [--pages <list>] -o <output.pdf> [--force] [--password <password>]
+
+Change text that is already on the pages. The text is found as `qingpdf text` gives it (one line at a
+time; case as written; a line is not joined to the next), the old letters are taken out of the page's
+drawing instructions (they are not covered over: copying the text, searching it and extracting it
+give the new text only), and the new text is drawn where they were, in the same size, colour and
+spacing. It uses the font of the old text when that font has every letter of the new text; the
+others come from a subset of a system font that looks like it (Song, Hei, Kai or Fang for Chinese),
+which is embedded in the file. Nothing is moved to make room: what follows a longer text in the same
+line moves with it, and a warning says by how much the new texts are wider.
+
+The output is the input with the change appended: the bytes of the input are kept as they are, so
+the old text stays in the earlier part of the file (the pages no longer have it; to get rid of it
+write the file again with 'qingpdf split out.pdf --pages 1- -o clean.pdf'). Text in a form that a
+page draws more than once, or cut by a letter that stands for several characters, is not changed;
+the number of such places is said. Exit status 1 when nothing was found or nothing could be
+changed. Files that are signed are refused, and so are encrypted files whose author did not allow
+changing them (give the owner password).
+
+Options:
+  --find <text>         The text to find (required; one line, at most 4000 characters)
+  --replace <text>      The text to put there (required; may be empty to take the found text out)
+  --pages <list>        Only these pages (default: all)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 /// The help text for the tool or for one command.
 pub fn text(command: Option<Command>) -> String {
     match command {
@@ -315,5 +345,6 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Watermark) => format!("{WATERMARK}{PAGE_LIST}"),
         Some(Command::Stamp) => STAMP.to_string(),
         Some(Command::Addtext) => ADDTEXT.to_string(),
+        Some(Command::Replace) => format!("{REPLACE}{PAGE_LIST}"),
     }
 }

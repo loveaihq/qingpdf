@@ -20,10 +20,11 @@ pub enum Command {
     Watermark,
     Stamp,
     Addtext,
+    Replace,
 }
 
 impl Command {
-    pub const ALL: [Command; 12] = [
+    pub const ALL: [Command; 13] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -36,6 +37,7 @@ impl Command {
         Command::Watermark,
         Command::Stamp,
         Command::Addtext,
+        Command::Replace,
     ];
 
     pub fn name(self) -> &'static str {
@@ -52,6 +54,7 @@ impl Command {
             Command::Watermark => "watermark",
             Command::Stamp => "stamp",
             Command::Addtext => "addtext",
+            Command::Replace => "replace",
         }
     }
 
@@ -90,6 +93,8 @@ pub enum Request {
     /// `page` from 1, `at` in points from the lower left of the page as shown.
     Stamp { input: PathBuf, image: PathBuf, page: usize, at: [f64; 2], width: f64, output: PathBuf, force: bool, password: String },
     Addtext { input: PathBuf, page: usize, at: [f64; 2], size: f64, text: String, output: PathBuf, force: bool, password: String },
+    /// Replace `find` by `with` in the text of the pages (all of them when `pages` is none).
+    Replace { input: PathBuf, find: String, with: String, pages: Option<String>, output: PathBuf, force: bool, password: String },
 }
 
 /// What `parse` found.
@@ -145,6 +150,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
         Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
         Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
+        Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
     }
 }
 
@@ -167,6 +173,8 @@ struct Collected {
     at: Option<String>,
     width: Option<String>,
     size: Option<String>,
+    find: Option<String>,
+    replace: Option<String>,
     tile: bool,
     under: bool,
 }
@@ -232,7 +240,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--page" if ok.page => {}
             "--dpi" if ok.dpi => {}
             "--password" if ok.password => {}
-            "--text" | "--image" | "--opacity" | "--at" | "--width" | "--size" if ok.mark && mark_option(command, &name) => {}
+            "--text" | "--image" | "--opacity" | "--at" | "--width" | "--size" | "--find" | "--replace" if ok.mark && mark_option(command, &name) => {}
             "--tile" | "--under" if ok.mark && mark_option(command, &name) => {
                 if inline.is_some() {
                     return Err(usage(c, format!("{name} does not take a value")));
@@ -305,12 +313,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                     return Err(slot_taken("--image"));
                 }
             }
-            "--text" | "--opacity" | "--at" | "--width" | "--size" => {
+            "--text" | "--opacity" | "--at" | "--width" | "--size" | "--find" | "--replace" => {
                 let slot = match name.as_str() {
                     "--text" => &mut got.text,
                     "--opacity" => &mut got.opacity,
                     "--at" => &mut got.at,
                     "--width" => &mut got.width,
+                    "--find" => &mut got.find,
+                    "--replace" => &mut got.replace,
                     _ => &mut got.size,
                 };
                 if slot.replace(text(value, &name, command)?).is_some() {
@@ -332,6 +342,7 @@ fn mark_option(command: Command, name: &str) -> bool {
     match command {
         Command::Watermark => matches!(name, "--text" | "--image" | "--opacity" | "--tile" | "--under"),
         Command::Stamp => matches!(name, "--image" | "--at" | "--width"),
+        Command::Replace => matches!(name, "--find" | "--replace"),
         _ => matches!(name, "--text" | "--at" | "--size"),
     }
 }
@@ -368,7 +379,7 @@ fn place(c: Option<Command>, value: Option<&str>) -> Result<[f64; 2], UsageError
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, tile, under } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -487,6 +498,13 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 return Err(usage(c, "addtext needs --size <points>, more than 0"));
             }
             Ok(Request::Addtext { input, page: page_number(c, page.as_deref())?, at: place(c, at.as_deref())?, size, text, output, force, password })
+        }
+        Command::Replace => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let find = find.filter(|f| !f.is_empty()).ok_or_else(|| usage(c, "replace needs --find <text>"))?;
+            let with = replace.ok_or_else(|| usage(c, "replace needs --replace <text> (it may be empty: the found text is taken out)"))?;
+            Ok(Request::Replace { input, find, with, pages, output, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {

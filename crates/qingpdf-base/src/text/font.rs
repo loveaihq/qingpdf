@@ -39,7 +39,7 @@ impl Warnings {
 }
 
 /// One character of a shown string.
-pub(crate) struct Shown {
+pub struct Shown {
     /// The character code (a byte for a simple font; the code of the CMap for a composite one).
     pub code: u32,
     /// The CID of a composite font's character (the code itself for a simple font).
@@ -57,12 +57,16 @@ pub(crate) struct Shown {
     pub vertical: Option<(f64, f64, f64)>,
     /// The code is the single byte 32: word spacing applies (9.3.3).
     pub is_space_code: bool,
+    /// How many bytes of the string the code takes.
+    pub len: u8,
 }
 
-pub(crate) struct Font {
+pub struct Font {
     /// For warnings: the base font name.
     pub name: String,
     pub vertical: bool,
+    /// A Type 3 font (its glyphs are drawn by content streams, so no other font can stand in for it).
+    pub type3: bool,
     body: Body,
 }
 
@@ -193,7 +197,7 @@ fn stream_data(doc: &Document, obj: Option<&Object>, what: &str, warnings: &mut 
 // --- loading -----------------------------------------------------------------------------------------
 
 impl Font {
-    pub fn load(doc: &Document, dict: &Dict, cmaps: &mut HashMap<String, Option<Arc<CMap>>>, warnings: &mut Warnings) -> Font {
+    pub(crate) fn load(doc: &Document, dict: &Dict, cmaps: &mut HashMap<String, Option<Arc<CMap>>>, warnings: &mut Warnings) -> Font {
         let subtype = dict.get_name("Subtype").map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned()).unwrap_or_default();
         let base = dict
             .get_name("BaseFont")
@@ -380,6 +384,7 @@ impl Font {
         Font {
             name,
             vertical: false,
+            type3: is_type3,
             body: Body::Simple(Simple { uni: packed, multi, widths, width_scale, glyph_uni, names: renamed, table, named_base, win_mac, has_widths: have_widths }),
         }
     }
@@ -453,6 +458,7 @@ impl Font {
         Font {
             name,
             vertical,
+            type3: false,
             body: Body::Composite(Composite {
                 cmap,
                 to_uni,
@@ -699,8 +705,61 @@ impl Composite {
 }
 
 impl Font {
+    /// A simple font without `/Widths` (a standard font may come without): its spacing is a guess (a space 278, the others 500), not
+    /// the one other readers, or the drawing of the page, have, and positions worked out from it are no better.
+    pub fn guessed_widths(&self) -> bool {
+        matches!(&self.body, Body::Simple(s) if !s.has_widths)
+    }
+
+    /// The ways this font can show the character `c`, best first: the bytes of the string and what showing them gives (one character,
+    /// checked: it reads back as `c`). Whether the font program has the glyph is another question. For a simple font the codes the
+    /// encoding gives `c`; for a composite one the codes `/ToUnicode` gives it, the code of a Unicode-coded CMap, or the CID of the
+    /// character collection (as two bytes, which is right for the Identity CMaps).
+    pub fn codes_for(&self, c: char) -> Vec<(Vec<u8>, Shown)> {
+        let mut found: Vec<Vec<u8>> = Vec::new();
+        match &self.body {
+            Body::Simple(s) => {
+                let want = u32::from(c);
+                found.extend((0..=255u8).filter(|&b| s.uni.get(usize::from(b)) == Some(&want)).map(|b| vec![b]));
+            }
+            Body::Composite(comp) => {
+                let mut codes: Vec<u32> = Vec::new();
+                if let Some(tu) = &comp.to_uni {
+                    tu.codes_for(c, &mut codes);
+                }
+                if comp.cmap.codes_are_unicode() {
+                    codes.push(u32::from(c));
+                }
+                if let Some(cid) = comp.ordering.and_then(|o| o.unicode_to_cid(u32::from(c))) {
+                    codes.push(cid);
+                }
+                for code in codes {
+                    for n in [2usize, 1, 3, 4] {
+                        if n < 4 && code >> (8 * n) != 0 {
+                            continue;
+                        }
+                        found.push(code.to_be_bytes().get(4 - n..).unwrap_or(&[]).to_vec());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(Vec<u8>, Shown)> = Vec::new();
+        for bytes in found {
+            let mut shown: Vec<Shown> = Vec::new();
+            self.show(&bytes, |s| shown.push(s));
+            if let [one] = shown.as_mut_slice()
+                && usize::from(one.len) == bytes.len()
+                && one.uni.first() == Some(c)
+                && !out.iter().any(|(b, _)| *b == bytes)
+            {
+                out.push((bytes, shown.remove(0)));
+            }
+        }
+        out
+    }
+
     /// What drawing needs of a simple font; `None` for a composite one.
-    pub fn simple_info(&self) -> Option<SimpleInfo<'_>> {
+    pub(crate) fn simple_info(&self) -> Option<SimpleInfo<'_>> {
         match &self.body {
             Body::Simple(s) => Some(SimpleInfo { names: &s.names, table: s.table, named_base: s.named_base, win_mac: s.win_mac, has_widths: s.has_widths }),
             Body::Composite(_) => None,
@@ -708,7 +767,7 @@ impl Font {
     }
 
     /// The Adobe character collection of a composite font, when it is one of the four with tables.
-    pub fn ordering(&self) -> Option<Ordering> {
+    pub(crate) fn ordering(&self) -> Option<Ordering> {
         match &self.body {
             Body::Composite(c) => c.ordering,
             Body::Simple(_) => None,
@@ -737,6 +796,7 @@ impl Font {
                         w0: f64::from(simple.widths.get(code).copied().unwrap_or(0.0)) * simple.width_scale,
                         vertical: None,
                         is_space_code: b == 32,
+                        len: 1,
                     });
                 }
             }
@@ -746,7 +806,7 @@ impl Font {
                     let (code, n) = comp.cmap.next_code(rest);
                     let n = n.max(1).min(rest.len());
                     let c = comp.char_at(code, n);
-                    f(Shown { code, cid: c.cid, glyph_uni: c.glyph_uni, uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32 });
+                    f(Shown { code, cid: c.cid, glyph_uni: c.glyph_uni, uni: c.uni.clone(), w0: c.w0, vertical: c.vertical, is_space_code: n == 1 && code == 32, len: u8::try_from(n).unwrap_or(1) });
                     rest = rest.get(n..).unwrap_or(&[]);
                 }
             }

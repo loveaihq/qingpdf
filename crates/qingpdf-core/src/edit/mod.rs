@@ -15,6 +15,7 @@ pub(crate) mod content;
 mod fill;
 pub(crate) mod fontsub;
 pub(crate) mod incremental;
+mod retext;
 pub(crate) mod signature;
 
 use std::collections::HashSet;
@@ -30,6 +31,7 @@ use crate::text::Shown;
 
 use crate::layout::reals;
 use appearance::{Appearance, Quad};
+pub use retext::{LineView, MAX_REPLACE_HITS, MAX_TEXT_CHARS, Replaced, replace_text, text_line};
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
 pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
@@ -100,6 +102,8 @@ pub enum Edit {
     AddImage { page: u32, rect: [f32; 4], image: Vec<u8> },
     /// A watermark on several pages (their own content, 4c).
     Watermark(Box<Watermark>),
+    /// Change the line of text at `at` (points of the page as shown; it reads `old`) into `text` (5a, the page's own content).
+    ReplaceLine { page: u32, at: [f32; 2], old: String, text: String },
 }
 
 /// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
@@ -124,7 +128,8 @@ impl Edit {
             | Edit::FreeText { page, .. }
             | Edit::Stamp { page, .. }
             | Edit::AddText { page, .. }
-            | Edit::AddImage { page, .. } => *page,
+            | Edit::AddImage { page, .. }
+            | Edit::ReplaceLine { page, .. } => *page,
             Edit::Watermark(_) => ALL_PAGES,
         }
     }
@@ -132,7 +137,7 @@ impl Edit {
     pub fn class(&self) -> EditClass {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
-            Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) => EditClass::Content,
+            Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::ReplaceLine { .. } => EditClass::Content,
             _ => EditClass::Annotate,
         }
     }
@@ -209,6 +214,8 @@ struct Ctx<'a> {
     /// and be refused afterwards).
     room: usize,
     used: usize,
+    /// Things the person should be told about what was done.
+    notes: Vec<String>,
 }
 
 impl Ctx<'_> {
@@ -292,15 +299,23 @@ const DEFAULT_ROOM: usize = 16 << 20;
 
 /// [`apply`] charging what it does to `work` (a page's allowance): an edit that would take more is refused.
 pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Vec<(u32, Object)>> {
+    apply_noted(doc, pages, edit, now, work, room).map(|(objects, _)| objects)
+}
+
+/// The objects an edit makes or changes, by number, and what the person is to be told about it.
+pub(crate) type Applied = (Vec<(u32, Object)>, Vec<String>);
+
+/// [`apply_metered`], and what the person is to be told about the change (a text that came out wider than the one it replaces).
+pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Applied> {
     if let Edit::Watermark(mark) = edit {
-        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0 };
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
         content::watermark(&mut ctx, pages, mark)?;
-        return Ok(ctx.objects);
+        return Ok((ctx.objects, ctx.notes));
     }
     let page_index = usize::try_from(edit.page()).unwrap_or(usize::MAX);
     let page = pages.get(page_index).ok_or_else(|| Error::Invalid("there is no such page".to_string()))?;
     let shown = Shown::of(page);
-    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0 };
+    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
     let change = match edit {
         Edit::Markup { kind, rects, color, author, .. } => AnnotsChange::Add(markup(&mut ctx, &shown, *kind, rects, *color, author, now)?),
         Edit::Ink { strokes, color, width, author, .. } => AnnotsChange::Add(ink(&mut ctx, &shown, strokes, *color, *width, author, now)?),
@@ -310,21 +325,25 @@ pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &s
         Edit::Stamp { rect, image, author, .. } => AnnotsChange::Add(boxes::stamp(&mut ctx, &shown, *rect, image, author, now)?),
         Edit::AddText { at, text, size, color, .. } => {
             content::add_text(&mut ctx, page, *at, text, *size, *color)?;
-            return Ok(ctx.objects);
+            return Ok((ctx.objects, ctx.notes));
         }
         Edit::AddImage { rect, image, .. } => {
             content::add_image(&mut ctx, page, *rect, image)?;
-            return Ok(ctx.objects);
+            return Ok((ctx.objects, ctx.notes));
         }
         Edit::Watermark(_) => return Err(Error::Invalid("a watermark is not made for one page".to_string())),
+        Edit::ReplaceLine { at, old, text, .. } => {
+            retext::replace_line(&mut ctx, page, *at, old, text)?;
+            return Ok((ctx.objects, ctx.notes));
+        }
         Edit::Fill { index, num, value, .. } => {
             let (widget_ref, widget) = widget_at(&ctx, pages, page, *index as usize, *num)?;
             fill::fill(&mut ctx, widget_ref, widget, value)?;
-            return Ok(ctx.objects);
+            return Ok((ctx.objects, ctx.notes));
         }
     };
     change_annots(&mut ctx, pages, page, change)?;
-    Ok(ctx.objects)
+    Ok((ctx.objects, ctx.notes))
 }
 
 /// The widget at place `index` of the page's `/Annots`, which must be object `num`.
@@ -724,6 +743,8 @@ pub(crate) fn save_section(doc: &Document) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod forms_tests;
+#[cfg(test)]
+mod retext_tests;
 
 #[cfg(test)]
 mod tests {

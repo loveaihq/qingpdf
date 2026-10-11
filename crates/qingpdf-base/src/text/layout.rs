@@ -152,7 +152,7 @@ fn repeats(glyphs: &[Glyph], line: &Line, order: &[usize]) -> Option<Vec<bool>> 
 /// Where the text of one glyph lies in the page's text: bytes `start..end` come from `glyph` (spaces the layout puts
 /// between glyphs and the line ends belong to no glyph).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Mark {
+pub struct Mark {
     pub start: usize,
     pub end: usize,
     pub glyph: usize,

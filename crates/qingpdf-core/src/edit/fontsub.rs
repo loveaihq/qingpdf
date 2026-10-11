@@ -145,6 +145,29 @@ pub(crate) fn choose(chars: &BTreeSet<char>, look: Look) -> Result<Arc<TtFont>> 
     }))
 }
 
+/// The system font that looks like a font of a page (`req`, from its name and flags) and has every character of `chars` (5a). A
+/// request for a face with Latin letters is turned into a Chinese one (Song for a serif face, Hei for the rest) when a character is
+/// Chinese, Japanese or Korean; when the font that fits the request lacks something, any font `choose` finds will do.
+pub(crate) fn choose_like(chars: &BTreeSet<char>, req: sysfont::Request) -> Result<Arc<TtFont>> {
+    use sysfont::{Cjk, Kind, Script};
+    let mut req = req;
+    if chars.iter().any(|&c| u32::from(c) >= 0x2E80) && !matches!(req.kind, Kind::Cjk(..)) {
+        let serif = matches!(req.kind, Kind::Serif | Kind::Georgia | Kind::Cambria);
+        req.kind = Kind::Cjk(Script::Gb1, if serif { Cjk::Song } else { Cjk::Hei });
+    }
+    let fits = |f: &TtFont| embedding_allowed(f.fs_type()).is_ok() && f.cmap.as_ref().is_some_and(|m| chars.iter().all(|&c| m.unicode(c as u32).is_some_and(|g| g != 0)));
+    if let Some(font) = sysfont::load(req)
+        && fits(&font)
+    {
+        return Ok(font);
+    }
+    choose(chars, match req.kind {
+        Kind::Mono | Kind::Consolas => Look::Mono,
+        Kind::Serif | Kind::Georgia | Kind::Cambria | Kind::Cjk(_, Cjk::Song) => Look::Serif,
+        _ => Look::Sans,
+    })
+}
+
 /// A font program made, and what the text that uses it needs to know.
 pub(crate) struct Embedded {
     pub program: Vec<u8>,
@@ -486,6 +509,11 @@ fn to_unicode(cid: &HashMap<char, u16>) -> String {
 
 /// Put the font's objects (program, descriptor, CID font, `ToUnicode`, Type 0 font) in the edit and give the Type 0 font.
 pub(super) fn add_objects(ctx: &mut Ctx<'_>, f: &Embedded) -> Result<ObjRef> {
+    add_objects_in(ctx, f, false)
+}
+
+/// [`add_objects`], with the font for vertical writing (`Identity-V`, the default vertical metrics, 9.7.4.3) when `vertical`.
+pub(super) fn add_objects_in(ctx: &mut Ctx<'_>, f: &Embedded, vertical: bool) -> Result<ObjRef> {
     let flate = |dict: &mut Dict, data: &[u8]| {
         dict.set("Filter", Object::from("FlateDecode"));
         compress_to_vec_zlib(data, 6)
@@ -523,6 +551,9 @@ pub(super) fn add_objects(ctx: &mut Ctx<'_>, f: &Embedded) -> Result<ObjRef> {
     cid_font.set("DW", Object::Integer(1000));
     cid_font.set("W", Object::Array(vec![Object::Integer(0), Object::Array(f.widths.iter().map(|&w| Object::Integer(i64::from(w))).collect())]));
     cid_font.set("CIDToGIDMap", Object::from("Identity"));
+    if vertical {
+        cid_font.set("DW2", Object::Array(vec![Object::Integer(880), Object::Integer(-1000)]));
+    }
     let cid_ref = ctx.alloc()?;
     ctx.objects.push((cid_ref.num, Object::Dict(cid_font)));
 
@@ -535,12 +566,90 @@ pub(super) fn add_objects(ctx: &mut Ctx<'_>, f: &Embedded) -> Result<ObjRef> {
     font.set("Type", Object::from("Font"));
     font.set("Subtype", Object::from("Type0"));
     font.set("BaseFont", Object::from(f.name.as_str()));
-    font.set("Encoding", Object::from("Identity-H"));
+    font.set("Encoding", Object::from(if vertical { "Identity-V" } else { "Identity-H" }));
     font.set("DescendantFonts", Object::Array(vec![Object::Ref(cid_ref)]));
     font.set("ToUnicode", Object::Ref(uni_ref));
     let font_ref = ctx.alloc()?;
     ctx.objects.push((font_ref.num, Object::Dict(font)));
     Ok(font_ref)
+}
+
+/// For each character of a font put in a page, the bytes that show it and its advance in ems.
+pub(super) type Codes = Vec<(char, Vec<u8>, f64)>;
+
+/// A Type 3 font (9.6.5) that has the characters `chars`, their outlines taken from `font`, made for a page whose own font is a Type 3
+/// one with the font matrix `m` (5a: text that stands next to glyphs of such a font is drawn the same way up, at the same size, with
+/// the same text matrix). Gives the font object and, for each character, the byte that shows it and its advance in ems.
+pub(super) fn add_type3(ctx: &mut Ctx<'_>, font: &TtFont, chars: &BTreeSet<char>, m: [f64; 6]) -> Result<(ObjRef, Codes)> {
+    embedding_allowed(font.fs_type()).map_err(|why| Error::Invalid(format!("the font is not embedded: {why}")))?;
+    if chars.len() > 255 {
+        return Err(Error::Limit("a Type 3 font takes at most 255 different characters".to_string()));
+    }
+    let cmap = font.cmap.as_ref().ok_or_else(|| Error::Invalid("the font has no character map".to_string()))?;
+    let det = m[0] * m[3] - m[1] * m[2];
+    if !det.is_finite() || det.abs() < 1.0e-12 || m[0].abs() < 1.0e-12 {
+        return Err(Error::Invalid("the Type 3 font has no usable font matrix".to_string()));
+    }
+    // Ems (the outlines, y up) onto glyph space: the inverse of the font matrix.
+    let (inv, e) = ([m[3] / det, -m[1] / det, -m[2] / det, m[0] / det], font.em_matrix());
+    let to_glyph = [e[0] * inv[0] + e[1] * inv[2], e[0] * inv[1] + e[1] * inv[3], e[2] * inv[0] + e[3] * inv[2], e[2] * inv[1] + e[3] * inv[3], 0.0, 0.0];
+    let (mut procs, mut widths, mut codes, mut names) = (Dict::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut cid: HashMap<char, u16> = HashMap::new();
+    let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for (i, &c) in chars.iter().enumerate() {
+        if !ctx.work.charge(GLYPH_COST) {
+            return Err(Error::Limit("the font took too much work".to_string()));
+        }
+        let gid = cmap.unicode(c as u32).filter(|&g| g != 0).ok_or_else(|| Error::Invalid(format!("the font has no glyph for U+{:04X}", c as u32)))?;
+        let adv = f64::from(font.advance(gid).ok_or_else(damaged)?);
+        let (proc_text, b) = crate::render::outline::charproc(font, gid, to_glyph, adv / m[0]).ok_or_else(damaged)?;
+        bbox = [bbox[0].min(f64::from(b[0])), bbox[1].min(f64::from(b[1])), bbox[2].max(f64::from(b[2])), bbox[3].max(f64::from(b[3]))];
+        let mut dict = Dict::new();
+        let data = if proc_text.len() > 256 {
+            dict.set("Filter", Object::from("FlateDecode"));
+            compress_to_vec_zlib(proc_text.as_bytes(), 6)
+        } else {
+            proc_text.into_bytes()
+        };
+        ctx.spend(data.len() + 96)?;
+        let r = ctx.alloc()?;
+        ctx.objects.push((r.num, Object::Stream(Stream { dict, data })));
+        let code = u8::try_from(i + 1).map_err(|_| damaged())?;
+        let name = format!("g{code}");
+        procs.set(name.as_str(), Object::Ref(r));
+        names.push(Object::from(name.as_str()));
+        widths.push(adv / m[0]);
+        codes.push((c, vec![code], adv));
+        cid.insert(c, u16::from(code));
+    }
+    if !bbox.iter().all(|v| v.is_finite()) {
+        bbox = [0.0; 4];
+    }
+    let mut uni_dict = Dict::new();
+    uni_dict.set("Filter", Object::from("FlateDecode"));
+    let uni_data = compress_to_vec_zlib(to_unicode(&cid).as_bytes(), 6);
+    ctx.spend(uni_data.len() + 96)?;
+    let uni_ref = ctx.alloc()?;
+    ctx.objects.push((uni_ref.num, Object::Stream(Stream { dict: uni_dict, data: uni_data })));
+    let mut encoding = Dict::new();
+    encoding.set("Type", Object::from("Encoding"));
+    encoding.set("Differences", Object::Array(std::iter::once(Object::Integer(1)).chain(names).collect()));
+    let mut f = Dict::new();
+    f.set("Type", Object::from("Font"));
+    f.set("Subtype", Object::from("Type3"));
+    f.set("FontBBox", crate::layout::reals(&bbox));
+    f.set("FontMatrix", crate::layout::reals(&m));
+    f.set("CharProcs", Object::Dict(procs));
+    f.set("Encoding", Object::Dict(encoding));
+    f.set("FirstChar", Object::Integer(1));
+    f.set("LastChar", Object::Integer(i64::try_from(chars.len()).unwrap_or(0)));
+    f.set("Widths", crate::layout::reals(&widths));
+    f.set("Resources", Object::Dict(Dict::new()));
+    f.set("ToUnicode", Object::Ref(uni_ref));
+    ctx.spend(f.approx_size() + 48)?;
+    let font_ref = ctx.alloc()?;
+    ctx.objects.push((font_ref.num, Object::Dict(f)));
+    Ok((font_ref, codes))
 }
 
 impl crate::layout::Face for Embedded {
