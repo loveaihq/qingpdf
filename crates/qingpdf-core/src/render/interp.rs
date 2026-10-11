@@ -400,6 +400,8 @@ pub(crate) struct Shared {
     /// The optional content configuration of the document, and whether the content of an XObject is shown.
     oc: Option<Rc<OcConfig>>,
     xobject_shown: FxMap<ObjRef, bool>,
+    /// The form of the document, read when the first field without an appearance needs it (4b).
+    acroform: Option<Option<Rc<crate::edit::forms::AcroForm>>>,
 }
 
 impl Shared {
@@ -612,6 +614,10 @@ pub(crate) struct Interp<'a> {
     uncolored: bool,
     chars: Vec<Shown>,
     /// Characters drawn as boxes so far, and by cause (no font, no character, not in the font).
+    /// Appearances made for the form fields of this page that have none (4b).
+    synthesized: usize,
+    /// What was left out of the page for a limit of its own (not the work meter's), told to whoever draws: the page is incomplete.
+    pub incomplete: Option<String>,
     pub boxed: usize,
     pub boxed_by: [usize; 3],
     /// Characters whose glyph the font does not have, drawn as nothing.
@@ -724,6 +730,8 @@ impl<'a> Interp<'a> {
             stack_floor: 0,
             uncolored: false,
             chars: Vec::new(),
+            synthesized: 0,
+            incomplete: None,
             boxed: 0,
             boxed_by: [0; 3],
             absent: 0,

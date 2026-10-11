@@ -320,12 +320,17 @@ impl RowSink {
 /// read row by row and compressed as it is read; more than 2^28 pixels, or an
 /// interlaced image needing more than 128 MiB, is a [`Error::Limit`].
 pub fn decode_png(data: &[u8]) -> Result<PngImage> {
+    decode_png_limited(data, MAX_PNG_PIXELS)
+}
+
+/// [`decode_png`] refusing an image of more than `max_pixels` pixels (before any of it is decoded).
+pub fn decode_png_limited(data: &[u8], max_pixels: u64) -> Result<PngImage> {
     let mut decoder = png::Decoder::new(Cursor::new(data));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     decoder.set_limits(png::Limits { bytes: PNG_WORKING_BYTES });
     let mut reader = decoder.read_info().map_err(bad_png)?;
     let (width, height) = reader.info().size();
-    if u64::from(width) * u64::from(height) > MAX_PNG_PIXELS {
+    if u64::from(width) * u64::from(height) > max_pixels.min(MAX_PNG_PIXELS) {
         return Err(png_too_large());
     }
     let (color_type, bit_depth) = reader.output_color_type();
@@ -451,6 +456,11 @@ pub fn place(width: u32, height: u32, orientation: u8, dpi: Option<(f64, f64)>, 
 /// (7.4.8, 8.9.5). Inverted CMYK (Adobe marker) gets a `/Decode` array that
 /// undoes the inversion (8.9.5.2).
 pub fn add_jpeg(b: &mut Builder<'_>, data: &[u8], info: &JpegInfo) -> Result<ObjRef> {
+    b.add(&Object::Stream(crate::object::Stream { dict: jpeg_dict(info), data: data.to_vec() }))
+}
+
+/// The dictionary of the image XObject a JPEG file is embedded as.
+pub(crate) fn jpeg_dict(info: &JpegInfo) -> Dict {
     let mut dict = Dict::new();
     dict.set("Type", Object::from("XObject"));
     dict.set("Subtype", Object::from("Image"));
@@ -468,12 +478,22 @@ pub fn add_jpeg(b: &mut Builder<'_>, data: &[u8], info: &JpegInfo) -> Result<Obj
         let inverted = [1, 0, 1, 0, 1, 0, 1, 0].into_iter().map(Object::Integer).collect();
         dict.set("Decode", Object::Array(inverted));
     }
-    b.add(&Object::Stream(crate::object::Stream { dict, data: data.to_vec() }))
+    dict
 }
 
 /// Add a decoded PNG as an image XObject, with its alpha channel as a soft
 /// mask image (`/SMask`). Both are already Flate-compressed.
 pub fn add_png(b: &mut Builder<'_>, png: PngImage) -> Result<ObjRef> {
+    let (mut dict, mask) = png_dicts(&png);
+    if let Some(alpha) = png.alpha_flate {
+        let mask = b.add_precompressed_flate_stream(mask, alpha)?;
+        dict.set("SMask", Object::Ref(mask));
+    }
+    b.add_precompressed_flate_stream(dict, png.pixels_flate)
+}
+
+/// The dictionaries of the image XObject a PNG is stored as and of its soft mask (the alpha channel, when there is one).
+pub(crate) fn png_dicts(png: &PngImage) -> (Dict, Dict) {
     let size = |space: &str| {
         let mut dict = Dict::new();
         dict.set("Type", Object::from("XObject"));
@@ -484,12 +504,25 @@ pub fn add_png(b: &mut Builder<'_>, png: PngImage) -> Result<ObjRef> {
         dict.set("BitsPerComponent", Object::Integer(8));
         dict
     };
-    let mut dict = size(if png.gray { "DeviceGray" } else { "DeviceRGB" });
-    if let Some(alpha) = png.alpha_flate {
-        let mask = b.add_precompressed_flate_stream(size("DeviceGray"), alpha)?;
-        dict.set("SMask", Object::Ref(mask));
+    (size(if png.gray { "DeviceGray" } else { "DeviceRGB" }), size("DeviceGray"))
+}
+
+/// The size of an image file as it is shown (width, height in pixels; a JPEG that its orientation turns on its side has the
+/// two the other way round), from the header only.
+pub fn probe(data: &[u8]) -> Result<(u32, u32, Format)> {
+    match sniff(data) {
+        Some(Format::Jpeg) => {
+            let info = parse_jpeg(data)?;
+            let (w, h) = if info.orientation >= 5 { (info.height, info.width) } else { (info.width, info.height) };
+            Ok((w, h, Format::Jpeg))
+        }
+        Some(Format::Png) => {
+            let reader = png::Decoder::new(Cursor::new(data)).read_info().map_err(bad_png)?;
+            let (w, h) = reader.info().size();
+            Ok((w, h, Format::Png))
+        }
+        None => Err(Error::Invalid("this is neither a JPEG nor a PNG file".to_string())),
     }
-    b.add_precompressed_flate_stream(dict, png.pixels_flate)
 }
 
 #[cfg(test)]

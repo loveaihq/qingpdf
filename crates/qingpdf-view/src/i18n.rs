@@ -118,6 +118,22 @@ pub enum Msg {
     NoteNoteHint,
     NoteEditFailed,
     NoteBusy,
+    ToolTextBox,
+    ToolStamp,
+    TextSizeMenu,
+    SizeSmall,
+    SizeMedium,
+    SizeLarge,
+    SizeHuge,
+    NoteTextBoxHint,
+    NoteStampHint,
+    NoteStampBad,
+    FilterImages,
+    StampTitle,
+    NoteFilled,
+    NoteFillDenied,
+    NoteReadOnlyField,
+    NoteSignatureField,
     NoteAdded,
     NoteRemoved,
     NoteNothingUndo,
@@ -128,7 +144,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 109] = [
+pub const ALL: [Msg; 125] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -232,6 +248,22 @@ pub const ALL: [Msg; 109] = [
     Msg::NoteNoteHint,
     Msg::NoteEditFailed,
     Msg::NoteBusy,
+    Msg::ToolTextBox,
+    Msg::ToolStamp,
+    Msg::TextSizeMenu,
+    Msg::SizeSmall,
+    Msg::SizeMedium,
+    Msg::SizeLarge,
+    Msg::SizeHuge,
+    Msg::NoteTextBoxHint,
+    Msg::NoteStampHint,
+    Msg::NoteStampBad,
+    Msg::FilterImages,
+    Msg::StampTitle,
+    Msg::NoteFilled,
+    Msg::NoteFillDenied,
+    Msg::NoteReadOnlyField,
+    Msg::NoteSignatureField,
     Msg::NoteAdded,
     Msg::NoteRemoved,
     Msg::NoteNothingUndo,
@@ -345,6 +377,22 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteNoteHint => ("Click where the note goes (Esc ends).", "点一下放便签的位置（按 Esc 结束）。"),
         Msg::NoteEditFailed => ("The change was not made:", "没能改成："),
         Msg::NoteBusy => ("Wait for the printing to finish first.", "请先等打印结束。"),
+        Msg::ToolTextBox => ("&Text box", "文字框(&T)"),
+        Msg::ToolStamp => ("Signature &image...", "签名图片(&I)..."),
+        Msg::TextSizeMenu => ("Text si&ze", "字号(&Z)"),
+        Msg::SizeSmall => ("Small (10 pt)", "小（10 磅）"),
+        Msg::SizeMedium => ("Medium (12 pt)", "中（12 磅）"),
+        Msg::SizeLarge => ("Large (16 pt)", "大（16 磅）"),
+        Msg::SizeHuge => ("Huge (24 pt)", "特大（24 磅）"),
+        Msg::NoteTextBoxHint => ("Drag a box for the text (or click), type, then click outside or press Ctrl+Enter. Esc ends.", "拖出放文字的框（或点一下），输入文字，点框外或按 Ctrl+Enter 完成，Esc 结束。"),
+        Msg::NoteStampHint => ("Drag the picture to move it, drag a corner to resize it, Enter places it, Esc cancels.", "拖动图片来移动，拖角来缩放，按 Enter 放好，按 Esc 取消。"),
+        Msg::NoteStampBad => ("That file is not a usable PNG or JPEG picture:", "这不是能用的 PNG 或 JPEG 图片："),
+        Msg::FilterImages => ("Pictures (PNG, JPEG)", "图片（PNG、JPEG）"),
+        Msg::StampTitle => ("Choose a picture", "选一张图片"),
+        Msg::NoteFilled => ("Field filled in (Ctrl+Z undoes it).", "已填写（Ctrl+Z 撤销）。"),
+        Msg::NoteFillDenied => ("The file's author does not allow filling in forms (the owner password is needed).", "文件作者不允许填写表单（需要所有者密码）。"),
+        Msg::NoteReadOnlyField => ("This field is read-only.", "这个字段是只读的。"),
+        Msg::NoteSignatureField => ("Signature fields cannot be signed here.", "这里不能签署签名字段。"),
         Msg::NoteAdded => ("Annotation added (Ctrl+Z undoes it).", "已加批注（Ctrl+Z 撤销）。"),
         Msg::NoteRemoved => ("Annotation removed (Ctrl+Z undoes it).", "已删除批注（Ctrl+Z 撤销）。"),
         Msg::NoteSigned => ("This file is signed: after the changes are saved, the signature will show the file as changed.", "这个文件有签名：保存改动后，签名会显示文件被修改过。"),
@@ -421,7 +469,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 109);
+        assert_eq!(ALL.len(), 125);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

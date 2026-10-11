@@ -1,8 +1,6 @@
 //! qingpdf-view: the reader. A window around the engine of `qingpdf-core`: open a file, scroll, zoom, turn pages.
 //!
-//! Layout of the program: `app.rs` is the reader (state, scheduling, drawing) and knows nothing of Windows;
-//! `win32.rs` is the one module that calls Windows (and the only one with `unsafe`); `ui.rs` is the plain-types
-//! contract between them. `layout`, `zoom`, `tiles`, `cache` and `sched` are plain logic with tests.
+//! The program is only the command line (and the manifest, `build.rs`): the reader is the library `qingpdf-view`.
 //!
 //! Run `qingpdf-view [file.pdf]`. The hidden `--bench <file.pdf>` opens the file, goes through its pages by itself,
 //! prints times and the memory peak and quits; `--bench-size WxH` gives the window of that test a client area of that
@@ -12,30 +10,14 @@
 
 #![windows_subsystem = "windows"]
 
-mod app;
-mod bench;
-mod cache;
-mod find;
-mod i18n;
-mod layout;
-mod printing;
-mod recent;
-mod sched;
-mod settings;
-mod select;
-mod tiles;
-mod ui;
-#[allow(unsafe_code)]
-mod win32;
-mod zoom;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::{App, PrintTest};
-use bench::Bench;
-use i18n::{Lang, Msg, t};
+use qingpdf_view::app::{App, PrintTest};
+use qingpdf_view::bench::Bench;
+use qingpdf_view::i18n::{Lang, Msg, t};
+use qingpdf_view::{settings, win32};
 
 /// "1920x1080" as a size in pixels.
 fn parse_size(s: &str) -> Option<(i32, i32)> {

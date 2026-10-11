@@ -100,6 +100,13 @@ impl Ordering {
                     map.entry(cp).or_insert(u32::try_from(cid).unwrap_or(0));
                 }
             }
+            // The table gives some characters as the Kangxi radical they are also written as (the CID of 子 and 香 is of the
+            // radical's code point): the ideograph itself finds that CID too.
+            for (cid, &cp) in self.cid_table().iter().enumerate() {
+                if cp != 0 {
+                    map.entry(normalize_cjk(cp)).or_insert(u32::try_from(cid).unwrap_or(0));
+                }
+            }
             map
         });
         map.get(&cp).copied()

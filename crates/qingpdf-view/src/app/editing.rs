@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use qingpdf_core::view::{AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, line_rects};
 
+use super::forms::FormState;
 use super::*;
 use crate::ui::SaveChoice;
 
@@ -37,6 +38,10 @@ pub(super) enum Tool {
     Markup(MarkupKind),
     Ink,
     Note,
+    /// Drag out a box and type the text that goes in it (4b).
+    TextBox,
+    /// The frame of a picture is being placed (4b); the tool is set by choosing the picture.
+    Stamp,
 }
 
 /// What is to be done once the changes are saved (or given up).
@@ -54,8 +59,9 @@ pub(super) struct InkDraft {
 
 /// What the engine was asked and has not yet answered.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Asked {
+pub(super) enum Asked {
     Add,
+    Fill,
     Remove,
     Undo,
     Redo,
@@ -67,24 +73,26 @@ pub(super) struct EditState {
     pub color: Option<usize>,
     pub width: usize,
     pub author: String,
-    ink: Option<InkDraft>,
+    pub(super) ink: Option<InkDraft>,
     /// The annotations of the pages near the window, and the engine's requests for them (request, page).
-    annots: HashMap<u32, Vec<AnnotInfo>>,
+    pub(super) annots: HashMap<u32, Vec<AnnotInfo>>,
     annots_asked: HashMap<u64, u32>,
     /// The annotation picked: its page and its place in that page's list.
-    picked: Option<(u32, usize)>,
-    asked: HashMap<u64, Asked>,
+    pub(super) picked: Option<(u32, usize)>,
+    pub(super) asked: HashMap<u64, Asked>,
     pub can_undo: bool,
     pub can_redo: bool,
     pub dirty: bool,
     /// The structure of the file was damaged: it is written afresh, as a whole.
     rewrote: bool,
     /// The save that is going on (its request) and where it writes; what to do when it is done.
-    saving: Option<(u64, PathBuf)>,
+    pub(super) saving: Option<(u64, PathBuf)>,
     after: Option<After>,
     /// The place where the pointer went down for a note, and where the note is to go while its text is asked for.
     note_press: Option<(u32, f32, f32, i64, i64)>,
     note_at: Option<(u32, f32, f32)>,
+    /// Form fields, text boxes and pictures (4b).
+    pub forms: FormState,
 }
 
 impl EditState {
@@ -107,6 +115,7 @@ impl EditState {
             after: None,
             note_press: None,
             note_at: None,
+            forms: FormState::new(),
         }
     }
 
@@ -122,10 +131,12 @@ impl EditState {
     pub(super) fn give_up_stroke(&mut self) {
         self.ink = None;
         self.note_press = None;
+        self.forms.give_up_drag();
     }
 
     pub(super) fn drop_page(&mut self, page: u32) {
         self.annots.remove(&page);
+        self.forms.drop_page(page);
         if self.picked.is_some_and(|(p, _)| p == page) {
             self.picked = None;
         }
@@ -140,13 +151,14 @@ impl EditState {
     pub(super) fn current_color(&self) -> usize {
         self.color.unwrap_or(match self.tool {
             Tool::Markup(MarkupKind::Highlight) | Tool::Note | Tool::Select => 0,
+            Tool::TextBox | Tool::Stamp => 5,
             _ => 4,
         })
     }
 }
 
 impl App {
-    fn rgb(&self) -> [u8; 3] {
+    pub(super) fn rgb(&self) -> [u8; 3] {
         COLORS.get(self.edit.current_color()).map_or([255, 235, 0], |c| c.1)
     }
 
@@ -161,6 +173,7 @@ impl App {
         }
         self.edit.ink = None;
         self.edit.picked = None;
+        self.edit.forms.give_up();
         self.menus_dirty = true;
         // Text that is already selected is marked at once, and the pointer goes back to what it was.
         if let Tool::Markup(kind) = tool
@@ -171,10 +184,11 @@ impl App {
         }
         self.edit.tool = tool;
         let hint = match tool {
-            Tool::Select => None,
+            Tool::Select | Tool::Stamp => None,
             Tool::Markup(_) => Some(Msg::NoteMarkHint),
             Tool::Ink => Some(Msg::NoteInkHint),
             Tool::Note => Some(Msg::NoteNoteHint),
+            Tool::TextBox => Some(Msg::NoteTextBoxHint),
         };
         match hint {
             Some(m) => self.say(t(self.lang, m).to_string()),
@@ -219,12 +233,13 @@ impl App {
 
     /// Esc: back to selecting, and no stroke or annotation picked.
     pub(super) fn escape_tool(&mut self) -> Option<Vec<Action>> {
-        if self.edit.tool == Tool::Select && self.edit.ink.is_none() && self.edit.picked.is_none() {
+        if self.edit.tool == Tool::Select && self.edit.ink.is_none() && self.edit.picked.is_none() && !self.edit.forms.has_stamp() {
             return None;
         }
         self.edit.tool = Tool::Select;
         self.edit.ink = None;
         self.edit.picked = None;
+        self.edit.forms.give_up();
         self.menus_dirty = true;
         Some(vec![Action::Invalidate])
     }
@@ -234,6 +249,9 @@ impl App {
     /// The pointer went down with a tool that takes it: a stroke is started, or the place of a note noted. `None`: the tool leaves
     /// it to selecting.
     pub(super) fn edit_mouse_down(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+        if let Some(actions) = self.forms_mouse_down(x, y) {
+            return Some(actions);
+        }
         match self.edit.tool {
             Tool::Ink => {
                 let (page, ..) = self.page_at_point(x, y)?;
@@ -255,6 +273,9 @@ impl App {
 
     /// The pointer moved with the button down: `true` if a stroke took it.
     pub(super) fn edit_mouse_move(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+        if let Some(actions) = self.forms_mouse_move(x, y) {
+            return Some(actions);
+        }
         let page = self.edit.ink.as_ref()?.page;
         let (xp, yp) = self.page_point(page, x, y)?;
         let draft = self.edit.ink.as_mut()?;
@@ -268,6 +289,9 @@ impl App {
 
     /// The button came up: a stroke is handed to the engine, or the text of a note asked for. `true` if a tool took it.
     pub(super) fn edit_mouse_up(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+        if let Some(actions) = self.forms_mouse_up(x, y) {
+            return Some(actions);
+        }
         if let Some(draft) = self.edit.ink.take() {
             if !self.rights.annotate {
                 return Some(self.say(t(self.lang, Msg::NoteAnnotDenied).to_string()));
@@ -313,7 +337,7 @@ impl App {
     }
 
     /// The point of `page` (points as the engine tells them) under a place of the window, held to the page.
-    fn page_point(&self, page: u32, x: i64, y: i64) -> Option<(f32, f32)> {
+    pub(super) fn page_point(&self, page: u32, x: i64, y: i64) -> Option<(f32, f32)> {
         let l = &self.doc.as_ref()?.layout;
         let map = l.page_map(page as usize)?;
         let (px, py) = ((x - self.view_x - l.left(page as usize, self.view_w, self.scroll_x)) as f64, (y + self.scroll_y - l.top(page as usize)) as f64);
@@ -374,6 +398,7 @@ impl App {
             self.edit.annots_asked.insert(id, page);
         }
         self.edit.annots.retain(|&p, _| p.abs_diff(first) <= 12 && p.abs_diff(last) <= 12);
+        self.ask_for_fields();
     }
 
     pub(super) fn on_annotations(&mut self, id: u64, page: u32, items: Vec<AnnotInfo>) -> Vec<Action> {
@@ -417,9 +442,9 @@ impl App {
     /// Is there an annotation under this place (so that the pointer can say so)?
     pub(super) fn annotation_cursor(&self) -> Option<Cursor> {
         match self.edit.tool {
-            Tool::Ink | Tool::Note => Some(Cursor::Cross),
+            Tool::Ink | Tool::Note | Tool::TextBox => Some(Cursor::Cross),
             Tool::Markup(_) => Some(Cursor::Text),
-            Tool::Select => None,
+            Tool::Select | Tool::Stamp => None,
         }
     }
 
@@ -493,6 +518,7 @@ impl App {
                 } else {
                     match what {
                         Asked::Add => Some(Msg::NoteAdded),
+                        Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
                         Asked::Undo | Asked::Redo => None,
                     }
@@ -501,7 +527,7 @@ impl App {
                     actions.extend(self.say(t(lang, m).to_string()));
                 }
             }
-            EditStatus::Denied => actions.extend(self.say(t(lang, Msg::NoteAnnotDenied).to_string())),
+            EditStatus::Denied => actions.extend(self.say(t(lang, if what == Asked::Fill { Msg::NoteFillDenied } else { Msg::NoteAnnotDenied }).to_string())),
             EditStatus::Failed => actions.extend(self.say(format!("{} {}", t(lang, Msg::NoteEditFailed), r.message))),
             EditStatus::Nothing => {
                 let m = if what == Asked::Redo { Msg::NoteNothingRedo } else { Msg::NoteNothingUndo };
@@ -618,6 +644,7 @@ impl App {
 
     /// The stroke being drawn and the frame of the annotation picked, on a page whose top left corner is at (`left`, `top`).
     pub(super) fn draw_edit_marks(&self, p: &mut dyn Painter, page: usize, left: i64, top: i64) {
+        self.draw_form_marks(p, page, left, top);
         let Some(doc) = self.doc.as_ref() else { return };
         let Some(map) = doc.layout.page_map(page) else { return };
         if let Some(draft) = self.edit.ink.as_ref().filter(|d| d.page as usize == page) {

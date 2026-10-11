@@ -165,6 +165,9 @@ impl App {
         {
             return shape;
         }
+        if let Some(shape) = self.field_cursor(x, y) {
+            return shape;
+        }
         if let Some((page, px, py)) = self.page_at_point(x, y)
             && let Some(map) = self.doc.as_ref().and_then(|d| d.layout.page_map(page))
         {
@@ -209,6 +212,8 @@ impl App {
             }
             EngineEvent::CharBoxes(b) if b.doc == self.doc_id => self.on_boxes(b),
             EngineEvent::Annotations { doc, id, page, items, .. } if doc == self.doc_id => self.on_annotations(id, page, items),
+            EngineEvent::Fields { doc, id, page, items, .. } if doc == self.doc_id => self.on_fields(id, page, items),
+            EngineEvent::Options { doc, id, items, .. } if doc == self.doc_id => self.on_options(id, items),
             EngineEvent::Edited(r) if r.doc == self.doc_id => self.on_edited(r),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
             EngineEvent::SearchHits { doc, id, page, hits } if doc == self.doc_id => self.on_search_hits(id, page, hits),

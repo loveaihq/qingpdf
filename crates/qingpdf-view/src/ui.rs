@@ -143,6 +143,34 @@ pub enum Event {
     PrintError(String),
     /// The answer to [`Action::SetClipboard`]: the text is on the clipboard (`true`), or it could not be put there.
     ClipboardSet(bool),
+    /// The box of [`Action::FieldEdit`] is closed: what is in it, and how it was left.
+    FieldDone { text: String, exit: FieldExit },
+    /// The answer to [`Action::Choose`]: the number of the item chosen, or none if the list was dismissed.
+    Chosen(Option<usize>),
+}
+
+/// How the person left the box a form field or a text box is typed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldExit {
+    /// Enter (single line) or Ctrl+Enter.
+    Commit,
+    /// Tab and Shift+Tab: what is typed is kept and the next (or the previous) field is next.
+    Next,
+    Prev,
+    /// Esc: what is typed is thrown away.
+    Cancel,
+    /// The keyboard went elsewhere (a click outside): what is typed is kept.
+    Blur,
+}
+
+/// The box a form field or a text box is typed in, over the page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldBox {
+    pub rect: Rect,
+    pub text: String,
+    pub multiline: bool,
+    /// Most characters (0: no limit beyond the engine's).
+    pub max_len: u32,
 }
 
 /// What a person answered to "save the changes?".
@@ -253,6 +281,13 @@ pub enum Action {
     /// [`Event::Printer`]. `max_page` is the number of pages of the document.
     ChoosePrinter { max_page: u32, preset: Option<PrinterPreset> },
     Print(PrintOp),
+    /// Show a box to type in over the page (or take it away): the text starts as given and is selected; the answer is
+    /// [`Event::FieldDone`] when the person leaves it.
+    FieldEdit(Option<FieldBox>),
+    /// The box of [`Action::FieldEdit`] moves to this place (the page was scrolled or zoomed), keeping what was typed.
+    FieldMove(Rect),
+    /// Show a list of choices at this place of the client area; the answer is [`Event::Chosen`].
+    Choose { items: Vec<String>, selected: Option<usize>, at: (i32, i32) },
 }
 
 #[derive(Debug)]

@@ -13,7 +13,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crate::document::{Document, Page};
-use crate::edit::{self, signature::Policy};
+use crate::edit::{self, EditClass, signature::Policy};
 use crate::error::Error;
 use crate::object::Object;
 use crate::ops;
@@ -22,6 +22,7 @@ use crate::render::{Bitmap, MAX_DPI, MIN_DPI, MemoryLimits, Renderer};
 use crate::text::{PageChars, TextExtractor};
 
 use super::editing::{EditStatus, SaveStatus, Session, write_atomic};
+use super::forms;
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
@@ -84,6 +85,8 @@ enum Job {
     Links { id: u64, page: u32 },
     CharBoxes { id: u64, page: u32 },
     Annotations { id: u64, page: u32 },
+    Fields { id: u64, page: u32 },
+    Options { id: u64, page: u32, index: u32, num: u32 },
     Search(SearchJob),
     Copy(CopyJob),
     Print(PrintJob),
@@ -92,7 +95,7 @@ enum Job {
 impl Job {
     fn id(&self) -> u64 {
         match self {
-            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } => *id,
+            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } => *id,
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
             Job::Print(p) => p.id,
@@ -101,7 +104,7 @@ impl Job {
 
     /// A quick request that someone is waiting for.
     fn immediate(&self) -> bool {
-        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. })
+        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::Fields { .. } | Job::Options { .. })
     }
 
     /// Has something to do now (a print job whose band is not used yet waits).
@@ -115,6 +118,8 @@ impl Job {
             Request::Links(page) => Job::Links { id, page },
             Request::CharBoxes(page) => Job::CharBoxes { id, page },
             Request::Annotations(page) => Job::Annotations { id, page },
+            Request::Fields(page) => Job::Fields { id, page },
+            Request::Options { page, index, num } => Job::Options { id, page, index, num },
             Request::Search { query, start } => Job::Search(SearchJob {
                 id,
                 needle: search::fold_query(&query),
@@ -496,6 +501,8 @@ impl Server<'_> {
             Job::Links { id, page } => self.links(*id, *page),
             Job::CharBoxes { id, page } => self.char_boxes(*id, *page),
             Job::Annotations { id, page } => self.annotations(*id, *page),
+            Job::Fields { id, page } => self.fields(*id, *page),
+            Job::Options { id, page, index, num } => self.options(*id, *page, *index, *num),
             Job::Search(s) => self.step_search(s),
             Job::Copy(c) => self.step_copy(c),
             Job::Print(p) => self.step_print(p),
@@ -574,6 +581,32 @@ impl Server<'_> {
         Step::Done
     }
 
+    fn fields(&mut self, id: u64, page: u32) -> Step {
+        let work = self.meter();
+        let (items, truncated) = match self.pages.get(page as usize) {
+            Some(p) => forms::read(self.document, p, &work),
+            None => (Vec::new(), false),
+        };
+        if work.was_cancelled() {
+            return Step::Cancelled;
+        }
+        self.tell(Event::Fields { doc: self.doc_id, id, page, items, truncated });
+        Step::Done
+    }
+
+    fn options(&mut self, id: u64, page: u32, index: u32, num: u32) -> Step {
+        let work = self.meter();
+        let (items, truncated) = match self.pages.get(page as usize) {
+            Some(p) => forms::options(self.document, p, &work, index, num),
+            None => (Vec::new(), false),
+        };
+        if work.was_cancelled() {
+            return Step::Cancelled;
+        }
+        self.tell(Event::Options { doc: self.doc_id, id, page, index, num, items, truncated });
+        Step::Done
+    }
+
     // --- editing --------------------------------------------------------------------------------------------------
 
     /// Read the dictionary of page `page_no` again, after an edit (or an undo) changed it, and forget what is kept of the page.
@@ -601,8 +634,10 @@ impl Server<'_> {
         match command {
             Command::Edit { doc, id, edit } => {
                 let page = edit.page();
-                if !self.rights.annotate {
-                    said(self, doc, id, EditStatus::Denied, DENIED_ANNOTATE, page);
+                let class = edit.class();
+                let allowed = if class == EditClass::Fill { self.rights.fill_forms } else { self.rights.annotate };
+                if !allowed {
+                    said(self, doc, id, EditStatus::Denied, if class == EditClass::Fill { DENIED_FILL } else { DENIED_ANNOTATE }, page);
                     return None;
                 }
                 if printing {
@@ -610,7 +645,7 @@ impl Server<'_> {
                     return None;
                 }
                 // A signed file is added to only as far as its signatures allow (12.8).
-                let policy = self.session.policy(self.document);
+                let policy = self.session.policy(self.document, class);
                 if let Policy::Refuse(why) = policy {
                     said(self, doc, id, EditStatus::Failed, why, page);
                     return None;
@@ -633,7 +668,11 @@ impl Server<'_> {
                         }
                     };
                 }
-                let objects = match edit::apply(self.document, &self.pages, &edit, &edit::pdf_date_now()) {
+                // An edit may use a page's worth of work, and all of a session's together twenty pages' worth.
+                let work = Work::with_allowance(self.session.work_left().min(crate::render::work::PAGE_WORK));
+                let made = edit::apply_metered(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work);
+                self.session.add_work(work.used());
+                let objects = match made {
                     Ok(objects) => objects,
                     Err(e) => {
                         said(self, doc, id, EditStatus::Failed, &e.to_string(), page);
@@ -911,6 +950,8 @@ fn print_dpi(asked: f64, rights: Rights) -> f64 {
     asked.clamp(MIN_DPI, cap.min(MAX_DPI))
 }
 
+const DENIED_FILL: &str = "the file's author did not allow filling in form fields, and the file was not opened with the owner password";
+
 const DENIED_ANNOTATE: &str = "the file's author did not allow adding annotations, and the file was not opened with the owner password";
 
 const DENIED_COPY: &str = "the file's author did not allow copying text, and the file was not opened with the owner password";
@@ -954,13 +995,14 @@ fn draw(renderer: &mut Renderer<'_>, pages: &[Page], request: &RenderRequest) ->
         Err(Error::Cancelled) => None,
         Err(e) => Some(result(RenderStatus::Failed, e.to_string(), 0, 0, Vec::new())),
         Ok(partial) => {
-            let (status, message) = match (&partial.error, partial.work_over) {
-                (Some(e), _) => (RenderStatus::Incomplete, e.to_string()),
-                (None, true) => (
+            let (status, message) = match (&partial.error, partial.work_over, &partial.incomplete) {
+                (Some(e), ..) => (RenderStatus::Incomplete, e.to_string()),
+                (None, true, _) => (
                     RenderStatus::Incomplete,
                     warnings.iter().find(|w| w.contains("more work")).cloned().unwrap_or_else(|| "the page asks for more work than is allowed".to_string()),
                 ),
-                (None, false) => (RenderStatus::Complete, String::new()),
+                (None, false, Some(why)) => (RenderStatus::Incomplete, why.clone()),
+                (None, false, None) => (RenderStatus::Complete, String::new()),
             };
             let (width, height) = (partial.bitmap.width, partial.bitmap.height);
             let bgra = to_bgra(partial.bitmap);
@@ -975,7 +1017,7 @@ mod tests {
 
     #[test]
     fn a_file_that_allows_only_low_quality_printing_is_drawn_at_150_dpi_at_most() {
-        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true };
+        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true };
         let low = Rights { print_high_quality: false, ..high };
         assert_eq!((print_dpi(1000.0, high), print_dpi(1000.0, low)), (300.0, 150.0));
         assert_eq!((print_dpi(200.0, high), print_dpi(200.0, low)), (200.0, 150.0));

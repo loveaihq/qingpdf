@@ -271,8 +271,12 @@ impl Work {
         self.decoder_memory
     }
 
-    /// A meter with `units` to spend (tests of the decoders).
-    #[cfg(test)]
+    /// The units spent so far (the edits of a session are held to an allowance in all; tests look at it too).
+    pub fn used(&self) -> f64 {
+        self.lock().1
+    }
+
+    /// A meter with `units` to spend (tests of the decoders, and the edits of a session, which have an allowance of their own).
     pub fn with_allowance(units: f64) -> Work {
         Work { state: Mutex::new((units, 0.0)), ..Work::new() }
     }
@@ -405,11 +409,6 @@ impl Work {
         self.over.load(Ordering::Relaxed)
     }
 
-    /// Units spent so far.
-    #[cfg(test)]
-    pub fn used(&self) -> f64 {
-        self.lock().1
-    }
 }
 
 #[cfg(test)]

@@ -280,6 +280,37 @@ struct Cache {
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
+/// The font file `path`, font number `face`: opened once for the process (a miss is kept as well).
+fn open_cached(cache: &mut Cache, path: &std::path::Path, face: usize) -> Option<Arc<TtFont>> {
+    let key = (path.to_string_lossy().into_owned(), face);
+    if let Some(f) = cache.opened.get(&key) {
+        return f.clone();
+    }
+    let opened = if cache.bytes >= MAX_BYTES { None } else { TtFont::from_file(path, face).ok().map(Arc::new) };
+    if let Some(f) = &opened {
+        cache.bytes = cache.bytes.saturating_add(f.memory());
+    }
+    cache.opened.insert(key, opened.clone());
+    opened
+}
+
+/// A system font by file name and number in its collection, for fonts that are put into a file (4b): looked for in the same
+/// folders, opened once and shared with the fonts the pages are drawn with.
+pub(crate) fn named(file: &str, face: usize) -> Option<Arc<TtFont>> {
+    let mut cache = CACHE.get_or_init(|| Mutex::new(Cache::default())).lock().ok()?;
+    let dirs = cache.dirs.get_or_insert_with(font_dirs).clone();
+    dirs.iter().map(|dir| dir.join(file)).filter(|p| p.is_file()).find_map(|p| open_cached(&mut cache, &p, face))
+}
+
+/// Is there a font file of this name that is an OpenType font with PostScript outlines (CFF), which cannot be embedded yet?
+pub(crate) fn is_cff_file(file: &str) -> bool {
+    use std::io::Read;
+    font_dirs().iter().map(|d| d.join(file)).any(|p| {
+        let mut head = [0u8; 4];
+        std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"OTTO"
+    })
+}
+
 /// The system font for a request, `None` when the system has none that fits.
 pub(crate) fn load(req: Request) -> Option<Arc<TtFont>> {
     let mut cache = CACHE.get_or_init(|| Mutex::new(Cache::default())).lock().ok()?;
@@ -303,18 +334,7 @@ pub(crate) fn load(req: Request) -> Option<Arc<TtFont>> {
                 if !path.is_file() {
                     continue;
                 }
-                let key = (path.to_string_lossy().into_owned(), face);
-                let font = match cache.opened.get(&key) {
-                    Some(f) => f.clone(),
-                    None => {
-                        let opened = if cache.bytes >= MAX_BYTES { None } else { TtFont::from_file(&path, face).ok().map(Arc::new) };
-                        if let Some(f) = &opened {
-                            cache.bytes = cache.bytes.saturating_add(f.memory());
-                        }
-                        cache.opened.insert(key, opened.clone());
-                        opened
-                    }
-                };
+                let font = open_cached(&mut cache, &path, face);
                 if font.is_some() {
                     result = font;
                     break 'search;

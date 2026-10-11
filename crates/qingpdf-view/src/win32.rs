@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo};
+use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -310,6 +310,8 @@ unsafe extern "system" {
     fn IsDialogMessageW(dialog: isize, msg: *mut Msg) -> i32;
     fn FillRect(hdc: isize, rect: *const WinRect, brush: isize) -> i32;
     fn ScreenToClient(hwnd: isize, point: *mut Point) -> i32;
+    fn ClientToScreen(hwnd: isize, point: *mut Point) -> i32;
+    fn TrackPopupMenu(menu: isize, flags: u32, x: i32, y: i32, reserved: i32, hwnd: isize, rect: *const WinRect) -> i32;
     fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void, flags: u32) -> i32;
     fn GetFocus() -> isize;
     fn GetCursorPos(point: *mut Point) -> i32;
@@ -471,6 +473,9 @@ const MB_ICONERROR: u32 = 0x10;
 const MB_TASKMODAL: u32 = 0x2000;
 const ES_AUTOHSCROLL: u32 = 0x80;
 const ES_PASSWORD: u32 = 0x20;
+const ES_MULTILINE: u32 = 0x4;
+const ES_AUTOVSCROLL: u32 = 0x40;
+const ES_WANTRETURN: u32 = 0x1000;
 const BS_PUSHBUTTON: u32 = 0;
 const BS_DEFPUSHBUTTON: u32 = 1;
 const IDOK: usize = 1;
@@ -502,12 +507,19 @@ const MK_LBUTTON: usize = 1;
 const HTCLIENT: u32 = 1;
 const IDC_HAND: usize = 32649;
 const EN_CHANGE: u32 = 0x0300;
+const EN_KILLFOCUS: u32 = 0x0200;
+const EM_LIMITTEXT: u32 = 0x00C5;
+/// TrackPopupMenu: answer with the item chosen instead of posting a command, left and top aligned.
+const TPM_RETURNCMD_NONOTIFY: u32 = 0x0100 | 0x0080;
 const EM_SETSEL: u32 = 0x00B1;
 const ICC_TREEVIEW_CLASSES: u32 = 0x2;
 const SW_HIDE: i32 = 0;
 /// Child windows: the bookmarks tree and the find box.
 const ID_TREE: isize = 101;
 const ID_FIND: isize = 102;
+/// The boxes a form field or a text box is typed in (one line, several lines).
+const ID_FIELD1: isize = 103;
+const ID_FIELD2: isize = 104;
 const TVS_HASBUTTONS: u32 = 0x1;
 const TVS_HASLINES: u32 = 0x2;
 const TVS_LINESATROOT: u32 = 0x4;
@@ -553,6 +565,9 @@ const LOGPIXELSX: i32 = 88;
 const COINIT_APARTMENTTHREADED: u32 = 2;
 /// The most characters of the find box that are read.
 const MAX_FIND_CHARS: usize = 2000;
+/// Most characters of the box of a form field or text box, and most items of a list of choices shown.
+const MAX_FIELD_CHARS: usize = 8000;
+const MAX_CHOICES: usize = 1000;
 const DEFAULT_WIDTH: i32 = 1000;
 const DEFAULT_HEIGHT: i32 = 800;
 
@@ -708,6 +723,10 @@ struct WindowState {
     /// The bookmarks tree and the find box, children of the window (0 if Windows would not make them).
     tree: Cell<isize>,
     find: Cell<isize>,
+    /// The boxes a form field or a text box is typed in, and the one that is in use (0: none).
+    field_single: Cell<isize>,
+    field_multi: Cell<isize>,
+    field_active: Cell<isize>,
     /// The printer a job is going to (from the print box, or named by the hidden test), until the job ends.
     printer: RefCell<Option<Printer>>,
     /// A menu is open (between WM_ENTERMENULOOP and WM_EXITMENULOOP), and the menus that came meanwhile, to be put when it closes:
@@ -816,6 +835,19 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
             Action::Outline(nodes) => fill_tree(state.tree.get(), &nodes),
             Action::Sidebar(r) => place_child(state.tree.get(), r),
             Action::Find(rect) => show_find(state, hwnd, rect),
+            Action::FieldEdit(Some(b)) => show_field(state, hwnd, b),
+            Action::FieldEdit(None) => hide_field(state, hwnd),
+            Action::FieldMove(r) => {
+                let edit = state.field_active.get();
+                if edit != 0 {
+                    // SAFETY: plain handle of a child window of ours and plain numbers.
+                    unsafe { MoveWindow(edit, r.x, r.y, r.w.max(1), r.h.max(1), 1) };
+                }
+            }
+            Action::Choose { items, selected, at } => {
+                let chosen = choose(hwnd, &items, selected, at);
+                queue.extend(deliver(state, Event::Chosen(chosen)));
+            }
             Action::OpenUri(uri) => {
                 // The reader has checked the address; it is checked again here, the last place before the system, so that nothing
                 // that is not a plain http, https or mailto address (an environment variable like %USERNAME%, say) reaches it.
@@ -955,6 +987,9 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             } else if lparam == state.find.get() && hiword(wparam) == EN_CHANGE {
                 let text = window_text(lparam, MAX_FIND_CHARS);
                 dispatch(state, Event::FindText(text));
+            } else if lparam == state.field_active.get() && hiword(wparam) == EN_KILLFOCUS {
+                // The keyboard went elsewhere (a click outside the box): what is typed is kept.
+                finish_field(state, FieldExit::Blur);
             }
             return 0;
         }
@@ -1257,7 +1292,7 @@ fn new_dpi(state: &WindowState, dpi: u32) {
         // deleted only after the new one is selected in its place.
         unsafe { SelectObject(back.dc, state.font.get()) };
     }
-    for child in [state.tree.get(), state.find.get()] {
+    for child in [state.tree.get(), state.find.get(), state.field_single.get(), state.field_multi.get()] {
         if child != 0 && state.font.get() != 0 {
             // SAFETY: WM_SETFONT takes a font handle (the one just made) and a redraw flag; `child` is a window of ours.
             unsafe { SendMessageW(child, WM_SETFONT, state.font.get() as usize, 1) };
@@ -1831,6 +1866,95 @@ fn show_find(state: &WindowState, hwnd: isize, rect: Option<Rect>) {
     }
 }
 
+/// Show the box a form field or text box is typed in at a place, with this text (selected) and the keyboard. The box for one line
+/// or the one for several is used as `b` says.
+fn show_field(state: &WindowState, hwnd: isize, b: FieldBox) {
+    let (edit, other) = if b.multiline { (state.field_multi.get(), state.field_single.get()) } else { (state.field_single.get(), state.field_multi.get()) };
+    if edit == 0 {
+        return;
+    }
+    // The box that was in use before is put away without telling the reader: it has moved on to this one already.
+    state.field_active.set(0);
+    let text = wide(&b.text.replace("\r\n", "\n").replace('\n', "\r\n"));
+    let limit = if b.max_len > 0 { (b.max_len as usize).min(MAX_FIELD_CHARS) } else { MAX_FIELD_CHARS };
+    // SAFETY: plain handles of child windows of ours; `text` is zero-terminated UTF-16 that outlives the call; EM_LIMITTEXT takes a
+    // number of characters; the whole text is selected (a start of 0 and an end of -1).
+    unsafe {
+        if other != 0 {
+            ShowWindow(other, SW_HIDE);
+        }
+        SendMessageW(edit, EM_LIMITTEXT, limit, 0);
+        SetWindowTextW(edit, text.as_ptr());
+    }
+    place_child(edit, b.rect);
+    state.field_active.set(edit);
+    // SAFETY: plain handle of the edit box just placed.
+    unsafe {
+        SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+    }
+    let _ = hwnd;
+}
+
+/// Put the box away, keeping nothing: the reader has asked for that.
+fn hide_field(state: &WindowState, hwnd: isize) {
+    let edit = state.field_active.replace(0);
+    if edit != 0 {
+        // SAFETY: plain handles; the keyboard goes back to the main window, and the box is hidden.
+        unsafe {
+            if GetFocus() == edit {
+                SetFocus(hwnd);
+            }
+            ShowWindow(edit, SW_HIDE);
+        }
+    }
+}
+
+/// The person has left the box: its text goes to the reader, with how it was left, and the box is put away.
+fn finish_field(state: &WindowState, exit: FieldExit) {
+    let edit = state.field_active.replace(0);
+    if edit == 0 {
+        return;
+    }
+    let text = window_text(edit, MAX_FIELD_CHARS).replace("\r\n", "\n").replace('\r', "\n");
+    let hwnd = state.hwnd.get();
+    // SAFETY: plain handles; the keyboard goes back to the main window and the box is hidden (the notification that follows is
+    // ignored: no box is in use any more).
+    unsafe {
+        if GetFocus() == edit {
+            SetFocus(hwnd);
+        }
+        ShowWindow(edit, SW_HIDE);
+    }
+    dispatch(state, Event::FieldDone { text, exit });
+}
+
+/// A list of choices at a place of the client area; the number of the one chosen.
+fn choose(hwnd: isize, items: &[String], selected: Option<usize>, at: (i32, i32)) -> Option<usize> {
+    // SAFETY: creates an empty pop-up menu; the handle is checked.
+    let menu = unsafe { CreatePopupMenu() };
+    if menu == 0 {
+        return None;
+    }
+    for (i, item) in items.iter().take(MAX_CHOICES).enumerate() {
+        let label = wide(&item.replace('&', "&&"));
+        let flags = MF_STRING | if selected == Some(i) { MF_CHECKED } else { 0 };
+        // SAFETY: `menu` is the menu just made; the item's number is its place plus one (0 is "nothing chosen"); `label` is
+        // zero-terminated UTF-16 that outlives the call (the menu copies it).
+        unsafe { AppendMenuW(menu, flags, i + 1, label.as_ptr()) };
+    }
+    let mut at = Point { x: at.0, y: at.1 };
+    // SAFETY: `at` is a live POINT turned into screen coordinates; the menu belongs to this window and is destroyed after use;
+    // TPM_RETURNCMD answers with the item's number (0 if the menu was dismissed) instead of posting a message.
+    let answer = unsafe {
+        ClientToScreen(hwnd, &mut at);
+        let answer = TrackPopupMenu(menu, TPM_RETURNCMD_NONOTIFY, at.x, at.y, 0, hwnd, null());
+        DestroyMenu(menu);
+        answer
+    };
+    usize::try_from(answer).ok().filter(|&n| n > 0).map(|n| n - 1)
+}
+
 /// Put text on the clipboard (as UTF-16, the line ends as the system writes them). `false`: it could not be done (the memory
 /// could not be had, or another program holds the clipboard); what was on the clipboard before stays then.
 fn set_clipboard(hwnd: isize, text: &str) -> bool {
@@ -2110,7 +2234,7 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     if hwnd == 0 {
         return 1;
     }
-    let state = Box::new(WindowState { hwnd: Cell::new(hwnd), closing: Cell::new(false), handler: RefCell::new(None), back: RefCell::new(Back::default()), font: Cell::new(0), dpi: Cell::new(96), tree: Cell::new(0), find: Cell::new(0), printer: RefCell::new(None), menu_open: Cell::new(false), menus_waiting: RefCell::new(None) });
+    let state = Box::new(WindowState { hwnd: Cell::new(hwnd), closing: Cell::new(false), handler: RefCell::new(None), back: RefCell::new(Back::default()), font: Cell::new(0), dpi: Cell::new(96), tree: Cell::new(0), find: Cell::new(0), field_single: Cell::new(0), field_multi: Cell::new(0), field_active: Cell::new(0), printer: RefCell::new(None), menu_open: Cell::new(false), menus_waiting: RefCell::new(None) });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize) };
@@ -2118,6 +2242,8 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     // The bookmarks tree and the find box: children of the window, hidden until the reader says where to put them.
     state.tree.set(make_child(hwnd, instance, "SysTreeView32", WS_EX_CLIENTEDGE, WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS, ID_TREE));
     state.find.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIND));
+    state.field_single.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIELD1));
+    state.field_multi.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, ID_FIELD2));
     if let Some((cw, ch)) = client {
         // The scroll bars and the like take some of the window: make the client area the size asked for.
         let (have_w, have_h) = client_size(hwnd);
@@ -2184,6 +2310,23 @@ fn make_child(parent: isize, instance: isize, class: &str, ex_style: u32, style:
 /// the reader uses (not the editing keys of the box: Ctrl+C, V, X, A, Z).
 fn forward_key(state: &WindowState, msg: &Msg) -> bool {
     let (tree, find) = (state.tree.get(), state.find.get());
+    // The box of a form field or text box: Esc leaves it (and throws what is typed away), Tab and Shift+Tab go to the next field and
+    // the one before, Enter ends a line of a field of one line (Ctrl+Enter ends the several lines of a field or text box).
+    let active = state.field_active.get();
+    if msg.hwnd != 0 && msg.hwnd == active {
+        let (ctrl, shift) = (modifier(0x11), modifier(0x10));
+        let exit = match msg.wparam as u32 {
+            0x1B => Some(FieldExit::Cancel),
+            0x09 => Some(if shift { FieldExit::Prev } else { FieldExit::Next }),
+            0x0D if ctrl || active == state.field_single.get() => Some(FieldExit::Commit),
+            _ => None,
+        };
+        if let Some(exit) = exit {
+            finish_field(state, exit);
+            return true;
+        }
+        return false;
+    }
     if msg.hwnd == 0 || (msg.hwnd != tree && msg.hwnd != find) {
         return false;
     }

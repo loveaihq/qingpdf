@@ -1,15 +1,10 @@
 [package]
 name = "qingpdf-view"
-description = "Windows reader for qingpdf: the window around the engine"
+description = "The reader of qingpdf: the window around the engine (a library of its own, so that it can be built for size while the program that links it is not)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-build = "build.rs"
-
-[[bin]]
-name = "qingpdf-view"
-path = "src/main.rs"
 
 [dependencies]
 qingpdf-core = { path = "../qingpdf-core" }

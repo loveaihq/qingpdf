@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view"]
+members = ["crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view", "crates/qingpdf-view-bin"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,3 +14,11 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# The reader (the library `qingpdf-view`: no pixel work in it, the engine draws and Windows puts it on the screen) is built for size:
+# 94 KB off qingpdf-view.exe, and no time that matters changed (docs/decisions.md, 4b). It is a library of its own because the
+# link-time optimization of the whole program runs at the level of the final crate: with this setting on the program itself the engine
+# is optimized for size too (141 KB off, but the pages take 28 % longer to draw). The engine stays at opt-level 3: at 2 they take
+# 20 to 28 % longer as well.
+[profile.release.package.qingpdf-view]
+opt-level = "z"

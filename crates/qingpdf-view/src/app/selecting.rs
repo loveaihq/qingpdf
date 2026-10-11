@@ -96,6 +96,9 @@ impl App {
             if press.moved {
                 // Text that was dragged over with a marking tool is marked.
                 actions.extend(self.drag_finished());
+            } else if self.edit.tool == Tool::Select && let Some(field) = self.field_at(press.page, press.x, press.y) {
+                // A field of a form comes before a link that lies under it.
+                actions.extend(self.activate_field(press.page, field));
             } else if let Some(index) = press.link {
                 actions.extend(self.activate_link(press.page, index));
             } else if self.edit.tool == Tool::Select {

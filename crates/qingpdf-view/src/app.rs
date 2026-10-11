@@ -6,6 +6,7 @@
 //! `menus` and `recents` (the menus; the files opened last).
 
 mod editing;
+mod forms;
 mod menus;
 mod outline;
 mod printjob;
@@ -62,6 +63,8 @@ pub const CMD_UNDO: u32 = 32;
 pub const CMD_REDO: u32 = 33;
 pub const CMD_REMOVE: u32 = 34;
 pub const CMD_AUTHOR: u32 = 35;
+/// Pick a picture to stamp on a page.
+pub const CMD_STAMP: u32 = 36;
 /// The tools of the Comment menu: select, the four markups, draw, note.
 pub const CMD_TOOL_SELECT: u32 = 40;
 pub const CMD_TOOL_HIGHLIGHT: u32 = 41;
@@ -70,9 +73,12 @@ pub const CMD_TOOL_STRIKE: u32 = 43;
 pub const CMD_TOOL_SQUIGGLY: u32 = 44;
 pub const CMD_TOOL_INK: u32 = 45;
 pub const CMD_TOOL_NOTE: u32 = 46;
+pub const CMD_TOOL_TEXTBOX: u32 = 47;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
+/// The sizes of the text of a text box.
+pub const CMD_SIZE_BASE: u32 = 70;
 /// The files in the list of recent ones are commands from here, one for each.
 pub const CMD_RECENT_BASE: u32 = 100;
 
@@ -185,7 +191,7 @@ pub struct App {
     wake: Arc<dyn Fn() + Send + Sync>,
     first_bitmap: Option<Instant>,
     last_sharp: Option<Instant>,
-    pub(crate) bench: Option<Bench>,
+    pub bench: Option<Bench>,
     pub(crate) started: Instant,
 
     // --- 3d-2 ---
@@ -270,7 +276,7 @@ impl App {
             last_sharp: None,
             bench: None,
             started,
-            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true },
+            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true },
             outline: Vec::new(),
             show_outline: true,
             links: HashMap::new(),
@@ -382,7 +388,7 @@ impl App {
         self.press = None;
         self.selection = None;
         self.note = None;
-        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true };
+        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.moving = false;
@@ -552,6 +558,7 @@ impl App {
         self.schedule();
         self.ask_for_links();
         self.ask_for_annots();
+        actions.extend(self.reposition_editor());
         actions.push(Action::Invalidate);
         actions
     }
@@ -817,6 +824,9 @@ impl App {
             CMD_REDO => self.redo(),
             CMD_REMOVE => self.remove_picked(),
             CMD_AUTHOR => self.ask_author(),
+            CMD_STAMP => self.ask_for_stamp(),
+            CMD_TOOL_TEXTBOX => self.set_tool(Tool::TextBox),
+            c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
             CMD_TOOL_HIGHLIGHT => self.set_tool(Tool::Markup(MarkupKind::Highlight)),
             CMD_TOOL_UNDERLINE => self.set_tool(Tool::Markup(MarkupKind::Underline)),
@@ -881,7 +891,10 @@ impl App {
         }
         match key {
             vk::ESCAPE => self.escape(),
-            vk::RETURN => self.find_enter(shift),
+            vk::RETURN => match self.stamp_place() {
+                Some(actions) => actions,
+                None => self.find_enter(shift),
+            },
             vk::F3 => self.find_step(!shift),
             vk::F4 => self.command(CMD_BOOKMARKS),
             vk::DELETE => self.command(CMD_REMOVE),
@@ -1076,8 +1089,19 @@ impl Handler for App {
             }
             Event::Timer(TIMER_DRAG) => self.drag_timer(),
             Event::Timer(_) => Vec::new(),
-            Event::FilePicked(Some(path)) => self.open_path(&path, ""),
-            Event::FilePicked(None) => Vec::new(),
+            Event::FilePicked(Some(path)) => {
+                if std::mem::take(&mut self.edit.forms.picking) {
+                    self.stamp_picked(&path)
+                } else {
+                    self.open_path(&path, "")
+                }
+            }
+            Event::FilePicked(None) => {
+                self.edit.forms.picking = false;
+                Vec::new()
+            }
+            Event::FieldDone { text, exit } => self.field_done(text, exit),
+            Event::Chosen(item) => self.chosen(item),
             Event::Text { tag: TAG_PASSWORD, text } => match (text, self.path.clone()) {
                 (Some(mut pw), Some(path)) => {
                     let actions = self.open_path(&path, &pw);

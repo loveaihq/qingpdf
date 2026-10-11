@@ -29,11 +29,11 @@
 
 - `Opened { doc, pages: [{宽, 高}], file_bytes, bitmap_cache_bytes, max_tile_pixels }`：每页大小（点，1/72 英寸，已按 `/Rotate` 转过；每边最多 14400，更大的页按 14400 截（取页面左上角），`/UserUnit` 引擎不处理）；`bitmap_cache_bytes` 是在总预算里留给界面存位图的字节数；`max_tile_pixels` 是一个请求最多该要多少像素。
 - `OpenFailed { doc, failure, message }`：`failure` 是 `NeedsPassword`（要密码，界面问了再 `open_file` 一次）、`WrongPassword`、`TooLarge`（文件超过 100 MB）、`Unreadable`（读不了，`message` 是系统的话）、`Damaged`（不是 PDF 或坏得太厉害）。
-- `Rendered { doc, id, page, status, message, width, height, bgra }`：**BGRA**，8 位，从上到下，没有行填充，不透明。`status`：`Complete`；`Incomplete`（位图有效，但这一页没画完：工作量超了或内容流中途出错，画到哪算哪）；`Failed`（没有位图，`message` 说原因）。
+- `Rendered { doc, id, page, status, message, width, height, bgra }`：**BGRA**，8 位，从上到下，没有行填充，不透明。`status`：`Complete`；`Incomplete`（位图有效，但这一页没画完：工作量超了、内容流中途出错，或这页的批注、没有外观的表单控件超过了上限，`message` 说是哪一种；画到哪算哪，不会悄悄少画）；`Failed`（没有位图，`message` 说原因）。
 
 ## 3d-2 的结果和限制
 
-- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate }`（`annotate` 是 4a 加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
+- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
 - `Outline { items: [{title, depth, page?, y?, open}], truncated }`：展平的前序列表，深度从 0 数；`page` 是页码（从 0），`y` 是该页上往下多少点（按页面显示后的样子）。最多 `MAX_OUTLINE_ITEMS`（20000）项、`MAX_OUTLINE_DEPTH`（32）层，标题最多 `MAX_TITLE_CHARS`（300）字，兄弟链或子链绕回已读过的项就在那里断。目标先看 `/Dest`，再看 `/A` 里的 GoTo，命名目标走 `dests.rs`。
 - `Links { links: [{rect, kind, page, y?, uri}] }`：`rect` 是页面显示后的点（左、上、右、下）；`kind` 是 `Page`（页内）或 `Uri`。每页最多 `MAX_LINKS`（2000）个；隐藏的、不显示的、没面积的不给。外部地址只留 http、https、mailto，并且全是 ASCII 可见字符、不含空格和 `" < > \ ^ ` { | }`、不超过 `MAX_URI_BYTES`（2048），`%` 只许作百分号转义（`%` 加两个十六进制数字，所以 `%USERNAME%` 这类会被系统当环境变量展开的写法不给），其余的丢掉；`view::safe_uri` 是同一套检查，界面在打开前再查一遍。
 - `CharBoxes { boxes }`：`boxes[i]` 是页文字（和 `text` 命令同一个顺序）第 i 个字符的 `[左, 上, 右, 下]`，单位点，**页面显示后的坐标（已按页自己的 /Rotate 转过，左上角为原点，y 向下）**，窗口再加的旋转由窗口自己转。排版插的空格和行尾是没有面积的点。每页最多 `text::MAX_PAGE_CHARS`（40 万）字。`view::line_rects` 把一段字的框并成每行一个矩形，`view::nearest_char` 找离某点最近的字（逐个看）；`view::CharIndex::new(&boxes)` 把一页的框切成一行一行，`nearest(&boxes, x, y)` 答案和 `nearest_char` 一样，但只看可能最近的几行，鼠标每动一下不必扫整页。
@@ -63,9 +63,27 @@
 
 - `Edited { doc, id, status, message, page, can_undo, can_redo, dirty, rewrote }`：加、删、撤销、重做都答它。`status`：`Done`、`Denied`（文件作者不让加批注，且没用所有者密码打开）、`Failed`（`message` 说原因，文件没变）、`Nothing`（没有可撤销/重做的）、`Busy`（正在打印）。`Done` 之后 `page` 那页画过的位图作废（别的页没变），排着的请求照常做；文档没有被换掉，改动在内存里（"怎么做的"），文件要等保存。`Done` 的 `message` 通常是空的，只有一种情况有字：文件有数字签名，保存后签名会显示文件被改过，这句话每个文件只说一次。`Failed` 的原因里有这几种：文件有 `/Perms /DocMDP` 认证且 `/P` 为 1 或 2（不许加批注）；签名文件的结构坏了、需要整份重写（重写会破坏签名，不重写）；没保存的改动太多（超过预算，先保存）。`dirty` 是文件和上次保存（或打开）时不一样；`rewrote` 是文件的交叉引用坏了（或 `%PDF-` 前有东西），第一次编辑前整份重写了，保存时也是整份写，原字节不保留。
 - `Saved { doc, id, status, message, bytes }`：`status` 是 `Done` 或 `Failed`。
-- `Opened.rights.annotate`：文件没加密、或有所有者密码、或权限位第 6 位开着时为真。不为真时 `add_*`/`delete_annotation` 答 `Denied`（`undo`/`redo`/`save` 不查）。
+- `Opened.rights.annotate`：文件没加密、或有所有者密码、或权限位第 6 位开着时为真。不为真时 `add_*`/`delete_annotation` 答 `Denied`（`undo`/`redo`/`save` 不查）。`Opened.rights.fill_forms`（4b）见下。
 
 怎么做的：文件打开后一直是原样的 `Document`；每次编辑算出它做的和改的对象（新批注、外观流、改过的页或 `/Annots` 数组），作为"盖在原对象前面的一层"放在内存里（`Document` 的 overlay，读对象先看这层）。画页、批注列表都从这一层读；只有被改的那一页的页字典重读、字缓存作废。撤销/重做是把这一层里那几个对象换回去/换上，历史里每一步存"这些对象改之前和改之后"，和 overlay 共用同一份对象，不拷贝。保存时把这一层的最终样子写成**一段**增量更新（一个交叉引用段），接在原文件字节后面，原文件的字节永远是新文件的前缀；写成后这个文件成为新的底本，这一层清空。内存是原文件加这一层（再加一份撤销历史），后两者合起来最多 16 MiB（算在内存预算里；超了先挤掉最旧的撤销步，还超就拒绝编辑、让用户先保存）。细节和理由见 `docs/decisions.md` 的"第 4 层 4a"。
+
+## 4b 的请求和结果：填表、文字框、签名图片
+
+同样走消息，位置同样是"页面显示后的点"。
+
+| 调用 | 作用 |
+|---|---|
+| `fields(doc, id, page)` | 取一页的表单字段（每个控件一项，按 `/Annots` 的顺序，也就是 Tab 的顺序），答 `Fields { items: [FieldInfo], truncated }`。`FieldInfo`：`index`、`num`（控件在 `/Annots` 里的位置和对象号，填表时原样交回）、`kind`（`Text`、`Check`、`Radio`、`Push`、`Combo`、`List`、`Signature`）、`rect`、`read_only`、`multiline`、`password`、`comb`、`max_len`（0 为不限）、`value`（文字、下拉、列表的当前值，选项显示成它的显示文字）、`checked`（勾选框和单选）、`editable`（可输入的下拉）、`name`。**列表里没有下拉和列表的选项**（几十个字段共用一个很长的 `/Opt` 时，每个字段各带一份会占几百 MB）：要选的时候用 `options` 单取。字段从控件沿 `/Parent` 往上找（最多 32 层，遇到重复就停），`/FT`、`/Ff`、`/V`、`/DA`、`/Q`、`/MaxLen`、`/Opt` 取最近的，没有就用 `/AcroForm` 的。每页最多 `MAX_FIELD_INFOS`（3000）项，整张列表（文字加每项结构体的大小）最多 `MAX_FIELDS_BYTES`（256 KB），超过的不给，`truncated` 为真；隐藏的控件不给。内存计划（`MemoryPlan`）为它们留了 `form_bytes`（8 MiB：25 页的列表加一次选项）。 |
+| `options(doc, id, page, index, num)` | 取一个下拉或列表的选项（`index`、`num` 是 `Fields` 给的那个字段），答 `Options { page, index, num, items: [(导出值, 显示文字)], truncated }`。最多 2000 项，文字合计最多 `MAX_OPTION_BYTES`（256 KB），多的不给，`truncated` 为真；字段不在了或不是选择字段给空表。选项只在人要选的时候取，不留着。 |
+| `fill_field(doc, id, page, index, num, FillValue)` | 填一个字段：`Text(字符串)`（文本框的文字，或下拉、列表的一个选项，可以是导出值也可以是显示文字；可输入的下拉接受任何文字）、`Checked(开关)`（勾选框、单选）。文字最多 `MAX_VALUE_CHARS`（4000）字，超过 `/MaxLen` 答 `Failed`；单行字段里的换行变成空格；只读的、签名、按钮不填。单选组里选一个，同组别的变成 `Off`；`NoToggleToOff` 的组不能关。答 `Edited`。 |
+| `add_freetext(doc, id, page, rect, text, size, color, author)` | 文字框（FreeText）：`rect` 是 `[左,上,右,下]`，文字 `size` 点（夹在 `MIN_FONT_SIZE` 4 到 `MAX_FONT_SIZE` 144），最多 `MAX_FREETEXT_CHARS`（4000）字，字符种类最多 3000；放不下时框向下长，不出页；太小的框撑到 8 点，出页的挪回页内。答 `Edited`。 |
+| `add_stamp(doc, id, page, rect, 图片字节, author)` | 图片（Stamp）：PNG（透明部分保持透明）或 JPEG，放成在 `rect` 里最大的、保持图片形状、居中的一块。图片最多 `MAX_STAMP_PIXELS`（1600 万）像素、`MAX_STAMP_FILE_BYTES`（12 MB）；认不出的、被截断的、超限的答 `Failed`。界面用 `qingpdf_core::image::probe(字节)`（只读文件头）取图片的宽高来定框的形状。答 `Edited`。 |
+
+`Rights` 多一项 `fill_forms`（权限位 9；版本 2 的文件看位 6；没加密或有所有者密码为真）。`fill_field` 看 `fill_forms`，`add_freetext`、`add_stamp` 看 `annotate`；不让时答 `Denied`。认证过的文件（`/Perms /DocMDP`）：`/P` 为 1 什么都不许；为 2 只许 `fill_field`，`add_freetext`、`add_stamp`、画、便签、删批注答 `Failed`（`message` 里写着 DocMDP）；为 3 都许。
+
+每次编辑的工作量记在计量器里：一次编辑最多一页的工作量（`PAGE_WORK`），一个会话里所有编辑加起来最多二十页的；用完了答 `Failed`。画页时没有外观的控件现场合成外观（只画，不写文件），每个文档最多 2 万个，每页再受页面计量器限制。
+
+填表、文字框、图片都写进"盖在原对象前面的一层"，和 4a 一样撤销、重做、保存；一次填写撤销一步，同一字段的几个控件（和字体、外观）一起回来。表单里的 JavaScript（`/AA`、格式化、计算、校验）不执行。
 
 ## 对接别的语言
 

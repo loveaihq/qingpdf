@@ -32,6 +32,9 @@ const TEXT_CACHE: u64 = 16 * MIB;
 /// the rest stay within the total. A save appends them to the file in memory (the file is read with room after it for that,
 /// `view::SPARE_AFTER_FILE`, 1 MiB, which an update rarely uses up).
 const EDIT_BYTES: u64 = 16 * MIB;
+/// The lists of form fields the window keeps for the pages round about (at most `MAX_FIELDS_BYTES` for each of 25 pages), and the
+/// options of the one choice being made (at most `MAX_OPTION_BYTES`). Not cut when the file is big: a list is what it is.
+const FORM_BYTES: u64 = 8 * MIB;
 /// The most pixels of one piece of a page drawn at once (16 MiB of canvas).
 const TILE_PIXELS: u64 = 4 * MIB;
 /// The window needs room for at least a few screens of bitmaps, or there is no plan.
@@ -67,6 +70,8 @@ pub struct MemoryPlan {
     pub text_cache: u64,
     /// What the unsaved edits and the history that undoes them may take.
     pub edit_bytes: u64,
+    /// What the lists of form fields and the options of a choice come to, in all (`view::MAX_FIELDS_BYTES`, `view::MAX_OPTION_BYTES`).
+    pub form_bytes: u64,
 }
 
 impl MemoryPlan {
@@ -80,6 +85,7 @@ impl MemoryPlan {
             + self.decoders
             + self.text_cache
             + self.edit_bytes
+            + self.form_bytes
             + u64::from(self.max_tile_pixels) * 4
     }
 }
@@ -113,6 +119,7 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
             decoders: part(DECODERS),
             text_cache: part(TEXT_CACHE),
             edit_bytes: part(EDIT_BYTES),
+            form_bytes: FORM_BYTES,
         };
         p.bitmap_cache_bytes = total.saturating_sub(file_bytes).saturating_sub(p.engine_bytes());
         p
@@ -159,10 +166,10 @@ mod tests {
     fn a_small_file_gets_the_full_plan_and_a_big_one_less() {
         let small = plan(TOTAL_BYTES, 5_000_000, HD).expect("a plan");
         let big = plan(TOTAL_BYTES, 90_000_000, HD).expect("a plan");
-        // Nearly all of it (a page turn needs room for two and a half pieces of a page and the pictures, which the engine gives up
-        // a little for).
-        assert!(small.render_caches > RENDER_CACHES * 8 / 10 && small.render_caches <= RENDER_CACHES, "{small:?}");
-        assert!(u64::from(small.max_tile_pixels) > TILE_PIXELS * 8 / 10 && u64::from(small.max_tile_pixels) <= TILE_PIXELS, "{small:?}");
+        // Most of it (a page turn needs room for two and a half pieces of a page and the pictures, and the lists of form fields
+        // have 8 MiB of their own, which the engine gives up a little for).
+        assert!(small.render_caches > RENDER_CACHES * 7 / 10 && small.render_caches <= RENDER_CACHES, "{small:?}");
+        assert!(u64::from(small.max_tile_pixels) > TILE_PIXELS * 7 / 10 && u64::from(small.max_tile_pixels) <= TILE_PIXELS, "{small:?}");
         assert!(big.render_caches < small.render_caches && big.decoders < small.decoders);
         assert!(big.max_tile_pixels >= MIN_TILE_PIXELS as u32);
     }
@@ -173,7 +180,7 @@ mod tests {
         // the engine gives up only a little for it.
         let hd = plan(TOTAL_BYTES, 5_000_000, HD).expect("a plan");
         assert!(hd.bitmap_cache_bytes >= HD * 12 && hd.bitmap_cache_bytes >= u64::from(hd.max_tile_pixels) * 4 * 5 / 2 + PREVIEWS, "{hd:?}");
-        assert!(hd.render_caches > RENDER_CACHES * 8 / 10, "{hd:?}");
+        assert!(hd.render_caches > RENDER_CACHES * 7 / 10, "{hd:?}");
         // A 4K window wants more than is left: the bitmaps get what they want and the engine's parts are cut.
         let uhd = plan(TOTAL_BYTES, 5_000_000, UHD).expect("a plan");
         assert!(uhd.bitmap_cache_bytes >= UHD * 12, "{uhd:?}");

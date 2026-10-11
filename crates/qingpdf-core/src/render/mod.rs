@@ -23,16 +23,16 @@ mod cff;
 mod color;
 mod fonts;
 mod func;
-mod glyf;
+pub(crate) mod glyf;
 mod image;
 mod interp;
 mod jbig2;
 mod jpx;
 mod mq;
 mod oc;
-mod outline;
+pub(crate) mod outline;
 mod shading;
-mod sysfont;
+pub(crate) mod sysfont;
 mod ttvm;
 mod type1;
 pub(crate) mod work;
@@ -105,6 +105,8 @@ pub struct Partial {
     pub error: Option<Error>,
     /// The page used up its allowance of work and the rest of it is not drawn.
     pub work_over: bool,
+    /// Something was left out for a limit of the drawing itself (too many annotations or form fields on the page): what it was.
+    pub incomplete: Option<String>,
 }
 
 /// Limits on the memory a [`Renderer`] holds besides the page itself, for a program that must stay within a total
@@ -237,6 +239,7 @@ impl<'a> Renderer<'a> {
         let boxed_causes = interp.boxed_by;
         let absent_glyphs = interp.absent;
         let work_over = interp.work_over();
+        let incomplete = interp.incomplete.take();
         let cancelled = interp.work_cancelled();
         #[cfg(test)]
         let last_work = interp.work_used();
@@ -258,7 +261,7 @@ impl<'a> Renderer<'a> {
             return Err(Error::Cancelled);
         }
         let bitmap = Bitmap { width: pixmap.width(), height: pixmap.height(), rgba: pixmap.take(), boxed_characters, boxed_causes, absent_glyphs };
-        Ok(Partial { bitmap, error: result.err(), work_over })
+        Ok(Partial { bitmap, error: result.err(), work_over, incomplete })
     }
 
     /// Stop the page being drawn when `flag` is set (from another thread): [`Renderer::render_partial`] and

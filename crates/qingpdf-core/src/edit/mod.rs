@@ -10,7 +10,11 @@
 //! the origin at the top left, y downwards, the page's own `/Rotate` applied. They are turned into default user space here.
 
 mod appearance;
+mod boxes;
+pub(crate) mod fontsub;
+pub(crate) mod forms;
 pub(crate) mod incremental;
+mod layout;
 pub(crate) mod signature;
 
 use std::collections::HashSet;
@@ -21,9 +25,12 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, Stream};
+use crate::render::work::Work;
 use crate::text::Shown;
 
 use appearance::{Appearance, Quad};
+pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
+pub use forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
 /// Most points one drawing has (all its strokes together); a longer one is thinned out, its ends kept.
 pub const MAX_INK_POINTS: usize = 8_192;
 /// Most strokes in one drawing.
@@ -78,12 +85,40 @@ pub enum Edit {
     /// Take an annotation out of the page: the `index`-th entry of its `/Annots`, which must be object number `num`
     /// (0 for an annotation written in the array itself). A popup that belongs to it goes with it.
     Delete { page: u32, index: u32, num: u32 },
+    /// Fill in a form field (4b): its widget is the `index`-th entry of the page's `/Annots`, object number `num`.
+    Fill { page: u32, index: u32, num: u32, value: FillValue },
+    /// A text box (`FreeText`) in `rect` (`[left, top, right, bottom]` of the page as shown), the text `size` points high.
+    FreeText { page: u32, rect: [f32; 4], text: String, size: f32, color: [u8; 3], author: String },
+    /// A picture (the bytes of a PNG or JPEG file) stamped on the page, as big as fits in `rect` with the picture's shape.
+    Stamp { page: u32, rect: [f32; 4], image: Vec<u8>, author: String },
+}
+
+/// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditClass {
+    /// Annotations are added or taken out (permission bit 6; a certified file allows them only with `/P` 3).
+    Annotate,
+    /// A form field is filled in (permission bit 9 or 6; a certified file allows it with `/P` 2 and 3).
+    Fill,
 }
 
 impl Edit {
     pub fn page(&self) -> u32 {
         match self {
-            Edit::Markup { page, .. } | Edit::Ink { page, .. } | Edit::Note { page, .. } | Edit::Delete { page, .. } => *page,
+            Edit::Markup { page, .. }
+            | Edit::Ink { page, .. }
+            | Edit::Note { page, .. }
+            | Edit::Delete { page, .. }
+            | Edit::Fill { page, .. }
+            | Edit::FreeText { page, .. }
+            | Edit::Stamp { page, .. } => *page,
+        }
+    }
+
+    pub fn class(&self) -> EditClass {
+        match self {
+            Edit::Fill { .. } => EditClass::Fill,
+            _ => EditClass::Annotate,
         }
     }
 }
@@ -152,6 +187,8 @@ struct Ctx<'a> {
     doc: &'a Document,
     next: u32,
     objects: Vec<(u32, Object)>,
+    /// What the edit may still do (appearances, fonts and pictures are charged to it).
+    work: &'a Work,
 }
 
 impl Ctx<'_> {
@@ -215,18 +252,42 @@ fn with_appearance(d: &mut Dict, form: ObjRef) {
 /// Work out `edit` against `doc` (the document as it stands now, `pages` its pages): the objects it makes or changes, by number.
 /// `now` is the date the new annotations get ([`pdf_date_now`]). Nothing is changed; [`commit`] puts the objects in the document.
 pub fn apply(doc: &Document, pages: &[Page], edit: &Edit, now: &str) -> Result<Vec<(u32, Object)>> {
+    apply_metered(doc, pages, edit, now, &Work::new())
+}
+
+/// [`apply`] charging what it does to `work` (a page's allowance): an edit that would take more is refused.
+pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work) -> Result<Vec<(u32, Object)>> {
     let page_index = usize::try_from(edit.page()).unwrap_or(usize::MAX);
     let page = pages.get(page_index).ok_or_else(|| Error::Invalid("there is no such page".to_string()))?;
     let shown = Shown::of(page);
-    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new() };
+    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work };
     let change = match edit {
         Edit::Markup { kind, rects, color, author, .. } => AnnotsChange::Add(markup(&mut ctx, &shown, *kind, rects, *color, author, now)?),
         Edit::Ink { strokes, color, width, author, .. } => AnnotsChange::Add(ink(&mut ctx, &shown, strokes, *color, *width, author, now)?),
         Edit::Note { at, text, color, author, .. } => AnnotsChange::Add(note(&mut ctx, &shown, *at, text, *color, author, now)?),
         Edit::Delete { index, num, .. } => AnnotsChange::Remove { index: *index as usize, num: *num },
+        Edit::FreeText { rect, text, size, color, author, .. } => AnnotsChange::Add(boxes::freetext(&mut ctx, &shown, *rect, text, *size, *color, author, now)?),
+        Edit::Stamp { rect, image, author, .. } => AnnotsChange::Add(boxes::stamp(&mut ctx, &shown, *rect, image, author, now)?),
+        Edit::Fill { index, num, value, .. } => {
+            let (widget_ref, widget) = widget_at(&ctx, pages, page, *index as usize, *num)?;
+            forms::fill(&mut ctx, widget_ref, widget, value)?;
+            return Ok(ctx.objects);
+        }
     };
     change_annots(&mut ctx, pages, page, change)?;
     Ok(ctx.objects)
+}
+
+/// The widget at place `index` of the page's `/Annots`, which must be object `num`.
+fn widget_at(ctx: &Ctx<'_>, pages: &[Page], page: &Page, index: usize, num: u32) -> Result<(ObjRef, Dict)> {
+    let gone = || Error::Invalid("the form field is not there any more".to_string());
+    let Object::Dict(page_dict) = ctx.doc.get(page.obj_ref)? else { return Err(gone()) };
+    let (items, _) = locate(ctx.doc, pages, page, &page_dict)?;
+    let Some(Object::Ref(r)) = items.get(index).cloned().filter(|o| o.as_obj_ref().is_some_and(|r| r.num == num)) else { return Err(gone()) };
+    match ctx.doc.get(r)? {
+        Object::Dict(d) if d.get_name("Subtype").is_some_and(|s| s == "Widget") => Ok((r, d)),
+        _ => Err(gone()),
+    }
 }
 
 fn markup(ctx: &mut Ctx<'_>, shown: &Shown, kind: MarkupKind, rects: &[[f32; 4]], color: [u8; 3], author: &str, now: &str) -> Result<Vec<ObjRef>> {
@@ -611,6 +672,9 @@ pub(crate) fn replay(doc: &Document, changes: &[Change], forward: bool) {
 pub(crate) fn save_section(doc: &Document) -> Result<Vec<u8>> {
     incremental::section(doc, &doc.overlay_entries())
 }
+
+#[cfg(test)]
+mod forms_tests;
 
 #[cfg(test)]
 mod tests {

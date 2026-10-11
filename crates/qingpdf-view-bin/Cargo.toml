@@ -1,0 +1,27 @@
+[package]
+name = "qingpdf-view-bin"
+description = "Windows reader for qingpdf: the program (the command line and the manifest); the reader is the library qingpdf-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "qingpdf-view"
+path = "src/main.rs"
+
+[dependencies]
+qingpdf-core = { path = "../qingpdf-core" }
+qingpdf-view = { path = "../qingpdf-view" }
+
+[lints.rust]
+# No `unsafe` here: the Windows calls are in `win32.rs` of the library.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# The same rules as the engine: nothing from a file, the command line or the window may panic.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

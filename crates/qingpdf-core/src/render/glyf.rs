@@ -62,6 +62,13 @@ fn read_at(f: &File, off: u64, len: usize) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Where the other tables of the font can be had from, for the few that are not kept (`TtFont::raw_table`, for embedding).
+enum Tables {
+    /// The file and every table's (tag, offset, length) in it.
+    File { file: Arc<File>, dir: Vec<([u8; 4], u64, usize)> },
+    Memory { data: Arc<Vec<u8>>, face: usize },
+}
+
 /// Where the glyph records are.
 enum Glyf {
     Memory { data: Arc<Vec<u8>>, off: usize, len: usize },
@@ -149,6 +156,7 @@ pub(crate) struct TtFont {
     loca: Vec<u8>,
     loca_long: bool,
     glyf: Glyf,
+    tables: Tables,
     hmtx: Vec<u8>,
     num_hmetrics: usize,
     pub cmap: Option<Cmap>,
@@ -163,6 +171,8 @@ pub(crate) struct TtFont {
     tricky: bool,
     /// The state `fpgm` and `prep` leave, made at the first hinted glyph (or why it could not be made).
     hint: OnceLock<Result<super::ttvm::Globals, &'static str>>,
+    /// `fsType` of the `OS/2` table, read at the first ask (embedding asks about every candidate font, for every field filled in).
+    fs_type: OnceLock<Option<u16>>,
 }
 
 impl TtFont {
@@ -174,7 +184,7 @@ impl TtFont {
         }
         let (goff, glen) = fontprog::sfnt_table_range(&data, face, b"glyf").ok_or("no glyf table")?;
         let mut get = |tag: &[u8; 4]| -> Option<Vec<u8>> { fontprog::sfnt_table_face(&data, face, tag).map(<[u8]>::to_vec) };
-        let mut font = TtFont::build(&mut get, Glyf::Memory { data: data.clone(), off: goff, len: glen }, true)?;
+        let mut font = TtFont::build(&mut get, Glyf::Memory { data: data.clone(), off: goff, len: glen }, Tables::Memory { data: data.clone(), face }, true)?;
         let range = |tag: &[u8; 4]| fontprog::sfnt_table_range(&data, face, tag).unwrap_or((0, 0));
         let (cvt, fpgm, prep) = (range(b"cvt "), range(b"fpgm"), range(b"prep"));
         let slice = |r: (usize, usize)| data.get(r.0..r.0.saturating_add(r.1)).unwrap_or_default();
@@ -223,7 +233,18 @@ impl TtFont {
             read_at(&file, off, len)
         };
         let handle = Arc::new(file.try_clone().map_err(|_| "cannot read the font file")?);
-        let mut font = TtFont::build(&mut get, Glyf::File { file: handle, off: goff, len: glen }, false)?;
+        let mut dir_entries: Vec<([u8; 4], u64, usize)> = Vec::new();
+        for i in 0..n {
+            let entry = table_dir.get(i * 16..i * 16 + 16).and_then(|rec| {
+                let tag: [u8; 4] = rec.get(..4)?.try_into().ok()?;
+                let off = u64::from(u32::from_be_bytes(rec.get(8..12)?.try_into().ok()?));
+                let len = u32::from_be_bytes(rec.get(12..16)?.try_into().ok()?) as usize;
+                (off.checked_add(len as u64)? <= size).then_some((tag, off, len))
+            });
+            dir_entries.extend(entry);
+        }
+        let tables = Tables::File { file: handle.clone(), dir: dir_entries };
+        let mut font = TtFont::build(&mut get, Glyf::File { file: handle, off: goff, len: glen }, tables, false)?;
         // A system font is tricky only by its tables (the old MingLiU of Windows before 7 is); they are kept when it is.
         let (cvt, fpgm, prep) = (get(b"cvt ").unwrap_or_default(), get(b"fpgm").unwrap_or_default(), get(b"prep").unwrap_or_default());
         if tricky::tables_are_tricky(&cvt, &fpgm, &prep) {
@@ -233,7 +254,7 @@ impl TtFont {
         Ok(font)
     }
 
-    fn build(get: &mut dyn FnMut(&[u8; 4]) -> Option<Vec<u8>>, glyf: Glyf, keep_post: bool) -> Res<TtFont> {
+    fn build(get: &mut dyn FnMut(&[u8; 4]) -> Option<Vec<u8>>, glyf: Glyf, tables: Tables, keep_post: bool) -> Res<TtFont> {
         let head = get(b"head").ok_or("no head table")?;
         let units_per_em = f64::from(u16_at(&head, 18).ok_or("bad head table")?);
         if !(16.0..=16384.0).contains(&units_per_em) {
@@ -257,6 +278,7 @@ impl TtFont {
             loca,
             loca_long,
             glyf,
+            tables,
             hmtx,
             num_hmetrics,
             cmap,
@@ -268,6 +290,7 @@ impl TtFont {
             prog: ProgSrc::None,
             tricky: false,
             hint: OnceLock::new(),
+            fs_type: OnceLock::new(),
         })
     }
 
@@ -279,6 +302,60 @@ impl TtFont {
     /// Bytes this font keeps in memory.
     pub fn memory(&self) -> usize {
         self.loca.len() + self.hmtx.len() + self.post.as_ref().map_or(0, Vec::len) + self.cmap.as_ref().map_or(0, Cmap::bytes) + self.prog.bytes() + 256
+    }
+
+    /// A table of the font file as it is (read now; not kept), `None` when the font has none or it is bigger than `MAX_TABLE`.
+    pub fn raw_table(&self, tag: &[u8; 4]) -> Option<Vec<u8>> {
+        match &self.tables {
+            Tables::File { file, dir } => {
+                let &(_, off, len) = dir.iter().find(|e| &e.0 == tag)?;
+                if len > MAX_TABLE { None } else { read_at(file, off, len) }
+            }
+            Tables::Memory { data, face } => fontprog::sfnt_table_face(data, *face, tag).filter(|t| t.len() <= MAX_TABLE).map(<[u8]>::to_vec),
+        }
+    }
+
+    /// The record of glyph `gid` in `glyf` (empty for a glyph with no outline).
+    pub fn glyph_record(&self, gid: u32) -> Option<Vec<u8>> {
+        let (a, b) = self.record(usize::try_from(gid).ok()?).ok()?;
+        if a == b {
+            return Some(Vec::new());
+        }
+        self.glyf.slice(a, b).map(Cow::into_owned)
+    }
+
+    pub fn units_per_em(&self) -> f64 {
+        self.units_per_em
+    }
+
+    /// The advance width of a glyph and its left side bearing, in font units.
+    pub fn metrics_units(&self, gid: u32) -> Option<(u16, i16)> {
+        if self.num_hmetrics == 0 {
+            return None;
+        }
+        let g = usize::try_from(gid).ok()?;
+        let advance = u16_at(&self.hmtx, g.min(self.num_hmetrics - 1) * 4)?;
+        let lsb = if g < self.num_hmetrics { u16_at(&self.hmtx, g * 4 + 2)? } else { u16_at(&self.hmtx, self.num_hmetrics * 4 + (g - self.num_hmetrics) * 2).unwrap_or(0) };
+        Some((advance, lsb as i16))
+    }
+
+    pub fn ascender_descender(&self) -> (i16, i16) {
+        (self.ascender, self.descender)
+    }
+
+    /// `fsType` of the `OS/2` table (the embedding licence, 2 = restricted); `None` when the font has no such table (or one too short
+    /// to have it). Only the ten bytes it needs are read, once.
+    pub fn fs_type(&self) -> Option<u16> {
+        *self.fs_type.get_or_init(|| {
+            let head: Vec<u8> = match &self.tables {
+                Tables::File { file, dir } => {
+                    let &(_, off, len) = dir.iter().find(|e| &e.0 == b"OS/2")?;
+                    read_at(file, off, len.min(10))?
+                }
+                Tables::Memory { data, face } => fontprog::sfnt_table_face(data, *face, b"OS/2")?.get(..10)?.to_vec(),
+            };
+            u16_at(&head, 8)
+        })
     }
 
     /// The advance of a glyph in em units.
@@ -384,9 +461,9 @@ impl TtFont {
 }
 
 /// One component of a composite glyph (OpenType, glyf): its flags, glyph, arguments and 2 x 2 matrix.
-struct Comp {
-    flags: u16,
-    child: usize,
+pub(crate) struct Comp {
+    pub flags: u16,
+    pub child: usize,
     /// The offset (font units) when ARGS_ARE_XY_VALUES, else the point numbers (in the glyph so far, in the component).
     arg1: i32,
     arg2: i32,
@@ -395,7 +472,7 @@ struct Comp {
 }
 
 /// Read the component at `pos` and move `pos` past it.
-fn parse_component(rec: &[u8], pos: &mut usize) -> Res<Comp> {
+pub(crate) fn parse_component(rec: &[u8], pos: &mut usize) -> Res<Comp> {
     const CUT: &str = "truncated composite glyph";
     let flags = u16_at(rec, *pos).ok_or(CUT)?;
     let child = usize::from(u16_at(rec, *pos + 2).ok_or(CUT)?);

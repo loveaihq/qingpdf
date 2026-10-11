@@ -1,12 +1,14 @@
 //! Signed and certified files (12.8): what an edit may do to a file that carries a signature without making the signature
 //! show the file as changed, or the certifier's rule (`/Perms /DocMDP`, 12.8.2.2) broken.
 //!
-//! The reader adds annotations only. A signature over a file stays valid for what it covered when the update is appended
-//! (that is what an incremental update is for), but a reader checking it later tells the person the file was changed after
-//! signing; a certified file says which changes it allows (`/P`: 1 none, 2 filling in forms and signing, 3 and annotations).
+//! The reader adds annotations and fills in forms (4b). A signature over a file stays valid for what it covered when the update
+//! is appended (that is what an incremental update is for), but a reader checking it later tells the person the file was
+//! changed after signing; a certified file says which changes it allows (`/P`: 1 none, 2 filling in forms and signing, 3 and
+//! annotations): with 2, a form may be filled in and nothing else is added.
 
 use std::collections::HashSet;
 
+use super::EditClass;
 use crate::document::Document;
 use crate::object::{Dict, Object};
 
@@ -22,20 +24,46 @@ pub(crate) enum Policy {
     /// Signed, with no rule against annotations: allowed, and the person is told once that the signature will show the file as
     /// changed afterwards.
     Warn,
+    /// Certified, and the rule allows this change: made without a word (the signature stays valid), but the file is not written
+    /// afresh.
+    Allowed,
     /// Certified with a rule that does not allow annotations: refused (the reason, for the person).
     Refuse(&'static str),
 }
 
-/// Look at the file's signatures and certification.
-pub(crate) fn policy(doc: &Document) -> Policy {
-    let Ok(catalog) = doc.catalog() else { return Policy::Free };
-    match certification(doc, &catalog) {
-        Some(1) => return Policy::Refuse("the file is certified and allows no changes at all (DocMDP 1); adding annotations would break the certification"),
-        Some(2) => return Policy::Refuse("the file is certified and allows only filling in forms and signing (DocMDP 2); adding annotations would break the certification"),
-        Some(_) => return Policy::Warn,
-        None => {}
+/// What the signatures of a file are (looked at once).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Signatures {
+    /// `/P` of the certifying signature, if there is one.
+    certification: Option<i64>,
+    signed: bool,
+}
+
+impl Signatures {
+    /// What an edit of this class may do to the file.
+    pub(crate) fn policy(&self, class: EditClass) -> Policy {
+        match (self.certification, class) {
+            (Some(1), EditClass::Annotate) => Policy::Refuse("the file is certified and allows no changes at all (DocMDP 1); adding annotations would break the certification"),
+            (Some(1), EditClass::Fill) => Policy::Refuse("the file is certified and allows no changes at all (DocMDP 1); filling in a form would break the certification"),
+            (Some(2), EditClass::Annotate) => Policy::Refuse("the file is certified and allows only filling in forms and signing (DocMDP 2); adding annotations would break the certification"),
+            (Some(_), EditClass::Fill) => Policy::Allowed,
+            (Some(_), EditClass::Annotate) => Policy::Warn,
+            (None, _) if self.signed => Policy::Warn,
+            (None, _) => Policy::Free,
+        }
     }
-    if has_signed_field(doc, &catalog) { Policy::Warn } else { Policy::Free }
+}
+
+/// Look at the file's signatures and certification.
+pub(crate) fn look(doc: &Document) -> Signatures {
+    let Ok(catalog) = doc.catalog() else { return Signatures { certification: None, signed: false } };
+    Signatures { certification: certification(doc, &catalog), signed: has_signed_field(doc, &catalog) }
+}
+
+/// What the signatures of the file leave to an annotation.
+#[cfg(test)]
+pub(crate) fn policy(doc: &Document) -> Policy {
+    look(doc).policy(EditClass::Annotate)
 }
 
 fn dict_of(doc: &Document, o: Option<&Object>) -> Option<Dict> {

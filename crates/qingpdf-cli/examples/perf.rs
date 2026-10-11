@@ -697,13 +697,19 @@ fn main() -> Result<(), String> {
     let jpx_grown = AFTER_JPX.saturating_sub(AFTER_JBIG2);
     let jpx_growth_ok = jpx_grown <= 250_000;
     println!("  grown by JPX (3c2-2):     {jpx_grown} bytes ({:.0} KB)  (target <= 0.25 MB; the size recorded at 3c2-2)  {}", jpx_grown as f64 / 1000.0, verdict(jpx_growth_ok));
-    let annots_grown = bytes.saturating_sub(AFTER_JPX);
+    // 2,797,568 bytes when 4a was finished (the program has no editing in it; what 3c2-3 made of annotations is all it has).
+    const AFTER_ANNOTS: u64 = 2_797_568;
+    let annots_grown = AFTER_ANNOTS.saturating_sub(AFTER_JPX);
     let annots_growth_ok = annots_grown <= 50_000;
-    println!("  grown by annotations (3c2-3): {annots_grown} bytes ({:.0} KB)  (target <= 0.05 MB)  {}", annots_grown as f64 / 1000.0, verdict(annots_growth_ok));
+    println!("  grown by annotations (3c2-3): {annots_grown} bytes ({:.0} KB)  (target <= 0.05 MB; the size recorded at 4a)  {}", annots_grown as f64 / 1000.0, verdict(annots_growth_ok));
+    // Layer 4, step 4b: the drawing of form fields that have no appearance (the program edits nothing) at most 0.1 MB more.
+    let forms_grown = bytes.saturating_sub(AFTER_ANNOTS);
+    let forms_growth_ok = forms_grown <= 100_000;
+    println!("  grown by form fields (4b): {forms_grown} bytes ({:.0} KB)  (target <= 0.1 MB)  {}", forms_grown as f64 / 1000.0, verdict(forms_growth_ok));
 
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
     let render_ok = render_case(&program)?;
 
-    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && transparency_growth_ok && jbig2_growth_ok && jpx_growth_ok && annots_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
+    if info_ok && merge_ok && size_ok && growth_ok && text_growth_ok && render_growth_ok && fonts_growth_ok && tricky_growth_ok && transparency_growth_ok && jbig2_growth_ok && jpx_growth_ok && annots_growth_ok && forms_growth_ok && encrypted_ok && text_ok && render_ok { Ok(()) } else { Err("a performance target was missed".to_string()) }
 }

@@ -68,6 +68,7 @@ impl SearchState {
     }
 
     /// Go to the next place after the current one (the first again after the last). `None` when there is none at all.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<HitRef> {
         let target = match self.current {
             None => self.first(),

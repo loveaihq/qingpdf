@@ -21,6 +21,9 @@ use crate::document::Page;
 pub(crate) const MAX_ANNOTS: usize = 20_000;
 /// Most levels of `/Parent` followed to find an inherited `/V` (12.7.3.1).
 const MAX_PARENTS: usize = 32;
+/// Most appearances made for form fields that have none on one page (each page drawn starts the count again; a page with more
+/// is drawn up to there and told to be incomplete).
+const MAX_SYNTHESIZED: usize = 10_000;
 
 /// Annotation flags (12.5.3, Table 165).
 const FLAG_INVISIBLE: i64 = 1;
@@ -102,7 +105,7 @@ impl Interp<'_> {
         self.start_annotations();
         for (i, item) in items.iter().enumerate() {
             if i >= MAX_ANNOTS {
-                self.warn(format!("the page has more than {MAX_ANNOTS} annotations; the rest are not drawn"));
+                self.leave_out(format!("the page has more than {MAX_ANNOTS} annotations; the rest are not drawn"));
                 break;
             }
             if !self.work.charge(cost::ANNOT_VISIT) {
@@ -186,10 +189,14 @@ impl Interp<'_> {
         let (r, form) = match self.normal_appearance(d)? {
             Found::Form(r, form) => (r, form),
             Found::Missing => {
-                if subtype.as_deref() == Some(b"Widget") {
-                    self.warn("a form field has no appearance stream; it is not drawn (NeedAppearances is not handled)");
+                // A form field with no appearance is drawn as its value, `/DA` and `/MK` say (12.7.3.3); nothing is written.
+                if subtype.as_deref() != Some(b"Widget") {
+                    return Ok(());
                 }
-                return Ok(());
+                match self.synthetic_widget(d, item)? {
+                    Some(made) => made,
+                    None => return Ok(()),
+                }
             }
             Found::Nothing => return Ok(()),
         };
@@ -236,6 +243,35 @@ impl Interp<'_> {
         let drawn = self.run_form(r, &form, res, 0);
         (self.base, self.pattern_base) = saved;
         drawn
+    }
+
+    /// Something is left out of the page for a limit of the drawing's own: the page is incomplete, and says why (once; the first
+    /// reason stays), and the reason is also a warning.
+    fn leave_out(&mut self, message: String) {
+        self.warn(message.clone());
+        self.incomplete.get_or_insert(message);
+    }
+
+    /// The appearance a widget without one would have (4b): made from the field and kept for this drawing only. At most
+    /// [`MAX_SYNTHESIZED`] for one page; the page is incomplete when there are more.
+    fn synthetic_widget(&mut self, d: &Dict, item: &Object) -> Result<Option<(ObjRef, Rc<Form>)>> {
+        let doc = self.doc;
+        if self.synthesized >= MAX_SYNTHESIZED {
+            if self.synthesized == MAX_SYNTHESIZED {
+                self.synthesized += 1;
+                self.leave_out(format!("more than {MAX_SYNTHESIZED} form fields of the page have no appearance; the rest are not drawn"));
+            }
+            return Ok(None);
+        }
+        let form = self.shared.acroform.get_or_insert_with(|| crate::edit::forms::acroform(doc, &self.work).map(Rc::new)).clone();
+        let Some(form) = form else { return Ok(None) };
+        let num = item.as_obj_ref().map_or(0, |r| r.num);
+        let Some((stream, lines_cut)) = crate::edit::forms::synthesize(doc, &form, num, d, &self.work) else { return Ok(None) };
+        self.synthesized += 1;
+        if lines_cut {
+            self.leave_out("a form field has more lines than are laid out; the rest of its text is not drawn".to_string());
+        }
+        Ok(self.load_form(&stream, None)?.map(|f| (ObjRef::new(num, 0), f)))
     }
 
     /// The appearance stream an annotation shows (12.5.5): `/AP /N`, or, when that is a dictionary of states, the

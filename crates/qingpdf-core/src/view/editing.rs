@@ -16,7 +16,8 @@ use std::rc::Rc;
 
 use super::wipe;
 use crate::document::Document;
-use crate::edit::signature::{self, Policy};
+use crate::edit::signature::{self, Policy, Signatures};
+use crate::edit::EditClass;
 use crate::edit::{self, Change};
 use crate::object::ObjRef;
 use crate::xref::XrefEntry;
@@ -24,13 +25,17 @@ use crate::xref::XrefEntry;
 /// Most edits that can be undone.
 pub const MAX_UNDO_STEPS: usize = 100;
 
+/// How many pages' worth of work all the edits of a session may cost together (an edit alone may cost one).
+const WORK_PAGES: f64 = 20.0;
+
 /// How an edit, an undo or a redo came out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EditStatus {
     /// Done: the document has changed (the page `page` is to be drawn again).
     Done = 0,
-    /// The file's author did not allow adding annotations and the file was not opened with the owner password.
+    /// The file's author did not allow this change (adding annotations, filling in forms) and the file was not opened with the
+    /// owner password.
     Denied = 1,
     /// Not done (`message` says why); the file is as it was.
     Failed = 2,
@@ -103,8 +108,10 @@ pub(crate) struct Session {
     budget: usize,
     /// What the file's signatures allow, looked at when the first edit comes; and whether the person has been told that the
     /// signature will show the file as changed.
-    policy: Option<Policy>,
+    signatures: Option<Signatures>,
     warned: bool,
+    /// What the edits made so far have cost the work meter, in all (the allowance is for the whole session).
+    work_used: f64,
 }
 
 impl Drop for Session {
@@ -124,8 +131,9 @@ impl Session {
             next: 1,
             rewrote: false,
             budget: usize::try_from(budget).unwrap_or(usize::MAX),
-            policy: None,
+            signatures: None,
             warned: false,
+            work_used: 0.0,
         }
     }
 
@@ -151,8 +159,18 @@ impl Session {
     }
 
     /// What the file's signatures allow an edit to do (looked at once, when the first edit comes).
-    pub(crate) fn policy(&mut self, doc: &Document) -> Policy {
-        self.policy.get_or_insert_with(|| signature::policy(doc)).clone()
+    pub(crate) fn policy(&mut self, doc: &Document, class: EditClass) -> Policy {
+        self.signatures.get_or_insert_with(|| signature::look(doc)).policy(class)
+    }
+
+    /// Edits may cost the work meter this much in all, over the life of the file's session (appearances, fonts, pictures): the
+    /// allowance of a page for each of [`WORK_PAGES`] pages.
+    pub(crate) fn work_left(&self) -> f64 {
+        (crate::render::work::PAGE_WORK * WORK_PAGES - self.work_used).max(0.0)
+    }
+
+    pub(crate) fn add_work(&mut self, used: f64) {
+        self.work_used += used;
     }
 
     /// Is the person to be told, now, that the signature will show the file as changed? Yes once.

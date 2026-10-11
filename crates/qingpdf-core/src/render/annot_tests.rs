@@ -193,18 +193,29 @@ fn hidden_annotations_popups_and_optional_content() {
 }
 
 #[test]
-fn form_fields_without_an_appearance_are_skipped_with_a_warning() {
+fn form_fields_without_an_appearance_are_drawn_from_what_they_hold() {
+    // With a form in the file: a field that has no normal appearance (one with only a down appearance too) is drawn as its `/MK` and
+    // value say (4b); a link and a hidden widget are not drawn; nothing is said.
+    let form = "/AcroForm << /Fields [10 0 R] /DA (/Helv 8 Tf 0 g) >>";
     let objs = [
-        (10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /FT /Tx >>".to_string()),
-        (11, "<< /Type /Annot /Subtype /Widget /Rect [20 0 30 10] /AP << /D 5 0 R >> >>".to_string()),
+        (10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /FT /Tx /T (a) /MK << /BG [1 0 0] >> >>".to_string()),
+        (11, "<< /Type /Annot /Subtype /Widget /Rect [20 0 30 10] /FT /Tx /T (b) /MK << /BG [0 1 0] >> /AP << /D 5 0 R >> >>".to_string()),
         (12, "<< /Type /Annot /Subtype /Link /Rect [40 0 50 10] >>".to_string()),
-        (13, "<< /Type /Annot /Subtype /Widget /Rect [60 0 70 10] /F 2 >>".to_string()),
+        (13, "<< /Type /Annot /Subtype /Widget /Rect [60 0 70 10] /F 2 /FT /Tx /T (c) /MK << /BG [0 0 1] >> >>".to_string()),
     ];
-    let doc = doc_of("", "<< >>", "/Annots [10 0 R 11 0 R 12 0 R 13 0 R]", "", &objs, &squares());
-    let (_, w) = render(&doc, true);
-    assert_eq!(w.len(), 1, "{w:?}");
-    assert!(has(&w, "form field has no appearance stream"), "{w:?}");
-    // No annotation at all: nothing to say.
+    let doc = doc_of(form, "<< >>", "/Annots [10 0 R 11 0 R 12 0 R 13 0 R]", "", &objs, &squares());
+    let (b, w) = render(&doc, true);
+    assert!(w.is_empty(), "{w:?}");
+    // The first two are filled with their backgrounds; the link and the hidden widget are not drawn at all.
+    assert_eq!(centre(&b, 0, 0), RED);
+    assert_eq!(centre(&b, 20, 0), GREEN);
+    for x in [40, 60] {
+        assert_eq!(centre(&b, x, 0), WHITE, "{x}");
+    }
+    // A widget in a file that has no form is not drawn, and no annotation at all has nothing to say.
+    let doc = doc_of("", "<< >>", "/Annots [10 0 R]", "", &objs[..1], &squares());
+    let (b, w) = render(&doc, true);
+    assert!(w.is_empty() && centre(&b, 0, 0) == WHITE, "{w:?}");
     let doc = doc_of("", "<< >>", "", "0 g 0 0 5 5 re f", &[], &[]);
     assert!(render(&doc, true).1.is_empty());
 }

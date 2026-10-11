@@ -18,6 +18,7 @@
 
 mod annots;
 mod editing;
+mod forms;
 mod geometry;
 mod links;
 mod outline;
@@ -42,6 +43,9 @@ use crate::ops::has_owner_rights;
 use crate::text;
 
 pub use annots::{AnnotInfo, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_PARTS};
+pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
+pub use crate::edit::MAX_OPTION_BYTES;
+pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
@@ -144,8 +148,10 @@ pub struct Rights {
     pub print: bool,
     /// ... at the best quality. Without it, printing is limited to [`LOW_QUALITY_PRINT_DPI`] dots per inch.
     pub print_high_quality: bool,
-    /// Annotations may be added and taken out (permission bit 6, Table 22; the owner password lifts it).
+    /// Annotations (text boxes and stamps too) may be added and taken out (permission bit 6, Table 22; the owner password lifts it).
     pub annotate: bool,
+    /// Form fields may be filled in (permission bit 9, or bit 6 of a file of revision 2; the owner password lifts it).
+    pub fill_forms: bool,
 }
 
 /// The most dots per inch a page is printed at when the file allows only low-quality printing (Table 22, bit 12).
@@ -273,6 +279,11 @@ pub enum Event {
     PrintDone { doc: u64, id: u64, status: PrintStatus, pages_done: u32, message: String },
     /// The annotations of a page that can be picked (the answer to [`Engine::annotations`]), in the order of the page's list.
     Annotations { doc: u64, id: u64, page: u32, items: Vec<AnnotInfo>, truncated: bool },
+    /// The form fields of a page (the answer to [`Engine::fields`]), in the order of the page's list (the order Tab goes in).
+    Fields { doc: u64, id: u64, page: u32, items: Vec<FieldInfo>, truncated: bool },
+    /// The options of a combo box or list (the answer to [`Engine::options`]): (export value, shown text), at most
+    /// [`MAX_OPTION_BYTES`] of text; `truncated`: some were left out. Empty when the field is not there any more or is no choice.
+    Options { doc: u64, id: u64, page: u32, index: u32, num: u32, items: Vec<(String, String)>, truncated: bool },
     /// The answer to an edit, an undo or a redo. After [`EditStatus::Done`] what was drawn of the page is out of date (the other
     /// pages are as they were), and the queued requests go on. The file is not changed until it is saved.
     Edited(EditResult),
@@ -289,6 +300,8 @@ pub(crate) enum Request {
     Copy { from: (u32, u32), to: (u32, u32) },
     Print(Vec<PrintPage>),
     Annotations(u32),
+    Fields(u32),
+    Options { page: u32, index: u32, num: u32 },
 }
 
 pub(crate) enum Command {
@@ -450,6 +463,42 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn add_note(&self, doc: u64, id: u64, page: u32, at: [f32; 2], text: &str, color: [u8; 3], author: &str) {
         let edit = crate::edit::Edit::Note { page, at, text: text.to_string(), color, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Ask for the form fields of a page: answered by [`Event::Fields`].
+    pub fn fields(&self, doc: u64, id: u64, page: u32) {
+        self.request(doc, id, Request::Fields(page));
+    }
+
+    /// Ask for the options of a combo box or list, when a person is about to choose from them: the field that [`Event::Fields`] told
+    /// as `index` and `num` of the page. Answered by [`Event::Options`]. (The lists of fields do not carry options: a form whose
+    /// fields share one long list would be sent that list for every field.)
+    pub fn options(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
+        self.request(doc, id, Request::Options { page, index, num });
+    }
+
+    /// Fill in a form field: the one that [`Event::Fields`] told as `index` and `num` of the page, with `value` (text for a text
+    /// field, the export value or the shown text of one of the choices of a combo box or list, on or off for a check box or
+    /// radio button). Answered by [`Event::Edited`]; needs the right to fill in forms ([`Rights::fill_forms`]).
+    pub fn fill_field(&self, doc: u64, id: u64, page: u32, index: u32, num: u32, value: FillValue) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Fill { page, index, num, value } });
+    }
+
+    /// Put a text box on the page: `rect` is `[left, top, right, bottom]` in the points of [`CharBoxes`]; the text is `size`
+    /// points high (between [`MIN_FONT_SIZE`] and [`MAX_FONT_SIZE`]), at most [`MAX_FREETEXT_CHARS`] characters; the box grows
+    /// downwards if the text needs more room. Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_freetext(&self, doc: u64, id: u64, page: u32, rect: [f32; 4], text: &str, size: f32, color: [u8; 3], author: &str) {
+        let edit = crate::edit::Edit::FreeText { page, rect, text: text.to_string(), size, color, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Stamp a picture (the bytes of a PNG or JPEG file; `crate::image::probe` tells its size) on the page, as big as fits in `rect`
+    /// with the picture's shape. At most [`MAX_STAMP_PIXELS`] pixels and [`MAX_STAMP_FILE_BYTES`] bytes. Answered by
+    /// [`Event::Edited`].
+    pub fn add_stamp(&self, doc: u64, id: u64, page: u32, rect: [f32; 4], image: Vec<u8>, author: &str) {
+        let edit = crate::edit::Edit::Stamp { page, rect, image, author: author.to_string() };
         let _ = self.commands.send(Command::Edit { doc, id, edit });
     }
 
@@ -618,16 +667,17 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
 fn rights_of(document: &Document, password: &str) -> Rights {
     let copy = text::check_extraction_allowed(document, password).is_ok();
     let Some(encryption) = document.encryption() else {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true };
     };
     if has_owner_rights(document, &encryption, password) {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true };
     }
     Rights {
         copy,
         print: encryption.permissions.print,
         print_high_quality: encryption.permissions.print_high_quality,
         annotate: encryption.permissions.annotate,
+        fill_forms: encryption.permissions.fill_forms,
     }
 }
 

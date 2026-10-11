@@ -2,6 +2,7 @@
 //! (about).
 
 use super::editing::{COLORS, Tool, WIDTHS};
+use super::forms::TEXT_SIZES;
 use super::*;
 use crate::ui::MenuEntry;
 
@@ -21,6 +22,7 @@ pub(super) struct MenuState {
     pub tool: u32,
     pub color: usize,
     pub width: usize,
+    pub text_size: usize,
 }
 
 impl MenuState {
@@ -38,6 +40,7 @@ impl MenuState {
             tool: CMD_TOOL_SELECT,
             color: 0,
             width: 1,
+            text_size: 1,
         }
     }
 }
@@ -122,6 +125,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             entries: {
                 let tool = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.tool == id, enabled: id == CMD_TOOL_SELECT && st.has_doc || st.can_edit };
                 let colors: Vec<MenuEntry> = COLORS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_COLOR_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.color == i, enabled: st.can_edit }).collect();
+                let sizes: Vec<MenuEntry> = TEXT_SIZES.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_SIZE_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.text_size == i, enabled: st.can_edit }).collect();
                 let widths: Vec<MenuEntry> = WIDTHS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_WIDTH_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.width == i, enabled: st.can_edit }).collect();
                 vec![
                     tool(CMD_TOOL_SELECT, Msg::ToolSelect),
@@ -132,9 +136,12 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     tool(CMD_TOOL_SQUIGGLY, Msg::ToolSquiggly),
                     tool(CMD_TOOL_INK, Msg::ToolInk),
                     tool(CMD_TOOL_NOTE, Msg::ToolNote),
+                    tool(CMD_TOOL_TEXTBOX, Msg::ToolTextBox),
+                    tool(CMD_STAMP, Msg::ToolStamp),
                     MenuEntry::Separator,
                     MenuEntry::Submenu { title: t(lang, Msg::ColorMenu).to_string(), entries: colors },
                     MenuEntry::Submenu { title: t(lang, Msg::WidthMenu).to_string(), entries: widths },
+                    MenuEntry::Submenu { title: t(lang, Msg::TextSizeMenu).to_string(), entries: sizes },
                     item(CMD_AUTHOR, Msg::AuthorItem, st.has_doc),
                     MenuEntry::Separator,
                     item(CMD_REMOVE, Msg::RemoveAnnot, st.has_picked && st.can_edit),
@@ -164,6 +171,8 @@ impl App {
             Tool::Markup(MarkupKind::Squiggly) => CMD_TOOL_SQUIGGLY,
             Tool::Ink => CMD_TOOL_INK,
             Tool::Note => CMD_TOOL_NOTE,
+            Tool::TextBox => CMD_TOOL_TEXTBOX,
+            Tool::Stamp => CMD_STAMP,
         };
         let st = MenuState {
             has_doc: self.doc.is_some(),
@@ -177,6 +186,7 @@ impl App {
             tool,
             color: self.edit.current_color(),
             width: self.edit.width,
+            text_size: self.edit.forms.text_size,
         };
         build_menus(self.lang, &st)
     }
@@ -225,7 +235,7 @@ mod tests {
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.
