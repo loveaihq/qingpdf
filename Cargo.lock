@@ -212,6 +212,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qingpdf-base"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "md-5",
+ "miniz_oxide 0.9.1",
+ "png",
+ "sha2",
+ "tiny-skia",
+ "zune-jpeg",
+]
+
+[[package]]
 name = "qingpdf-cli"
 version = "0.1.0"
 dependencies = [
@@ -227,9 +240,7 @@ dependencies = [
  "md-5",
  "miniz_oxide 0.9.1",
  "png",
- "sha2",
- "tiny-skia",
- "zune-jpeg",
+ "qingpdf-base",
 ]
 
 [[package]]

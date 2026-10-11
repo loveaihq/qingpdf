@@ -1,4 +1,4 @@
-"""Make the DeviceCMYK to RGB table of crates/qingpdf-core/src/render/cmyk.bin.
+"""Make the DeviceCMYK to RGB table of crates/qingpdf-base/src/render/cmyk.bin.
 
     python tests/tools/make_cmyk_table.py [--check]
 

@@ -11,10 +11,10 @@
 
 mod appearance;
 mod boxes;
+pub(crate) mod content;
+mod fill;
 pub(crate) mod fontsub;
-pub(crate) mod forms;
 pub(crate) mod incremental;
-mod layout;
 pub(crate) mod signature;
 
 use std::collections::HashSet;
@@ -28,9 +28,11 @@ use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, St
 use crate::render::work::Work;
 use crate::text::Shown;
 
+use crate::layout::reals;
 use appearance::{Appearance, Quad};
+pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
-pub use forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
+pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
 /// Most points one drawing has (all its strokes together); a longer one is thinned out, its ends kept.
 pub const MAX_INK_POINTS: usize = 8_192;
 /// Most strokes in one drawing.
@@ -91,6 +93,13 @@ pub enum Edit {
     FreeText { page: u32, rect: [f32; 4], text: String, size: f32, color: [u8; 3], author: String },
     /// A picture (the bytes of a PNG or JPEG file) stamped on the page, as big as fits in `rect` with the picture's shape.
     Stamp { page: u32, rect: [f32; 4], image: Vec<u8>, author: String },
+    /// Text drawn into the page's own content (4c, not an annotation): the left end of the first line's baseline is at `at` (points
+    /// of the page as shown), the lines (the text's line ends) go down from there, `size` points high.
+    AddText { page: u32, at: [f32; 2], text: String, size: f32, color: [u8; 3] },
+    /// A picture drawn into the page's own content, as big as fits in `rect` with the picture's shape, in the middle of it.
+    AddImage { page: u32, rect: [f32; 4], image: Vec<u8> },
+    /// A watermark on several pages (their own content, 4c).
+    Watermark(Box<Watermark>),
 }
 
 /// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
@@ -100,6 +109,8 @@ pub enum EditClass {
     Annotate,
     /// A form field is filled in (permission bit 9 or 6; a certified file allows it with `/P` 2 and 3).
     Fill,
+    /// The content of pages is written (permission bit 4; a signed file allows nothing of the kind).
+    Content,
 }
 
 impl Edit {
@@ -111,13 +122,17 @@ impl Edit {
             | Edit::Delete { page, .. }
             | Edit::Fill { page, .. }
             | Edit::FreeText { page, .. }
-            | Edit::Stamp { page, .. } => *page,
+            | Edit::Stamp { page, .. }
+            | Edit::AddText { page, .. }
+            | Edit::AddImage { page, .. } => *page,
+            Edit::Watermark(_) => ALL_PAGES,
         }
     }
 
     pub fn class(&self) -> EditClass {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
+            Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) => EditClass::Content,
             _ => EditClass::Annotate,
         }
     }
@@ -160,9 +175,6 @@ fn text_string(s: &str) -> Object {
     Object::String(PdfString::hex(bytes))
 }
 
-fn reals(values: &[f64]) -> Object {
-    Object::Array(values.iter().map(|&v| Object::Real(v)).collect())
-}
 
 fn unit(rgb: [u8; 3]) -> [f64; 3] {
     [f64::from(rgb[0]) / 255.0, f64::from(rgb[1]) / 255.0, f64::from(rgb[2]) / 255.0]
@@ -182,6 +194,9 @@ const FLAG_LOCKED: i64 = 128;
 /// How many steps of replies to replies are followed when an annotation is taken out.
 const MAX_REPLY_DEPTH: usize = 8;
 
+/// What an edit that would take more than its room says (the reader adds what the person can do about it).
+pub const TOO_BIG: &str = "the change is too big";
+
 /// What a change is worked out with: the document, the numbers taken for new objects and the objects to write.
 struct Ctx<'a> {
     doc: &'a Document,
@@ -189,6 +204,11 @@ struct Ctx<'a> {
     objects: Vec<(u32, Object)>,
     /// What the edit may still do (appearances, fonts and pictures are charged to it).
     work: &'a Work,
+    /// How many bytes the objects of the edit may take in all (the memory set aside for what is not saved yet), and how many the
+    /// ones counted so far do (page content counts them as it goes: an edit of many pages would otherwise build its objects first
+    /// and be refused afterwards).
+    room: usize,
+    used: usize,
 }
 
 impl Ctx<'_> {
@@ -199,6 +219,18 @@ impl Ctx<'_> {
         let r = ObjRef::new(self.next, 0);
         self.next += 1;
         Ok(r)
+    }
+
+    /// Count `bytes` more against the room; refused when the edit would take more than it may.
+    fn spend(&mut self, bytes: usize) -> Result<()> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.room { Err(Error::Limit(TOO_BIG.to_string())) } else { Ok(()) }
+    }
+
+    /// Count the objects made since `from` (an index of `objects`).
+    fn tally(&mut self, from: usize) -> Result<()> {
+        let bytes = self.objects.get(from..).unwrap_or(&[]).iter().fold(0usize, |sum, (_, o)| sum.saturating_add(o.approx_size()).saturating_add(48));
+        self.spend(bytes)
     }
 
     fn form(&mut self, a: &Appearance) -> Result<ObjRef> {
@@ -252,15 +284,23 @@ fn with_appearance(d: &mut Dict, form: ObjRef) {
 /// Work out `edit` against `doc` (the document as it stands now, `pages` its pages): the objects it makes or changes, by number.
 /// `now` is the date the new annotations get ([`pdf_date_now`]). Nothing is changed; [`commit`] puts the objects in the document.
 pub fn apply(doc: &Document, pages: &[Page], edit: &Edit, now: &str) -> Result<Vec<(u32, Object)>> {
-    apply_metered(doc, pages, edit, now, &Work::new())
+    apply_metered(doc, pages, edit, now, &Work::new(), DEFAULT_ROOM)
 }
 
+/// What one edit may take, in bytes, when nothing says otherwise: the memory the reader sets aside for what is not saved yet.
+const DEFAULT_ROOM: usize = 16 << 20;
+
 /// [`apply`] charging what it does to `work` (a page's allowance): an edit that would take more is refused.
-pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work) -> Result<Vec<(u32, Object)>> {
+pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Vec<(u32, Object)>> {
+    if let Edit::Watermark(mark) = edit {
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0 };
+        content::watermark(&mut ctx, pages, mark)?;
+        return Ok(ctx.objects);
+    }
     let page_index = usize::try_from(edit.page()).unwrap_or(usize::MAX);
     let page = pages.get(page_index).ok_or_else(|| Error::Invalid("there is no such page".to_string()))?;
     let shown = Shown::of(page);
-    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work };
+    let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0 };
     let change = match edit {
         Edit::Markup { kind, rects, color, author, .. } => AnnotsChange::Add(markup(&mut ctx, &shown, *kind, rects, *color, author, now)?),
         Edit::Ink { strokes, color, width, author, .. } => AnnotsChange::Add(ink(&mut ctx, &shown, strokes, *color, *width, author, now)?),
@@ -268,9 +308,18 @@ pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &s
         Edit::Delete { index, num, .. } => AnnotsChange::Remove { index: *index as usize, num: *num },
         Edit::FreeText { rect, text, size, color, author, .. } => AnnotsChange::Add(boxes::freetext(&mut ctx, &shown, *rect, text, *size, *color, author, now)?),
         Edit::Stamp { rect, image, author, .. } => AnnotsChange::Add(boxes::stamp(&mut ctx, &shown, *rect, image, author, now)?),
+        Edit::AddText { at, text, size, color, .. } => {
+            content::add_text(&mut ctx, page, *at, text, *size, *color)?;
+            return Ok(ctx.objects);
+        }
+        Edit::AddImage { rect, image, .. } => {
+            content::add_image(&mut ctx, page, *rect, image)?;
+            return Ok(ctx.objects);
+        }
+        Edit::Watermark(_) => return Err(Error::Invalid("a watermark is not made for one page".to_string())),
         Edit::Fill { index, num, value, .. } => {
             let (widget_ref, widget) = widget_at(&ctx, pages, page, *index as usize, *num)?;
-            forms::fill(&mut ctx, widget_ref, widget, value)?;
+            fill::fill(&mut ctx, widget_ref, widget, value)?;
             return Ok(ctx.objects);
         }
     };

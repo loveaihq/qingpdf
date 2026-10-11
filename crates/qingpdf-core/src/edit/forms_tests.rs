@@ -2,7 +2,7 @@
 //! needs a Chinese font says so and passes quietly on a machine that has none.
 
 use super::fontsub::Look;
-use super::forms::{MAX_KIDS, text_of};
+use crate::forms::{MAX_KIDS, text_of};
 use super::*;
 use crate::edit::{Edit, apply, commit, save_section};
 use crate::render::Renderer;

@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use qingpdf_core::edit::{self, ContentOp};
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
 use qingpdf_core::security::{Method, PasswordKind};
@@ -120,7 +121,57 @@ fn run(request: Request) -> Result<(), Failure> {
             render_command(&input, pages.as_deref(), dpi, annots, &output, force, &password)
         }
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
+        Request::Watermark { input, text, image, opacity, angle, tile, under, pages, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
+            let wanted = match pages {
+                Some(list) => page_list(&doc, &input, &list)?,
+                None => (0..doc.page_count().map_err(|e| op_error(&input, &e))?).collect(),
+            };
+            check_output(&output, std::slice::from_ref(&input), force)?;
+            let image = match &image {
+                Some(path) => read_picture(path)?,
+                None => Vec::new(),
+            };
+            let pages = wanted.iter().map(|&p| u32::try_from(p).unwrap_or(u32::MAX)).collect();
+            let mark = edit::Watermark { text: text.unwrap_or_default(), image, opacity, angle, tile, under, pages };
+            add_command(&doc, &password, &input, &output, &ContentOp::Watermark(mark))
+        }
+        Request::Stamp { input, image, page, at, width, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
+            check_output(&output, std::slice::from_ref(&input), force)?;
+            let image = read_picture(&image)?;
+            add_command(&doc, &password, &input, &output, &ContentOp::Image { page: page - 1, at, width, image })
+        }
+        Request::Addtext { input, page, at, size, text, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
+            check_output(&output, std::slice::from_ref(&input), force)?;
+            add_command(&doc, &password, &input, &output, &ContentOp::Text { page: page - 1, at, size, text: text.replace("\\n", "\n"), color: [0, 0, 0] })
+        }
     }
+}
+
+/// Read a picture file for a page (a size over the limit is refused before it is read).
+fn read_picture(path: &Path) -> Result<Vec<u8>, Failure> {
+    let size = fs::metadata(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?.len();
+    if size > edit::MAX_STAMP_FILE_BYTES as u64 {
+        return Err(format!("{} is bigger than {} MB, the most a picture file may be", path.display(), edit::MAX_STAMP_FILE_BYTES >> 20));
+    }
+    fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
+/// Put what `op` says on the pages and write the file: the input as it was, with the change appended to it.
+fn add_command(doc: &Document, password: &str, input: &Path, output: &Path, op: &ContentOp) -> Result<(), Failure> {
+    let added = edit::add_content(doc, password, op).map_err(|e| op_error(input, &e))?;
+    write_file(output, &added.data)?;
+    for warning in &added.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if added.rewritten {
+        eprintln!("warning: {} had damaged structure data, so it was written afresh as a whole; its original bytes are not kept", input.display());
+    }
+    let pages = doc.page_count().unwrap_or(0);
+    say(&format!("wrote {} ({} page{})\n", output.display(), pages, plural(pages)));
+    Ok(())
 }
 
 // --- reading and writing files -------------------------------------------------------

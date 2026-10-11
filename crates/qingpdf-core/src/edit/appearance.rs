@@ -20,20 +20,7 @@ pub(crate) struct Appearance {
     pub multiply: bool,
 }
 
-/// A number for a content stream: four decimals at most, no exponent, no trailing zeros.
-pub(crate) fn num(v: f64) -> String {
-    let v = if v.is_finite() { v } else { 0.0 };
-    let mut s = format!("{v:.4}");
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    if s == "-0" { "0".to_string() } else { s }
-}
+pub(crate) use crate::layout::num;
 
 fn point(out: &mut String, p: (f64, f64), op: &str) {
     let _ = writeln!(out, "{} {} {op}", num(p.0), num(p.1));

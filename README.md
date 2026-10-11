@@ -19,7 +19,12 @@ qingpdf img2pdf 1.jpg 2.png -o out.pdf              one image per page (JPEG kep
 qingpdf decrypt a.pdf -o plain.pdf --password P     write an unencrypted copy (owner password, or a file that allows everything)
 qingpdf text a.pdf -o a.txt                         text in reading order (scans give nothing: no OCR)
 qingpdf render a.pdf --pages 1-3 --dpi 150 -o page_%d.png  draw pages to PNG
+qingpdf watermark a.pdf --text "机密" --opacity 0.3 --angle 45 --tile -o out.pdf   text or picture watermark (--under the content, --pages 1-3)
+qingpdf stamp a.pdf --image sig.png --page 3 --at 72,100 --width 120 -o out.pdf  put a picture on a page (a PNG's transparency is kept)
+qingpdf addtext a.pdf --page 1 --at 72,720 --size 12 --text "你好" -o out.pdf     put text on a page (Chinese too)
 ```
+
+`watermark`, `stamp` and `addtext` write into the pages' own content, so every other program and a printer show it too; the text is embedded as a font subset, so Chinese is shown everywhere. The output is the input with the change appended as an incremental update (the input's bytes stay exactly as they are; the input itself is never touched). Places are points from the lower left corner of the page as it is shown, and a watermark stays upright and centred on a turned page. A signed or certified file is refused, and so is an encrypted file whose author did not allow changing it (give the owner password).
 
 Every command that reads a PDF takes `--password <password>` for encrypted files (a password that is given is tried first, then the empty one); the results are encrypted the way the input was, with the same passwords and permissions. A file that restricts what may be done with it (it was not opened with its owner password and its author did not allow everything) can only be the first input of a merge, whose output then carries its protection, unless its owner password is given. `info` shows how a file is protected and what its author allows.
 
@@ -67,7 +72,7 @@ Third-party software and data, with their licence texts, are listed in [THIRD-PA
 
 ## 中文简介
 
-qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。阅读界面、转换和编辑还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
+qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。`watermark`、`stamp`、`addtext` 三个命令可以给页面加水印（文字或图片，平铺、旋转、半透明）、图片和中文文字，写进页面自己的内容，用增量方式追加，原文件的字节不动。阅读界面（含批注、填表和"插入"菜单）在 Windows 版里，转换还没做。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
 
 ## 许可证
 

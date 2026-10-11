@@ -1,0 +1,30 @@
+[package]
+name = "qingpdf-base"
+description = "The PDF engine of qingpdf without its editing and reader parts: reading, text, drawing, writing (built for speed; qingpdf-core, built for size, adds the rest)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# `testutil` (small PDF files built by hand) for the tests of qingpdf-core.
+testutil = []
+
+[dependencies]
+aes = "0.9.3"
+md-5 = "0.11.0"
+miniz_oxide = "0.9.1"
+png = "0.18.1"
+sha2 = "0.11.0"
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Every PDF is untrusted input: the engine must never panic on file data.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use qingpdf_core::view::{AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, line_rects};
+use qingpdf_core::view::{ALL_PAGES, AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, line_rects};
 
 use super::forms::FormState;
 use super::*;
@@ -168,8 +168,11 @@ impl App {
         if self.doc.is_none() {
             return Vec::new();
         }
-        if tool != Tool::Select && !self.rights.annotate {
-            return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
+        if tool != Tool::TextBox {
+            self.edit.forms.content = false;
+        }
+        if tool != Tool::Select && !self.can_make() {
+            return self.say(t(self.lang, if self.edit.forms.content { Msg::NoteModifyDenied } else { Msg::NoteAnnotDenied }).to_string());
         }
         self.edit.ink = None;
         self.edit.picked = None;
@@ -496,16 +499,19 @@ impl App {
         let mut actions = vec![Action::SetTitle(self.title()), Action::Invalidate];
         match r.status {
             EditStatus::Done => {
-                // What was drawn of the page is out of date; everything else is as it was.
-                self.cache.remove_page(r.page);
-                self.failed.retain(|k| k.page != r.page);
-                self.notices.remove(&r.page);
-                self.links.remove(&r.page);
-                for id in self.links_asked.iter().filter(|(_, p)| **p == r.page).map(|(id, _)| *id).collect::<Vec<_>>() {
-                    self.engine.cancel(id);
-                    self.links_asked.remove(&id);
+                // What was drawn of the page is out of date (of every page, for a watermark); everything else is as it was.
+                let changed = if r.page == ALL_PAGES { 0..self.page_count() as u32 } else { r.page..r.page + 1 };
+                for page in changed {
+                    self.cache.remove_page(page);
+                    self.failed.retain(|k| k.page != page);
+                    self.notices.remove(&page);
+                    self.links.remove(&page);
+                    for id in self.links_asked.iter().filter(|(_, p)| **p == page).map(|(id, _)| *id).collect::<Vec<_>>() {
+                        self.engine.cancel(id);
+                        self.links_asked.remove(&id);
+                    }
+                    self.edit.drop_page(page);
                 }
-                self.edit.drop_page(r.page);
                 self.schedule();
                 self.ask_for_links();
                 self.ask_for_annots();

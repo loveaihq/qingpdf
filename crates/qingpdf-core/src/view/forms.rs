@@ -4,7 +4,8 @@
 //! for, for the one field being chosen from ([`options`]).
 
 use crate::document::{Document, Page};
-use crate::edit::{FieldInfo, forms};
+use crate::edit::FieldInfo;
+use crate::forms;
 use crate::object::Object;
 use crate::render::work::{Work, cost};
 use crate::text::Shown;

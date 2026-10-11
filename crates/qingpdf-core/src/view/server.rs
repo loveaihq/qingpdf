@@ -613,6 +613,17 @@ impl Server<'_> {
     /// Nothing else is kept by page: what the renderer keeps is by object, and an edit only makes objects with numbers that were
     /// never used before.
     fn refresh_page(&mut self, page_no: u32) {
+        if page_no == edit::ALL_PAGES {
+            // Every page (a watermark).
+            for (n, p) in self.pages.iter_mut().enumerate() {
+                if let Ok(Object::Dict(mut dict)) = self.document.get(p.obj_ref) {
+                    dict.remove("Parent");
+                    p.dict = Rc::new(dict);
+                }
+                self.chars.forget(n as u32);
+            }
+            return;
+        }
         let Some(page_ref) = self.pages.get(page_no as usize).map(|p| p.obj_ref) else { return };
         if let Ok(Object::Dict(mut dict)) = self.document.get(page_ref) {
             dict.remove("Parent");
@@ -635,9 +646,13 @@ impl Server<'_> {
             Command::Edit { doc, id, edit } => {
                 let page = edit.page();
                 let class = edit.class();
-                let allowed = if class == EditClass::Fill { self.rights.fill_forms } else { self.rights.annotate };
+                let (allowed, denied) = match class {
+                    EditClass::Fill => (self.rights.fill_forms, DENIED_FILL),
+                    EditClass::Content => (self.rights.modify, DENIED_MODIFY),
+                    EditClass::Annotate => (self.rights.annotate, DENIED_ANNOTATE),
+                };
                 if !allowed {
-                    said(self, doc, id, EditStatus::Denied, if class == EditClass::Fill { DENIED_FILL } else { DENIED_ANNOTATE }, page);
+                    said(self, doc, id, EditStatus::Denied, denied, page);
                     return None;
                 }
                 if printing {
@@ -670,10 +685,17 @@ impl Server<'_> {
                 }
                 // An edit may use a page's worth of work, and all of a session's together twenty pages' worth.
                 let work = Work::with_allowance(self.session.work_left().min(crate::render::work::PAGE_WORK));
-                let made = edit::apply_metered(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work);
+                // (What the edit may take is what is left of the memory set aside, after what is in front of the file already.)
+                let room = self.session.budget().saturating_sub(self.document.overlay_bytes());
+                let made = edit::apply_metered(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work, room);
                 self.session.add_work(work.used());
                 let objects = match made {
                     Ok(objects) => objects,
+                    Err(Error::Limit(m)) if m == edit::TOO_BIG => {
+                        let advice = if self.document.has_overlay() { "save the file first, or do it in parts" } else { "do it in parts (fewer pages at a time)" };
+                        said(self, doc, id, EditStatus::Failed, &format!("{m}: {advice}"), page);
+                        return None;
+                    }
                     Err(e) => {
                         said(self, doc, id, EditStatus::Failed, &e.to_string(), page);
                         return None;
@@ -952,6 +974,7 @@ fn print_dpi(asked: f64, rights: Rights) -> f64 {
 
 const DENIED_FILL: &str = "the file's author did not allow filling in form fields, and the file was not opened with the owner password";
 
+const DENIED_MODIFY: &str = "the file's author did not allow changing its content, and the file was not opened with the owner password";
 const DENIED_ANNOTATE: &str = "the file's author did not allow adding annotations, and the file was not opened with the owner password";
 
 const DENIED_COPY: &str = "the file's author did not allow copying text, and the file was not opened with the owner password";
@@ -1017,7 +1040,7 @@ mod tests {
 
     #[test]
     fn a_file_that_allows_only_low_quality_printing_is_drawn_at_150_dpi_at_most() {
-        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true };
+        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
         let low = Rights { print_high_quality: false, ..high };
         assert_eq!((print_dpi(1000.0, high), print_dpi(1000.0, low)), (300.0, 150.0));
         assert_eq!((print_dpi(200.0, high), print_dpi(200.0, low)), (200.0, 150.0));

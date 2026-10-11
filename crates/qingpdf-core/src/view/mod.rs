@@ -46,6 +46,7 @@ pub use annots::{AnnotInfo, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_PARTS};
 pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
 pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
+pub use crate::edit::{ALL_PAGES, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
@@ -152,6 +153,8 @@ pub struct Rights {
     pub annotate: bool,
     /// Form fields may be filled in (permission bit 9, or bit 6 of a file of revision 2; the owner password lifts it).
     pub fill_forms: bool,
+    /// The content of pages may be changed: text, pictures and watermarks added (permission bit 4; the owner password lifts it).
+    pub modify: bool,
 }
 
 /// The most dots per inch a page is printed at when the file allows only low-quality printing (Table 22, bit 12).
@@ -502,6 +505,28 @@ impl Engine {
         let _ = self.commands.send(Command::Edit { doc, id, edit });
     }
 
+    /// Write text into the page's own content (4c, not an annotation): the first line's baseline starts at `at` (points of the page as
+    /// shown, from the top left), `size` points high, the lines of `text` one under another. Needs [`Rights::modify`] and a file
+    /// without signatures. Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_text(&self, doc: u64, id: u64, page: u32, at: [f32; 2], text: &str, size: f32, color: [u8; 3]) {
+        let edit = crate::edit::Edit::AddText { page, at, text: text.to_string(), size, color };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Draw a picture (the bytes of a PNG or JPEG file) into the page's own content, as big as fits in `rect` with the picture's
+    /// shape. Like [`Engine::add_text`] in what it needs and how it is answered.
+    pub fn add_image(&self, doc: u64, id: u64, page: u32, rect: [f32; 4], image: Vec<u8>) {
+        let edit = crate::edit::Edit::AddImage { page, rect, image };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Put a watermark on the pages `mark.pages` (their own content). Like [`Engine::add_text`] in what it needs; answered by one
+    /// [`Event::Edited`] with `page` [`ALL_PAGES`] (every page's picture is out of date), one step to undo.
+    pub fn add_watermark(&self, doc: u64, id: u64, mark: Watermark) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Watermark(Box::new(mark)) });
+    }
+
     /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by
     /// [`Event::Edited`].
     pub fn delete_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
@@ -667,10 +692,10 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
 fn rights_of(document: &Document, password: &str) -> Rights {
     let copy = text::check_extraction_allowed(document, password).is_ok();
     let Some(encryption) = document.encryption() else {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
     };
     if has_owner_rights(document, &encryption, password) {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
     }
     Rights {
         copy,
@@ -678,6 +703,7 @@ fn rights_of(document: &Document, password: &str) -> Rights {
         print_high_quality: encryption.permissions.print_high_quality,
         annotate: encryption.permissions.annotate,
         fill_forms: encryption.permissions.fill_forms,
+        modify: encryption.permissions.modify,
     }
 }
 

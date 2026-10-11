@@ -18,6 +18,9 @@ Commands:
   text      Extract the text of a PDF, in reading order
   render    Draw pages as PNG images (graphics and images; letters as boxes for now)
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
+  watermark Put a text or picture watermark on pages
+  stamp     Put a picture (a signature, a logo) on a page
+  addtext   Put text on a page
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -31,6 +34,12 @@ copying ...) opens without a password. For one that needs a password, add
 --password <password> to the command (it is used for every input that needs
 one; a password that is given is tried first, then the empty one). Results keep
 the encryption of the input; only 'decrypt' removes it.
+
+watermark, stamp and addtext write into the pages' own content, so every other
+program and a printer show it too. The output is the input with the change
+appended (the input's bytes are kept as they are, and signatures stay valid for
+what they covered); they refuse a file that is signed, and an encrypted file whose
+author did not allow changing it (give the owner password).
 
 Exit status: 0 success, 1 error, 2 wrong command line.
 ";
@@ -224,6 +233,72 @@ Options:
   --force               Overwrite the output file if it exists
 ";
 
+const WATERMARK: &str = "\
+Usage:
+  qingpdf watermark <file.pdf> (--text <text> | --image <file>) [--opacity <0-1>] [--angle <degrees>]
+                    [--tile] [--under] [--pages <list>] -o <output.pdf> [--force] [--password <password>]
+
+Put a watermark on the pages: the text (Chinese too; it is embedded as a font
+subset, so every reader shows it), a PNG or JPEG picture (a PNG's transparency
+is kept), or both (the picture above the text). It is one mark in the middle of
+the page, or with --tile repeated all over it. The mark is scaled to the page
+and stays upright and centred on a page that has a /Rotate and on one whose box
+does not start at 0.
+
+Options:
+  --text <text>         The text (at most 200 characters)
+  --image <file>        A PNG or JPEG file (at most 16 million pixels, 12 MB)
+  --opacity <number>    More than 0 and at most 1 (default 0.3)
+  --angle <degrees>     Counterclockwise as the page is seen, -36000 to 36000 (default 0)
+  --tile                Repeat the mark over the whole page
+  --under               Put it under the page's own content (default: over it)
+  --pages <list>        The pages (default: all; at most 20000 at once)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file (the result keeps
+                        its encryption)
+";
+
+const STAMP: &str = "\
+Usage:
+  qingpdf stamp <file.pdf> --image <file> --page <N> --at <X,Y> --width <W> -o <output.pdf> [--force] [--password <password>]
+
+Put a PNG or JPEG picture (a signature, a logo; a PNG's transparency is kept)
+on page N. X,Y is the picture's lower left corner and W its width, in points
+(1/72 inch), from the lower left corner of the page as it is shown; the height
+follows the picture's shape.
+
+Options:
+  --image <file>        The picture (required)
+  --page <N>            The page, from 1 (required)
+  --at <X,Y>            The lower left corner, in points (required; a place off the page is warned of)
+  --width <W>           The width in points, up to 10000000 (required)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
+const ADDTEXT: &str = "\
+Usage:
+  qingpdf addtext <file.pdf> --page <N> --at <X,Y> --size <S> --text <text> -o <output.pdf> [--force] [--password <password>]
+
+Put text, in black, on page N, S points high. X,Y is where the first line's
+baseline starts, in points from the lower left corner of the page as it is shown
+(72 points are an inch). A backslash and an n in the text (\\n) start another
+line below. The text is embedded as a font subset taken from the fonts of the
+system, so Chinese is shown by every reader; a font that may not be embedded is
+not used.
+
+Options:
+  --page <N>            The page, from 1 (required)
+  --at <X,Y>            Where the text starts, in points (required; a place off the page is warned of)
+  --size <S>            The size in points, 4 to 144; another size is changed to the nearest, with a warning (required)
+  --text <text>         The text, at most 4000 characters (required)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 /// The help text for the tool or for one command.
 pub fn text(command: Option<Command>) -> String {
     match command {
@@ -237,5 +312,8 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Text) => format!("{TEXT}{PAGE_LIST}"),
         Some(Command::Render) => format!("{RENDER}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),
+        Some(Command::Watermark) => format!("{WATERMARK}{PAGE_LIST}"),
+        Some(Command::Stamp) => STAMP.to_string(),
+        Some(Command::Addtext) => ADDTEXT.to_string(),
     }
 }

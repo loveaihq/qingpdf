@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view", "crates/qingpdf-view-bin"]
+members = ["crates/qingpdf-base", "crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view", "crates/qingpdf-view-bin"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,4 +21,10 @@ panic = "abort"
 # is optimized for size too (141 KB off, but the pages take 28 % longer to draw). The engine stays at opt-level 3: at 2 they take
 # 20 to 28 % longer as well.
 [profile.release.package.qingpdf-view]
+opt-level = "z"
+
+# The editing and the reader's server (qingpdf-core: edit/ and view/; everything that decides the speed of reading, text, drawing and
+# writing is in qingpdf-base, which stays at opt-level 3) are built for size like the reader's window: they run once for each thing
+# the person does, not for each pixel or each byte of a file (docs/decisions.md, 4c).
+[profile.release.package.qingpdf-core]
 opt-level = "z"

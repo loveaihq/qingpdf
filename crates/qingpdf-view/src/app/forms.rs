@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use qingpdf_core::view::{FieldInfo, FieldKind, FillValue, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES};
+use qingpdf_core::view::{FieldInfo, FieldKind, FillValue, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, Watermark};
 
 use super::editing::{Asked, Tool};
 use super::*;
@@ -77,11 +77,29 @@ pub(super) struct FormState {
     /// The file box that is open is for a picture, not for a document.
     pub picking: bool,
     pub text_size: usize,
+    /// The text box or picture being made is written into the page's content (the Insert menu, 4c), not made an annotation.
+    pub(super) content: bool,
+    pub wm: Watermarking,
 }
+
+/// What a watermark made from the Insert menu is like: which opacity and angle of the lists below, and the three switches.
+#[derive(Clone, Copy)]
+pub(super) struct Watermarking {
+    pub opacity: usize,
+    pub angle: usize,
+    pub tile: bool,
+    pub under: bool,
+    pub page_only: bool,
+}
+
+/// The opacities (percent) and angles (degrees) to choose from.
+pub(super) const WM_OPACITY: [u32; 3] = [20, 30, 50];
+pub(super) const WM_ANGLE: [i32; 3] = [0, 45, 90];
 
 impl FormState {
     pub(super) fn new() -> FormState {
-        FormState { fields: HashMap::new(), asked: HashMap::new(), editing: None, choosing: None, dragging: None, stamp: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE }
+        let wm = Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false };
+        FormState { fields: HashMap::new(), asked: HashMap::new(), editing: None, choosing: None, dragging: None, stamp: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE, content: false, wm }
     }
 
     pub(super) fn drop_page(&mut self, page: u32) {
@@ -286,7 +304,12 @@ impl App {
                     let id = self.new_id();
                     let size = TEXT_SIZES.get(self.edit.forms.text_size).map_or(12.0, |s| s.1);
                     let text: String = text.chars().take(MAX_FREETEXT_CHARS).collect();
-                    self.engine.add_freetext(self.doc_id, id, page, rect, &text, size, self.rgb(), &self.edit.author);
+                    if self.edit.forms.content {
+                        // The text starts at the corner of the box, its first line a little below it.
+                        self.engine.add_text(self.doc_id, id, page, [rect[0], rect[1] + size * 0.85], &text, size, self.rgb());
+                    } else {
+                        self.engine.add_freetext(self.doc_id, id, page, rect, &text, size, self.rgb(), &self.edit.author);
+                    }
                     self.edit.asked.insert(id, Asked::Add);
                 }
             }
@@ -401,12 +424,13 @@ impl App {
     // --- picture stamps --------------------------------------------------------------------------------------------
 
     /// The menu item: ask which picture.
-    pub(super) fn ask_for_stamp(&mut self) -> Vec<Action> {
+    pub(super) fn ask_for_stamp(&mut self, content: bool) -> Vec<Action> {
         if self.doc.is_none() {
             return Vec::new();
         }
-        if !self.rights.annotate {
-            return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
+        self.edit.forms.content = content;
+        if !self.can_make() {
+            return self.say(t(self.lang, if content { Msg::NoteModifyDenied } else { Msg::NoteAnnotDenied }).to_string());
         }
         self.edit.forms.picking = true;
         let filters = vec![(t(self.lang, Msg::FilterImages).to_string(), "*.png;*.jpg;*.jpeg".to_string()), (t(self.lang, Msg::FilterAll).to_string(), "*.*".to_string())];
@@ -457,9 +481,71 @@ impl App {
         self.edit.tool = Tool::Select;
         self.menus_dirty = true;
         let id = self.new_id();
-        self.engine.add_stamp(self.doc_id, id, draft.page, draft.rect, draft.image, &self.edit.author);
+        if self.edit.forms.content {
+            self.engine.add_image(self.doc_id, id, draft.page, draft.rect, draft.image);
+        } else {
+            self.engine.add_stamp(self.doc_id, id, draft.page, draft.rect, draft.image, &self.edit.author);
+        }
         self.edit.asked.insert(id, Asked::Add);
         Some(vec![Action::Invalidate])
+    }
+
+    // --- the Insert menu (4c) ----------------------------------------------------------------------------------------
+
+    /// Whether the text box or picture about to be made may be: a page's content needs the right to change it, an annotation the
+    /// right to annotate.
+    pub(super) fn can_make(&self) -> bool {
+        if self.edit.forms.content { self.rights.modify } else { self.rights.annotate }
+    }
+
+    /// The text box tool: its text goes into an annotation (the Comment menu) or into the page (the Insert menu).
+    pub(super) fn text_tool(&mut self, content: bool) -> Vec<Action> {
+        self.edit.forms.content = content;
+        self.set_tool(Tool::TextBox)
+    }
+
+    pub(super) fn ask_watermark(&mut self) -> Vec<Action> {
+        if self.doc.is_none() {
+            return Vec::new();
+        }
+        if !self.rights.modify {
+            return self.say(t(self.lang, Msg::NoteModifyDenied).to_string());
+        }
+        vec![Action::AskText {
+            tag: TAG_WATERMARK,
+            title: t(self.lang, Msg::InsertWatermark).replace('&', ""),
+            prompt: t(self.lang, Msg::WatermarkPrompt).to_string(),
+            secret: false,
+            ok: t(self.lang, Msg::Ok).to_string(),
+            cancel: t(self.lang, Msg::Cancel).to_string(),
+        }]
+    }
+
+    /// The text of the watermark was typed: it goes on every page, or the one in view, as the menu says.
+    pub(super) fn watermark_answered(&mut self, text: Option<String>) -> Vec<Action> {
+        let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Vec::new() };
+        let wm = self.edit.forms.wm;
+        let pages: Vec<u32> = if wm.page_only { vec![self.current_page() as u32] } else { (0..self.page_count() as u32).collect() };
+        let opacity = WM_OPACITY.get(wm.opacity).map_or(30, |&p| p) as f32 / 100.0;
+        let angle = WM_ANGLE.get(wm.angle).map_or(0, |&a| a) as f32;
+        let mark = Watermark { text, image: Vec::new(), opacity, angle, tile: wm.tile, under: wm.under, pages };
+        let id = self.new_id();
+        self.engine.add_watermark(self.doc_id, id, mark);
+        self.edit.asked.insert(id, Asked::Add);
+        Vec::new()
+    }
+
+    pub(super) fn set_watermark_option(&mut self, cmd: u32) -> Vec<Action> {
+        let wm = &mut self.edit.forms.wm;
+        match cmd {
+            CMD_WM_TILE => wm.tile = !wm.tile,
+            CMD_WM_UNDER => wm.under = !wm.under,
+            CMD_WM_PAGE => wm.page_only = !wm.page_only,
+            c if c >= CMD_WM_ANGLE_BASE => wm.angle = ((c - CMD_WM_ANGLE_BASE) as usize).min(WM_ANGLE.len() - 1),
+            c => wm.opacity = ((c - CMD_WM_OPACITY_BASE) as usize).min(WM_OPACITY.len() - 1),
+        }
+        self.menus_dirty = true;
+        Vec::new()
     }
 
     // --- drawing -----------------------------------------------------------------------------------------------------
@@ -712,6 +798,106 @@ mod tests {
         app.event(Event::Command(CMD_STAMP));
         app.event(Event::FilePicked(Some(junk)));
         assert!(app.edit.forms.stamp.is_none() && app.note.as_deref().is_some_and(|n| n.contains("PNG or JPEG")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn menu_items(menus: &[Menu]) -> Vec<(u32, bool, bool)> {
+        fn walk(entries: &[crate::ui::MenuEntry], out: &mut Vec<(u32, bool, bool)>) {
+            for e in entries {
+                match e {
+                    crate::ui::MenuEntry::Item { id, checked, enabled, .. } => out.push((*id, *checked, *enabled)),
+                    crate::ui::MenuEntry::Submenu { entries, .. } => walk(entries, out),
+                    crate::ui::MenuEntry::Separator => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        menus.iter().for_each(|m| walk(&m.entries, &mut out));
+        out
+    }
+
+    #[test]
+    fn the_insert_menu_writes_text_a_picture_and_a_watermark_into_the_pages() {
+        if !["msyh.ttc", "simsun.ttc", "simhei.ttf"].iter().any(|f| std::path::Path::new("C:/Windows/Fonts").join(f).is_file()) {
+            println!("SKIPPED: no Chinese TrueType font on this machine");
+            return;
+        }
+        let objects = vec![
+            (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+            (2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string()),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>".to_string()),
+            (4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] >>".to_string()),
+        ];
+        let dir = std::env::temp_dir().join(format!("qingpdf-view-insert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("two.pdf");
+        std::fs::write(&file, pdf(&objects)).unwrap();
+        let picture = dir.join("logo.png");
+        std::fs::write(&picture, png(40, 20)).unwrap();
+
+        let mut app = App::new(Lang::En, Arc::new(|| {}), Instant::now(), 1920 * 1080, "Tester".to_string());
+        app.event(Event::Size { w: 900, h: 700 });
+        app.open_path(&file, "");
+        pump(&mut app, "the file to open", |a| a.has_document());
+        let items = menu_items(&app.menus());
+        assert!([CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE].iter().all(|c| items.iter().any(|i| i.0 == *c && i.2)), "the Insert menu is enabled: {items:?}");
+
+        // Text: the text box tool, a click, Chinese typed; it goes into the page, not into an annotation.
+        app.event(Event::Command(CMD_INS_TEXT));
+        let r = app.window_rect(0, [40.0, 60.0, 40.0, 60.0]).unwrap();
+        app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false });
+        app.event(Event::MouseUp { x: r.x, y: r.y });
+        app.event(Event::FieldDone { text: "你好，世界".to_string(), exit: FieldExit::Blur });
+        pump(&mut app, "the text", |a| a.edit.can_undo);
+        app.event(Event::Command(CMD_TOOL_SELECT));
+        // A picture: asked for, framed, put with Enter (into the page, not as a stamp).
+        let asked = app.event(Event::Command(CMD_INS_IMAGE));
+        assert!(asked.iter().any(|a| matches!(a, Action::PickFile { .. })));
+        app.event(Event::FilePicked(Some(picture)));
+        assert!(app.edit.forms.stamp.is_some());
+        app.event(Event::Key { vk: vk::RETURN, ctrl: false, shift: false });
+        pump(&mut app, "the picture", |a| a.edit.forms.stamp.is_none() && a.edit.asked.is_empty());
+        // The watermark: its options are chosen from the menu (tiled, turned 45 degrees, 50 per cent, under the content), its text typed.
+        for cmd in [CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE + 1] {
+            app.event(Event::Command(cmd));
+        }
+        let items = menu_items(&app.menus());
+        let checked = |c: u32| items.iter().any(|i| i.0 == c && i.1);
+        assert!(checked(CMD_WM_TILE) && checked(CMD_WM_UNDER) && checked(CMD_WM_OPACITY_BASE + 2) && checked(CMD_WM_ANGLE_BASE + 1) && !checked(CMD_WM_PAGE));
+        let ask = app.event(Event::Command(CMD_INS_WM));
+        assert!(ask.iter().any(|a| matches!(a, Action::AskText { tag: TAG_WATERMARK, .. })), "{ask:?}");
+        app.event(Event::Text { tag: TAG_WATERMARK, text: Some("机密".to_string()) });
+        pump(&mut app, "the watermark", |a| a.edit.asked.is_empty());
+        assert!(app.edit.dirty && app.edit.can_undo && app.note.as_deref().is_some_and(|n| n.contains("added")), "{:?}", app.note);
+        // Nothing is an annotation: no list of annotations has a thing in it.
+        assert!(app.edit.annots.values().all(Vec::is_empty));
+
+        // Saved: the Chinese text is in the content of page 1, the watermark in both pages, and the picture is a drawn image.
+        app.event(Event::Command(CMD_SAVE));
+        pump(&mut app, "the save", |a| !a.edit.dirty && a.edit.saving.is_none());
+        let doc = qingpdf_core::Document::open(&file).unwrap();
+        let pages = doc.pages().unwrap();
+        let mut extractor = qingpdf_core::text::TextExtractor::new(&doc);
+        let first = extractor.page_text(&pages[0]).unwrap();
+        assert!(first.contains("你好，世界") && !first.contains("机密"), "the added text is text, the watermark is not: {first:?}");
+        assert!(!extractor.page_text(&pages[1]).unwrap().contains("机密"));
+        // The watermark is on both pages, drawn as an artifact (14.8.2.2).
+        for (n, page) in pages.iter().enumerate() {
+            let Ok(qingpdf_core::Object::Dict(dict)) = doc.get(page.obj_ref) else { panic!("page {n}") };
+            let Some(qingpdf_core::Object::Array(list)) = dict.get("Contents") else { panic!("page {n}: {dict:?}") };
+            let marked = list.iter().filter_map(|o| o.as_obj_ref()).any(|r| match doc.get(r) {
+                Ok(qingpdf_core::Object::Stream(s)) => String::from_utf8_lossy(&doc.decode_stream(&s).unwrap()).contains("/Subtype /Watermark>> BDC"),
+                _ => false,
+            });
+            assert!(marked, "page {n} has no watermark");
+        }
+        assert!(!String::from_utf8_lossy(&std::fs::read(&file).unwrap()).contains("/Subtype /Stamp"));
+        // A file whose author does not allow changing it: the menu is greyed and a try is told why.
+        app.rights.modify = false;
+        app.menus_dirty = true;
+        assert!(menu_items(&app.menus()).iter().all(|i| ![CMD_INS_TEXT, CMD_INS_WM].contains(&i.0) || !i.2));
+        assert!(app.event(Event::Command(CMD_INS_WM)).iter().all(|a| !matches!(a, Action::AskText { .. })));
+        assert!(app.note.as_deref().is_some_and(|n| n.contains("content")), "{:?}", app.note);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

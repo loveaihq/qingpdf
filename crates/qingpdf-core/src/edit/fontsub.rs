@@ -543,6 +543,20 @@ pub(super) fn add_objects(ctx: &mut Ctx<'_>, f: &Embedded) -> Result<ObjRef> {
     Ok(font_ref)
 }
 
+impl crate::layout::Face for Embedded {
+    fn width(&self, c: char) -> f64 {
+        Embedded::width(self, c)
+    }
+
+    fn ascent_descent(&self) -> (f64, f64) {
+        (self.asc_em, self.desc_em)
+    }
+
+    fn encode(&self, text: &str) -> String {
+        Embedded::encode(self, text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

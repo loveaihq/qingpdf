@@ -1078,7 +1078,7 @@ These tables are compiled into qingpdf-core (for text extraction, and for drawin
 
 - Licence: BSD-3-Clause
 - Upstream: https://github.com/adobe-type-tools/cmap-resources (commit f5cf3bca7fdfeaceb77aa82847e974f2306c20b4)
-- Embedded in: crates/qingpdf-core/data/text/cid2uni-gb1.bin, cid2uni-cns1.bin, cid2uni-japan1.bin, cid2uni-korea1.bin, cmaps-gb1.bin, cmaps-cns1.bin, cmaps-japan1.bin, cmaps-korea1.bin
+- Embedded in: crates/qingpdf-base/data/text/cid2uni-gb1.bin, cid2uni-cns1.bin, cid2uni-japan1.bin, cid2uni-korea1.bin, cmaps-gb1.bin, cmaps-cns1.bin, cmaps-japan1.bin, cmaps-korea1.bin
 
 ```text
 Copyright 1990-2023 Adobe. All rights reserved.
@@ -1115,7 +1115,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - Licence: BSD-3-Clause
 - Upstream: https://github.com/adobe-type-tools/agl-aglfn (commit 4036a9ca80a62f64f9de4f7321a9a045ad0ecfd6)
-- Embedded in: crates/qingpdf-core/data/text/agl.bin
+- Embedded in: crates/qingpdf-base/data/text/agl.bin
 
 ```text
 Copyright 2002-2019 Adobe (http://www.adobe.com/).
@@ -1152,7 +1152,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - Licence: Unicode License v3
 - Upstream: https://www.unicode.org/Public/UCD/latest/ucd/CJKRadicals.txt
-- Embedded in: crates/qingpdf-core/data/text/cjknorm.bin
+- Embedded in: crates/qingpdf-base/data/text/cjknorm.bin
 - Note: the compatibility ideographs were mapped with NFKC, taken from the Unicode Character Database through Python's unicodedata module.
 
 ```text
@@ -1201,7 +1201,7 @@ authorization of the copyright holder.
 
 - Licence: BSD-3-Clause
 - Upstream: https://pdfium.googlesource.com/pdfium/
-- Embedded in: crates/qingpdf-core/src/render/cmyk.bin
+- Embedded in: crates/qingpdf-base/src/render/cmyk.bin
 - Note: the table is 6561 colours of three bytes, made by `tests/tools/make_cmyk_table.py`, which draws a grid of DeviceCMYK swatches with PDFium (through pypdfium2 5.14.0) and writes down the colour PDFium shows for each. It holds measurements of PDFium's output, not PDFium's code. It is credited here because it reproduces PDFium's conversion of DeviceCMYK, which PDFium keeps as a table of its own.
 
 ```text

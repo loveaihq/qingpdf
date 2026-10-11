@@ -65,6 +65,16 @@ pub const CMD_REMOVE: u32 = 34;
 pub const CMD_AUTHOR: u32 = 35;
 /// Pick a picture to stamp on a page.
 pub const CMD_STAMP: u32 = 36;
+/// The Insert menu (4c): text and a picture written into the page, a watermark; the watermark's options (opacity and angle from
+/// here, one for each choice, then the three switches).
+pub const CMD_INS_TEXT: u32 = 37;
+pub const CMD_INS_IMAGE: u32 = 38;
+pub const CMD_INS_WM: u32 = 39;
+pub const CMD_WM_OPACITY_BASE: u32 = 80;
+pub const CMD_WM_ANGLE_BASE: u32 = 84;
+pub const CMD_WM_TILE: u32 = 88;
+pub const CMD_WM_UNDER: u32 = 89;
+pub const CMD_WM_PAGE: u32 = 90;
 /// The tools of the Comment menu: select, the four markups, draw, note.
 pub const CMD_TOOL_SELECT: u32 = 40;
 pub const CMD_TOOL_HIGHLIGHT: u32 = 41;
@@ -89,6 +99,7 @@ const TAG_LINK: u32 = 3;
 const TAG_NOTE: u32 = 4;
 const TAG_AUTHOR: u32 = 5;
 const TAG_UNSAVED: u32 = 6;
+const TAG_WATERMARK: u32 = 7;
 
 // Timers.
 /// The view has stopped moving.
@@ -276,7 +287,7 @@ impl App {
             last_sharp: None,
             bench: None,
             started,
-            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true },
+            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true },
             outline: Vec::new(),
             show_outline: true,
             links: HashMap::new(),
@@ -388,7 +399,7 @@ impl App {
         self.press = None;
         self.selection = None;
         self.note = None;
-        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true };
+        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.moving = false;
@@ -824,8 +835,10 @@ impl App {
             CMD_REDO => self.redo(),
             CMD_REMOVE => self.remove_picked(),
             CMD_AUTHOR => self.ask_author(),
-            CMD_STAMP => self.ask_for_stamp(),
-            CMD_TOOL_TEXTBOX => self.set_tool(Tool::TextBox),
+            CMD_STAMP | CMD_INS_IMAGE => self.ask_for_stamp(cmd == CMD_INS_IMAGE),
+            CMD_TOOL_TEXTBOX | CMD_INS_TEXT => self.text_tool(cmd == CMD_INS_TEXT),
+            CMD_INS_WM => self.ask_watermark(),
+            CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
             CMD_TOOL_HIGHLIGHT => self.set_tool(Tool::Markup(MarkupKind::Highlight)),
@@ -1118,6 +1131,7 @@ impl Handler for App {
             },
             Event::Text { tag: TAG_NOTE, text } => self.note_answered(text),
             Event::Text { tag: TAG_AUTHOR, text } => self.author_answered(text),
+            Event::Text { tag: TAG_WATERMARK, text } => self.watermark_answered(text),
             Event::Text { tag: TAG_GOTO, text } => match text.and_then(|s| s.trim().parse::<usize>().ok()) {
                 Some(n) if n >= 1 => self.go_to_page(n - 1),
                 _ => Vec::new(),

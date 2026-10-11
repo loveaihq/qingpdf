@@ -19,7 +19,7 @@
 - 依赖越少越好。加任何依赖前先说明理由。
 - 引擎核心自己写：解析、写回、内容解释、文字、渲染、编辑。通用零件可以用现成的库：压缩、字体文件解析、JPEG 解码、光栅化（tiny-skia）。
 - MuPDF、qpdf、Chrome 只当测试时的参考答案，不进产品。
-- `unsafe` 只许出现在 `qingpdf-view` 的 `win32.rs`（调用 Windows 函数），每处注明为什么安全；`qingpdf-core` 和 `qingpdf-cli` 仍然 `forbid`。Windows 函数的声明自己写，不加 windows-sys。
+- `unsafe` 只许出现在 `qingpdf-view` 的 `win32.rs`（调用 Windows 函数），每处注明为什么安全；`qingpdf-base`、`qingpdf-core` 和 `qingpdf-cli` 仍然 `forbid`。Windows 函数的声明自己写，不加 windows-sys。
 - 阅读器的 exe 来自 `qingpdf-view-bin`（它 `forbid(unsafe_code)`）；`unsafe` 仍然只在 `qingpdf-view`（库）的 `win32.rs`，别处不加（测试里也不写自定义分配器之类的 `unsafe`）。
 - 代码、注释、提交信息用英文；`docs/` 下的文档用中文。
 

@@ -137,6 +137,11 @@ impl Session {
         }
     }
 
+    /// What the objects in front of the file and the history may take together, in bytes.
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
     pub(crate) fn password(&self) -> &str {
         &self.password
     }

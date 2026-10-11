@@ -17,10 +17,13 @@ pub enum Command {
     Text,
     Render,
     Img2pdf,
+    Watermark,
+    Stamp,
+    Addtext,
 }
 
 impl Command {
-    pub const ALL: [Command; 9] = [
+    pub const ALL: [Command; 12] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -30,6 +33,9 @@ impl Command {
         Command::Text,
         Command::Render,
         Command::Img2pdf,
+        Command::Watermark,
+        Command::Stamp,
+        Command::Addtext,
     ];
 
     pub fn name(self) -> &'static str {
@@ -43,6 +49,9 @@ impl Command {
             Command::Text => "text",
             Command::Render => "render",
             Command::Img2pdf => "img2pdf",
+            Command::Watermark => "watermark",
+            Command::Stamp => "stamp",
+            Command::Addtext => "addtext",
         }
     }
 
@@ -64,6 +73,23 @@ pub enum Request {
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
     Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
+    /// `text` and `image` are not both empty. `pages`: a page list (all pages when none).
+    Watermark {
+        input: PathBuf,
+        text: Option<String>,
+        image: Option<PathBuf>,
+        opacity: f32,
+        angle: f32,
+        tile: bool,
+        under: bool,
+        pages: Option<String>,
+        output: PathBuf,
+        force: bool,
+        password: String,
+    },
+    /// `page` from 1, `at` in points from the lower left of the page as shown.
+    Stamp { input: PathBuf, image: PathBuf, page: usize, at: [f64; 2], width: f64, output: PathBuf, force: bool, password: String },
+    Addtext { input: PathBuf, page: usize, at: [f64; 2], size: f64, text: String, output: PathBuf, force: bool, password: String },
 }
 
 /// What `parse` found.
@@ -100,11 +126,13 @@ struct Allowed {
     no_annots: bool,
     /// `--password`: every command that reads a PDF file.
     password: bool,
+    /// The options that put things on pages: `--text`, `--image`, `--opacity`, `--tile`, `--under`, `--at`, `--width`, `--size`.
+    mark: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
     let none =
-        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, no_annots: false, password: false };
+        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, no_annots: false, password: false, mark: false };
     match c {
         Command::Info => Allowed { password: true, ..none },
         Command::Merge => Allowed { output: true, force: true, password: true, ..none },
@@ -115,6 +143,8 @@ fn allowed(c: Command) -> Allowed {
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
+        Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
+        Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
     }
 }
 
@@ -131,6 +161,14 @@ struct Collected {
     page: Option<String>,
     dpi: Option<String>,
     password: Option<String>,
+    text: Option<String>,
+    image: Option<PathBuf>,
+    opacity: Option<String>,
+    at: Option<String>,
+    width: Option<String>,
+    size: Option<String>,
+    tile: bool,
+    under: bool,
 }
 
 fn text(value: OsString, option: &str, command: Command) -> Result<String, UsageError> {
@@ -194,6 +232,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--page" if ok.page => {}
             "--dpi" if ok.dpi => {}
             "--password" if ok.password => {}
+            "--text" | "--image" | "--opacity" | "--at" | "--width" | "--size" if ok.mark && mark_option(command, &name) => {}
+            "--tile" | "--under" if ok.mark && mark_option(command, &name) => {
+                if inline.is_some() {
+                    return Err(usage(c, format!("{name} does not take a value")));
+                }
+                if name == "--tile" {
+                    got.tile = true;
+                } else {
+                    got.under = true;
+                }
+                continue;
+            }
             "--force" if ok.force => {
                 if inline.is_some() {
                     return Err(usage(c, "--force does not take a value"));
@@ -250,6 +300,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                     return Err(slot_taken("--password"));
                 }
             }
+            "--image" => {
+                if got.image.replace(PathBuf::from(value)).is_some() {
+                    return Err(slot_taken("--image"));
+                }
+            }
+            "--text" | "--opacity" | "--at" | "--width" | "--size" => {
+                let slot = match name.as_str() {
+                    "--text" => &mut got.text,
+                    "--opacity" => &mut got.opacity,
+                    "--at" => &mut got.at,
+                    "--width" => &mut got.width,
+                    _ => &mut got.size,
+                };
+                if slot.replace(text(value, &name, command)?).is_some() {
+                    return Err(slot_taken(&name));
+                }
+            }
             _ => {
                 if got.page.replace(text(value, "--page", command)?).is_some() {
                     return Err(slot_taken("--page"));
@@ -260,9 +327,48 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
     finish(command, got).map(Parsed::Run)
 }
 
+/// Which of the options that put things on pages a command takes.
+fn mark_option(command: Command, name: &str) -> bool {
+    match command {
+        Command::Watermark => matches!(name, "--text" | "--image" | "--opacity" | "--tile" | "--under"),
+        Command::Stamp => matches!(name, "--image" | "--at" | "--width"),
+        _ => matches!(name, "--text" | "--at" | "--size"),
+    }
+}
+
+/// A number option: `default` when it was not given (NaN: it must be given, and the caller says so when it is not more than 0).
+fn number(c: Option<Command>, name: &str, value: Option<&str>, default: f64) -> Result<f64, UsageError> {
+    match value {
+        None => Ok(default),
+        Some(v) => v.trim().parse::<f64>().ok().filter(|n| n.is_finite()).ok_or_else(|| usage(c, format!("{name} needs a number, not '{v}'"))),
+    }
+}
+
+/// `--page N` (from 1), required.
+fn page_number(c: Option<Command>, value: Option<&str>) -> Result<usize, UsageError> {
+    let v = value.ok_or_else(|| usage(c, "--page <number> is required"))?;
+    v.trim().parse::<usize>().ok().filter(|&n| n >= 1).ok_or_else(|| usage(c, format!("--page needs a page number from 1, not '{v}'")))
+}
+
+/// The biggest number a place, a width or an angle may be (what the engine takes as a number on a page), and the most degrees of
+/// a watermark's angle.
+const MAX_PLACE: f64 = 1.0e7;
+const MAX_ANGLE: f64 = 36_000.0;
+
+/// `--at X,Y`, required: points from the lower left corner of the page as it is shown.
+fn place(c: Option<Command>, value: Option<&str>) -> Result<[f64; 2], UsageError> {
+    let v = value.ok_or_else(|| usage(c, "--at <X,Y> is required"))?;
+    let parsed = v.split_once(',').and_then(|(x, y)| Some([x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?])).filter(|p| p.iter().all(|n| n.is_finite()));
+    let parsed = parsed.ok_or_else(|| usage(c, format!("--at needs two numbers like 72,720, not '{v}'")))?;
+    if parsed.iter().any(|n| n.abs() > MAX_PLACE) {
+        return Err(usage(c, format!("--at must be between -{MAX_PLACE} and {MAX_PLACE} points, not '{v}'")));
+    }
+    Ok(parsed)
+}
+
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, tile, under } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -341,6 +447,46 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                     .ok_or_else(|| usage(c, format!("--dpi must be a number from 1 to 2400, not '{d}'")))?,
             };
             Ok(Request::Render { input, pages, dpi, annots: !no_annots, output, force, password })
+        }
+        Command::Watermark => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let text = text.filter(|t| !t.trim().is_empty());
+            if text.is_none() && image.is_none() {
+                return Err(usage(c, "watermark needs --text <text> or --image <file>"));
+            }
+            let opacity = number(c, "--opacity", opacity.as_deref(), 0.3)?;
+            if !(opacity > 0.0 && opacity <= 1.0) {
+                return Err(usage(c, "--opacity must be more than 0 and at most 1"));
+            }
+            let degrees = number(c, "--angle", angle.as_deref(), 0.0)?;
+            if degrees.abs() > MAX_ANGLE {
+                return Err(usage(c, format!("--angle must be from -{MAX_ANGLE} to {MAX_ANGLE} degrees, not '{}'", angle.as_deref().unwrap_or_default())));
+            }
+            Ok(Request::Watermark { input, text, image, opacity: opacity as f32, angle: degrees as f32, tile, under, pages, output, force, password })
+        }
+        Command::Stamp => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let image = image.ok_or_else(|| usage(c, "stamp needs --image <file>"))?;
+            let points = number(c, "--width", width.as_deref(), f64::NAN)?;
+            if points.is_nan() || points <= 0.0 {
+                return Err(usage(c, "stamp needs --width <points>, more than 0"));
+            }
+            if points > MAX_PLACE {
+                return Err(usage(c, format!("--width must be at most {MAX_PLACE} points, not '{}'", width.as_deref().unwrap_or_default())));
+            }
+            Ok(Request::Stamp { input, image, page: page_number(c, page.as_deref())?, at: place(c, at.as_deref())?, width: points, output, force, password })
+        }
+        Command::Addtext => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let text = text.filter(|t| !t.trim().is_empty()).ok_or_else(|| usage(c, "addtext needs --text <text>"))?;
+            let size = number(c, "--size", size.as_deref(), f64::NAN)?;
+            if size.is_nan() || size <= 0.0 {
+                return Err(usage(c, "addtext needs --size <points>, more than 0"));
+            }
+            Ok(Request::Addtext { input, page: page_number(c, page.as_deref())?, at: place(c, at.as_deref())?, size, text, output, force, password })
         }
         Command::Img2pdf => {
             if inputs.is_empty() {

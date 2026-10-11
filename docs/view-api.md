@@ -33,7 +33,7 @@
 
 ## 3d-2 的结果和限制
 
-- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
+- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms, modify }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，`modify` 是 4c 加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
 - `Outline { items: [{title, depth, page?, y?, open}], truncated }`：展平的前序列表，深度从 0 数；`page` 是页码（从 0），`y` 是该页上往下多少点（按页面显示后的样子）。最多 `MAX_OUTLINE_ITEMS`（20000）项、`MAX_OUTLINE_DEPTH`（32）层，标题最多 `MAX_TITLE_CHARS`（300）字，兄弟链或子链绕回已读过的项就在那里断。目标先看 `/Dest`，再看 `/A` 里的 GoTo，命名目标走 `dests.rs`。
 - `Links { links: [{rect, kind, page, y?, uri}] }`：`rect` 是页面显示后的点（左、上、右、下）；`kind` 是 `Page`（页内）或 `Uri`。每页最多 `MAX_LINKS`（2000）个；隐藏的、不显示的、没面积的不给。外部地址只留 http、https、mailto，并且全是 ASCII 可见字符、不含空格和 `" < > \ ^ ` { | }`、不超过 `MAX_URI_BYTES`（2048），`%` 只许作百分号转义（`%` 加两个十六进制数字，所以 `%USERNAME%` 这类会被系统当环境变量展开的写法不给），其余的丢掉；`view::safe_uri` 是同一套检查，界面在打开前再查一遍。
 - `CharBoxes { boxes }`：`boxes[i]` 是页文字（和 `text` 命令同一个顺序）第 i 个字符的 `[左, 上, 右, 下]`，单位点，**页面显示后的坐标（已按页自己的 /Rotate 转过，左上角为原点，y 向下）**，窗口再加的旋转由窗口自己转。排版插的空格和行尾是没有面积的点。每页最多 `text::MAX_PAGE_CHARS`（40 万）字。`view::line_rects` 把一段字的框并成每行一个矩形，`view::nearest_char` 找离某点最近的字（逐个看）；`view::CharIndex::new(&boxes)` 把一页的框切成一行一行，`nearest(&boxes, x, y)` 答案和 `nearest_char` 一样，但只看可能最近的几行，鼠标每动一下不必扫整页。
@@ -84,6 +84,22 @@
 每次编辑的工作量记在计量器里：一次编辑最多一页的工作量（`PAGE_WORK`），一个会话里所有编辑加起来最多二十页的；用完了答 `Failed`。画页时没有外观的控件现场合成外观（只画，不写文件），每个文档最多 2 万个，每页再受页面计量器限制。
 
 填表、文字框、图片都写进"盖在原对象前面的一层"，和 4a 一样撤销、重做、保存；一次填写撤销一步，同一字段的几个控件（和字体、外观）一起回来。表单里的 JavaScript（`/AA`、格式化、计算、校验）不执行。
+
+## 4c 的请求和结果：往页面内容里加文字、图片、水印
+
+这三样写进页面**本身的内容**（不是批注）：打印、别的软件都看得到；文字和图片也是页面的内容，提取文字、查找、选择都包括；**水印除外**：它的画法标成 `/Artifact`（`/Type /Pagination /Subtype /Watermark`，ISO 32000-1 14.8.2.2），引擎的取字（`TextExtractor`、阅读器的查找和选择）跳过标成这种水印的内容，别的软件通常也一样。位置同样是"页面显示后的点"（左上角为原点、y 向下、已按页自己的 `/Rotate` 和裁剪框转过），引擎自己转回用户空间：页面有 `/Rotate`、裁剪框不从 0 起、有 `/UserUnit`（引擎不处理它）时，文字和图片照样正着摆在要的地方，水印照样正着、在裁剪框的正中。
+
+| 调用 | 作用 |
+|---|---|
+| `add_text(doc, id, page, at, text, size, color)` | 文字：`at` 是**第一行基线的左端**，`text` 里的换行是换行（一行一行往下排，行距是字体的上升加下降），最多 `MAX_FREETEXT_CHARS`（4000）字、2000 行；`size` 夹在 `MIN_FONT_SIZE`..`MAX_FONT_SIZE`；字体是 4b 的系统字体子集（中文能显示，复制出来是对的）。答 `Edited`。 |
+| `add_image(doc, id, page, rect, 图片字节)` | 图片：放成在 `rect` 里最大、保持形状、居中的一块；不挪进页内（出页的部分被页面剪掉）。PNG 的透明保持，限制和 `add_stamp` 一样（1600 万像素、12 MB）。答 `Edited`。 |
+| `add_watermark(doc, id, Watermark)` | 水印，作用于 `pages`（从 0 数，最多 `MAX_WATERMARK_PAGES`=100000 页（再大由计量器和编辑的内存预算拦），同一页写几次只做一次）。`Watermark { text, image, opacity, angle, tile, under, pages }`：`text` 最多 `MAX_WATERMARK_CHARS`（200）字，`image` 是 PNG/JPEG 字节（可以为空；文字和图片都有时图片在上），两者不能都空；`opacity` 大于 0、不超过 1（`ca`/`CA`）；`angle` 是度数，按页面看到的样子逆时针；`tile` 铺满整页（错开排，每页最多 1600 个格子里取，格子大了就放粗）；`under` 垫在原内容下面（默认盖在上面）。一个水印一次撤销一步，`Edited.page` 是 `ALL_PAGES`（`u32::MAX`）：界面把每一页的位图都作废。 |
+
+字体、图片和水印的标记（一个带自己资源的 Form XObject）**只做一次**，每页只引用它；被几页共用或继承来的 `/Resources` 复制一份给这些页，不改原对象；原内容的流（共用的也一样）原样留着；盖在上面时，引擎把原内容的每个流读一次（按对象号缓存），数出它留着没关的 `q`、没有 `q` 对应的 `Q`、没结束的 `BT` 和没画的路径：前面补上同样多的 `q`，后面先补 `n`、`ET` 再补同样多的 `Q`，新内容就在页面开始时的图形状态里画（垫在下面的不用）。细节见 `docs/decisions.md` 的"第 4 层 4c"。
+
+`Rights` 多一项 `modify`（权限位 4，没加密或有所有者密码为真）：三个调用看它，不让时答 `Denied`。**有签名的文件（有签了名的签名字段，或有 `/Perms /DocMDP`，任何级别）一律答 `Failed`**，`message` 里写着 signed 或 certified：页面内容的改动哪一级认证都不允许，签了名的文件也不动。`Failed` 的别的原因：没有文字也没有图片、文字太长、不透明度或角度不是数、页码不在、页数超限、图片认不出或超限、位置不是数、这次改动的对象总共超过编辑的内存预算还剩的部分（16 MiB 减去已经放在文件前面还没存的，做的时候就数，超了就停，不是做完再拒；`message` 是 `the change is too big`，后面写怎么办：文件里已有没存的改动就是"存盘后再做，或分几次做"，没有就是"分几次做（每次少几页）"）、字体找不到（和 4b 一样列出缺哪些字）。
+
+每次编辑的工作量记在计量器里：每页 6000 单位（再加页面字典和资源的字节数乘 8）、平铺的每一块 2500、文字每字 600、图片每像素 12、字体每个字形 4 万、盖在上面时原内容的每个字节 10（读一遍数 `q`/`Q`）；实测记的账是真实用时的 1 到 1.4 倍（空页 2.5 倍）。命令行用同一套代码（`qingpdf_core::edit::add_content`），见 `docs/decisions.md`。
 
 ## 对接别的语言
 

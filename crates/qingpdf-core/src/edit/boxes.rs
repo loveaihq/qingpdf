@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use miniz_oxide::deflate::compress_to_vec_zlib;
 
 use super::fontsub::{self, Look};
-use super::layout::{self, Da, Face, Spec};
+use crate::layout::{self, Da, Face, Spec};
 use super::{Ctx, annotation, finite_place, reals, text_string};
 use crate::error::{Error, Result};
 use crate::image::{self, Format};
@@ -29,8 +29,8 @@ pub const MAX_STAMP_FILE_BYTES: usize = 12 << 20;
 /// The smallest side of a box or stamp on the page, in points.
 const MIN_SIDE: f64 = 8.0;
 /// What a pixel of a picture costs the work meter (decoded, split into colour and alpha, compressed).
-const PIXEL_COST: f64 = 12.0;
-const BOX_COST: f64 = 300_000.0;
+pub(super) const PIXEL_COST: f64 = 12.0;
+pub(super) const BOX_COST: f64 = 300_000.0;
 
 /// The rectangle `[left, top, right, bottom]` of the page as shown, in order, at least [`MIN_SIDE`] a side and inside the page.
 fn normalized(shown: &Shown, rect: [f32; 4]) -> Result<[f64; 4]> {
@@ -138,8 +138,17 @@ pub(super) fn freetext(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], text: &
     Ok(vec![annot_ref])
 }
 
-/// A stamp with the picture `bytes` (a PNG or a JPEG file), as big as fits in `rect` with the picture's shape, in the middle of it.
-pub(super) fn stamp(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], bytes: &[u8], author: &str, now: &str) -> Result<Vec<ObjRef>> {
+/// A picture's objects in an edit: the image XObject (with its soft mask, a PNG's transparency), how a JPEG is turned (EXIF; a PNG
+/// is upright) and the size it is shown at, in pixels.
+pub(super) struct Picture {
+    pub image: ObjRef,
+    pub orientation: u8,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Make the objects of the picture `bytes` (a PNG or a JPEG file), charging the meter for its pixels.
+pub(super) fn picture(ctx: &mut Ctx<'_>, bytes: &[u8]) -> Result<Picture> {
     if bytes.len() > MAX_STAMP_FILE_BYTES {
         return Err(Error::Limit(format!("the picture file is bigger than {} MB", MAX_STAMP_FILE_BYTES >> 20)));
     }
@@ -151,8 +160,7 @@ pub(super) fn stamp(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], bytes: &[u
     if !ctx.work.charge(BOX_COST + PIXEL_COST * pixels as f64) {
         return Err(Error::Limit("the picture took too much work".to_string()));
     }
-    // The picture's objects; `orientation` says how a JPEG is turned (EXIF), a PNG is upright.
-    let (image_ref, orientation) = match format {
+    let (image, orientation) = match format {
         Format::Jpeg => {
             let info = image::parse_jpeg(bytes)?;
             let r = ctx.alloc()?;
@@ -175,6 +183,12 @@ pub(super) fn stamp(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], bytes: &[u
             (r, 1)
         }
     };
+    Ok(Picture { image, orientation, width: shown_w, height: shown_h })
+}
+
+/// A stamp with the picture `bytes` (a PNG or a JPEG file), as big as fits in `rect` with the picture's shape, in the middle of it.
+pub(super) fn stamp(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], bytes: &[u8], author: &str, now: &str) -> Result<Vec<ObjRef>> {
+    let Picture { image: image_ref, orientation, width: shown_w, height: shown_h } = picture(ctx, bytes)?;
 
     // As big as fits the rectangle, with the shape of the picture, in its middle.
     let [l, t, r, b] = normalized(shown, rect)?;

@@ -139,12 +139,23 @@ pub enum Msg {
     NoteNothingUndo,
     NoteNothingRedo,
     NoteSigned,
+    InsertMenu,
+    InsertText,
+    InsertImage,
+    InsertWatermark,
+    WatermarkPrompt,
+    WmOpacity,
+    WmAngle,
+    WmTile,
+    WmUnder,
+    WmPage,
+    NoteModifyDenied,
     ShutdownReason,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 125] = [
+pub const ALL: [Msg; 136] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -269,6 +280,17 @@ pub const ALL: [Msg; 125] = [
     Msg::NoteNothingUndo,
     Msg::NoteNothingRedo,
     Msg::NoteSigned,
+    Msg::InsertMenu,
+    Msg::InsertText,
+    Msg::InsertImage,
+    Msg::InsertWatermark,
+    Msg::WatermarkPrompt,
+    Msg::WmOpacity,
+    Msg::WmAngle,
+    Msg::WmTile,
+    Msg::WmUnder,
+    Msg::WmPage,
+    Msg::NoteModifyDenied,
     Msg::ShutdownReason,
 ];
 
@@ -396,6 +418,17 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteAdded => ("Annotation added (Ctrl+Z undoes it).", "已加批注（Ctrl+Z 撤销）。"),
         Msg::NoteRemoved => ("Annotation removed (Ctrl+Z undoes it).", "已删除批注（Ctrl+Z 撤销）。"),
         Msg::NoteSigned => ("This file is signed: after the changes are saved, the signature will show the file as changed.", "这个文件有签名：保存改动后，签名会显示文件被修改过。"),
+        Msg::InsertMenu => ("&Insert", "插入(&I)"),
+        Msg::InsertText => ("Add &text", "加文字(&T)"),
+        Msg::InsertImage => ("Add &picture...", "加图片(&P)..."),
+        Msg::InsertWatermark => ("Add &watermark...", "加水印(&W)..."),
+        Msg::WatermarkPrompt => ("The text of the watermark:", "水印文字："),
+        Msg::WmOpacity => ("&Opacity of the watermark", "水印透明度(&O)"),
+        Msg::WmAngle => ("&Angle of the watermark", "水印角度(&A)"),
+        Msg::WmTile => ("Ti&led over the page", "平铺满页(&L)"),
+        Msg::WmUnder => ("&Under the page's content", "垫在页面内容下面(&U)"),
+        Msg::WmPage => ("This pa&ge only", "只加在当前页(&G)"),
+        Msg::NoteModifyDenied => ("The file's author does not allow changing its content (the owner password is needed).", "文件作者不允许修改内容（需要所有者密码）。"),
         Msg::ShutdownReason => ("This PDF has unsaved changes.", "这个 PDF 有没保存的改动。"),
         Msg::NoteNothingUndo => ("Nothing to undo.", "没有可撤销的。"),
         Msg::NoteNothingRedo => ("Nothing to redo.", "没有可重做的。"),
@@ -469,7 +502,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 125);
+        assert_eq!(ALL.len(), 136);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

@@ -702,10 +702,11 @@ fn main() -> Result<(), String> {
     let annots_grown = AFTER_ANNOTS.saturating_sub(AFTER_JPX);
     let annots_growth_ok = annots_grown <= 50_000;
     println!("  grown by annotations (3c2-3): {annots_grown} bytes ({:.0} KB)  (target <= 0.05 MB; the size recorded at 4a)  {}", annots_grown as f64 / 1000.0, verdict(annots_growth_ok));
-    // Layer 4, step 4b: the drawing of form fields that have no appearance (the program edits nothing) at most 0.1 MB more.
+    // Layer 4 (4a-4c): form fields drawn without an appearance, and the watermark, stamp and addtext commands, at most
+    // 0.4 MB more (the editing code is built for size in qingpdf-core).
     let forms_grown = bytes.saturating_sub(AFTER_ANNOTS);
-    let forms_growth_ok = forms_grown <= 100_000;
-    println!("  grown by form fields (4b): {forms_grown} bytes ({:.0} KB)  (target <= 0.1 MB)  {}", forms_grown as f64 / 1000.0, verdict(forms_growth_ok));
+    let forms_growth_ok = forms_grown <= 400_000;
+    println!("  grown by editing (layer 4): {forms_grown} bytes ({:.0} KB)  (target <= 0.4 MB)  {}", forms_grown as f64 / 1000.0, verdict(forms_growth_ok));
 
     let encrypted_ok = encrypted()?;
     let text_ok = text_case(&program)?;
