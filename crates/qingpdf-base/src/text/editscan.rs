@@ -59,6 +59,8 @@ pub struct Show {
     pub tc: f64,
     pub tw: f64,
     pub th: f64,
+    /// The text rendering mode (9.3.6): 3 draws nothing.
+    pub render: u8,
     /// The operands `aw` and `ac` of a `"`.
     pub spacing: Option<(f64, f64)>,
     pub items: Vec<ShowItem>,

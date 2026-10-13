@@ -69,7 +69,7 @@ const MAX_NAME_TRIES: usize = 32;
 /// The most coordinates a place may have (points).
 const LIMIT: f64 = 1.0e7;
 
-type Matrix = [f64; 6];
+pub(super) type Matrix = [f64; 6];
 
 /// A watermark: text, a picture or both (the picture above the text), drawn on every page of `pages`.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +104,7 @@ fn mul(l: Matrix, m: Matrix) -> Matrix {
 }
 
 /// The page as it is shown, with its origin at the lower left and y up, onto user space.
-fn upright(shown: &Shown) -> Matrix {
+pub(super) fn upright(shown: &Shown) -> Matrix {
     let (_, h) = shown.size();
     let p0 = shown.unmap(0.0, h);
     let pu = shown.unmap(1.0, h);
@@ -114,7 +114,7 @@ fn upright(shown: &Shown) -> Matrix {
 
 /// The operator for a matrix. (A mark is made at about the size it has on the page, so the four decimals of `num` are enough for
 /// its scale and turn.)
-fn cm(m: Matrix) -> String {
+pub(super) fn cm(m: Matrix) -> String {
     format!("{} {} {} {} {} {} cm", num(m[0]), num(m[1]), num(m[2]), num(m[3]), num(m[4]), num(m[5]))
 }
 
@@ -131,7 +131,7 @@ fn place(v: f32) -> Result<f64> {
 
 /// What the pages of one edit share (small sorted lists: the keys are found by bisection).
 #[derive(Default)]
-struct Shared {
+pub(super) struct Shared {
     /// Streams made, by their content.
     streams: Vec<(Vec<u8>, ObjRef)>,
     /// The copy made of a `/Resources` that pages share (its object number, or for one that the page tree gives them an address
@@ -319,7 +319,7 @@ fn add_xobject(ctx: &mut Ctx<'_>, shared: &mut Shared, resources: &mut Dict, wan
 
 /// Make the page draw the mark `xobject`: `draw(name)` is the content that does it, `name` the one the mark has in the page's
 /// resources (`wanted` unless the page has that already). On top of the page (its own content between `q` and `Q`), or `under` it.
-fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, wanted: &str, xobject: ObjRef, under: bool, draw: &dyn Fn(&str) -> String) -> Result<()> {
+pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, wanted: &str, xobject: ObjRef, under: bool, draw: &dyn Fn(&str) -> String) -> Result<()> {
     let Object::Dict(mut dict) = ctx.doc.get(page.obj_ref)? else { return Err(Error::Invalid("the page is not a dictionary".to_string())) };
     charge(ctx, PAGE_COST + BYTE_COST * dict.approx_size() as f64)?;
 

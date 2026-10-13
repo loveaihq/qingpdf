@@ -3,11 +3,12 @@
 //!
 //! The parts of it that came with 3d-2 are in the modules below, each an `impl App` of its own: `outline` (the bookmarks, links
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
-//! `menus` and `recents` (the menus; the files opened last).
+//! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans).
 
 mod editing;
 mod forms;
 mod menus;
+mod ocr;
 mod outline;
 mod printjob;
 mod recents;
@@ -57,6 +58,9 @@ pub const CMD_FIND: u32 = 18;
 pub const CMD_FIND_NEXT: u32 = 19;
 pub const CMD_FIND_PREV: u32 = 20;
 pub const CMD_COPY: u32 = 21;
+/// Tools > Recognize text: in every scanned page, on this page.
+pub const CMD_OCR_ALL: u32 = 26;
+pub const CMD_OCR_PAGE: u32 = 27;
 pub const CMD_SAVE: u32 = 30;
 pub const CMD_SAVE_AS: u32 = 31;
 /// Make a Word file of the document (5b).
@@ -248,6 +252,11 @@ pub struct App {
     // --- 4a ---
     /// The tool, the annotations, the history of the changes and the saving.
     edit: EditState,
+
+    // --- 5c ---
+    /// The run of text recognition that is going on, if one is; and (for tests) the recogniser to use instead of Windows' own.
+    ocr: Option<crate::ocr::Run>,
+    pub(crate) ocr_test_opener: Option<crate::ocr::Opener>,
 }
 
 impl App {
@@ -313,6 +322,8 @@ impl App {
             menus_dirty: true,
             print_test: None,
             edit: EditState::new(author),
+            ocr: None,
+            ocr_test_opener: None,
         }
     }
 
@@ -379,6 +390,7 @@ impl App {
             self.engine.cancel(id);
         }
         let mut actions = self.cancel_print_for_new_document();
+        self.drop_ocr();
         for id in self.links_asked.drain().map(|(id, _)| id).chain(self.boxes_asked.drain().map(|(id, _)| id)) {
             self.engine.cancel(id);
         }
@@ -673,6 +685,7 @@ impl App {
         if redraw {
             actions.push(Action::Invalidate);
         }
+        actions.extend(self.pump_ocr());
         actions
     }
 
@@ -835,6 +848,7 @@ impl App {
             CMD_SAVE => self.save(),
             CMD_SAVE_AS => self.save_as(),
             CMD_EXPORT_DOCX => self.export_word(),
+            CMD_OCR_ALL | CMD_OCR_PAGE => self.start_ocr(cmd == CMD_OCR_PAGE),
             CMD_UNDO => self.undo(),
             CMD_REDO => self.redo(),
             CMD_REMOVE => self.remove_picked(),

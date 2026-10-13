@@ -26,6 +26,8 @@ pub(super) struct MenuState {
     /// The page's content may be changed (the Insert menu), and what the watermark is like.
     pub can_modify: bool,
     pub wm: Watermarking,
+    /// Text of scans can be recognized (a file is open and no recognition is going on).
+    pub can_ocr: bool,
 }
 
 impl MenuState {
@@ -46,6 +48,7 @@ impl MenuState {
             text_size: 1,
             can_modify: false,
             wm: Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false },
+            can_ocr: false,
         }
     }
 }
@@ -181,6 +184,10 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             },
         },
         Menu {
+            title: t(lang, Msg::ToolsMenu).to_string(),
+            entries: vec![item(CMD_OCR_ALL, Msg::OcrAll, st.can_ocr), item(CMD_OCR_PAGE, Msg::OcrPageOnly, st.can_ocr)],
+        },
+        Menu {
             title: t(lang, Msg::GoMenu).to_string(),
             entries: vec![item(CMD_GOTO, Msg::PageNumber, st.has_doc)],
         },
@@ -222,6 +229,7 @@ impl App {
             text_size: self.edit.forms.text_size,
             can_modify: self.doc.is_some() && self.rights.modify,
             wm: self.edit.forms.wm,
+            can_ocr: self.doc.is_some() && self.ocr.is_none(),
         };
         build_menus(self.lang, &st)
     }
@@ -250,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_seven_menus_and_every_command_is_in_one() {
+    fn there_are_eight_menus_and_every_command_is_in_one() {
         let st = MenuState {
             has_doc: true,
             has_outline: true,
@@ -260,18 +268,19 @@ mod tests {
             can_redo: true,
             has_picked: true,
             can_modify: true,
+            can_ocr: true,
             ..MenuState::idle()
         };
         for lang in [Lang::En, Lang::Zh] {
             let menus = build_menus(lang, &st);
-            assert_eq!(menus.len(), 7);
+            assert_eq!(menus.len(), 8);
             let listed = all(&menus);
             let mut ids: Vec<u32> = listed.iter().map(|(id, ..)| *id).collect();
             ids.sort_unstable();
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.
@@ -287,7 +296,7 @@ mod tests {
         assert_eq!(enabled(CMD_OPEN), Some(true));
         assert_eq!(enabled(CMD_EXIT), Some(true));
         assert_eq!(enabled(CMD_ABOUT), Some(true));
-        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV] {
+        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }
         assert!(listed.iter().any(|(id, label, e)| *id == 0 && label == "(none)" && !e));

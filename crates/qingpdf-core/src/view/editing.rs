@@ -10,6 +10,7 @@
 //! The history is bounded ([`MAX_UNDO_STEPS`] steps, and with the objects in front of the file together within the memory the
 //! plan sets aside for edits): the oldest step that does not fit any more becomes part of the document for good.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
@@ -20,10 +21,14 @@ use crate::edit::signature::{self, Policy, Signatures};
 use crate::edit::EditClass;
 use crate::edit::{self, Change};
 use crate::object::ObjRef;
+use crate::text::PageChars;
 use crate::xref::XrefEntry;
 
 /// Most edits that can be undone.
 pub const MAX_UNDO_STEPS: usize = 100;
+
+/// Most characters of recognised text a file that may not be written to keeps in memory (about 4 MB of boxes and text).
+pub(crate) const MAX_MEMORY_TEXT_CHARS: usize = 200_000;
 
 /// How many pages' worth of work all the edits of a session may cost together (an edit alone may cost one).
 const WORK_PAGES: f64 = 20.0;
@@ -112,6 +117,10 @@ pub(crate) struct Session {
     warned: bool,
     /// What the edits made so far have cost the work meter, in all (the allowance is for the whole session).
     work_used: f64,
+    /// Recognised text (5c) of a file that may not be written to (it is signed, or its author did not allow changes): kept here, for
+    /// the reader's search, selection and copy only, never saved; by page, and how many characters it holds in all.
+    memory_text: HashMap<u32, Rc<PageChars>>,
+    memory_chars: usize,
 }
 
 impl Drop for Session {
@@ -134,7 +143,27 @@ impl Session {
             signatures: None,
             warned: false,
             work_used: 0.0,
+            memory_text: HashMap::new(),
+            memory_chars: 0,
         }
+    }
+
+    /// Keep the recognised text of a page for this session only, if the characters kept so far and these are no more than
+    /// [`MAX_MEMORY_TEXT_CHARS`]. `false`: not kept.
+    pub(crate) fn keep_text(&mut self, page: u32, chars: Rc<PageChars>) -> bool {
+        let old = self.memory_text.get(&page).map_or(0, |c| c.boxes.len());
+        let total = self.memory_chars.saturating_sub(old).saturating_add(chars.boxes.len());
+        if total > MAX_MEMORY_TEXT_CHARS {
+            return false;
+        }
+        self.memory_chars = total;
+        self.memory_text.insert(page, chars);
+        true
+    }
+
+    /// The recognised text kept for the page, if any.
+    pub(crate) fn kept_text(&self, page: u32) -> Option<Rc<PageChars>> {
+        self.memory_text.get(&page).cloned()
     }
 
     /// What the objects in front of the file and the history may take together, in bytes.

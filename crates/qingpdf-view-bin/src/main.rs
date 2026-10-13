@@ -6,7 +6,8 @@
 //! prints times and the memory peak and quits; `--bench-size WxH` gives the window of that test a client area of that
 //! many pixels (it may be bigger than the screen). The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
 //! (the first three by default) to the printer "Microsoft Print to PDF", which writes `out.pdf`, with no box, says how it went
-//! and the memory peak, and quits.
+//! and the memory peak, and quits. The hidden `--ocr-test <in.pdf> <out.pdf> [--ocr-pages first-last] [--ocr-lang zh|en]` recognises the text of
+//! the scanned pages with the same chain the window uses, saves the file with the text layer, prints how long each page took and quits.
 
 #![windows_subsystem = "windows"]
 
@@ -18,6 +19,9 @@ use qingpdf_view::app::{App, PrintTest};
 use qingpdf_view::bench::Bench;
 use qingpdf_view::i18n::{Lang, Msg, t};
 use qingpdf_view::{settings, win32};
+
+/// The hidden OCR test: the file, the file to write, the pages (`None`: every scan).
+type OcrTest = (PathBuf, PathBuf, Option<(u32, u32)>);
 
 /// "1920x1080" as a size in pixels.
 fn parse_size(s: &str) -> Option<(i32, i32)> {
@@ -55,6 +59,9 @@ fn main() {
     let mut open: Option<PathBuf> = None;
     // The hidden print test: the file, the file to write, the pages.
     let mut print_test: Option<(PathBuf, PathBuf, (u32, u32))> = None;
+    // The hidden OCR test: the file, the file to write, the pages (all the scans by default), Chinese or the person's languages.
+    let mut ocr_test: Option<OcrTest> = None;
+    let mut ocr_chinese: Option<bool> = None;
     while let Some(arg) = args.next() {
         if arg == "--bench" {
             bench_file = args.next().map(PathBuf::from);
@@ -64,14 +71,28 @@ fn main() {
             let (file, out) = (args.next().map(PathBuf::from), args.next().map(PathBuf::from));
             let pages = args.next().and_then(|s| parse_pages(&s.to_string_lossy())).unwrap_or((1, 3));
             print_test = file.zip(out).map(|(f, o)| (f, o, pages));
+        } else if arg == "--ocr-test" {
+            let (file, out) = (args.next().map(PathBuf::from), args.next().map(PathBuf::from));
+            ocr_test = file.zip(out).map(|(f, o)| (f, o, None));
+        } else if arg == "--ocr-pages" {
+            let pages = args.next().and_then(|s| parse_pages(&s.to_string_lossy()));
+            if let Some(t) = ocr_test.as_mut() {
+                t.2 = pages;
+            }
+        } else if arg == "--ocr-lang" {
+            ocr_chinese = args.next().map(|s| s.to_string_lossy().to_ascii_lowercase().starts_with("zh"));
         } else if open.is_none() && !arg.to_string_lossy().starts_with("--") {
             open = Some(PathBuf::from(arg));
         }
     }
-    if bench_file.is_some() || print_test.is_some() {
+    if bench_file.is_some() || print_test.is_some() || ocr_test.is_some() {
         win32::attach_console();
     }
     let lang = Lang::from_langid(win32::ui_language());
+    if let Some((file, out, pages)) = ocr_test {
+        let chinese = ocr_chinese.unwrap_or(lang == Lang::Zh);
+        std::process::exit(qingpdf_view::ocr::ocr_test(&file.to_string_lossy(), &out.to_string_lossy(), pages, chinese));
+    }
     show_panics(lang);
     let menus = App::initial_menus(lang);
     // The most pixels the window can show: the work area of the screen, or the size the speed test asked for.

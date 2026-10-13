@@ -2384,3 +2384,494 @@ pub fn fatal_box(title: &str, text: &str) {
     // own; it is modal to the thread and returns when it is closed.
     unsafe { MessageBoxW(0, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR | MB_TASKMODAL) };
 }
+
+// --- Windows text recognition (5c) ---------------------------------------------------------------------------------------
+//
+// `Windows.Media.Ocr` is a Windows Runtime class: objects are COM interface pointers (a vtable of function pointers behind the
+// pointer), made by the factory of their class (`RoGetActivationFactory`), and strings are HSTRINGs. Everything here is declared by
+// hand: the interfaces below are called by the slot of the method in the vtable (the three methods of IUnknown, three more of
+// IInspectable, then the interface's own, in the order of the Windows SDK's metadata), and no object of ours is ever given to
+// Windows. What the unsafe code relies on:
+// - an `Obj` holds one reference to a live interface pointer (never null) and gives it back in `Drop`, so every interface is
+//   released on every path, early returns and errors included;
+// - a method is called only through a function pointer type that is its signature (the `get_*` helpers name the signature and the
+//   caller names the slot and the interface it belongs to);
+// - an out-parameter is a live local that Windows writes once, and what it hands back (an interface pointer or an HSTRING) is
+//   owned by us from then on and released exactly once;
+// - the thread that makes a `Recogniser` initialises the Windows Runtime for itself (`RoGuard`) and the recogniser is dropped
+//   on that thread, so the objects never cross threads.
+
+use std::time::Duration;
+
+use crate::ocr::{GrayImage, OcrError, Recognizer};
+use qingpdf_core::view::{MAX_WORDS_PER_PAGE, OcrLine, OcrWord};
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+/// `Windows.Media.Ocr.IOcrEngineStatics`
+const IID_OCR_ENGINE_STATICS: Guid = Guid { data1: 0x5BFF_A85A, data2: 0x3384, data3: 0x3540, data4: [0x99, 0x40, 0x69, 0x91, 0x20, 0xD4, 0x28, 0xA8] };
+/// `Windows.Foundation.IAsyncInfo`
+const IID_ASYNC_INFO: Guid = Guid { data1: 0x0000_0036, data2: 0x0000, data3: 0x0000, data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46] };
+/// `Windows.Graphics.Imaging.ISoftwareBitmapStatics`
+const IID_SOFTWARE_BITMAP_STATICS: Guid = Guid { data1: 0xDF03_85DB, data2: 0x672F, data3: 0x4A9D, data4: [0x80, 0x6E, 0xC2, 0x44, 0x2F, 0x34, 0x3E, 0x86] };
+/// `Windows.Security.Cryptography.ICryptographicBufferStatics`
+const IID_CRYPTO_BUFFER_STATICS: Guid = Guid { data1: 0x320B_7E22, data2: 0x3CB0, data3: 0x4CDF, data4: [0x86, 0x63, 0x1D, 0x28, 0x91, 0x00, 0x65, 0xEB] };
+
+/// `BitmapPixelFormat::Gray8`
+const PIXEL_FORMAT_GRAY8: i32 = 62;
+/// `RO_INIT_MULTITHREADED`, and the answer when the thread is a single-threaded apartment already.
+const RO_INIT_MULTITHREADED: i32 = 1;
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+const E_POINTER: i32 = 0x8000_4003_u32 as i32;
+const E_FAIL: i32 = 0x8000_4005_u32 as i32;
+/// `AsyncStatus`: Started, Completed, Canceled, Error.
+const ASYNC_STARTED: u32 = 0;
+const ASYNC_COMPLETED: u32 = 1;
+const ASYNC_CANCELED: u32 = 2;
+const ASYNC_ERROR: u32 = 3;
+/// Most lines read off a page.
+const MAX_OCR_LINES: u32 = 10_000;
+
+#[link(name = "runtimeobject")]
+unsafe extern "system" {
+    fn RoInitialize(kind: i32) -> i32;
+    fn RoUninitialize();
+    fn RoGetActivationFactory(class_id: isize, iid: *const Guid, factory: *mut *mut c_void) -> i32;
+    fn WindowsCreateString(source: *const u16, length: u32, string: *mut isize) -> i32;
+    fn WindowsDeleteString(string: isize) -> i32;
+    fn WindowsGetStringRawBuffer(string: isize, length: *mut u32) -> *const u16;
+}
+
+/// An HSTRING we made, deleted when dropped.
+struct HString(isize);
+
+impl HString {
+    fn new(s: &str) -> Result<HString, i32> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut h = 0isize;
+        // SAFETY: `units` holds `length` UTF-16 units that live through the call (Windows copies them); `h` is a live isize that
+        // receives the new string handle.
+        let hr = unsafe { WindowsCreateString(units.as_ptr(), units.len() as u32, &mut h) };
+        if hr < 0 { Err(hr) } else { Ok(HString(h)) }
+    }
+}
+
+impl Drop for HString {
+    fn drop(&mut self) {
+        // SAFETY: the handle was made by WindowsCreateString and is deleted only here.
+        unsafe { WindowsDeleteString(self.0) };
+    }
+}
+
+/// Take the text of an HSTRING that Windows gave us, and delete it.
+fn take_hstring(h: isize) -> String {
+    let mut len = 0u32;
+    // SAFETY: `h` is a handle Windows gave us (0 is allowed: it gives a null pointer and a length of 0); the buffer it returns is
+    // valid until the handle is deleted, which is after the copy below; `len` is a live u32.
+    let text = unsafe {
+        let p = WindowsGetStringRawBuffer(h, &mut len);
+        if p.is_null() { String::new() } else { String::from_utf16_lossy(std::slice::from_raw_parts(p, len as usize)) }
+    };
+    // SAFETY: `h` is ours (the out-parameter of a method that gives its caller the string) and is deleted once, here.
+    unsafe { WindowsDeleteString(h) };
+    text
+}
+
+/// The thread's Windows Runtime initialisation, undone when dropped (a thread that was a single-threaded apartment already is not
+/// undone, it was not ours).
+struct RoGuard(bool);
+
+impl RoGuard {
+    fn new() -> Result<RoGuard, i32> {
+        // SAFETY: takes a plain number and changes only the apartment state of this thread.
+        let hr = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+        if hr >= 0 {
+            Ok(RoGuard(true))
+        } else if hr == RPC_E_CHANGED_MODE {
+            Ok(RoGuard(false))
+        } else {
+            Err(hr)
+        }
+    }
+}
+
+impl Drop for RoGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the successful RoInitialize of this thread; every object of the thread is released before (the guard
+            // is the last field of what holds them).
+            unsafe { RoUninitialize() };
+        }
+    }
+}
+
+/// One reference to a Windows Runtime object (an interface pointer, never null).
+struct Obj(*mut c_void);
+
+type GetObj = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32;
+type GetU32 = unsafe extern "system" fn(*mut c_void, *mut u32) -> i32;
+type GetI32 = unsafe extern "system" fn(*mut c_void, *mut i32) -> i32;
+type GetHString = unsafe extern "system" fn(*mut c_void, *mut isize) -> i32;
+type GetRect = unsafe extern "system" fn(*mut c_void, *mut [f32; 4]) -> i32;
+type ObjWithObj = unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> i32;
+type ObjAt = unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32;
+type Call0 = unsafe extern "system" fn(*mut c_void) -> i32;
+type Release = unsafe extern "system" fn(*mut c_void) -> u32;
+type Query = unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32;
+type CreateFromBytes = unsafe extern "system" fn(*mut c_void, u32, *const u8, *mut *mut c_void) -> i32;
+type CreateBitmap = unsafe extern "system" fn(*mut c_void, *mut c_void, i32, i32, i32, *mut *mut c_void) -> i32;
+
+fn check(hr: i32) -> Result<(), i32> {
+    if hr < 0 { Err(hr) } else { Ok(()) }
+}
+
+impl Obj {
+    /// Own the interface pointer `p`; an error when it is null.
+    ///
+    /// # Safety
+    /// A non-null `p` must be a pointer to a live interface of a runtime object, of which one reference is given to the new `Obj`
+    /// (it is released when the `Obj` is dropped).
+    unsafe fn new(p: *mut c_void) -> Result<Obj, i32> {
+        if p.is_null() { Err(E_POINTER) } else { Ok(Obj(p)) }
+    }
+
+    /// The function in slot `n` of the vtable, as the function pointer type `F`.
+    ///
+    /// # Safety
+    /// The object must have a vtable with at least `n + 1` slots, and slot `n` must be a method of the signature `F` (a function
+    /// pointer type).
+    unsafe fn method<F: Copy>(&self, n: usize) -> F {
+        debug_assert!(std::mem::size_of::<F>() == std::mem::size_of::<usize>());
+        // SAFETY: an interface pointer points to a pointer to the vtable, an array of function addresses; the caller promises
+        // that slot `n` is there and has the signature `F`, a function pointer, which is the size of an address.
+        unsafe {
+            let vtable = *(self.0 as *const *const usize);
+            std::mem::transmute_copy::<usize, F>(&*vtable.add(n))
+        }
+    }
+
+    // The methods below take a slot of the vtable (or are for one interface only), and a wrong one is not a mistake the compiler
+    // can find: every one of them is `unsafe`, and its caller says why the slot is right for the object.
+
+    /// `HRESULT Method([out] Interface** value)` in slot `n`.
+    ///
+    /// # Safety
+    /// Slot `n` of the object must be a getter of an interface pointer, with that signature.
+    unsafe fn get_obj(&self, n: usize) -> Result<Obj, i32> {
+        let mut out = null_mut();
+        // SAFETY: the caller promises that slot `n` is a getter of an interface pointer; `out` is a live pointer that is written
+        // once.
+        let hr = unsafe { self.method::<GetObj>(n)(self.0, &mut out) };
+        check(hr)?;
+        // SAFETY: the call succeeded, so `out` is a new reference to an interface (or null, which `new` refuses).
+        unsafe { Obj::new(out) }
+    }
+
+    /// `HRESULT Method([out] UINT32* value)` in slot `n`.
+    ///
+    /// # Safety
+    /// Slot `n` of the object must be a getter of a 32-bit number, with that signature.
+    unsafe fn get_u32(&self, n: usize) -> Result<u32, i32> {
+        let mut out = 0u32;
+        // SAFETY: the caller promises that slot `n` is a getter of a 32-bit number; `out` is a live u32.
+        check(unsafe { self.method::<GetU32>(n)(self.0, &mut out) })?;
+        Ok(out)
+    }
+
+    /// `HRESULT Method([out] HSTRING* value)` in slot `n`.
+    ///
+    /// # Safety
+    /// Slot `n` of the object must be a getter of an HSTRING, with that signature.
+    unsafe fn get_string(&self, n: usize) -> Result<String, i32> {
+        let mut out = 0isize;
+        // SAFETY: the caller promises that slot `n` is a getter of an HSTRING; `out` is a live handle that is written once, and it
+        // is ours when the call succeeds.
+        check(unsafe { self.method::<GetHString>(n)(self.0, &mut out) })?;
+        Ok(take_hstring(out))
+    }
+
+    /// `HRESULT BoundingRect([out] Rect* value)` in slot `n` (four floats: x, y, width, height).
+    ///
+    /// # Safety
+    /// Slot `n` of the object must be the getter of a `Windows.Foundation.Rect`.
+    unsafe fn get_rect(&self, n: usize) -> Result<[f32; 4], i32> {
+        let mut out = [0f32; 4];
+        // SAFETY: the caller promises that slot `n` is the getter of a `Windows.Foundation.Rect`, four 32-bit floats; `out` is a
+        // live array of four.
+        check(unsafe { self.method::<GetRect>(n)(self.0, &mut out) })?;
+        Ok(out)
+    }
+
+    /// `HRESULT Method([in] Interface* argument, [out] Interface** value)` in slot `n`.
+    ///
+    /// # Safety
+    /// Slot `n` of the object must take one interface pointer (of the kind `argument` is) and give one.
+    unsafe fn call_with(&self, n: usize, argument: &Obj) -> Result<Obj, i32> {
+        let mut out = null_mut();
+        // SAFETY: the caller promises that slot `n` takes one interface pointer and gives one; `argument` is live for the call;
+        // `out` is written once.
+        check(unsafe { self.method::<ObjWithObj>(n)(self.0, argument.0, &mut out) })?;
+        // SAFETY: the call succeeded, so `out` is a new reference to an interface (or null, which `new` refuses).
+        unsafe { Obj::new(out) }
+    }
+
+    /// `HRESULT GetAt([in] UINT32 index, [out] T* value)` of an `IVectorView` of runtime objects (slot 6).
+    ///
+    /// # Safety
+    /// The object must be an `IVectorView` of runtime objects.
+    unsafe fn at(&self, index: u32) -> Result<Obj, i32> {
+        let mut out = null_mut();
+        // SAFETY: the caller promises that this is an IVectorView, whose slot 6 is GetAt(index, out); `out` is written once.
+        check(unsafe { self.method::<ObjAt>(6)(self.0, index, &mut out) })?;
+        // SAFETY: the call succeeded, so `out` is a new reference to an interface (or null, which `new` refuses).
+        unsafe { Obj::new(out) }
+    }
+
+    /// `HRESULT Method()` in slot `n` (Cancel and Close of IAsyncInfo).
+    ///
+    /// # Safety
+    /// Slot `n` of the object must be a method with no argument besides the object.
+    unsafe fn call0(&self, n: usize) -> i32 {
+        // SAFETY: the caller promises that slot `n` takes no argument besides the object.
+        unsafe { self.method::<Call0>(n)(self.0) }
+    }
+
+    /// QueryInterface for another interface of the object.
+    fn query(&self, iid: &Guid) -> Result<Obj, i32> {
+        let mut out = null_mut();
+        // SAFETY: slot 0 of every interface is QueryInterface(iid, out); `iid` is a live GUID; `out` is written once.
+        check(unsafe { self.method::<Query>(0)(self.0, iid, &mut out) })?;
+        // SAFETY: the call succeeded, so `out` is a new reference to an interface (or null, which `new` refuses).
+        unsafe { Obj::new(out) }
+    }
+}
+
+/// An operation of the recogniser (`IAsyncInfo`) that is being waited for. However it is left, it is cancelled if it may still be
+/// running, and closed (an operation may be closed only when it is not running).
+struct Pending(Obj);
+
+impl Pending {
+    /// The state of the operation (`ASYNC_*`).
+    fn status(&self) -> Result<u32, i32> {
+        // SAFETY: slot 7 of IAsyncInfo is get_Status(out AsyncStatus), a 32-bit number.
+        unsafe { self.0.get_u32(7) }
+    }
+
+    /// The error code of a failed operation (IAsyncInfo, slot 8).
+    fn error_code(&self) -> i32 {
+        let mut hr = 0i32;
+        // SAFETY: slot 8 of IAsyncInfo is get_ErrorCode(out HRESULT); `hr` is a live i32.
+        unsafe { self.0.method::<GetI32>(8)(self.0.0, &mut hr) };
+        hr
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // A state that is not known counts as running.
+        if !matches!(self.status(), Ok(ASYNC_COMPLETED | ASYNC_CANCELED | ASYNC_ERROR)) {
+            // SAFETY: slot 9 of IAsyncInfo is Cancel().
+            unsafe { self.0.call0(9) };
+            for _ in 0..40 {
+                match self.status() {
+                    Ok(ASYNC_STARTED) => std::thread::sleep(Duration::from_millis(5)),
+                    _ => break,
+                }
+            }
+        }
+        // SAFETY: slot 10 of IAsyncInfo is Close().
+        unsafe { self.0.call0(10) };
+    }
+}
+
+impl Drop for Obj {
+    fn drop(&mut self) {
+        // SAFETY: slot 2 of every interface is Release, and this reference is given back once.
+        unsafe { self.method::<Release>(2)(self.0) };
+    }
+}
+
+/// The factory of a runtime class, as the interface `iid` (its statics).
+fn factory(class: &str, iid: &Guid) -> Result<Obj, i32> {
+    let name = HString::new(class)?;
+    let mut out = null_mut();
+    // SAFETY: `name` is a live HSTRING; `iid` is a live GUID; `out` is written once and is ours when the call succeeds.
+    check(unsafe { RoGetActivationFactory(name.0, iid, &mut out) })?;
+    // SAFETY: the call succeeded, so `out` is a new reference to the factory (or null, which `new` refuses).
+    unsafe { Obj::new(out) }
+}
+
+/// The text recogniser of Windows, made on the thread that uses it.
+struct Recogniser {
+    engine: Obj,
+    bitmaps: Obj,
+    buffers: Obj,
+    language: String,
+    max_dimension: u32,
+    // (Dropped last: after every object of the thread is released.)
+    _runtime: RoGuard,
+}
+
+fn failed(what: &str, hr: i32) -> OcrError {
+    OcrError::Failed(format!("{what} (error 0x{:08X})", hr as u32))
+}
+
+/// Make the recogniser: for Chinese when `chinese` (and say so if Windows has none), else for the languages the person uses.
+pub fn open_recognizer(chinese: bool) -> Result<Box<dyn Recognizer>, OcrError> {
+    let runtime = RoGuard::new().map_err(|hr| failed("the Windows Runtime could not be started", hr))?;
+    let statics = factory("Windows.Media.Ocr.OcrEngine", &IID_OCR_ENGINE_STATICS).map_err(|hr| failed("the text recogniser of Windows is not there", hr))?;
+    // SAFETY: `statics` is an IOcrEngineStatics; its slot 6 is get_MaxImageDimension (a UINT32), 7 AvailableRecognizerLanguages (an
+    // IVectorView<Language>), 9 TryCreateFromLanguage(language, out engine), 10 TryCreateFromUserProfileLanguages(out engine). An
+    // IVectorView has Size in slot 7 (a UINT32) and GetAt in slot 6; an ILanguage has LanguageTag in slot 6 (an HSTRING).
+    let max_dimension = unsafe { statics.get_u32(6) }.map_err(|hr| failed("the recogniser did not say how big a picture it takes", hr))?;
+    // The languages Windows can recognise (IOcrEngineStatics.AvailableRecognizerLanguages, a view of Language objects).
+    // SAFETY: as above.
+    let languages = unsafe { statics.get_obj(7) }.map_err(|hr| failed("the recogniser did not list its languages", hr))?;
+    // SAFETY: `languages` is an IVectorView.
+    let count = unsafe { languages.get_u32(7) }.unwrap_or(0).min(256);
+    let mut found: Vec<(String, Obj)> = Vec::new();
+    for i in 0..count {
+        // SAFETY: `languages` is an IVectorView of Language objects, and a Language is an ILanguage.
+        let Ok(language) = (unsafe { languages.at(i) }) else { continue };
+        // SAFETY: as above (slot 6 of ILanguage is LanguageTag, an HSTRING).
+        if let Ok(tag) = unsafe { language.get_string(6) } {
+            found.push((tag, language));
+        }
+    }
+    let tags = |found: &[(String, Obj)]| found.iter().map(|(tag, _)| tag.clone()).collect::<Vec<_>>();
+    let (engine, language) = if chinese {
+        // A Simplified Chinese recogniser first, any Chinese one after.
+        let pick = found.iter().find(|(tag, _)| tag.starts_with("zh-Hans")).or_else(|| found.iter().find(|(tag, _)| tag.starts_with("zh")));
+        let Some((tag, language)) = pick else { return Err(OcrError::NoLanguage { chinese: true, available: tags(&found) }) };
+        // SAFETY: slot 9 of IOcrEngineStatics takes a Language and gives an OcrEngine.
+        let engine = unsafe { statics.call_with(9, language) }.map_err(|_| OcrError::NoLanguage { chinese: true, available: tags(&found) })?;
+        (engine, tag.clone())
+    } else {
+        // The languages of the person's profile (IOcrEngineStatics.TryCreateFromUserProfileLanguages), else the first there is.
+        // SAFETY: slot 10 of IOcrEngineStatics gives an OcrEngine.
+        match unsafe { statics.get_obj(10) } {
+            Ok(engine) => {
+                // SAFETY: slot 7 of IOcrEngine is get_RecognizerLanguage (a Language), whose slot 6 is the tag (an HSTRING).
+                let tag = unsafe { engine.get_obj(7).and_then(|l| l.get_string(6)) }.unwrap_or_default();
+                (engine, tag)
+            }
+            Err(_) => {
+                let Some((tag, language)) = found.first() else { return Err(OcrError::NoLanguage { chinese: false, available: tags(&found) }) };
+                // SAFETY: slot 9 of IOcrEngineStatics takes a Language and gives an OcrEngine.
+                let engine = unsafe { statics.call_with(9, language) }.map_err(|_| OcrError::NoLanguage { chinese: false, available: tags(&found) })?;
+                (engine, tag.clone())
+            }
+        }
+    };
+    let bitmaps = factory("Windows.Graphics.Imaging.SoftwareBitmap", &IID_SOFTWARE_BITMAP_STATICS).map_err(|hr| failed("the bitmaps of Windows are not there", hr))?;
+    let buffers = factory("Windows.Security.Cryptography.CryptographicBuffer", &IID_CRYPTO_BUFFER_STATICS).map_err(|hr| failed("the buffers of Windows are not there", hr))?;
+    Ok(Box::new(Recogniser { engine, bitmaps, buffers, language, max_dimension, _runtime: runtime }))
+}
+
+impl Recogniser {
+    /// The picture as a `SoftwareBitmap` (Gray8): the bytes are copied into a buffer and the buffer into the bitmap, so nothing
+    /// refers to the pixels after this returns.
+    fn bitmap(&self, image: &GrayImage) -> Result<Obj, OcrError> {
+        let mut buffer = null_mut();
+        // SAFETY: slot 9 of ICryptographicBufferStatics is CreateFromByteArray(length, bytes, out); the pixels are `length` bytes
+        // and Windows copies them during the call; `buffer` is written once.
+        let hr = unsafe { self.buffers.method::<CreateFromBytes>(9)(self.buffers.0, image.pixels.len() as u32, image.pixels.as_ptr(), &mut buffer) };
+        check(hr).map_err(|hr| failed("the picture could not be put in a buffer", hr))?;
+        // SAFETY: the call succeeded, so `buffer` is a new reference to an IBuffer (or null, which `new` refuses).
+        let buffer = unsafe { Obj::new(buffer) }.map_err(|hr| failed("the picture could not be put in a buffer", hr))?;
+        let mut bitmap = null_mut();
+        // SAFETY: slot 9 of ISoftwareBitmapStatics is CreateCopyFromBuffer(buffer, format, width, height, out); `buffer` is live
+        // and holds width x height bytes of Gray8; the bitmap gets a copy; `bitmap` is written once.
+        let hr = unsafe { self.bitmaps.method::<CreateBitmap>(9)(self.bitmaps.0, buffer.0, PIXEL_FORMAT_GRAY8, image.width as i32, image.height as i32, &mut bitmap) };
+        check(hr).map_err(|hr| failed("the picture could not be made into a bitmap", hr))?;
+        // SAFETY: the call succeeded, so `bitmap` is a new reference to a SoftwareBitmap (or null, which `new` refuses).
+        unsafe { Obj::new(bitmap) }.map_err(|hr| failed("the picture could not be made into a bitmap", hr))
+    }
+}
+
+impl Recognizer for Recogniser {
+    fn language(&self) -> String {
+        self.language.clone()
+    }
+
+    fn max_dimension(&self) -> u32 {
+        self.max_dimension
+    }
+
+    fn recognize(&mut self, image: &GrayImage, cancel: &AtomicBool, timeout: Duration) -> Result<Vec<OcrLine>, OcrError> {
+        if image.width == 0 || image.height == 0 || image.width > self.max_dimension || image.height > self.max_dimension || image.pixels.len() != image.width as usize * image.height as usize {
+            return Err(OcrError::Failed("the picture is not a size the recogniser takes".to_string()));
+        }
+        let bitmap = self.bitmap(image)?;
+        // RecognizeAsync(bitmap) -> IAsyncOperation<OcrResult> (IOcrEngine slot 6).
+        // SAFETY: slot 6 of IOcrEngine is RecognizeAsync(SoftwareBitmap) and gives an IAsyncOperation<OcrResult>.
+        let operation = unsafe { self.engine.call_with(6, &bitmap) }.map_err(|hr| failed("the recogniser did not start", hr))?;
+        drop(bitmap);
+        // From here on every way out cancels the operation if it still runs and closes it (`Pending`).
+        let info = Pending(operation.query(&IID_ASYNC_INFO).map_err(|hr| failed("the recogniser's operation cannot be watched", hr))?);
+        let started = std::time::Instant::now();
+        let mut pause = 2;
+        loop {
+            match info.status() {
+                Ok(ASYNC_COMPLETED) => break,
+                Ok(ASYNC_STARTED) => {}
+                Ok(_) => {
+                    let code = info.error_code();
+                    return Err(failed("the recogniser failed", if code < 0 { code } else { E_FAIL }));
+                }
+                Err(hr) => return Err(failed("the recogniser's state cannot be read", hr)),
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(OcrError::Cancelled);
+            }
+            if started.elapsed() >= timeout {
+                return Err(OcrError::TimedOut);
+            }
+            std::thread::sleep(Duration::from_millis(pause));
+            pause = (pause * 2).min(25);
+        }
+        // IAsyncOperation<OcrResult>.GetResults (slot 8), then the lines and their words.
+        // SAFETY: slot 8 of IAsyncOperation<OcrResult> is GetResults() and gives the OcrResult; the operation is completed.
+        let result = unsafe { operation.get_obj(8) }.map_err(|hr| failed("the recogniser gave no result", hr))?;
+        // SAFETY: the OcrResult's slot 6 is get_Lines (an IVectorView<OcrLine>), whose Size is slot 7 (a UINT32) and GetAt slot 6; an
+        // OcrLine has Words in slot 6 (an IVectorView<OcrWord>) and an OcrWord has BoundingRect in slot 6 (a Rect) and Text in slot 7
+        // (an HSTRING).
+        let lines = unsafe { result.get_obj(6) }.map_err(|hr| failed("the recogniser gave no lines", hr))?;
+        // SAFETY: `lines` is an IVectorView.
+        let count = unsafe { lines.get_u32(7) }.map_err(|hr| failed("the recogniser's lines cannot be counted", hr))?.min(MAX_OCR_LINES);
+        let (mut out, mut words_in_all) = (Vec::new(), 0usize);
+        for i in 0..count {
+            // SAFETY: as above.
+            let line = unsafe { lines.at(i) }.map_err(|hr| failed("a line cannot be read", hr))?;
+            // SAFETY: as above.
+            let words = unsafe { line.get_obj(6) }.map_err(|hr| failed("the words of a line cannot be read", hr))?;
+            // SAFETY: as above.
+            let n = unsafe { words.get_u32(7) }.map_err(|hr| failed("the words of a line cannot be counted", hr))?;
+            let mut line_words = Vec::new();
+            for j in 0..n {
+                words_in_all += 1;
+                if words_in_all > MAX_WORDS_PER_PAGE {
+                    return Err(OcrError::Failed("the page has too many words".to_string()));
+                }
+                // SAFETY: as above.
+                let word = unsafe { words.at(j) }.map_err(|hr| failed("a word cannot be read", hr))?;
+                // SAFETY: as above.
+                let text = unsafe { word.get_string(7) }.map_err(|hr| failed("the text of a word cannot be read", hr))?;
+                // SAFETY: as above.
+                let [x, y, w, h] = unsafe { word.get_rect(6) }.map_err(|hr| failed("the box of a word cannot be read", hr))?;
+                line_words.push(OcrWord { text, rect: [x, y, x + w, y + h] });
+            }
+            if !line_words.is_empty() {
+                out.push(OcrLine { words: line_words });
+            }
+        }
+        Ok(out)
+    }
+}

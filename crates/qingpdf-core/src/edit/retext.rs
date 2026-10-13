@@ -31,6 +31,7 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 use super::appearance::num;
 use super::content::{check_content_allowed, contents_list};
 use super::fontsub;
+use super::ocr::OCR_MARK;
 use super::{Ctx, TOO_BIG, commit, replay, save_section, text_string};
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
@@ -67,6 +68,8 @@ const CLI_ROOM: usize = 512 << 20;
 /// How far from a glyph (in its size) a click may be and still be on its line.
 const REACH: f64 = 0.7;
 const NOT_THERE: &str = "the text is not where it should be";
+/// How many forms inside forms are followed when looking for a mark (the reader's own limit is 32).
+const MAX_FORM_NESTING: usize = 32;
 
 fn charge(ctx: &Ctx<'_>, units: f64) -> Result<()> {
     if ctx.work.charge(units) { Ok(()) } else { Err(Error::Limit("the change took too much work".to_string())) }
@@ -148,10 +151,33 @@ fn stream_problem(source: &Source, a: usize, b: usize) -> Option<&'static str> {
     None
 }
 
+/// Is the content stream `src` a recognised text layer (5c), or a form inside one? The layer is a form with the mark of `ocr`.
+fn in_ocr_layer(scan: &Scan, mut src: u32) -> bool {
+    for _ in 0..MAX_FORM_NESTING {
+        let Some(source) = scan.sources.get(src as usize) else { return false };
+        if matches!(source.dict.get(OCR_MARK), Some(Object::Bool(true))) {
+            return true;
+        }
+        if source.form.is_none() {
+            return false;
+        }
+        src = source.parent;
+    }
+    false
+}
+
 /// Why the text of a glyph cannot be changed, if it cannot.
 fn not_editable(scan: &Scan, g: usize) -> Option<&'static str> {
     let rec = scan.chars.get(g)?;
     let Some(show) = scan.parts.get(rec.part as usize).and_then(|p| scan.shows.get(p.show as usize)) else { return Some(NOT_THERE) };
+    // The recognised text of a scan is the picture's words, not the picture: changing it would leave the picture as it is. Other
+    // invisible text (text rendering mode 3, 9.3.6) is the same thing, from another program.
+    if in_ocr_layer(scan, show.src) {
+        return Some("the text is the recognised text of a scanned page; the picture it stands for is not changed");
+    }
+    if show.render == 3 {
+        return Some("the text is invisible (text rendering mode 3, such as the text layer of a scan)");
+    }
     if scan.fonts.get(show.font as usize).is_none() {
         return Some("the text is in a font that was not found");
     }

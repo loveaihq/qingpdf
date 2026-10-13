@@ -98,6 +98,7 @@ const OP_TW: u32 = key2(b'T', b'w');
 const OP_TZ: u32 = key2(b'T', b'z');
 const OP_TL: u32 = key2(b'T', b'L');
 const OP_TS: u32 = key2(b'T', b's');
+const OP_TR: u32 = key2(b'T', b'r');
 const OP_TF: u32 = key2(b'T', b'f');
 const OP_TM: u32 = key2(b'T', b'm');
 const OP_T_STAR: u32 = key2(b'T', b'*');
@@ -218,6 +219,8 @@ struct GState {
     th: f64,
     tl: f64,
     rise: f64,
+    /// The text rendering mode (9.3.6, `Tr`): 0 to 7.
+    render: u8,
 }
 
 /// What the matrices give for every character of a string: the linear part of the text
@@ -311,7 +314,7 @@ impl<'a> Interp<'a> {
             glyphs: Vec::new(),
             ops_left: MAX_OPERATORS,
             in_progress: Vec::new(),
-            gs: GState { ctm: IDENTITY, font: None, rec_font: u32::MAX, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0 },
+            gs: GState { ctm: IDENTITY, font: None, rec_font: u32::MAX, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0, render: 0 },
             stack: Vec::new(),
             tm: IDENTITY,
             tlm: IDENTITY,
@@ -456,6 +459,13 @@ impl<'a> Interp<'a> {
                     self.gs.rise = v;
                 }
             }
+            OP_TR => {
+                if let Some([v]) = numbers::<1>(ops)
+                    && (0.0..8.0).contains(&v)
+                {
+                    self.gs.render = v as u8;
+                }
+            }
             OP_TF => {
                 if let [.., Operand::Name(name), Operand::Num(size)] = ops {
                     self.gs.size = *size;
@@ -523,7 +533,7 @@ impl<'a> Interp<'a> {
     // --- reading a page for editing (`editscan`) -----------------------------------------------------------------------
 
     fn begin_show(&mut self, op: ShowOp, spacing: Option<(f64, f64)>) -> Result<()> {
-        let (src, stmt, font, size, tc, tw, th) = (self.cur_src, self.stmt, self.gs.rec_font, self.gs.size, self.gs.tc, self.gs.tw, self.gs.th);
+        let (src, stmt, font, size, tc, tw, th, render) = (self.cur_src, self.stmt, self.gs.rec_font, self.gs.size, self.gs.tc, self.gs.tw, self.gs.th, self.gs.render);
         if self.rec.is_some() {
             // (Keeping what is read costs about as much as reading it.)
             self.charge(cost::TEXT_OP)?;
@@ -531,7 +541,7 @@ impl<'a> Interp<'a> {
         if let Some(rec) = self.rec.as_mut() {
             rec.add_pieces(1)?;
             rec.mark = (rec.parts.len(), rec.chars.len());
-            rec.shows.push(Show { src, start: stmt.0, end: stmt.1, op, font, size, tc, tw, th, spacing, items: Vec::new(), scale: 1.0 });
+            rec.shows.push(Show { src, start: stmt.0, end: stmt.1, op, font, size, tc, tw, th, render, spacing, items: Vec::new(), scale: 1.0 });
         }
         Ok(())
     }

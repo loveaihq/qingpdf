@@ -215,7 +215,13 @@ impl App {
             EngineEvent::Fields { doc, id, page, items, .. } if doc == self.doc_id => self.on_fields(id, page, items),
             EngineEvent::Options { doc, id, items, .. } if doc == self.doc_id => self.on_options(id, items),
             EngineEvent::TextLine { doc, id, status, message, line, .. } if doc == self.doc_id => self.on_text_line(id, status, &message, line),
-            EngineEvent::Edited(r) if r.doc == self.doc_id => self.on_edited(r),
+            EngineEvent::Edited(r) if r.doc == self.doc_id => {
+                if self.is_ocr_layer(r.id) {
+                    self.edit.asked.insert(r.id, editing::Asked::Ocr);
+                }
+                self.on_edited(r)
+            }
+            ev @ (EngineEvent::OcrPages { .. } | EngineEvent::OcrImage { .. }) => self.on_ocr_event(ev),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
             EngineEvent::Exported { doc, id, status, message, .. } if doc == self.doc_id => self.on_exported(id, status, &message),
             EngineEvent::SearchHits { doc, id, page, hits } if doc == self.doc_id => self.on_search_hits(id, page, hits),

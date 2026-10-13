@@ -32,7 +32,7 @@ impl App {
         vec![Action::KillTimer(TIMER_FIND), Action::Find(None), Action::Invalidate]
     }
 
-    /// Esc: stops a print, else a Word export, else closes the find box, else lets go of the selection.
+    /// Esc: stops a print, else a Word export, else text recognition, else closes the find box, else lets go of the selection.
     pub(super) fn escape(&mut self) -> Vec<Action> {
         if self.print.is_some() {
             let mut actions = self.cancel_print_for_new_document();
@@ -40,6 +40,9 @@ impl App {
             return actions;
         }
         if let Some(actions) = self.cancel_export() {
+            return actions;
+        }
+        if let Some(actions) = self.stop_ocr() {
             return actions;
         }
         if self.find_open {

@@ -163,11 +163,37 @@ pub enum Msg {
     NoteExported,
     NoteExportFailed,
     NoteExportCancelled,
+    ToolsMenu,
+    OcrAll,
+    OcrPageOnly,
+    OcrTitle,
+    OcrLooking,
+    OcrWorking,
+    OcrWriting,
+    OcrNothing,
+    OcrBusy,
+    OcrDone,
+    OcrStopped,
+    OcrStoppedNone,
+    OcrNoText,
+    OcrNotWritten,
+    OcrMemoryOnly,
+    OcrTooMany,
+    OcrSkipped,
+    OcrSkippedWhy,
+    OcrIncomplete,
+    OcrIncompleteWhy,
+    OcrPageN,
+    OcrFailed,
+    OcrNoChinese,
+    OcrNoLanguage,
+    OcrAvailable,
+    OcrNoneAvailable,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 148] = [
+pub const ALL: [Msg; 174] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -316,6 +342,32 @@ pub const ALL: [Msg; 148] = [
     Msg::NoteExported,
     Msg::NoteExportFailed,
     Msg::NoteExportCancelled,
+    Msg::ToolsMenu,
+    Msg::OcrAll,
+    Msg::OcrPageOnly,
+    Msg::OcrTitle,
+    Msg::OcrLooking,
+    Msg::OcrWorking,
+    Msg::OcrWriting,
+    Msg::OcrNothing,
+    Msg::OcrBusy,
+    Msg::OcrDone,
+    Msg::OcrStopped,
+    Msg::OcrStoppedNone,
+    Msg::OcrNoText,
+    Msg::OcrNotWritten,
+    Msg::OcrMemoryOnly,
+    Msg::OcrTooMany,
+    Msg::OcrSkipped,
+    Msg::OcrSkippedWhy,
+    Msg::OcrIncomplete,
+    Msg::OcrIncompleteWhy,
+    Msg::OcrPageN,
+    Msg::OcrFailed,
+    Msg::OcrNoChinese,
+    Msg::OcrNoLanguage,
+    Msg::OcrAvailable,
+    Msg::OcrNoneAvailable,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -466,6 +518,32 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteExported => ("Exported to Word.", "已导出为 Word。"),
         Msg::NoteExportFailed => ("The file could not be exported to Word:", "导出为 Word 失败："),
         Msg::NoteExportCancelled => ("Export to Word cancelled.", "已取消导出为 Word。"),
+        Msg::ToolsMenu => ("&Tools", "工具(&T)"),
+        Msg::OcrAll => ("Recognize text in all &scanned pages", "识别所有扫描页的文字(&S)"),
+        Msg::OcrPageOnly => ("Recognize text on this &page", "识别当前页的文字(&P)"),
+        Msg::OcrTitle => ("Recognize text", "识别文字"),
+        Msg::OcrLooking => ("Looking for scanned pages... (Esc to stop)", "正在查找扫描页……（按 Esc 停止）"),
+        Msg::OcrWorking => ("Recognizing text: page {n} of {total} (Esc to stop)", "正在识别文字：第 {n} / {total} 页（按 Esc 停止）"),
+        Msg::OcrWriting => ("Adding the text layer...", "正在加入文字层……"),
+        Msg::OcrNothing => ("No page to recognize: pages that already have text are skipped.", "没有要识别的页：已有文字的页会被跳过。"),
+        Msg::OcrBusy => ("Text is being recognized already (Esc stops it).", "正在识别文字（按 Esc 可停止）。"),
+        Msg::OcrDone => ("Recognized {pages} page(s), {chars} characters. They can be searched and copied; Undo takes the text out.", "已识别 {pages} 页、{chars} 个字符，现在可以搜索和复制；撤销可去掉识别出的文字。"),
+        Msg::OcrStopped => ("Stopped. {pages} page(s) were recognized ({chars} characters); Undo takes the text out.", "已停止。已识别 {pages} 页（{chars} 个字符）；撤销可去掉识别出的文字。"),
+        Msg::OcrStoppedNone => ("Stopped; no text was recognized.", "已停止，没有识别出文字。"),
+        Msg::OcrNoText => ("No text was found on the pages.", "页面上没有识别出文字。"),
+        Msg::OcrNotWritten => ("The recognized text could not be added:", "识别出的文字没能加入文件："),
+        Msg::OcrMemoryOnly => ("The file may not be changed, so the text is used in this window only and is not saved.", "文件不允许修改，识别出的文字只在本窗口里使用，不会保存。"),
+        Msg::OcrTooMany => ("There were more pages than one run does; run it again for the rest.", "页数超过一次能识别的数量，剩下的请再识别一次。"),
+        Msg::OcrSkipped => ("{n} page(s) were skipped.", "跳过了 {n} 页。"),
+        Msg::OcrSkippedWhy => ("These pages were skipped:", "这些页被跳过了："),
+        Msg::OcrIncomplete => ("{n} page(s) could be drawn only in part, so some of their text may be missing.", "有 {n} 页只画出了一部分，其中的文字可能不全。"),
+        Msg::OcrIncompleteWhy => ("These pages were drawn only in part:", "这些页只画出了一部分："),
+        Msg::OcrPageN => ("Page {n}", "第 {n} 页"),
+        Msg::OcrFailed => ("Text recognition failed:", "文字识别失败："),
+        Msg::OcrNoChinese => ("Windows has no Chinese text recognition installed. Add the Chinese language in Settings > Time & language > Language & region, then try again. (qingpdf does not change system settings.)", "这台电脑没有安装中文文字识别。请在“设置 → 时间和语言 → 语言和区域”里添加中文语言包，然后再试。（qingpdf 不会改动系统设置。）"),
+        Msg::OcrNoLanguage => ("Windows has no text recognition installed. Add a language in Settings > Time & language > Language & region, then try again. (qingpdf does not change system settings.)", "这台电脑没有安装文字识别。请在“设置 → 时间和语言 → 语言和区域”里添加语言包，然后再试。（qingpdf 不会改动系统设置。）"),
+        Msg::OcrAvailable => ("Languages with text recognition on this computer:", "这台电脑上可用于识别的语言："),
+        Msg::OcrNoneAvailable => ("none", "没有"),
         Msg::NoteNothingUndo => ("Nothing to undo.", "没有可撤销的。"),
         Msg::NoteNothingRedo => ("Nothing to redo.", "没有可重做的。"),
     };
@@ -538,7 +616,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 148);
+        assert_eq!(ALL.len(), 174);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

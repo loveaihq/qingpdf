@@ -68,6 +68,29 @@ struct CopyJob {
     truncated: bool,
 }
 
+struct OcrScanJob {
+    id: u64,
+    only: Option<u32>,
+    /// The next page to look at.
+    next: u32,
+    found: Vec<u32>,
+    looked: u32,
+    unreadable: u32,
+    truncated: bool,
+}
+
+struct OcrImageJob {
+    id: u64,
+    page: u32,
+    max_side: u32,
+    /// The picture's size in pixels and its resolution, once worked out; the grey pixels drawn so far (a band at a time) and the next row.
+    size: Option<(u32, u32, f64)>,
+    y: u32,
+    gray: Vec<u8>,
+    /// Why the page was not drawn whole, if it was not.
+    incomplete: String,
+}
+
 struct PrintJob {
     id: u64,
     pages: Vec<PrintPage>,
@@ -91,6 +114,8 @@ enum Job {
     Search(SearchJob),
     Copy(CopyJob),
     Print(PrintJob),
+    OcrScan(OcrScanJob),
+    OcrImage(OcrImageJob),
 }
 
 impl Job {
@@ -100,6 +125,8 @@ impl Job {
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
             Job::Print(p) => p.id,
+            Job::OcrScan(o) => o.id,
+            Job::OcrImage(o) => o.id,
         }
     }
 
@@ -135,6 +162,16 @@ impl Job {
                 let (from, to) = if from <= to { (from, to) } else { (to, from) };
                 Job::Copy(CopyJob { id, from, to, page: from.0, pages_done: 0, text: String::new(), chars: 0, skipped: 0, truncated: false })
             }
+            Request::OcrScan { only } => Job::OcrScan(OcrScanJob {
+                id,
+                only,
+                next: only.unwrap_or(0),
+                found: Vec::new(),
+                looked: 0,
+                unreadable: 0,
+                truncated: false,
+            }),
+            Request::OcrImage { page, max_side } => Job::OcrImage(OcrImageJob { id, page, max_side, size: None, y: 0, gray: Vec::new(), incomplete: String::new() }),
             Request::Print(mut list) => {
                 list.truncate(MAX_PRINT_PAGES);
                 Job::Print(PrintJob { id, pages: list, at: 0, y: 0, waiting: false, checked: false, printed: 0 })
@@ -511,6 +548,8 @@ impl Server<'_> {
             Job::Search(s) => self.step_search(s),
             Job::Copy(c) => self.step_copy(c),
             Job::Print(p) => self.step_print(p),
+            Job::OcrScan(o) => self.step_ocr_scan(o),
+            Job::OcrImage(o) => self.step_ocr_image(o),
         };
         self.shared.current.store(0, Ordering::SeqCst);
         match step {
@@ -533,7 +572,12 @@ impl Server<'_> {
         }
         let page = self.pages.get(page_no as usize)?;
         Some(self.text.page_chars(page, work).map(|c| {
-            let c = Rc::new(c);
+            // A page with no text of its own has the text recognised for it in this session, if there is some (5c: a file that may
+            // not be written to keeps it in memory).
+            let c = match self.session.kept_text(page_no) {
+                Some(kept) if c.text.trim().is_empty() => kept,
+                _ => Rc::new(c),
+            };
             self.chars.put(page_no, c.clone(), pass);
             c
         }))
@@ -641,6 +685,26 @@ impl Server<'_> {
 
     // --- editing --------------------------------------------------------------------------------------------------
 
+    /// Keep the text recognised for pages (5c) in the session, for a file that may not be written to; gives how many pages were
+    /// kept and how many had words.
+    fn keep_recognised(&mut self, recognised: &[edit::OcrPage]) -> (usize, usize) {
+        let (mut kept, mut asked) = (0usize, 0usize);
+        for o in recognised.iter().take(edit::MAX_OCR_PAGES) {
+            let Some(page) = self.pages.get(o.page as usize) else { continue };
+            let (w, h) = crate::text::Shown::of(page).size();
+            let Ok(chars) = edit::ocr_page_chars(o, w, h) else { continue };
+            if chars.boxes.is_empty() {
+                continue;
+            }
+            asked += 1;
+            if self.session.keep_text(o.page, Rc::new(chars)) {
+                self.chars.forget(o.page);
+                kept += 1;
+            }
+        }
+        (kept, asked)
+    }
+
     /// Read the dictionary of page `page_no` again, after an edit (or an undo) changed it, and forget what is kept of the page.
     /// Nothing else is kept by page: what the renderer keeps is by object, and an edit only makes objects with numbers that were
     /// never used before.
@@ -683,6 +747,15 @@ impl Server<'_> {
                     EditClass::Content => (self.rights.modify, DENIED_MODIFY),
                     EditClass::Annotate => (self.rights.annotate, DENIED_ANNOTATE),
                 };
+                // Recognised text for a file that may not be changed is used in this window and not written (5c).
+                if let edit::Edit::OcrLayer(recognised) = &edit
+                    && (!allowed || matches!(self.session.policy(self.document, class), Policy::Refuse(_)))
+                {
+                    let (kept, asked) = self.keep_recognised(recognised);
+                    let message = if kept == asked { MEMORY_ONLY.to_string() } else { format!("{MEMORY_ONLY} Only {kept} of the {asked} pages fit in memory.") };
+                    said(self, doc, id, if kept > 0 { EditStatus::Done } else { EditStatus::Failed }, if kept > 0 { &message } else { "the recognised text is too big to keep in memory" }, page);
+                    return None;
+                }
                 if !allowed {
                     said(self, doc, id, EditStatus::Denied, denied, page);
                     return None;
@@ -989,6 +1062,97 @@ impl Server<'_> {
 
     // --- print ----------------------------------------------------------------------------------------------------
 
+    // --- recognising scans (5c) -----------------------------------------------------------------------------------------
+
+    /// One page of the search for scans: its text and its pictures decide.
+    fn step_ocr_scan(&mut self, s: &mut OcrScanJob) -> Step {
+        let total = u32::try_from(self.pages.len()).unwrap_or(u32::MAX);
+        let end = s.only.map_or(total, |p| p.saturating_add(1).min(total));
+        if s.next >= end || s.truncated {
+            self.tell(Event::OcrPages { doc: self.doc_id, id: s.id, pages: std::mem::take(&mut s.found), looked: s.looked, unreadable: s.unreadable, truncated: s.truncated });
+            return Step::Done;
+        }
+        let work = self.meter();
+        let Some(page) = self.pages.get(s.next as usize) else { return Step::Done };
+        match self.text.page_layout(page, &work) {
+            Ok(layout) => {
+                // (A page that has our own layer is done, whatever the number of characters in it.)
+                if edit::wants_text(&edit::scan_state(&layout), s.only.is_none()) && !edit::has_ocr_layer(self.document, page) {
+                    if s.found.len() >= edit::MAX_OCR_PAGES {
+                        s.truncated = true;
+                        return Step::More;
+                    }
+                    s.found.push(s.next);
+                }
+            }
+            Err(Error::Cancelled) => return Step::Cancelled,
+            Err(_) => s.unreadable += 1,
+        }
+        let _ = self.text.take_warnings();
+        s.looked += 1;
+        s.next += 1;
+        Step::More
+    }
+
+    /// One band of the picture of a page for the recogniser: grey pixels, the page as it is shown.
+    fn step_ocr_image(&mut self, j: &mut OcrImageJob) -> Step {
+        let (doc, id, page_no) = (self.doc_id, j.id, j.page);
+        let fail = |this: &Self, message: &str| {
+            this.tell(Event::OcrImage { doc, id, page: page_no, status: RenderStatus::Failed, message: message.to_string(), width: 0, height: 0, dpi: 0.0, gray: Vec::new() });
+            Step::Done
+        };
+        let Some(page) = self.pages.get(j.page as usize) else { return fail(self, "there is no such page") };
+        let (w, h, dpi) = match j.size {
+            Some(known) => known,
+            None => {
+                let (pw, ph) = crate::text::Shown::of(page).size();
+                let Some(dpi) = edit::ocr_dpi(pw, ph, j.max_side) else { return fail(self, "the page is too large to be recognised at a useful resolution") };
+                let (w, h) = Renderer::page_pixels(page, dpi, 0);
+                if w > u64::from(j.max_side) || h > u64::from(j.max_side) || w.saturating_mul(h) > edit::MAX_IMAGE_PIXELS {
+                    return fail(self, "the page is too large to be recognised at a useful resolution");
+                }
+                let (w, h) = (u32::try_from(w).unwrap_or(u32::MAX), u32::try_from(h).unwrap_or(u32::MAX));
+                j.gray = vec![255u8; w as usize * h as usize];
+                j.size = Some((w, h, dpi));
+                (w, h, dpi)
+            }
+        };
+        let rows = (self.max_tile_pixels / w.max(1)).clamp(1, h.saturating_sub(j.y).max(1));
+        match self.renderer.render_partial(page, dpi, 0, Some([0, j.y, w, rows])) {
+            Err(Error::Cancelled) => Step::Cancelled,
+            Err(e) => fail(self, &e.to_string()),
+            Ok(partial) => {
+                let warnings = self.renderer.take_warnings();
+                if j.incomplete.is_empty() {
+                    match (&partial.error, partial.work_over, &partial.incomplete) {
+                        (Some(e), ..) => j.incomplete = e.to_string(),
+                        (None, true, _) => j.incomplete = warnings.iter().find(|m| m.contains("more work")).cloned().unwrap_or_else(|| "the page asks for more work than is allowed".to_string()),
+                        (None, false, Some(why)) => j.incomplete = why.clone(),
+                        (None, false, None) => {}
+                    }
+                }
+                if partial.bitmap.width != w || partial.bitmap.height != rows {
+                    return fail(self, "the page was drawn at a size other than the one asked for");
+                }
+                let from = j.y as usize * w as usize;
+                let (pixels, _) = partial.bitmap.rgba.as_chunks::<4>();
+                if let Some(band) = j.gray.get_mut(from..from + pixels.len()) {
+                    for (g, px) in band.iter_mut().zip(pixels) {
+                        // (Weights of Rec. 601, in 256ths.)
+                        *g = ((77 * u32::from(px[0]) + 150 * u32::from(px[1]) + 29 * u32::from(px[2])) >> 8) as u8;
+                    }
+                }
+                j.y += rows;
+                if j.y < h {
+                    return Step::More;
+                }
+                let status = if j.incomplete.is_empty() { RenderStatus::Complete } else { RenderStatus::Incomplete };
+                self.tell(Event::OcrImage { doc, id, page: page_no, status, message: std::mem::take(&mut j.incomplete), width: w, height: h, dpi, gray: std::mem::take(&mut j.gray) });
+                Step::Done
+            }
+        }
+    }
+
     fn step_print(&mut self, p: &mut PrintJob) -> Step {
         let fail = |this: &Self, p: &PrintJob, message: &str| {
             this.tell(Event::PrintDone { doc: this.doc_id, id: p.id, status: PrintStatus::Failed, pages_done: p.printed, message: message.to_string() });
@@ -1064,6 +1228,8 @@ const DENIED_MODIFY: &str = "the file's author did not allow changing its conten
 const DENIED_ANNOTATE: &str = "the file's author did not allow adding annotations, and the file was not opened with the owner password";
 
 const DENIED_COPY: &str = "the file's author did not allow copying text, and the file was not opened with the owner password";
+
+const MEMORY_ONLY: &str = "the file may not be changed, so the recognised text is used in this window only and is not saved.";
 
 const SIGNED_WARNING: &str = "this file is signed: after the annotations are saved, the signature will show the file as changed";
 

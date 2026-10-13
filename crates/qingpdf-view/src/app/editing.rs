@@ -69,6 +69,8 @@ pub(super) enum Asked {
     Redo,
     /// A line of the page's text was changed (5a).
     Line,
+    /// The text layer of a run of text recognition was written (5c): the run says how it went.
+    Ocr,
 }
 
 pub(super) struct EditState {
@@ -516,6 +518,8 @@ impl App {
                     self.failed.retain(|k| k.page != page);
                     self.notices.remove(&page);
                     self.links.remove(&page);
+                    // (The boxes of the characters: a page that was recognized has some now.)
+                    self.boxes.remove(&page);
                     for id in self.links_asked.iter().filter(|(_, p)| **p == page).map(|(id, _)| *id).collect::<Vec<_>>() {
                         self.engine.cancel(id);
                         self.links_asked.remove(&id);
@@ -530,6 +534,8 @@ impl App {
                 let note = if what == Asked::Line {
                     extra = r.message.clone();
                     Some(Msg::NoteLineChanged)
+                } else if what == Asked::Ocr {
+                    None
                 } else if !r.message.is_empty() {
                     Some(Msg::NoteSigned)
                 } else if r.rewrote && !self.edit.rewrote {
@@ -540,13 +546,15 @@ impl App {
                         Asked::Add => Some(Msg::NoteAdded),
                         Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
-                        Asked::Undo | Asked::Redo | Asked::Line => None,
+                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr => None,
                     }
                 };
                 if let Some(m) = note {
                     actions.extend(self.say(format!("{} {extra}", t(lang, m)).trim_end().to_string()));
                 }
             }
+            EditStatus::Denied if what == Asked::Ocr => {}
+            EditStatus::Failed if what == Asked::Ocr => {}
             EditStatus::Denied => actions.extend(self.say(t(lang, if what == Asked::Fill { Msg::NoteFillDenied } else { Msg::NoteAnnotDenied }).to_string())),
             EditStatus::Failed => actions.extend(self.say(format!("{} {}", t(lang, Msg::NoteEditFailed), r.message))),
             EditStatus::Nothing => {
@@ -554,6 +562,9 @@ impl App {
                 actions.extend(self.say(t(lang, m).to_string()));
             }
             EditStatus::Busy => actions.extend(self.say(t(lang, Msg::NoteBusy).to_string())),
+        }
+        if what == Asked::Ocr {
+            actions.extend(self.ocr_layer_answered(r.id, r.status, &r.message));
         }
         actions
     }

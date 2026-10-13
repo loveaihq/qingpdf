@@ -14,6 +14,7 @@ pub mod cache;
 pub mod find;
 pub mod i18n;
 pub mod layout;
+pub mod ocr;
 pub mod printing;
 pub mod recent;
 pub mod sched;

@@ -11,7 +11,7 @@
 //! Limits: [`MAX_GLYPHS`] glyphs in one subset (components included), [`MAX_FONT_BYTES`] for the font program before it is
 //! compressed, [`MAX_COMPONENT_VISITS`] components looked at; every glyph is charged to the work meter.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 use std::sync::Arc;
 
@@ -143,6 +143,36 @@ pub(crate) fn choose(chars: &BTreeSet<char>, look: Look) -> Result<Arc<TtFont>> 
         _ if seen_cff => "the system has only OpenType fonts with PostScript outlines (CFF), which cannot be embedded yet".to_string(),
         _ => "the system has no TrueType font to embed".to_string(),
     }))
+}
+
+/// The system font that has the most of the characters of `counts` (each with how often it is used), and the ones of them it has (5c:
+/// recognised text can have a character that no font has; the layer does without it). A font that has all of them is the one
+/// [`choose`] finds. White space is not counted when fonts are compared (nearly every font has a space, so it says nothing about a
+/// font); when no font has a single character that is not white space, the error is the one `choose` gave: which characters no
+/// installed font has, or that there is no font to embed.
+pub(crate) fn choose_covering(counts: &BTreeMap<char, u32>) -> Result<(Arc<TtFont>, BTreeSet<char>)> {
+    let all: BTreeSet<char> = counts.keys().copied().collect();
+    let none_has_all = match choose(&all, Look::Sans) {
+        Ok(font) => return Ok((font, all)),
+        Err(e) => e,
+    };
+    let mut best: Option<(u64, Arc<TtFont>, BTreeSet<char>)> = None;
+    for (file, face) in candidates(Look::Sans) {
+        let Some(font) = sysfont::named(file, face) else { continue };
+        let Some(cmap) = font.cmap.as_ref() else { continue };
+        if embedding_allowed(font.fs_type()).is_err() {
+            continue;
+        }
+        let has: BTreeSet<char> = all.iter().copied().filter(|&c| cmap.unicode(c as u32).is_some_and(|g| g != 0)).collect();
+        let score: u64 = has.iter().filter(|c| !c.is_whitespace()).map(|c| u64::from(counts.get(c).copied().unwrap_or(0))).sum();
+        if best.as_ref().is_none_or(|(most, ..)| score > *most) {
+            best = Some((score, font, has));
+        }
+    }
+    match best {
+        Some((score, font, has)) if score > 0 => Ok((font, has)),
+        _ => Err(none_has_all),
+    }
 }
 
 /// The system font that looks like a font of a page (`req`, from its name and flags) and has every character of `chars` (5a). A

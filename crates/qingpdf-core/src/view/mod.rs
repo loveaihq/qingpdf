@@ -48,6 +48,7 @@ pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use crate::edit::{LineView, MAX_TEXT_CHARS};
 pub use crate::edit::{ALL_PAGES, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark};
+pub use crate::edit::{MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, TARGET_DPI};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
@@ -297,6 +298,13 @@ pub enum Event {
     Edited(EditResult),
     /// The answer to [`Engine::save`].
     Saved { doc: u64, id: u64, status: SaveStatus, message: String, bytes: u64 },
+    /// The pages worth recognising (the answer to [`Engine::ocr_scan`]), in page order, at most [`MAX_OCR_PAGES`] (`truncated`: there
+    /// were more). `looked` pages were looked at; `unreadable` of them could not be read for their text and are not in the list.
+    OcrPages { doc: u64, id: u64, pages: Vec<u32>, looked: u32, unreadable: u32, truncated: bool },
+    /// A page drawn for the recogniser (the answer to [`Engine::ocr_image`]): `width` by `height` pixels of grey (8 bits, 0 black, rows
+    /// from the top, no padding) showing the whole page as it is shown, at `dpi` dots to the inch. `status` is [`RenderStatus::Failed`]
+    /// (nothing drawn, `message` says why) or [`RenderStatus::Incomplete`] (the page stopped part-way, `message` says) or complete.
+    OcrImage { doc: u64, id: u64, page: u32, status: RenderStatus, message: String, width: u32, height: u32, dpi: f64, gray: Vec<u8> },
     /// The answer to [`Engine::export_docx`]: `Done` (`message` is what the conversion warned of, if anything; `pages` how many pages
     /// are in the Word file) or `Failed` (`message` says why; no file was written).
     Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, bytes: u64 },
@@ -314,6 +322,8 @@ pub(crate) enum Request {
     Fields(u32),
     Options { page: u32, index: u32, num: u32 },
     TextLine { page: u32, at: [f32; 2] },
+    OcrScan { only: Option<u32> },
+    OcrImage { page: u32, max_side: u32 },
 }
 
 pub(crate) enum Command {
@@ -581,6 +591,28 @@ impl Engine {
     /// changed cannot be undone any more). A signed file is saved as `save` does, so as not to break its signature.
     pub fn save_as(&self, doc: u64, id: u64, path: &str) {
         let _ = self.commands.send(Command::Save { doc, id, path: path.to_string(), whole: true });
+    }
+
+    /// Look for the pages to recognise (5c): the ones with no text that are mostly pictures (`only` is `None`), or the one page `only`
+    /// names, which needs only to have no text. One page at a time between the other work; answered by [`Event::OcrPages`].
+    /// [`Engine::cancel`] stops it (and then nothing is told).
+    pub fn ocr_scan(&self, doc: u64, id: u64, only: Option<u32>) {
+        self.request(doc, id, Request::OcrScan { only });
+    }
+
+    /// Draw `page` as grey pixels for a recogniser that takes pictures of up to `max_side` pixels on a side: the whole page as it is
+    /// shown, at [`TARGET_DPI`] or less (see [`crate::edit::ocr_dpi`]), at most [`MAX_IMAGE_PIXELS`]. Drawn a band at a time between the
+    /// other work; answered by [`Event::OcrImage`]; only that one picture is held, so ask for the next page when this one is used.
+    pub fn ocr_image(&self, doc: u64, id: u64, page: u32, max_side: u32) {
+        self.request(doc, id, Request::OcrImage { page, max_side });
+    }
+
+    /// Give the pages the text a recogniser found in them (`pages`: at most [`MAX_OCR_PAGES`], each [`OcrPage`] with the boxes in the
+    /// pixels of the picture [`Engine::ocr_image`] drew): an invisible text layer in the page's own content (text rendering mode 3), one
+    /// font for all the pages. Needs [`Rights::modify`] and a file without signatures; one step to undo; answered by [`Event::Edited`]
+    /// with `page` [`ALL_PAGES`]. A file that does not allow it is not changed.
+    pub fn ocr_layer(&self, doc: u64, id: u64, pages: Vec<OcrPage>) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::OcrLayer(pages) });
     }
 
     /// Write the whole document, with the edits not yet saved, as a Word file (`.docx`) to `path` (5b; `qingpdf_core::docx`): into a

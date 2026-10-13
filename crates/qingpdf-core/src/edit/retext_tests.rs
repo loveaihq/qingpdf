@@ -462,40 +462,64 @@ fn many_content_streams_and_empty_strings_do_not_take_time_or_memory_the_page_do
         println!("SKIPPED: no Latin font on this machine");
         return;
     }
-    // A page of 40000 content streams of one letter each, 20000 of them to be changed: found by position, not by looking through
-    // the list for every character.
-    let mut b = PdfBuilder::new();
-    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
-    b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
-    let streams = 40_000u32;
-    let list: String = (0..streams).map(|i| format!("{} 0 R ", 10 + i)).collect();
-    b.obj(3, &format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [{list}] /Resources << /Font << /F1 5 0 R >> >> >>"));
-    b.obj(5, HELV);
-    for i in 0..streams {
-        b.stream_obj(10 + i, "", format!("BT /F1 12 Tf {} {} Td ({}) Tj ET", 20 + (i % 40) * 14, 780 - (i / 40) * 2, if i % 2 == 0 { 'e' } else { 'x' }).as_bytes());
-    }
-    let doc = Document::from_bytes(b.finish_classic(10 + streams, "/Root 1 0 R")).unwrap();
-    let started = std::time::Instant::now();
-    let done = replace_text(&doc, "", "e", "X", None).unwrap();
-    let took = started.elapsed().as_secs_f64();
-    assert_eq!(done.count, 20_000, "{:?}", done.skipped);
-    assert!(took < 4.0, "{took} s for {streams} content streams (the looking through the list took 5 s and more)");
+    // How long it takes is judged by how it grows, not by the clock (a slow or busy machine is slow for both sizes): four times the
+    // work may take less than eight times the time (looking through a list for every item takes sixteen), and nothing may take
+    // half a minute. The tests of a run share the machine, and one size may be timed while another test is busy; the better of up
+    // to three rounds of the two sizes counts (a way of working that grows too fast does so in every round).
+    const BACKSTOP: f64 = 30.0;
+    let grows = |what: &str, n: usize, run: &dyn Fn(usize) -> f64| {
+        let (mut small, mut big) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..3 {
+            small = small.min(run(n));
+            big = big.min(run(4 * n));
+            assert!(small < BACKSTOP && big < BACKSTOP, "{what}: {small} s and {big} s");
+            println!("{what}: {small:.3} s for {n}, {big:.3} s for {}", 4 * n);
+            if big / small.max(1.0e-3) < 8.0 {
+                return;
+            }
+        }
+        panic!("{what}: {small} s for n and {big} s for 4n grow faster than the work does");
+    };
+    // A page of n content streams of one letter each, half of them to be changed: found by position, not by looking through the
+    // list for every character.
+    let streams_run = |streams: usize| {
+        let streams = streams as u32;
+        let mut b = PdfBuilder::new();
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let list: String = (0..streams).map(|i| format!("{} 0 R ", 10 + i)).collect();
+        b.obj(3, &format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [{list}] /Resources << /Font << /F1 5 0 R >> >> >>"));
+        b.obj(5, HELV);
+        for i in 0..streams {
+            b.stream_obj(10 + i, "", format!("BT /F1 12 Tf {} {} Td ({}) Tj ET", 20 + (i % 40) * 14, 780 - (i / 40) * 2, if i % 2 == 0 { 'e' } else { 'x' }).as_bytes());
+        }
+        let doc = Document::from_bytes(b.finish_classic(10 + streams, "/Root 1 0 R")).unwrap();
+        let started = std::time::Instant::now();
+        let done = replace_text(&doc, "", "e", "X", None).unwrap();
+        let took = started.elapsed().as_secs_f64();
+        assert_eq!(done.count, streams as usize / 2, "{:?}", done.skipped);
+        took
+    };
+    grows("content streams", 10_000, &streams_run);
     // Millions of empty strings are nothing to keep: the page is read into what is on it.
-    let empties = "() Tj ".repeat(3_000_000);
-    let page = one_page(&format!("BT /F1 12 Tf {empties} 72 700 Td (zzz) Tj ET"), HELV, "", &[]);
-    let doc = Document::from_bytes(page).unwrap();
-    let pages = doc.pages().unwrap();
-    let started = std::time::Instant::now();
-    let scan = crate::text::EditScanner::new(&doc).scan(&pages[0], &Work::new()).unwrap();
-    assert_eq!((scan.shows.len(), scan.parts.len(), scan.glyphs.len()), (1, 1, 3));
-    assert!(started.elapsed().as_secs_f64() < 4.0);
+    let empties_run = |n: usize| {
+        let empties = "() Tj ".repeat(n);
+        let page = one_page(&format!("BT /F1 12 Tf {empties} 72 700 Td (zzz) Tj ET"), HELV, "", &[]);
+        let doc = Document::from_bytes(page).unwrap();
+        let pages = doc.pages().unwrap();
+        let started = std::time::Instant::now();
+        let scan = crate::text::EditScanner::new(&doc).scan(&pages[0], &Work::new()).unwrap();
+        assert_eq!((scan.shows.len(), scan.parts.len(), scan.glyphs.len()), (1, 1, 3));
+        started.elapsed().as_secs_f64()
+    };
+    grows("empty strings", 750_000, &empties_run);
     // And a page with more pieces than may be kept is refused, not read.
     let many = "(a) Tj ".repeat(700_000);
     let doc = Document::from_bytes(one_page(&format!("BT /F1 12 Tf {many} ET"), HELV, "", &[])).unwrap();
     let pages = doc.pages().unwrap();
     let started = std::time::Instant::now();
     assert!(matches!(crate::text::EditScanner::new(&doc).scan(&pages[0], &Work::new()), Err(Error::Limit(_))));
-    assert!(started.elapsed().as_secs_f64() < 4.0);
+    assert!(started.elapsed().as_secs_f64() < BACKSTOP);
 }
 
 #[test]
@@ -581,4 +605,47 @@ fn places_that_cannot_be_changed_count_toward_the_limit_and_a_form_that_many_pag
         copies.insert(format!("{:?}", forms.get("Fm0").unwrap()));
     }
     assert_eq!(copies.len(), 1, "{copies:?}");
+}
+
+#[test]
+fn invisible_text_and_the_recognised_text_of_a_scan_are_skipped_with_a_reason_and_the_rest_is_changed() {
+    if !have_latin_font() {
+        println!("SKIPPED: no Latin font on this machine");
+        return;
+    }
+    // Page content: text with `3 Tr` (invisible), visible text (`0 Tr` again), invisible text inside `q Q` and visible text after the
+    // `Q` (the rendering mode is part of the graphics state, which `Q` restores), and a form that carries the mark of a recognised
+    // layer (its text is shown with the default rendering mode; the mark alone makes it the layer's).
+    let content = "BT /F1 12 Tf 72 700 Td 3 Tr (Hello invisible) Tj ET\n\
+                   BT /F1 12 Tf 72 680 Td 0 Tr (Hello visible) Tj ET\n\
+                   q BT /F1 12 Tf 72 660 Td 3 Tr (Hello hidden) Tj ET Q\n\
+                   BT /F1 12 Tf 72 640 Td (Hello restored) Tj ET\n\
+                   q /Qo20 Do Q\n";
+    let form = "BT /F1 12 Tf 72 620 Td (Hello layer) Tj ET";
+    let mut b = PdfBuilder::new();
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Qo20 20 0 R >> >> >>");
+    b.stream_obj(4, "", content.as_bytes());
+    b.obj(5, HELV);
+    b.stream_obj(20, "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /QingpdfOCR true /Resources << /Font << /F1 5 0 R >> >>", form.as_bytes());
+    let original = b.finish_classic(21, "/Root 1 0 R");
+    let doc = Document::from_bytes(original).unwrap();
+    let done = replace_text(&doc, "", "Hello", "Bye", None).unwrap();
+    // Only the visible text and the one after the Q are changed.
+    assert_eq!((done.count, done.pages), (2, 1), "{:?}", done.skipped);
+    let (text, new) = read(&done.data, 0);
+    assert!(new.contains("(Hello invisible) Tj") && new.contains("(Hello hidden) Tj"), "{new}");
+    assert!(new.contains("(Bye visible)") && new.contains("(Bye restored)"), "{new}");
+    assert!(text.contains("Hello invisible") && text.contains("Hello hidden") && text.contains("Hello layer") && text.contains("Bye visible"), "{text}");
+    // Each skip says why: two invisible places, one in the layer.
+    let why = |part: &str| done.skipped.iter().find(|(m, _)| m.contains(part)).map(|(_, n)| *n);
+    assert_eq!((why("invisible"), why("recognised text")), (Some(2), Some(1)), "{:?}", done.skipped);
+    // Nothing at all to change: no change, and the same reasons.
+    let none = replace_text(&doc, "", "invisible", "visible", None).unwrap();
+    assert_eq!((none.count, none.data.len()), (0, 0));
+    assert_eq!(none.skipped.len(), 1, "{:?}", none.skipped);
+    let layer = replace_text(&doc, "", "layer", "page", None).unwrap();
+    assert_eq!((layer.count, layer.data.len()), (0, 0));
+    assert!(layer.skipped.iter().any(|(m, n)| m.contains("recognised text") && *n == 1), "{:?}", layer.skipped);
 }
