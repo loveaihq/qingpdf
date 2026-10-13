@@ -159,8 +159,13 @@ pub enum Msg {
     ExportWord,
     ExportTitle,
     FilterDocx,
+    ExportExcel,
+    ExportExcelTitle,
+    FilterXlsx,
     NoteExporting,
     NoteExported,
+    NoteExportedExcel,
+    NoteExportedNoTables,
     NoteExportFailed,
     NoteExportCancelled,
     ToolsMenu,
@@ -193,7 +198,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 174] = [
+pub const ALL: [Msg; 179] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -338,8 +343,13 @@ pub const ALL: [Msg; 174] = [
     Msg::ExportWord,
     Msg::ExportTitle,
     Msg::FilterDocx,
+    Msg::ExportExcel,
+    Msg::ExportExcelTitle,
+    Msg::FilterXlsx,
     Msg::NoteExporting,
     Msg::NoteExported,
+    Msg::NoteExportedExcel,
+    Msg::NoteExportedNoTables,
     Msg::NoteExportFailed,
     Msg::NoteExportCancelled,
     Msg::ToolsMenu,
@@ -514,10 +524,15 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::ExportWord => ("Export to &Word...", "导出为 Word(&W)..."),
         Msg::ExportTitle => ("Export to Word", "导出为 Word"),
         Msg::FilterDocx => ("Word documents", "Word 文档"),
-        Msg::NoteExporting => ("Exporting to Word...", "正在导出为 Word……"),
+        Msg::ExportExcel => ("Export to &Excel...", "导出为 Excel(&E)..."),
+        Msg::ExportExcelTitle => ("Export to Excel", "导出为 Excel"),
+        Msg::FilterXlsx => ("Excel workbooks", "Excel 工作簿"),
+        Msg::NoteExporting => ("Exporting...", "正在导出……"),
         Msg::NoteExported => ("Exported to Word.", "已导出为 Word。"),
-        Msg::NoteExportFailed => ("The file could not be exported to Word:", "导出为 Word 失败："),
-        Msg::NoteExportCancelled => ("Export to Word cancelled.", "已取消导出为 Word。"),
+        Msg::NoteExportedExcel => ("Exported to Excel.", "已导出为 Excel。"),
+        Msg::NoteExportedNoTables => ("Exported to Excel: no table was found, so the sheet has the text of the pages.", "已导出为 Excel：没有找到表格，工作表里是各页的文字。"),
+        Msg::NoteExportFailed => ("The file could not be exported:", "导出失败："),
+        Msg::NoteExportCancelled => ("Export cancelled.", "已取消导出。"),
         Msg::ToolsMenu => ("&Tools", "工具(&T)"),
         Msg::OcrAll => ("Recognize text in all &scanned pages", "识别所有扫描页的文字(&S)"),
         Msg::OcrPageOnly => ("Recognize text on this &page", "识别当前页的文字(&P)"),
@@ -616,7 +631,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 174);
+        assert_eq!(ALL.len(), 179);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

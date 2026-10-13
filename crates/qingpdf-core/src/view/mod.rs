@@ -305,9 +305,10 @@ pub enum Event {
     /// from the top, no padding) showing the whole page as it is shown, at `dpi` dots to the inch. `status` is [`RenderStatus::Failed`]
     /// (nothing drawn, `message` says why) or [`RenderStatus::Incomplete`] (the page stopped part-way, `message` says) or complete.
     OcrImage { doc: u64, id: u64, page: u32, status: RenderStatus, message: String, width: u32, height: u32, dpi: f64, gray: Vec<u8> },
-    /// The answer to [`Engine::export_docx`]: `Done` (`message` is what the conversion warned of, if anything; `pages` how many pages
-    /// are in the Word file) or `Failed` (`message` says why; no file was written).
-    Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, bytes: u64 },
+    /// The answer to [`Engine::export_docx`] and [`Engine::export_xlsx`]: `Done` (`message` is what the conversion warned of, if
+    /// anything; `pages` how many pages were converted; `tables` how many tables are in the file: a Word table or an Excel sheet, and 0
+    /// for an Excel file made of the text of the pages) or `Failed` (`message` says why; no file was written).
+    Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, tables: u32, bytes: u64 },
 }
 
 /// What can be asked of the open document besides drawing.
@@ -334,7 +335,7 @@ pub(crate) enum Command {
     Undo { doc: u64, id: u64 },
     Redo { doc: u64, id: u64 },
     Save { doc: u64, id: u64, path: String, whole: bool },
-    Export { doc: u64, id: u64, path: String },
+    Export { doc: u64, id: u64, path: String, excel: bool },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
@@ -620,7 +621,15 @@ impl Engine {
     /// copying text is refused unless the owner password opened it. Done at once, one at a time, before the drawing; [`Engine::cancel`]
     /// stops it (it gets no result then).
     pub fn export_docx(&self, doc: u64, id: u64, path: &str) {
-        let _ = self.commands.send(Command::Export { doc, id, path: path.to_string() });
+        let _ = self.commands.send(Command::Export { doc, id, path: path.to_string(), excel: false });
+    }
+
+    /// Write the tables of the whole document, with the edits not yet saved, as an Excel file (`.xlsx`) to `path` (5d;
+    /// `qingpdf_core::xlsx`), a sheet for each table; a file with no table gets one sheet with its text. The same as
+    /// [`Engine::export_docx`] in every other way (one answer, [`Event::Exported`]; copying text must be allowed; [`Engine::cancel`]
+    /// stops it).
+    pub fn export_xlsx(&self, doc: u64, id: u64, path: &str) {
+        let _ = self.commands.send(Command::Export { doc, id, path: path.to_string(), excel: true });
     }
 
     /// Withdraw a request: dropped if it has not started, stopped at its next operator if it is being worked on. A

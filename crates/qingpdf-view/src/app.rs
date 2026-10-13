@@ -63,8 +63,9 @@ pub const CMD_OCR_ALL: u32 = 26;
 pub const CMD_OCR_PAGE: u32 = 27;
 pub const CMD_SAVE: u32 = 30;
 pub const CMD_SAVE_AS: u32 = 31;
-/// Make a Word file of the document (5b).
+/// Make a Word file of the document (5b), and an Excel file of its tables (5d).
 pub const CMD_EXPORT_DOCX: u32 = 29;
+pub const CMD_EXPORT_XLSX: u32 = 28;
 pub const CMD_UNDO: u32 = 32;
 pub const CMD_REDO: u32 = 33;
 pub const CMD_REMOVE: u32 = 34;
@@ -847,7 +848,7 @@ impl App {
             },
             CMD_SAVE => self.save(),
             CMD_SAVE_AS => self.save_as(),
-            CMD_EXPORT_DOCX => self.export_word(),
+            CMD_EXPORT_DOCX | CMD_EXPORT_XLSX => self.export_file(cmd == CMD_EXPORT_XLSX),
             CMD_OCR_ALL | CMD_OCR_PAGE => self.start_ocr(cmd == CMD_OCR_PAGE),
             CMD_UNDO => self.undo(),
             CMD_REDO => self.redo(),

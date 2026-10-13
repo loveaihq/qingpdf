@@ -3,76 +3,15 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 mod common;
+mod package;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use qingpdf_base::testutil::PdfBuilder;
 use qingpdf_core::docx;
-use qingpdf_core::render::export::crc32_update;
+use package::{unzip, well_formed};
 use qingpdf_core::{Document, Error};
-
-// --- a reader for what the writer wrote ---------------------------------------------------------------------------------------
-
-/// Every entry of a ZIP file with its name and contents; the sizes, the CRC and the headers are checked on the way.
-fn unzip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let u16_at = |at: usize| usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
-    let u32_at = |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let end = bytes.len() - 22;
-    assert_eq!(u32_at(end), 0x0605_4B50, "end of central directory");
-    let (count, size, start) = (u16_at(end + 10), u32_at(end + 12) as usize, u32_at(end + 16) as usize);
-    assert_eq!(start + size, end, "the central directory runs up to the end record");
-    let mut out = Vec::new();
-    let mut at = start;
-    for _ in 0..count {
-        assert_eq!(u32_at(at), 0x0201_4B50, "central directory header");
-        let (flags, method, crc, packed, unpacked) = (u16_at(at + 8), u16_at(at + 10), u32_at(at + 16), u32_at(at + 20) as usize, u32_at(at + 24) as usize);
-        let (name_len, extra, comment, local) = (u16_at(at + 28), u16_at(at + 30), u16_at(at + 32), u32_at(at + 42) as usize);
-        let name = std::str::from_utf8(&bytes[at + 46..at + 46 + name_len]).unwrap().to_string();
-        assert_eq!(flags & 0x0800, 0x0800, "{name}: names are UTF-8");
-        // The local header says the same.
-        assert_eq!(u32_at(local), 0x0403_4B50, "{name}: local header");
-        assert_eq!((u16_at(local + 8), u32_at(local + 14), u32_at(local + 18) as usize, u32_at(local + 22) as usize), (method, crc, packed, unpacked), "{name}");
-        let data_at = local + 30 + u16_at(local + 26) + u16_at(local + 28);
-        let data = &bytes[data_at..data_at + packed];
-        let data = match method {
-            0 => data.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec(data).expect("deflate"),
-            m => panic!("method {m}"),
-        };
-        assert_eq!(data.len(), unpacked, "{name}");
-        assert_eq!(crc32_update(0, &data), crc, "{name}: CRC");
-        out.push((name, data));
-        at += 46 + name_len + extra + comment;
-    }
-    out
-}
-
-/// Are the tags of an XML text opened and closed in order (and every attribute value quoted)?
-fn well_formed(xml: &str) -> Result<(), String> {
-    let mut stack: Vec<&str> = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find('<') {
-        rest = &rest[i + 1..];
-        let j = rest.find('>').ok_or("a tag that is never closed")?;
-        let tag = &rest[..j];
-        rest = &rest[j + 1..];
-        if tag.starts_with('?') || tag.starts_with('!') {
-            continue;
-        }
-        if !tag.matches('"').count().is_multiple_of(2) {
-            return Err(format!("an attribute value that is not closed: <{tag}>"));
-        }
-        if let Some(name) = tag.strip_prefix('/') {
-            if stack.pop() != Some(name.trim()) {
-                return Err(format!("</{name}> closes nothing"));
-            }
-        } else if !tag.ends_with('/') {
-            stack.push(tag.split_whitespace().next().unwrap_or(""));
-        }
-    }
-    if stack.is_empty() { Ok(()) } else { Err(format!("not closed: {stack:?}")) }
-}
 
 struct Docx {
     parts: Vec<(String, Vec<u8>)>,
@@ -250,6 +189,32 @@ fn lines_drawn_as_a_grid_make_a_table_with_the_text_in_its_cells() {
     let tcs: Vec<usize> = doc.match_indices("<w:tc>").map(|(i, _)| i).collect();
     assert!(tcs[0] < doc.find("alpha").unwrap() && doc.find("alpha").unwrap() < tcs[1] && tcs[1] < doc.find("beta").unwrap());
     assert!(doc.contains("<w:tcBorders><w:top w:val=\"single\""));
+}
+
+#[test]
+fn text_lined_up_in_columns_with_no_lines_round_it_is_a_table_without_borders() {
+    // A statement: a heading row and five rows of three columns (the amounts end at one place), a paragraph above and one below.
+    let mut lines: Vec<(&str, String, f32, f32, f32)> = vec![("F1", "Statement of the account for the month".to_string(), 10.0, 72.0, 760.0)];
+    for (i, (d, m, a)) in [("Date", "Memo", "Amount"), ("2024-05-01", "Salary", "15,000.00"), ("2024-05-02", "Rent", "-3,200.50"), ("2024-05-03", "Food", "-86.20"), ("2024-05-04", "Interest", "1.25"), ("2024-05-05", "Gift", "(500.00)")].iter().enumerate() {
+        let y = 700.0 - 14.0 * i as f32;
+        lines.push(("F1", d.to_string(), 9.0, 72.0, y));
+        lines.push(("F1", m.to_string(), 9.0, 200.0, y));
+        // (Right-aligned by hand: Helvetica digits are 0.556 of the size wide.)
+        lines.push(("F1", a.to_string(), 9.0, 400.0 - 5.0 * a.len() as f32, y));
+    }
+    lines.push(("F1", "End of the statement, with a note under it.".to_string(), 10.0, 72.0, 560.0));
+    let borrowed: Vec<(&str, &str, f32, f32, f32)> = lines.iter().map(|(f, t, s, x, y)| (*f, t.as_str(), *s, *x, *y)).collect();
+    let (docx, report) = convert(page_with(&text_at(&borrowed), (595, 842), |_| {}, ""));
+    let doc = docx.document();
+    assert_eq!(report.counts.tables, 1, "{doc}");
+    assert_eq!((doc.matches("<w:tr>").count(), doc.matches("<w:tc>").count(), doc.matches("<w:gridCol ").count()), (6, 18, 3));
+    // No border on any edge: the page had no lines.
+    assert!(!doc.contains("w:val=\"single\""), "{doc}");
+    let order: Vec<usize> = ["Statement of the account", "Date", "Salary", "15,000.00", "(500.00)", "End of the statement"].iter().map(|w| doc.find(w).unwrap()).collect();
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    // The first row of the table is in the first row of cells: "Memo" is in the second cell, "Amount" in the third.
+    let tcs: Vec<usize> = doc.match_indices("<w:tc>").map(|(i, _)| i).collect();
+    assert!(tcs[1] < doc.find("Memo").unwrap() && doc.find("Memo").unwrap() < tcs[2] && tcs[2] < doc.find("Amount").unwrap() && doc.find("Amount").unwrap() < tcs[3]);
 }
 
 #[test]

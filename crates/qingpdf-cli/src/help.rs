@@ -23,6 +23,7 @@ Commands:
   addtext   Put text on a page
   replace   Find text in the pages and replace it with other text
   docx      Make a Word file (.docx) of a PDF: text, headings, lists, tables, pictures
+  xlsx      Make an Excel file (.xlsx) of the tables of a PDF, one sheet for each table
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -315,9 +316,12 @@ text. A page that is only a picture (a scan) is a picture; the letters in it are
 what the next step will do). Nothing is moved to match the page exactly: this is a Word file to work
 on, not a picture of the page.
 
-Not done: text in the page that the file has as pictures or paths, tables with no lines around them
-(their text is plain paragraphs), pictures turned by other than mirroring, and anything that is not
-text, a picture or a ruled table (drawings, charts). A file whose author did not allow copying text
+Tables with no lines round them are found too, where the text lines up in rows and columns (a bank
+statement, a financial report); text in columns that fills them, like the pages of a book, is not a
+table.
+
+Not done: text in the page that the file has as pictures or paths, pictures turned by other than
+mirroring, and anything that is not text, a picture or a table (drawings, charts). A file whose author did not allow copying text
 is refused unless the owner password is given. At most 5,000 pages, 8 million characters and 3,000
 different pictures; choose some pages with --pages for more.
 
@@ -357,6 +361,36 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const XLSX: &str = "Usage:
+  qingpdf xlsx <file.pdf> [--pages <list>] -o <output.xlsx> [--force] [--password <password>]
+
+Make an Excel file of the tables in the pages: each table is a sheet, named after its page and its
+place on it (\"第3页-表1\"). Tables drawn with lines are found from the lines (cells joined across
+lines that are missing stay merged cells); tables with no lines round them are found where the text
+lines up in rows and columns, as in a bank statement or a financial report (a cell folded in two lines
+is one cell, a heading across columns is a merged cell). A table that goes on from page to page (a
+statement) is one sheet. Pages with no table give no sheet; a file with no table at all gets one
+sheet with the text of its pages, a line to a row, and a warning.
+
+Amounts, whole numbers, decimals with thousands separators (1,234.50), negative numbers (-12; (12)
+and 12- when the column is made of amounts, else they are list numbers and stay text), percents and
+amounts with a currency sign are stored as numbers in the same format, and dates (2024-05-01,
+2024/5/1, 2024.05.01, 2024年5月1日) as dates. What a spreadsheet would spoil stays text:
+identity numbers, phone numbers and card numbers (whole numbers of ten digits or more), codes that
+begin with a zero (007), numbers of more than 15 digits, versions (1.2.3), ranges (3-5).
+
+Not done: tables in vertical text, tables that are pictures or drawings, and fonts, colours or
+borders of the cells. A file whose author did not allow copying text is refused unless the owner
+password is given. At most 5,000 pages, 8 million characters, 1,000 tables and 32,767 characters in a
+cell; choose some pages with --pages for more.
+
+Options:
+  --pages <list>        Only these pages (default: all)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 /// The help text for the tool or for one command.
 pub fn text(command: Option<Command>) -> String {
     match command {
@@ -375,5 +409,6 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Addtext) => ADDTEXT.to_string(),
         Some(Command::Replace) => format!("{REPLACE}{PAGE_LIST}"),
         Some(Command::Docx) => format!("{DOCX}{PAGE_LIST}"),
+        Some(Command::Xlsx) => format!("{XLSX}{PAGE_LIST}"),
     }
 }

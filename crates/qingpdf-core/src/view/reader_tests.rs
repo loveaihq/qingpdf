@@ -793,6 +793,26 @@ fn the_document_with_its_unsaved_changes_is_exported_as_a_word_file() {
 }
 
 #[test]
+fn the_document_is_exported_as_an_excel_file_with_its_text_when_it_has_no_table() {
+    let engine = Engine::start(Box::new(|| {}));
+    super::tests::open(&engine, text_pdf(&["The first page|has two lines", "The second page"]));
+    let path = std::env::temp_dir().join(format!("qingpdf-export-{}.xlsx", std::process::id()));
+    engine.export_xlsx(1, 2, &path.to_string_lossy());
+    let (status, message, pages, bytes) = exported_result(&engine, 2);
+    assert_eq!(status, SaveStatus::Done, "{message}");
+    assert_eq!(pages, 2);
+    assert!(message.contains("no table"), "{message}");
+    let xlsx = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(xlsx.len() as u64, bytes);
+    assert!(xlsx.starts_with(b"PK") && xlsx.windows(20).any(|w| w == b"xl/sharedStrings.xml"));
+    // (The conversion says how many tables it made: none, so the viewer can say the sheet has the text.)
+    engine.export_xlsx(1, 3, &std::env::temp_dir().join("no-such-folder-5d").join("a.xlsx").to_string_lossy());
+    let (status, _, _, _) = exported_result(&engine, 3);
+    assert_eq!(status, SaveStatus::Failed);
+}
+
+#[test]
 fn a_cancelled_word_export_gives_no_answer_and_no_file_and_the_engine_goes_on() {
     let engine = Engine::start(Box::new(|| {}));
     let pages: Vec<String> = (0..600).map(|i| format!("Page {i} has some text|and a second line of it|and a third")).collect();

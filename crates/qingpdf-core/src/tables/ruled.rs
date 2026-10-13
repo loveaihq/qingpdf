@@ -2,60 +2,16 @@
 //! places where they cross are the cell corners; a cell edge with no line along it is not an edge, so the cells either side of
 //! it are one cell (a merged cell). A table needs at least two rows and two columns of cells: boxes in a drawing and text with no lines around it are no table here.
 
-use super::flow::sort;
+use super::{Grid, MAX_COLS, MAX_ROWS, MAX_TABLES, sort};
 
 /// How near (points) two lines must be to be one line, and to touch.
 const TOL: f32 = 2.0;
-/// Most lines of a page we try to find tables in (a chart or a hatched area has thousands), and most rows and columns of a table.
+/// Most lines of a page we try to find tables in (a chart or a hatched area has thousands).
 const MAX_LINES: usize = 4_000;
-pub(super) const MAX_ROWS: usize = 300;
-pub(super) const MAX_COLS: usize = 40;
 /// Most pairs of a horizontal and a vertical line of a page that are looked at for a crossing (a page with more has no tables found
 /// in it), and what each costs in the work meter.
 const MAX_PAIRS: usize = 1 << 20;
-pub(super) const PAIR_WORK: f64 = 8.0;
-
-pub(super) struct Grid {
-    pub bbox: [f32; 4],
-    /// The column edges (left to right) and the row edges (top to bottom).
-    pub xs: Vec<f32>,
-    pub ys: Vec<f32>,
-    /// Is there a line on the left edge of cell (row, column), `(rows) × (cols + 1)`, and on the top edge, `(rows + 1) × (cols)`.
-    vline: Vec<bool>,
-    hline: Vec<bool>,
-    /// The cell (row, column) that each cell belongs to: itself, or the one it was merged into.
-    owner: Vec<(u16, u16)>,
-}
-
-impl Grid {
-    pub(super) fn rows(&self) -> usize {
-        self.ys.len().saturating_sub(1)
-    }
-
-    pub(super) fn cols(&self) -> usize {
-        self.xs.len().saturating_sub(1)
-    }
-
-    pub(super) fn owner(&self, r: usize, c: usize) -> (usize, usize) {
-        self.owner.get(r * self.cols() + c).map_or((r, c), |&(a, b)| (usize::from(a), usize::from(b)))
-    }
-
-    /// Is there a line on the left edge of column `c` (`c == cols` is the right edge of the last one) in row `r`?
-    pub(super) fn v(&self, r: usize, c: usize) -> bool {
-        self.vline.get(r * (self.cols() + 1) + c).copied().unwrap_or(false)
-    }
-
-    /// Is there a line on the top edge of row `r` (`r == rows` is the bottom of the last) in column `c`?
-    pub(super) fn h(&self, r: usize, c: usize) -> bool {
-        self.hline.get(r * self.cols() + c).copied().unwrap_or(false)
-    }
-
-    /// The cell (row, column) a point is in, clamped to the table.
-    pub(super) fn cell_at(&self, x: f32, y: f32) -> (usize, usize) {
-        let find = |edges: &[f32], v: f32| edges.partition_point(|&e| e <= v).saturating_sub(1).min(edges.len().saturating_sub(2));
-        self.owner(find(&self.ys, y), find(&self.xs, x))
-    }
-}
+pub(crate) const PAIR_WORK: f64 = 8.0;
 
 #[derive(Clone, Copy)]
 struct Seg {
@@ -143,7 +99,7 @@ fn edges(mut v: Vec<f32>) -> Vec<f32> {
 
 /// The tables of a page, and how many pairs of lines were looked at for a crossing (for the work meter). `rules` are
 /// `[left, top, right, bottom]` lines with one of the two sizes 0; `page` is the page's size.
-pub(super) fn find(rules: &[[f32; 4]], page: (f32, f32)) -> (Vec<Grid>, u64) {
+pub(crate) fn find(rules: &[[f32; 4]], page: (f32, f32)) -> (Vec<Grid>, u64) {
     let (mut hs, mut vs) = (Vec::new(), Vec::new());
     for r in rules {
         if r[3] - r[1] < 0.5 && r[2] - r[0] >= 3.0 {
@@ -237,7 +193,7 @@ pub(super) fn find(rules: &[[f32; 4]], page: (f32, f32)) -> (Vec<Grid>, u64) {
             }
         }
         tables.push(Grid { bbox, xs, ys, vline, hline, owner });
-        if tables.len() >= 64 {
+        if tables.len() >= MAX_TABLES {
             break;
         }
     }

@@ -15,9 +15,7 @@
 //! ```
 
 mod flow;
-mod table;
 mod write;
-mod zip;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -34,7 +32,7 @@ use crate::{Document, Error, ObjRef, Result};
 
 use flow::{Align, Pic};
 pub use write::Counts;
-use zip::Zip;
+use crate::zip::{self, Zip};
 
 /// Most pages, characters, different pictures and bytes of picture one document is made of; and the work all its pages may take
 /// together (every page has its own allowance of [`PAGE_WORK`] as well).
@@ -128,11 +126,7 @@ pub fn export<W: Write>(doc: &Document, password: &str, pages: Option<&[usize]>,
         return Err(Error::Limit("the text of the document is too big; choose some of the pages".to_string()));
     }
     let rels = document_rels(&images.files);
-    let (y, mo, d, h, mi, s) = zip::civil(now);
-    let stamp = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
-    let core = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:creator>qingpdf</dc:creator><cp:lastModifiedBy>qingpdf</cp:lastModifiedBy><dcterms:created xsi:type=\"dcterms:W3CDTF\">{stamp}</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">{stamp}</dcterms:modified></cp:coreProperties>"
-    );
+    let core = zip::core_properties(now);
     zip.add_deflated("word/document.xml", parts.document.as_bytes())?;
     zip.add_deflated("word/_rels/document.xml.rels", rels.as_bytes())?;
     zip.add_deflated("word/styles.xml", parts.styles.as_bytes())?;
@@ -147,25 +141,7 @@ pub fn export<W: Write>(doc: &Document, password: &str, pages: Option<&[usize]>,
 
 /// [`export`] to the file `path`: written into a file of its own in the same folder, which replaces `path` only when it is whole.
 pub fn export_to_path(doc: &Document, password: &str, pages: Option<&[usize]>, path: &Path, cancel: Option<Arc<AtomicBool>>) -> Result<Report> {
-    let name = path.file_name().ok_or_else(|| Error::Invalid("no file name".to_string()))?;
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let mut temp_name = std::ffi::OsString::from(".");
-    temp_name.push(name);
-    temp_name.push(format!(".qingpdf-{}.tmp", std::process::id()));
-    let temp = dir.join(temp_name);
-    let result = (|| {
-        let file = std::fs::File::create(&temp)?;
-        let mut sink = std::io::BufWriter::new(file);
-        let report = export(doc, password, pages, &mut sink, cancel)?;
-        sink.flush()?;
-        sink.into_inner().map_err(|e| Error::Io(e.into_error()))?.sync_all()?;
-        std::fs::rename(&temp, path)?;
-        Ok(report)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
+    crate::zip::write_file(path, |sink| export(doc, password, pages, sink, cancel))
 }
 
 /// The pictures written so far.
@@ -233,7 +209,7 @@ fn convert_page<W: Write>(
     }
     let out = flow::analyze(&layout, &pics);
     let tables: f64 = out.blocks.iter().map(|b| if let flow::Block::Table(t) = b { flow::table_cost(t) } else { 0.0 }).sum();
-    if !work.charge(tables + out.crossings as f64 * table::PAIR_WORK) {
+    if !work.charge(tables + out.table_work) {
         return Err(Error::Limit("the tables of the page are more than one page of a conversion is allowed".to_string()));
     }
     Ok(Converted { out, chars: chars as u64, left_out, why })

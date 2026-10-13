@@ -7,7 +7,11 @@
 
 pub mod docx;
 pub mod edit;
+mod tables;
 pub mod view;
+pub mod xlsx;
+mod xml;
+mod zip;
 
 pub use qingpdf_base::{document, error, filter, image, info, lexer, object, ops, parser, render, repair, security, text, writer, xref};
 // (Used inside this crate only.)

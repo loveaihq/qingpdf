@@ -123,11 +123,11 @@
 
 | 调用 | 作用 |
 |---|---|
-| `export_docx(doc, id, 路径)` | 把整份文档（连没保存的改动一起）做成 Word 文件（.docx）写到路径，答 `Exported { doc, id, status, message, pages, bytes }`。`status` 是 `Done`（`message` 是转换的提醒，比如某页太大被略过，没有就是空；`pages` 是进了 Word 文件的页数，`bytes` 是文件大小）或 `Failed`（`message` 说原因，没有写出文件）。和保存一样先写同目录的临时文件、再改名替换，出错原文件不动。 |
+| `export_docx(doc, id, 路径)` | 把整份文档（连没保存的改动一起）做成 Word 文件（.docx）写到路径，答 `Exported { doc, id, status, message, pages, tables, bytes }`。`status` 是 `Done`（`message` 是转换的提醒，比如某页太大被略过，没有就是空；`pages` 是进了 Word 文件的页数，`tables` 是文件里 Word 表格的个数（5d 加的字段），`bytes` 是文件大小）或 `Failed`（`message` 说原因，没有写出文件）。和保存一样先写同目录的临时文件、再改名替换，出错原文件不动。 |
 
 和 `save` 一样，一次一个、马上做（排在画页前面），做的时候引擎线程不画页（几页的文件零点几秒，100 页的论文约一秒；窗口自己不会卡）；`cancel(id)` 在页与页之间（和一页里的下一个操作符处）停下，停下的请求没有结果、也不留临时文件（窗口里按 Esc 就是它；已经做完的请求照样会答复，收到时认得 id 不对就忽略）。文件作者不让复制文字、又没用所有者密码打开的，答 `Failed`（和 `copy_text` 同一个检查：`text::check_extraction_allowed`）；打印在进行时答 `Failed`（`a print job is running`）。命令行 `qingpdf docx` 用同一个函数 `qingpdf_core::docx::export_to_path`。
 
-做法和限制见 `docs/decisions.md` 的"第 5 层 5b"。最多 5000 页（`docx::MAX_PAGES`）、800 万字、3000 张不同的图；每页一份 `PAGE_WORK` 的工作量，整次最多 40 页的量（`docx` 的 `JOB_WORK`；整页是图的扫描件每页约 0.25 秒，所以一次最多转几百页），一页读不下去的略过那页，一张图超了限（解码后 48 MiB、1.28 亿像素、一页的工作量、3000 张、图共 1 GiB）只略过那张图、页的文字照留，都在 `message` 里写出来（每页最多一条）；整次用完则 `Failed`。每页有自己的解码额度（和画页一样），长的扫描件不会因为前面的页用完了额度而丢后面页的文字。
+做法和限制见 `docs/decisions.md` 的"第 5 层 5b"。5d 起没有框线的表格也变 Word 表格（`tables::find`，见 "第 5 层 5d"）。最多 5000 页（`docx::MAX_PAGES`）、800 万字、3000 张不同的图；每页一份 `PAGE_WORK` 的工作量，整次最多 40 页的量（`docx` 的 `JOB_WORK`；整页是图的扫描件每页约 0.25 秒，所以一次最多转几百页），一页读不下去的略过那页，一张图超了限（解码后 48 MiB、1.28 亿像素、一页的工作量、3000 张、图共 1 GiB）只略过那张图、页的文字照留，都在 `message` 里写出来（每页最多一条）；整次用完则 `Failed`。每页有自己的解码额度（和画页一样），长的扫描件不会因为前面的页用完了额度而丢后面页的文字。
 
 ## 5c 的请求和结果：识别扫描页的文字
 
@@ -144,6 +144,16 @@
 **不让改的文件（有签名，或没有"允许修改内容"）：** `ocr_layer` 仍然答 `Done`，但文件一个字节都不写：识别出的字按页放在会话里（最多 20 万个字符），只给我们自己的搜索、选字、复制用（`page_chars` 看到页面自己没有文字时用它），不能撤销、不算"有改动"、保存出的文件和原来一样；`message` 里说"used in this window only"。超出内存上限的页不留，`message` 说留了几页。
 
 阅读器：菜单"工具"→"识别所有扫描页的文字"、"识别当前页的文字"。进度显示在状态栏，Esc 停下并保留已识别的页（写成文字层）。识别用 `Windows.Media.Ocr`：中文界面用简体中文识别器，没有就提示在"设置 → 时间和语言 → 语言和区域"里添加中文语言包并列出现有的语言（我们不改系统设置）；别的界面语言用用户的语言。识别接口出错或单页超过 30 秒就取消这一操作、关掉它、跳过这一页并提示。隐藏参数 `qingpdf-view --ocr-test 输入.pdf 输出.pdf [--ocr-pages 首-末] [--ocr-lang zh|en]` 不开窗口走同一条链、存盘、打印每页用时。
+
+## 5d 的请求和结果：导出为 Excel
+
+| 调用 | 作用 |
+|---|---|
+| `export_xlsx(doc, id, 路径)` | 把整份文档（连没保存的改动一起）里的表格做成 Excel 文件（.xlsx）写到路径，一个表格一个工作表；整份文件没有表格时做一个放各页文字的工作表。答的和 `export_docx` 一样：`Exported { doc, id, status, message, pages, tables, bytes }`，`tables` 是有表格的工作表个数，**没有表格时是 0**（窗口据此提示"没有找到表格，工作表里是各页的文字"）；`message` 是转换的提醒（某页太大被略过、单元格超过 32,767 字被截断、没有表格），没有就是空。 |
+
+排队、取消（`cancel(id)`，窗口里按 Esc）、临时文件、版权检查（`text::check_extraction_allowed`）、打印时答 `Failed` 都和 `export_docx` 一样（同一个引擎请求，只多一个"Word 还是 Excel"的标志）。命令行 `qingpdf xlsx` 用同一个函数 `qingpdf_core::xlsx::export_to_path`。窗口：文件菜单"导出为 Excel"（命令号 `CMD_EXPORT_XLSX` = 28），保存框起始名是 PDF 的名字换成 `.xlsx`。
+
+做法和限制见 `docs/decisions.md` 的"第 5 层 5d"。最多 5000 页（`xlsx::MAX_PAGES`）、800 万字、1000 个表格（工作表）、一个单元格 32,767 个字、共享字符串共 128 MiB、工作表 XML 共 256 MiB；每页一份 `PAGE_WORK` 的工作量，整次最多 40 页的量，一页读不下去的略过那页，写在 `message` 里。
 
 ## 对接别的语言
 

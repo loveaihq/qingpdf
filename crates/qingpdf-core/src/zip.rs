@@ -1,4 +1,4 @@
-//! The container a .docx is: a ZIP archive (PKWARE APPNOTE 4.3: local file headers, the central directory, the end record),
+//! The container a .docx or .xlsx is: a ZIP archive (PKWARE APPNOTE 4.3: local file headers, the central directory, the end record),
 //! written in one pass, to a sink.
 
 use std::io::{self, Write};
@@ -6,8 +6,41 @@ use std::io::{self, Write};
 use miniz_oxide::deflate::compress_to_vec;
 use qingpdf_base::render::export::crc32_update;
 
+/// `docProps/core.xml` (the creator and the dates) for a package made at `now` (seconds since 1970).
+pub(crate) fn core_properties(now: u64) -> String {
+    let (y, mo, d, h, mi, s) = civil(now);
+    let stamp = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:creator>qingpdf</dc:creator><cp:lastModifiedBy>qingpdf</cp:lastModifiedBy><dcterms:created xsi:type=\"dcterms:W3CDTF\">{stamp}</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">{stamp}</dcterms:modified></cp:coreProperties>"
+    )
+}
+
+/// Run `make` on a file of its own in the folder of `path`; the file replaces `path` only when `make` is done and it is on disk (an
+/// error or a cancel leaves `path` as it was, and no stray file).
+pub(crate) fn write_file<T>(path: &std::path::Path, make: impl FnOnce(&mut io::BufWriter<std::fs::File>) -> crate::Result<T>) -> crate::Result<T> {
+    let name = path.file_name().ok_or_else(|| crate::Error::Invalid("no file name".to_string()))?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".qingpdf-{}.tmp", std::process::id()));
+    let temp = dir.join(temp_name);
+    let result = (|| {
+        let mut sink = io::BufWriter::new(std::fs::File::create(&temp)?);
+        let made = make(&mut sink)?;
+        sink.flush()?;
+        sink.into_inner().map_err(|e| crate::Error::Io(e.into_error()))?.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        Ok(made)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Seconds since 1970 to (year, month, day, hour, minute, second), UTC.
-pub(super) fn civil(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+pub(crate) fn civil(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let (days, rest) = (secs / 86_400, secs % 86_400);
     // Days since 0000-03-01 (the algorithm of Howard Hinnant).
     let z = days as i64 + 719_468;
@@ -32,7 +65,7 @@ struct Entry {
 }
 
 /// A ZIP archive written to `out` one entry at a time. No ZIP64: an archive over 4 GB, or with over 65,535 entries, is refused.
-pub(super) struct Zip<W: Write> {
+pub(crate) struct Zip<W: Write> {
     out: W,
     pos: u64,
     entries: Vec<Entry>,
@@ -40,11 +73,11 @@ pub(super) struct Zip<W: Write> {
 }
 
 fn too_big() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "the .docx would be over 4 GB (or have over 65,535 parts)")
+    io::Error::new(io::ErrorKind::InvalidData, "the file would be over 4 GB (or have over 65,535 parts)")
 }
 
 impl<W: Write> Zip<W> {
-    pub(super) fn new(out: W, now: u64) -> Zip<W> {
+    pub(crate) fn new(out: W, now: u64) -> Zip<W> {
         let (y, mo, d, h, mi, s) = civil(now);
         let date = ((y.clamp(1980, 2107) - 1980) << 9) | (mo << 5) | d;
         let time = (h << 11) | (mi << 5) | (s / 2);
@@ -52,7 +85,7 @@ impl<W: Write> Zip<W> {
     }
 
     /// Bytes written so far.
-    pub(super) fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         self.pos
     }
 
@@ -63,13 +96,13 @@ impl<W: Write> Zip<W> {
     }
 
     /// One entry, compressed with Deflate (for XML).
-    pub(super) fn add_deflated(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn add_deflated(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         let packed = compress_to_vec(data, 6);
         self.add(name, data, &packed, 8)
     }
 
     /// One entry as it is (for images, which are compressed already).
-    pub(super) fn add_stored(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
+    pub(crate) fn add_stored(&mut self, name: &str, data: &[u8]) -> io::Result<()> {
         self.add(name, data, data, 0)
     }
 
@@ -101,7 +134,7 @@ impl<W: Write> Zip<W> {
     }
 
     /// The central directory and the end record; gives back the sink and the size of the archive.
-    pub(super) fn finish(mut self) -> io::Result<(W, u64)> {
+    pub(crate) fn finish(mut self) -> io::Result<(W, u64)> {
         let start = u32::try_from(self.pos).map_err(|_| too_big())?;
         let entries = std::mem::take(&mut self.entries);
         let mut dir = Vec::new();

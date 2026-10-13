@@ -835,10 +835,10 @@ impl Server<'_> {
                 }
                 None
             }
-            Command::Export { doc, id, path } => {
-                let reply = |this: &Self, status: SaveStatus, message: String, pages: u32, bytes: u64| this.tell(Event::Exported { doc, id, status, message, pages, bytes });
+            Command::Export { doc, id, path, excel } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, pages: u32, tables: u32, bytes: u64| this.tell(Event::Exported { doc, id, status, message, pages, tables, bytes });
                 if printing {
-                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0, 0);
+                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0, 0, 0);
                     return None;
                 }
                 // The conversion looks at the stop flag between pages (and the work of a page at its next step), so that `cancel(id)`, or
@@ -853,7 +853,13 @@ impl Server<'_> {
                         }
                         Ok(true) => {}
                     }
-                    let result = crate::docx::export_to_path(self.document, self.session.password(), None, std::path::Path::new(&path), Some(self.shared.stop.clone()));
+                    let (to, stop) = (std::path::Path::new(&path), Some(self.shared.stop.clone()));
+                    // (What the two conversions tell, alike: pages, tables, bytes, and what they warned of.)
+                    let result = if excel {
+                        crate::xlsx::export_to_path(self.document, self.session.password(), None, to, stop).map(|r| (r.pages, r.tables, r.bytes, r.warnings))
+                    } else {
+                        crate::docx::export_to_path(self.document, self.session.password(), None, to, stop).map(|r| (r.pages, r.counts.tables, r.bytes, r.warnings))
+                    };
                     self.shared.current.store(0, Ordering::SeqCst);
                     if matches!(result, Err(Error::Cancelled)) {
                         match self.really_cancelled(id) {
@@ -865,8 +871,8 @@ impl Server<'_> {
                     break result;
                 };
                 match result {
-                    Ok(r) => reply(self, SaveStatus::Done, r.warnings.join("; "), u32::try_from(r.pages).unwrap_or(u32::MAX), r.bytes),
-                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
+                    Ok((pages, tables, bytes, warnings)) => reply(self, SaveStatus::Done, warnings.join("; "), u32::try_from(pages).unwrap_or(u32::MAX), u32::try_from(tables).unwrap_or(u32::MAX), bytes),
+                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0, 0),
                 }
                 None
             }

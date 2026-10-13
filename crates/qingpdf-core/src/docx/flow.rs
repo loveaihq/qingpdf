@@ -17,7 +17,8 @@
 use qingpdf_base::text::font::STYLE_HEAVY;
 use qingpdf_base::text::{PageLayout, Piece, TextLine};
 
-use super::table::{self, Grid};
+use crate::tables::{self, Grid};
+pub(super) use crate::tables::{is_wide, sort};
 
 /// The bits of a font's style that make a run differ from the one beside it (bold, italic, family, kind of Chinese face).
 const STYLE_MASK: u8 = 0x3F;
@@ -194,8 +195,8 @@ pub(super) struct PageOut {
     pub blocks: Vec<Block>,
     /// How far down the page the text reaches (0 to 1); 0 for a page that is a picture, so that the next page starts afresh.
     pub filled: f32,
-    /// Pairs of ruled lines looked at for a crossing (the work meter is charged for them).
-    pub crossings: u64,
+    /// The work it took to find the tables (pairs of ruled lines looked at for a crossing, pieces of text looked at for columns).
+    pub table_work: f64,
 }
 
 impl PageOut {
@@ -255,10 +256,6 @@ enum Item {
     Line(Ln),
     Pic(Pic),
     Table(Table),
-}
-
-pub(super) fn is_wide(c: char) -> bool {
-    matches!(u32::from(c), 0x2E80..=0xA4CF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF | 0x20000..=0x2FFFF)
 }
 
 fn heavy_style(style: u8) -> bool {
@@ -473,26 +470,6 @@ struct Column {
     left: f32,
     right: f32,
     pitch: f32,
-}
-
-/// Sort `v` so that `less(a, b)` holds for each `a` before a `b` (a shell sort: the sorts of the library are some kilobytes for each
-/// kind of thing sorted, and the lists here are short; this is one small loop for all of them).
-pub(super) fn sort<T>(v: &mut [T], less: &mut dyn FnMut(&T, &T) -> bool) {
-    let n = v.len();
-    let mut h = 1;
-    while h < n / 3 {
-        h = 3 * h + 1;
-    }
-    while h >= 1 {
-        for i in h..n {
-            let mut j = i;
-            while j >= h && v.get(j).zip(v.get(j - h)).is_some_and(|(a, b)| less(a, b)) {
-                v.swap(j, j - h);
-                j -= h;
-            }
-        }
-        h /= 3;
-    }
 }
 
 fn median(v: &mut [f32]) -> Option<f32> {
@@ -730,8 +707,7 @@ fn cut(rects: &[Rect], idx: Vec<usize>, gutter: f32, depth: u32, id: u32, next_i
 
 /// The cost of the analysis of a page, for the work meter: units per character, line, picture and rule.
 pub(super) fn cost(layout: &PageLayout) -> f64 {
-    let chars: usize = layout.lines.iter().map(|l| l.text.len()).sum();
-    chars as f64 * 150.0 + layout.lines.len() as f64 * 5_000.0 + layout.images.len() as f64 * 20_000.0 + layout.rules.len() as f64 * 4_000.0
+    tables::cost(layout) + layout.images.len() as f64 * 20_000.0
 }
 
 /// The work of the cells of a table.
@@ -743,10 +719,8 @@ pub(super) fn table_cost(t: &Table) -> f64 {
 /// the image in `layout.images`.
 pub(super) fn analyze(layout: &PageLayout, pics: &[Option<Pic>]) -> PageOut {
     let (w, h) = layout.size;
-    let total: usize = layout.lines.iter().map(|l| l.text.len()).sum();
-    let vertical_chars: usize = layout.lines.iter().filter(|l| l.vertical).map(|l| l.text.len()).sum();
-    let vertical = total > 0 && vertical_chars * 2 > total;
-    let (grids, crossings) = if vertical { (Vec::new(), 0) } else { table::find(&layout.rules, (w, h)) };
+    let vertical = tables::vertical(layout);
+    let (grids, table_work) = tables::find(layout, vertical, true);
 
     let mut cells_of: Vec<Vec<Vec<Ln>>> = grids.iter().map(|g| vec![Vec::new(); g.rows() * g.cols()]).collect();
     let mut rects: Vec<Rect> = Vec::new();
@@ -849,7 +823,7 @@ pub(super) fn analyze(layout: &PageLayout, pics: &[Option<Pic>]) -> PageOut {
     } else {
         1.0
     };
-    PageOut { w, h, vertical, blocks, filled, crossings }
+    PageOut { w, h, vertical, blocks, filled, table_work }
 }
 
 /// Put the pieces of a line into the cells of a table.

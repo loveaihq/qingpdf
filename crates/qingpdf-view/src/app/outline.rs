@@ -223,7 +223,7 @@ impl App {
             }
             ev @ (EngineEvent::OcrPages { .. } | EngineEvent::OcrImage { .. }) => self.on_ocr_event(ev),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
-            EngineEvent::Exported { doc, id, status, message, .. } if doc == self.doc_id => self.on_exported(id, status, &message),
+            EngineEvent::Exported { doc, id, status, message, tables, .. } if doc == self.doc_id => self.on_exported(id, status, &message, tables),
             EngineEvent::SearchHits { doc, id, page, hits } if doc == self.doc_id => self.on_search_hits(id, page, hits),
             EngineEvent::SearchProgress { doc, id, pages_done, pages_total, .. } if doc == self.doc_id => self.on_search_progress(id, pages_done, pages_total),
             EngineEvent::SearchDone { doc, id, status, pages_skipped, .. } if doc == self.doc_id => self.on_search_done(id, status, pages_skipped),

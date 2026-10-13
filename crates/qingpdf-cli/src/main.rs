@@ -14,7 +14,7 @@ use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
 use qingpdf_core::security::{Method, PasswordKind};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
-use qingpdf_core::{Document, Error, Warning, docx, render, text};
+use qingpdf_core::{Document, Error, Warning, docx, render, text, xlsx};
 
 use args::{Parsed, Request, UsageError};
 
@@ -143,6 +143,7 @@ fn run(request: Request) -> Result<(), Failure> {
             add_command(&doc, &password, &input, &output, &ContentOp::Image { page: page - 1, at, width, image })
         }
         Request::Docx { input, pages, output, force, password } => docx_command(&input, pages.as_deref(), &output, force, &password),
+        Request::Xlsx { input, pages, output, force, password } => xlsx_command(&input, pages.as_deref(), &output, force, &password),
         Request::Replace { input, find, with, pages, output, force, password } => replace_command(&input, &find, &with, pages.as_deref(), &output, force, &password),
         Request::Addtext { input, page, at, size, text, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
@@ -178,6 +179,33 @@ fn docx_command(input: &Path, pages: Option<&str>, output: &Path, force: bool, p
         plural(c.tables),
         c.images,
         plural(c.images),
+        report.bytes
+    ));
+    Ok(())
+}
+
+/// Make an Excel file of the tables of the pages.
+fn xlsx_command(input: &Path, pages: Option<&str>, output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    let wanted = match pages {
+        Some(list) => Some(page_list(&doc, input, list)?),
+        None => None,
+    };
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let report = xlsx::export_to_path(&doc, password, wanted.as_deref(), output, None).map_err(|e| op_error(input, &e))?;
+    for w in &report.warnings {
+        eprintln!("warning: {}", clean(w));
+    }
+    say(&format!(
+        "wrote {} ({} page{}, {} table{}, {} cell{}, {} bytes)
+",
+        output.display(),
+        report.pages,
+        plural(report.pages),
+        report.tables,
+        plural(report.tables),
+        report.cells,
+        plural(report.cells as usize),
         report.bytes
     ));
     Ok(())

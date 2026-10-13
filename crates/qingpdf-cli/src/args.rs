@@ -22,10 +22,11 @@ pub enum Command {
     Addtext,
     Replace,
     Docx,
+    Xlsx,
 }
 
 impl Command {
-    pub const ALL: [Command; 14] = [
+    pub const ALL: [Command; 15] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -40,6 +41,7 @@ impl Command {
         Command::Addtext,
         Command::Replace,
         Command::Docx,
+        Command::Xlsx,
     ];
 
     pub fn name(self) -> &'static str {
@@ -58,6 +60,7 @@ impl Command {
             Command::Addtext => "addtext",
             Command::Replace => "replace",
             Command::Docx => "docx",
+            Command::Xlsx => "xlsx",
         }
     }
 
@@ -100,6 +103,8 @@ pub enum Request {
     Replace { input: PathBuf, find: String, with: String, pages: Option<String>, output: PathBuf, force: bool, password: String },
     /// Make a Word file (.docx) of the pages (all of them when `pages` is none).
     Docx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
+    /// Make an Excel file (.xlsx) of the tables of the pages (all of them when `pages` is none).
+    Xlsx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
 }
 
 /// What `parse` found.
@@ -156,7 +161,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
         Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
         Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
-        Command::Docx => Allowed { output: true, force: true, pages: true, password: true, ..none },
+        Command::Docx | Command::Xlsx => Allowed { output: true, force: true, pages: true, password: true, ..none },
     }
 }
 
@@ -508,6 +513,10 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
         Command::Docx => {
             let input = one_input(&mut inputs)?;
             Ok(Request::Docx { input, pages, output: need_output(output)?, force, password })
+        }
+        Command::Xlsx => {
+            let input = one_input(&mut inputs)?;
+            Ok(Request::Xlsx { input, pages, output: need_output(output)?, force, password })
         }
         Command::Replace => {
             let input = one_input(&mut inputs)?;

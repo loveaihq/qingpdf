@@ -94,8 +94,11 @@ pub(super) struct EditState {
     /// The save that is going on (its request) and where it writes; what to do when it is done.
     pub(super) saving: Option<(u64, PathBuf, bool)>,
     /// The Word export (5b): the box that asks where to write it is open, and the request that is writing it.
-    export_asked: bool,
+    /// A name was asked for an export: to Excel (true) or to Word (false).
+    export_asked: Option<bool>,
     exporting: Option<u64>,
+    /// The export going is to Excel.
+    export_excel: bool,
     after: Option<After>,
     /// The place where the pointer went down for a note, and where the note is to go while its text is asked for.
     note_press: Option<(u32, f32, f32, i64, i64)>,
@@ -121,8 +124,9 @@ impl EditState {
             dirty: false,
             rewrote: false,
             saving: None,
-            export_asked: false,
+            export_asked: None,
             exporting: None,
+            export_excel: false,
             after: None,
             note_press: None,
             note_at: None,
@@ -586,24 +590,31 @@ impl App {
         vec![Action::PickSavePath { title: t(self.lang, Msg::SaveTitle).to_string(), filters, name }]
     }
 
-    /// File > Export to Word: ask where to write the .docx.
-    pub(super) fn export_word(&mut self) -> Vec<Action> {
+    /// File > Export to Word (or Excel): ask where to write the .docx (.xlsx).
+    pub(super) fn export_file(&mut self, excel: bool) -> Vec<Action> {
         let Some(path) = self.path.clone().filter(|_| self.doc.is_some() && self.edit.exporting.is_none()) else { return Vec::new() };
-        let name = path.with_extension("docx").file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let filters = vec![(t(self.lang, Msg::FilterDocx).to_string(), "*.docx".to_string())];
-        self.edit.export_asked = true;
-        vec![Action::PickSavePath { title: t(self.lang, Msg::ExportTitle).to_string(), filters, name }]
+        let ext = if excel { "xlsx" } else { "docx" };
+        let name = path.with_extension(ext).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let filters = vec![(t(self.lang, if excel { Msg::FilterXlsx } else { Msg::FilterDocx }).to_string(), format!("*.{ext}"))];
+        self.edit.export_asked = Some(excel);
+        vec![Action::PickSavePath { title: t(self.lang, if excel { Msg::ExportExcelTitle } else { Msg::ExportTitle }).to_string(), filters, name }]
     }
 
-    fn export_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
+    fn export_picked(&mut self, path: Option<PathBuf>, excel: bool) -> Vec<Action> {
         let Some(p) = path.filter(|_| self.doc.is_some()) else { return Vec::new() };
         let id = self.new_id();
-        self.engine.export_docx(self.doc_id, id, &std::path::absolute(&p).unwrap_or(p).to_string_lossy());
+        let to = std::path::absolute(&p).unwrap_or(p).to_string_lossy().into_owned();
+        if excel {
+            self.engine.export_xlsx(self.doc_id, id, &to);
+        } else {
+            self.engine.export_docx(self.doc_id, id, &to);
+        }
         self.edit.exporting = Some(id);
+        self.edit.export_excel = excel;
         self.say(t(self.lang, Msg::NoteExporting).to_string())
     }
 
-    /// Esc while the Word export is going: the engine is told to stop at the next page (it answers nothing), the temporary file goes,
+    /// Esc while the export is going: the engine is told to stop at the next page (it answers nothing), the temporary file goes,
     /// and the old file is as it was. `None`: no export is going.
     pub(super) fn cancel_export(&mut self) -> Option<Vec<Action>> {
         let id = self.edit.exporting.take()?;
@@ -611,20 +622,22 @@ impl App {
         Some(self.say(t(self.lang, Msg::NoteExportCancelled).to_string()))
     }
 
-    pub(super) fn on_exported(&mut self, id: u64, status: SaveStatus, message: &str) -> Vec<Action> {
+    pub(super) fn on_exported(&mut self, id: u64, status: SaveStatus, message: &str, tables: u32) -> Vec<Action> {
         if self.edit.exporting != Some(id) {
             return Vec::new();
         }
         self.edit.exporting = None;
         match status {
-            SaveStatus::Done => self.say(t(self.lang, Msg::NoteExported).to_string()),
-            SaveStatus::Failed => vec![Action::Message { title: t(self.lang, Msg::Error).to_string(), text: format!("{}\n{message}", t(self.lang, Msg::NoteExportFailed)) }],
+            SaveStatus::Done if !self.edit.export_excel => self.say(t(self.lang, Msg::NoteExported).to_string()),
+            SaveStatus::Done => self.say(t(self.lang, if tables == 0 { Msg::NoteExportedNoTables } else { Msg::NoteExportedExcel }).to_string()),
+            SaveStatus::Failed => vec![Action::Message { title: t(self.lang, Msg::Error).to_string(), text: format!("{}
+{message}", t(self.lang, Msg::NoteExportFailed)) }],
         }
     }
 
     pub(super) fn save_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
-        if std::mem::take(&mut self.edit.export_asked) {
-            return self.export_picked(path);
+        if let Some(excel) = self.edit.export_asked.take() {
+            return self.export_picked(path, excel);
         }
         match path {
             Some(p) if self.doc.is_some() => self.start_save(std::path::absolute(&p).unwrap_or(p), true),
@@ -896,6 +909,40 @@ mod tests {
         // (Either it was stopped in time, or it was done before the key: a whole file, never half of one.)
         if stopped.exists() {
             assert!(std::fs::read(&stopped).unwrap().starts_with(b"PK\x03\x04"));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_to_excel_asks_for_an_xlsx_name_and_says_when_the_file_has_no_table() {
+        let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/public/xref-classic/hello_world.pdf");
+        let dir = std::env::temp_dir().join(format!("qingpdf-view-export-xlsx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.pdf");
+        std::fs::copy(corpus, &file).unwrap();
+        let mut app = App::new(Lang::En, Arc::new(|| {}), Instant::now(), 1920 * 1080, "Tester".to_string());
+        assert!(!app.event(Event::Command(CMD_EXPORT_XLSX)).iter().any(|a| matches!(a, Action::PickSavePath { .. })));
+        app.event(Event::Size { w: 900, h: 700 });
+        app.open_path(&file, "");
+        pump(&mut app, "the file to open", |a| a.has_document());
+        let asked = app.event(Event::Command(CMD_EXPORT_XLSX));
+        let Some(Action::PickSavePath { filters, name, .. }) = asked.iter().find(|a| matches!(a, Action::PickSavePath { .. })) else { panic!("no question: {asked:?}") };
+        assert_eq!((name.as_str(), filters.first().map(|f| f.1.as_str())), ("a.xlsx", Some("*.xlsx")));
+        // Answered: the engine writes the workbook; the page has no table, and the note says what the sheet has.
+        let target = dir.join("out.xlsx");
+        app.event(Event::SavePicked(Some(target.clone())));
+        pump(&mut app, "the export", |a| a.edit.exporting.is_none() && a.note.as_deref().is_some_and(|n| n.starts_with("Exported to Excel: no table")));
+        let bytes = std::fs::read(&target).unwrap();
+        assert!(bytes.starts_with(b"PK") && bytes.windows(15).any(|w| w == b"xl/workbook.xml"));
+        // Esc while it is going stops it, as for Word.
+        app.event(Event::Command(CMD_EXPORT_XLSX));
+        app.event(Event::SavePicked(Some(dir.join("stopped.xlsx"))));
+        app.event(Event::Key { vk: crate::ui::vk::ESCAPE, ctrl: false, shift: false });
+        assert!(app.edit.exporting.is_none());
+        // (The engine may still be at it for a moment; the folder goes when it is done.)
+        for _ in 0..30 {
+            app.event(Event::Wake);
+            std::thread::sleep(Duration::from_millis(10));
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
