@@ -67,8 +67,20 @@ pub struct Font {
     pub vertical: bool,
     /// A Type 3 font (its glyphs are drawn by content streams, so no other font can stand in for it).
     pub type3: bool,
+    /// What a word processor needs of the font (the `STYLE_*` bits), worked out from its name and descriptor.
+    pub style: u8,
     body: Body,
 }
+
+/// [`Font::style`]: bold and italic, the family (two bits: serif, sans, monospaced) and the kind of Chinese face (two bits: Song,
+/// Hei, Kai, Fang, from bit 4).
+pub const STYLE_BOLD: u8 = 1;
+pub const STYLE_ITALIC: u8 = 2;
+pub const STYLE_FAMILY_SHIFT: u32 = 2;
+/// A heavy face: bold, or a Chinese Hei face (黑体), which is bold without a bold name.
+pub const STYLE_HEAVY: u8 = 0x40;
+pub const STYLE_CJK_SHIFT: u32 = 4;
+
 
 enum Body {
     Simple(Simple),
@@ -151,6 +163,39 @@ fn number_at(doc: &Document, obj: &Object) -> Option<f64> {
     resolved(doc, Some(obj))?.as_f64()
 }
 
+/// [`Font::style`] of a font: its name and the flags, weight and slant of its descriptor (the one of its CID font for a composite font).
+fn style_of(doc: &Document, dict: &Dict, base: &[u8]) -> u8 {
+    use crate::render::sysfont::{self, Cjk, Kind};
+    let cid = match resolved(doc, dict.get("DescendantFonts")) {
+        Some(Object::Array(a)) => a.first().and_then(|o| resolved(doc, Some(o))),
+        _ => None,
+    };
+    let holder = cid.as_ref().and_then(Object::as_dict).unwrap_or(dict);
+    let d = dict_at(doc, holder, "FontDescriptor");
+    let num = |k: &str| d.as_ref().and_then(|d| d.get(k)).and_then(Object::as_f64).unwrap_or(0.0);
+    let flags = d.as_ref().and_then(|d| d.get_int("Flags")).unwrap_or(0);
+    let ordering = dict_at(doc, holder, "CIDSystemInfo").and_then(|c| match resolved(doc, c.get("Ordering")) {
+        Some(Object::String(s)) => Ordering::from_name(&s.bytes),
+        _ => None,
+    });
+    let r = sysfont::request_for(base, flags, num("FontWeight"), num("ItalicAngle"), ordering);
+    let lower: String = base.iter().map(|b| char::from(b.to_ascii_lowercase())).collect();
+    // TeX and Nimbus names that say "bold" in their own way.
+    let bold = r.bold || lower.contains("cmbx") || lower.ends_with("medi") || lower.ends_with("-rb");
+    let (family, cjk) = match r.kind {
+        Kind::Serif | Kind::Georgia | Kind::Cambria | Kind::Symbol | Kind::Dingbats => (0, 0),
+        Kind::Mono | Kind::Consolas => (2, 0),
+        Kind::Cjk(_, Cjk::Song) => (0, 0),
+        Kind::Cjk(_, Cjk::Hei) => (1, 1),
+        Kind::Cjk(_, Cjk::Kai) => (0, 2),
+        Kind::Cjk(_, Cjk::Fang) => (0, 3),
+        _ => (1, 0),
+    };
+    // A Chinese Hei face (黑体) is heavy without being called bold; the sans faces that are regular weight are not.
+    let hei = matches!(r.kind, Kind::Cjk(sysfont::Script::Gb1, Cjk::Hei)) && !["yahei", "msyh", "dengxian", "pingfang", "sourcehansans", "notosans"].iter().any(|k| lower.contains(k));
+    u8::from(bold) | (u8::from(r.italic) << 1) | (family << STYLE_FAMILY_SHIFT) | (cjk << STYLE_CJK_SHIFT) | if bold || hei { STYLE_HEAVY } else { 0 }
+}
+
 fn strip_subset_prefix(name: &str) -> &str {
     match name.split_once('+') {
         Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
@@ -205,10 +250,13 @@ impl Font {
             .unwrap_or_default();
         let name = strip_subset_prefix(&base).to_string();
         let to_uni = load_to_unicode(doc, dict, warnings);
-        if subtype == "Type0" {
-            return Font::load_composite(doc, dict, name, to_uni, cmaps, warnings);
-        }
-        Font::load_simple(doc, dict, &subtype, name, to_uni, warnings)
+        let mut font = if subtype == "Type0" {
+            Font::load_composite(doc, dict, name, to_uni, cmaps, warnings)
+        } else {
+            Font::load_simple(doc, dict, &subtype, name, to_uni, warnings)
+        };
+        font.style = style_of(doc, dict, strip_subset_prefix(&base).as_bytes());
+        font
     }
 
     fn load_simple(doc: &Document, dict: &Dict, subtype: &str, name: String, to_uni: Option<ToUni>, warnings: &mut Warnings) -> Font {
@@ -385,6 +433,7 @@ impl Font {
             name,
             vertical: false,
             type3: is_type3,
+            style: 0,
             body: Body::Simple(Simple { uni: packed, multi, widths, width_scale, glyph_uni, names: renamed, table, named_base, win_mac, has_widths: have_widths }),
         }
     }
@@ -459,6 +508,7 @@ impl Font {
             name,
             vertical,
             type3: false,
+            style: 0,
             body: Body::Composite(Composite {
                 cmap,
                 to_uni,

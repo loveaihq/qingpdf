@@ -91,6 +91,9 @@ pub(super) struct EditState {
     rewrote: bool,
     /// The save that is going on (its request) and where it writes; what to do when it is done.
     pub(super) saving: Option<(u64, PathBuf, bool)>,
+    /// The Word export (5b): the box that asks where to write it is open, and the request that is writing it.
+    export_asked: bool,
+    exporting: Option<u64>,
     after: Option<After>,
     /// The place where the pointer went down for a note, and where the note is to go while its text is asked for.
     note_press: Option<(u32, f32, f32, i64, i64)>,
@@ -116,6 +119,8 @@ impl EditState {
             dirty: false,
             rewrote: false,
             saving: None,
+            export_asked: false,
+            exporting: None,
             after: None,
             note_press: None,
             note_at: None,
@@ -570,7 +575,46 @@ impl App {
         vec![Action::PickSavePath { title: t(self.lang, Msg::SaveTitle).to_string(), filters, name }]
     }
 
+    /// File > Export to Word: ask where to write the .docx.
+    pub(super) fn export_word(&mut self) -> Vec<Action> {
+        let Some(path) = self.path.clone().filter(|_| self.doc.is_some() && self.edit.exporting.is_none()) else { return Vec::new() };
+        let name = path.with_extension("docx").file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let filters = vec![(t(self.lang, Msg::FilterDocx).to_string(), "*.docx".to_string())];
+        self.edit.export_asked = true;
+        vec![Action::PickSavePath { title: t(self.lang, Msg::ExportTitle).to_string(), filters, name }]
+    }
+
+    fn export_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
+        let Some(p) = path.filter(|_| self.doc.is_some()) else { return Vec::new() };
+        let id = self.new_id();
+        self.engine.export_docx(self.doc_id, id, &std::path::absolute(&p).unwrap_or(p).to_string_lossy());
+        self.edit.exporting = Some(id);
+        self.say(t(self.lang, Msg::NoteExporting).to_string())
+    }
+
+    /// Esc while the Word export is going: the engine is told to stop at the next page (it answers nothing), the temporary file goes,
+    /// and the old file is as it was. `None`: no export is going.
+    pub(super) fn cancel_export(&mut self) -> Option<Vec<Action>> {
+        let id = self.edit.exporting.take()?;
+        self.engine.cancel(id);
+        Some(self.say(t(self.lang, Msg::NoteExportCancelled).to_string()))
+    }
+
+    pub(super) fn on_exported(&mut self, id: u64, status: SaveStatus, message: &str) -> Vec<Action> {
+        if self.edit.exporting != Some(id) {
+            return Vec::new();
+        }
+        self.edit.exporting = None;
+        match status {
+            SaveStatus::Done => self.say(t(self.lang, Msg::NoteExported).to_string()),
+            SaveStatus::Failed => vec![Action::Message { title: t(self.lang, Msg::Error).to_string(), text: format!("{}\n{message}", t(self.lang, Msg::NoteExportFailed)) }],
+        }
+    }
+
     pub(super) fn save_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
+        if std::mem::take(&mut self.edit.export_asked) {
+            return self.export_picked(path);
+        }
         match path {
             Some(p) if self.doc.is_some() => self.start_save(std::path::absolute(&p).unwrap_or(p), true),
             _ => Vec::new(),
@@ -781,6 +825,67 @@ mod tests {
         assert!(discarded.iter().any(|a| matches!(a, Action::AskSave { .. })));
         let quit = app.event(Event::SaveChoice { tag: TAG_UNSAVED, choice: SaveChoice::Discard });
         assert!(quit.iter().any(|a| matches!(a, Action::Quit)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_to_word_asks_for_a_name_writes_the_file_and_says_so() {
+        let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/public/xref-classic/hello_world.pdf");
+        let dir = std::env::temp_dir().join(format!("qingpdf-view-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.pdf");
+        std::fs::copy(corpus, &file).unwrap();
+        let mut app = App::new(Lang::En, Arc::new(|| {}), Instant::now(), 1920 * 1080, "Tester".to_string());
+        // Nothing open: nothing to ask.
+        assert!(!app.event(Event::Command(CMD_EXPORT_DOCX)).iter().any(|a| matches!(a, Action::PickSavePath { .. })));
+        app.event(Event::Size { w: 900, h: 700 });
+        app.open_path(&file, "");
+        pump(&mut app, "the file to open", |a| a.has_document());
+        // The box asks for a .docx file, starting from the name of the file.
+        let asked = app.event(Event::Command(CMD_EXPORT_DOCX));
+        let Some(Action::PickSavePath { filters, name, .. }) = asked.iter().find(|a| matches!(a, Action::PickSavePath { .. })) else { panic!("no question: {asked:?}") };
+        assert_eq!((name.as_str(), filters.first().map(|f| f.1.as_str())), ("a.docx", Some("*.docx")));
+        // Cancelled: nothing is written, and the file name box was for this and not for a PDF save.
+        app.event(Event::SavePicked(None));
+        assert!(app.edit.exporting.is_none() && !dir.join("a.docx").exists());
+        // Asked again and answered: the engine writes the file.
+        app.event(Event::Command(CMD_EXPORT_DOCX));
+        let target = dir.join("out.docx");
+        let said = app.event(Event::SavePicked(Some(target.clone())));
+        assert!(!said.iter().any(|a| matches!(a, Action::PickSavePath { .. })));
+        pump(&mut app, "the export", |a| a.edit.exporting.is_none() && a.note.as_deref() == Some("Exported to Word."));
+        assert!(std::fs::read(&target).unwrap().starts_with(b"PK\x03\x04"));
+        // The PDF is untouched and is still not changed.
+        assert!(!app.edit.dirty && !app.title().starts_with('*'));
+        // A name that cannot be written says so in a message box.
+        let bad = dir.join("no-such-folder").join("x.docx");
+        app.event(Event::Command(CMD_EXPORT_DOCX));
+        app.event(Event::SavePicked(Some(bad)));
+        let mut shown = Vec::new();
+        for _ in 0..1000 {
+            shown.extend(app.event(Event::Wake));
+            if shown.iter().any(|a| matches!(a, Action::Message { .. })) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(shown.iter().any(|a| matches!(a, Action::Message { text, .. } if text.contains("could not be exported"))), "{shown:?}");
+        // Esc while it is going stops it: nothing is said but that it was stopped, and no message box comes after it.
+        app.event(Event::Command(CMD_EXPORT_DOCX));
+        let stopped = dir.join("stopped.docx");
+        app.event(Event::SavePicked(Some(stopped.clone())));
+        let said = app.event(Event::Key { vk: crate::ui::vk::ESCAPE, ctrl: false, shift: false });
+        assert!(app.edit.exporting.is_none(), "{said:?}");
+        let mut shown = Vec::new();
+        for _ in 0..30 {
+            shown.extend(app.event(Event::Wake));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!shown.iter().any(|a| matches!(a, Action::Message { .. })), "{shown:?}");
+        // (Either it was stopped in time, or it was done before the key: a whole file, never half of one.)
+        if stopped.exists() {
+            assert!(std::fs::read(&stopped).unwrap().starts_with(b"PK\x03\x04"));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

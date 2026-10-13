@@ -21,10 +21,11 @@ pub enum Command {
     Stamp,
     Addtext,
     Replace,
+    Docx,
 }
 
 impl Command {
-    pub const ALL: [Command; 13] = [
+    pub const ALL: [Command; 14] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -38,6 +39,7 @@ impl Command {
         Command::Stamp,
         Command::Addtext,
         Command::Replace,
+        Command::Docx,
     ];
 
     pub fn name(self) -> &'static str {
@@ -55,6 +57,7 @@ impl Command {
             Command::Stamp => "stamp",
             Command::Addtext => "addtext",
             Command::Replace => "replace",
+            Command::Docx => "docx",
         }
     }
 
@@ -95,6 +98,8 @@ pub enum Request {
     Addtext { input: PathBuf, page: usize, at: [f64; 2], size: f64, text: String, output: PathBuf, force: bool, password: String },
     /// Replace `find` by `with` in the text of the pages (all of them when `pages` is none).
     Replace { input: PathBuf, find: String, with: String, pages: Option<String>, output: PathBuf, force: bool, password: String },
+    /// Make a Word file (.docx) of the pages (all of them when `pages` is none).
+    Docx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
 }
 
 /// What `parse` found.
@@ -151,6 +156,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
         Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
         Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
+        Command::Docx => Allowed { output: true, force: true, pages: true, password: true, ..none },
     }
 }
 
@@ -498,6 +504,10 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 return Err(usage(c, "addtext needs --size <points>, more than 0"));
             }
             Ok(Request::Addtext { input, page: page_number(c, page.as_deref())?, at: place(c, at.as_deref())?, size, text, output, force, password })
+        }
+        Command::Docx => {
+            let input = one_input(&mut inputs)?;
+            Ok(Request::Docx { input, pages, output: need_output(output)?, force, password })
         }
         Command::Replace => {
             let input = one_input(&mut inputs)?;

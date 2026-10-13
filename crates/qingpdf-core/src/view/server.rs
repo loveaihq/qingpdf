@@ -393,9 +393,9 @@ impl Server<'_> {
                 }
                 None
             }
-            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. }) => {
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. }) => {
                 let doc = match &c {
-                    Command::Edit { doc, .. } | Command::Undo { doc, .. } | Command::Redo { doc, .. } | Command::Save { doc, .. } => *doc,
+                    Command::Edit { doc, .. } | Command::Undo { doc, .. } | Command::Redo { doc, .. } | Command::Save { doc, .. } | Command::Export { doc, .. } => *doc,
                     _ => 0,
                 };
                 if doc == self.doc_id {
@@ -759,6 +759,41 @@ impl Server<'_> {
                         self.refresh_page(page);
                         said(self, doc, id, EditStatus::Done, "", page);
                     }
+                }
+                None
+            }
+            Command::Export { doc, id, path } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, pages: u32, bytes: u64| this.tell(Event::Exported { doc, id, status, message, pages, bytes });
+                if printing {
+                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0, 0);
+                    return None;
+                }
+                // The conversion looks at the stop flag between pages (and the work of a page at its next step), so that `cancel(id)`, or
+                // closing the document, ends it; a withdrawn request gets no answer. A flag raised late for the request before this one
+                // stops it too, and then it is started again.
+                let result = loop {
+                    match self.begin(id) {
+                        Err(end) => return Some(end),
+                        Ok(false) => {
+                            self.shared.current.store(0, Ordering::SeqCst);
+                            return None;
+                        }
+                        Ok(true) => {}
+                    }
+                    let result = crate::docx::export_to_path(self.document, self.session.password(), None, std::path::Path::new(&path), Some(self.shared.stop.clone()));
+                    self.shared.current.store(0, Ordering::SeqCst);
+                    if matches!(result, Err(Error::Cancelled)) {
+                        match self.really_cancelled(id) {
+                            Err(end) => return Some(end),
+                            Ok(true) => return None,
+                            Ok(false) => continue,
+                        }
+                    }
+                    break result;
+                };
+                match result {
+                    Ok(r) => reply(self, SaveStatus::Done, r.warnings.join("; "), u32::try_from(r.pages).unwrap_or(u32::MAX), r.bytes),
+                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
                 }
                 None
             }

@@ -22,6 +22,7 @@ Commands:
   stamp     Put a picture (a signature, a logo) on a page
   addtext   Put text on a page
   replace   Find text in the pages and replace it with other text
+  docx      Make a Word file (.docx) of a PDF: text, headings, lists, tables, pictures
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -300,6 +301,33 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const DOCX: &str = "Usage:
+  qingpdf docx <file.pdf> [--pages <list>] -o <output.docx> [--force] [--password <password>]
+
+Make a Word file of the pages, as text that can be edited: lines are joined into paragraphs (words
+split by a hyphen at the end of a line are joined), big or bold lines become headings, bullets and
+numbers become Word lists, two columns are read one after the other, tables that are drawn with
+lines become Word tables with the text in the right cells, and the pictures are put in where they
+are (JPEG as they are, the others as PNG). Running page headers, footers and page numbers are taken
+out of the text and put in Word's header and footer. Chinese text keeps its kind of font (Song, Hei,
+Kai, Fang) and full-width punctuation as it is; a page of vertical text becomes a section of vertical
+text. A page that is only a picture (a scan) is a picture; the letters in it are not read (that is
+what the next step will do). Nothing is moved to match the page exactly: this is a Word file to work
+on, not a picture of the page.
+
+Not done: text in the page that the file has as pictures or paths, tables with no lines around them
+(their text is plain paragraphs), pictures turned by other than mirroring, and anything that is not
+text, a picture or a ruled table (drawings, charts). A file whose author did not allow copying text
+is refused unless the owner password is given. At most 5,000 pages, 8 million characters and 3,000
+different pictures; choose some pages with --pages for more.
+
+Options:
+  --pages <list>        Only these pages (default: all)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 const REPLACE: &str = "Usage:
   qingpdf replace <file.pdf> --find <text> --replace <text> [--pages <list>] -o <output.pdf> [--force] [--password <password>]
 
@@ -346,5 +374,6 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Stamp) => STAMP.to_string(),
         Some(Command::Addtext) => ADDTEXT.to_string(),
         Some(Command::Replace) => format!("{REPLACE}{PAGE_LIST}"),
+        Some(Command::Docx) => format!("{DOCX}{PAGE_LIST}"),
     }
 }

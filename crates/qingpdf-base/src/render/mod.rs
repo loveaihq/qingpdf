@@ -21,6 +21,7 @@
 mod ccitt;
 mod cff;
 mod color;
+pub mod export;
 mod fonts;
 pub use fonts::GlyphProbe;
 mod func;
@@ -31,6 +32,7 @@ mod jbig2;
 mod jpx;
 mod mq;
 mod oc;
+mod pngout;
 pub mod outline;
 mod shading;
 pub mod sysfont;

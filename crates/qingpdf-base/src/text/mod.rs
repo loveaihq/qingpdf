@@ -21,6 +21,7 @@ pub mod font;
 pub mod fontprog;
 pub(crate) mod interp;
 mod layout;
+mod page;
 pub mod scan;
 
 use std::rc::Rc;
@@ -37,6 +38,7 @@ pub use editscan::{ActualSpan, CharRec, EditScanner, FontRec, Part, Scan, Show, 
 pub use interp::Glyph;
 pub use layout::Mark;
 pub use chars::Shown;
+pub use page::{ImagePlace, PageLayout, Piece, TextLine};
 use interp::{Interp, Scope, Shared};
 
 /// Most decoded content stream bytes one page may have, all its streams together.
@@ -115,6 +117,11 @@ impl<'a> TextExtractor<'a> {
 
     /// The page's characters in drawing order (what [`layout`] builds lines from), with the ones off the page left out.
     fn page_glyphs(&mut self, page: &Page, work: Option<&Work>) -> Result<Vec<interp::Glyph>> {
+        self.page_run(page, work, false).map(|(glyphs, _)| glyphs)
+    }
+
+    /// [`TextExtractor::page_glyphs`], and when `graphics` is set the images and ruled lines the page draws.
+    fn page_run(&mut self, page: &Page, work: Option<&Work>, graphics: bool) -> Result<(Vec<interp::Glyph>, Option<Box<page::Gfx>>)> {
         if self.doc.is_locked() {
             return Err(Error::PasswordRequired);
         }
@@ -129,9 +136,13 @@ impl<'a> TextExtractor<'a> {
         if let Some(w) = work {
             interp = interp.with_work(w);
         }
+        if graphics {
+            interp.gfx = Some(Box::new(page::Gfx::default()));
+        }
         interp.run(&content, &scope, 0)?;
         let mut glyphs = std::mem::take(&mut interp.glyphs);
         let unmapped = std::mem::take(&mut interp.unmapped);
+        let gfx = interp.gfx.take();
         drop(interp);
         for name in unmapped.keys() {
             self.shared.warnings.add(format!(
@@ -145,7 +156,14 @@ impl<'a> TextExtractor<'a> {
                 g.x >= x0 - margin && g.x <= x1 + margin && g.y >= y0 - margin && g.y <= y1 + margin
             });
         }
-        Ok(glyphs)
+        Ok((glyphs, gfx))
+    }
+
+    /// The page for a word processor (5b): its lines of text (the same lines as [`TextExtractor::page_text`], each with the box,
+    /// size and style of every character), the images it shows and the ruled lines it draws. Charged to `work`.
+    pub fn page_layout(&mut self, page: &Page, work: &Work) -> Result<PageLayout> {
+        let (glyphs, gfx) = self.page_run(page, Some(work), true)?;
+        page::build(page, glyphs, gfx, work)
     }
 
     /// What went wrong without stopping the extraction so far (each kind once, at most 50),

@@ -74,10 +74,10 @@ fn cjk_of_name(raw: &[u8], squashed: &str, ordering: Option<Ordering>) -> Option
     let gbk = |b: &[u8]| has(raw, b);
     let utf8 = |s: &str| has(raw, s.as_bytes());
     // 宋体 黑体 楷体 仿宋 in GBK and in UTF-8
-    let song = gbk(b"\xCB\xCE\xCC\xE5") || utf8("宋") || any(&["simsun", "nsimsun", "stsong", "songti", "fzsong", "song"]);
-    let hei = gbk(b"\xBA\xDA\xCC\xE5") || utf8("黑") || utf8("雅黑") || any(&["simhei", "heiti", "stheiti", "yahei", "msyh", "fzhei", "dengxian", "pingfang"]);
-    let kai = gbk(b"\xBF\xAC\xCC\xE5") || utf8("楷") || any(&["simkai", "kaiti", "stkaiti", "fzkai"]);
-    let fang = gbk(b"\xB7\xC2\xCB\xCE") || utf8("仿宋") || any(&["fangsong", "simfang", "fzfangsong"]);
+    let song = gbk(b"\xCB\xCE\xCC\xE5") || utf8("宋") || any(&["simsun", "nsimsun", "stsong", "songti", "fzsong", "fzxbs", "fzss", "sourcehanserif", "notoserifcjk", "notoserifsc", "song"]);
+    let hei = gbk(b"\xBA\xDA\xCC\xE5") || utf8("黑") || utf8("雅黑") || any(&["simhei", "heiti", "stheiti", "yahei", "msyh", "fzhei", "fzht", "hanyihei", "sourcehansans", "notosanscjk", "notosanssc", "dengxian", "pingfang"]);
+    let kai = gbk(b"\xBF\xAC\xCC\xE5") || utf8("楷") || any(&["simkai", "kaiti", "stkaiti", "fzkai", "fzkt"]);
+    let fang = gbk(b"\xB7\xC2\xCB\xCE") || utf8("仿宋") || any(&["fangsong", "simfang", "fzfangsong", "fzfs"]);
     let by_name = if fang {
         Some((Script::Gb1, Cjk::Fang))
     } else if kai {

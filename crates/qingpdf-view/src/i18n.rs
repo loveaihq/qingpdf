@@ -156,11 +156,18 @@ pub enum Msg {
     NoteLineChanged,
     NoteLineNo,
     ShutdownReason,
+    ExportWord,
+    ExportTitle,
+    FilterDocx,
+    NoteExporting,
+    NoteExported,
+    NoteExportFailed,
+    NoteExportCancelled,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 141] = [
+pub const ALL: [Msg; 148] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -302,6 +309,13 @@ pub const ALL: [Msg; 141] = [
     Msg::NoteLineChanged,
     Msg::NoteLineNo,
     Msg::ShutdownReason,
+    Msg::ExportWord,
+    Msg::ExportTitle,
+    Msg::FilterDocx,
+    Msg::NoteExporting,
+    Msg::NoteExported,
+    Msg::NoteExportFailed,
+    Msg::NoteExportCancelled,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -445,6 +459,13 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::WmPage => ("This pa&ge only", "只加在当前页(&G)"),
         Msg::NoteModifyDenied => ("The file's author does not allow changing its content (the owner password is needed).", "文件作者不允许修改内容（需要所有者密码）。"),
         Msg::ShutdownReason => ("This PDF has unsaved changes.", "这个 PDF 有没保存的改动。"),
+        Msg::ExportWord => ("Export to &Word...", "导出为 Word(&W)..."),
+        Msg::ExportTitle => ("Export to Word", "导出为 Word"),
+        Msg::FilterDocx => ("Word documents", "Word 文档"),
+        Msg::NoteExporting => ("Exporting to Word...", "正在导出为 Word……"),
+        Msg::NoteExported => ("Exported to Word.", "已导出为 Word。"),
+        Msg::NoteExportFailed => ("The file could not be exported to Word:", "导出为 Word 失败："),
+        Msg::NoteExportCancelled => ("Export to Word cancelled.", "已取消导出为 Word。"),
         Msg::NoteNothingUndo => ("Nothing to undo.", "没有可撤销的。"),
         Msg::NoteNothingRedo => ("Nothing to redo.", "没有可重做的。"),
     };
@@ -517,7 +538,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 141);
+        assert_eq!(ALL.len(), 148);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

@@ -1537,7 +1537,7 @@ fn line_height(dc: isize) -> i32 {
 // --- boxes -------------------------------------------------------------------------------------------------------
 
 /// The box that picks a file: to open (`save_name` is `None`) or to write (`Some(name)`, the name the box starts with; it asks before
-/// it replaces a file, and a name without an extension gets `.pdf`).
+/// it replaces a file, and a name without an extension gets `.pdf`, or `.docx` when the name it starts with ends in that).
 fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_name: Option<&str>) -> Option<PathBuf> {
     let mut filter: Vec<u16> = Vec::new();
     for (name, pattern) in filters {
@@ -1555,7 +1555,8 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
             *slot = unit;
         }
     }
-    let def_ext = wide("pdf");
+    // (A name without an extension gets the one the box started with: .docx for a Word file, else .pdf.)
+    let def_ext = wide(if save_name.is_some_and(|n| n.to_ascii_lowercase().ends_with(".docx")) { "docx" } else { "pdf" });
     let mut ofn = OpenFileNameW {
         struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
         owner,

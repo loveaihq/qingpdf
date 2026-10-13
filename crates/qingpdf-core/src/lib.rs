@@ -5,6 +5,7 @@
 //!
 //! Spec references in comments point to ISO 32000-1:2008 unless noted.
 
+pub mod docx;
 pub mod edit;
 pub mod view;
 

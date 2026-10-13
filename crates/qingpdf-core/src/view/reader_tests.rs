@@ -738,3 +738,96 @@ fn a_second_save_adds_to_the_file_the_first_one_wrote() {
     assert!(!doc.was_repaired());
     std::fs::remove_file(&path).unwrap();
 }
+
+// --- 5b: the Word export through the engine ---
+
+fn exported_result(engine: &Engine, id: u64) -> (SaveStatus, String, u32, u64) {
+    until(engine, |e| match e {
+        Event::Exported { id: i, status, message, pages, bytes, .. } if i == id => Some((status, message, pages, bytes)),
+        _ => None,
+    })
+}
+
+/// The text of `word/document.xml` of a .docx file (the entries are found by their names in the local headers; the XML of ours is
+/// stored deflated, so it is inflated).
+fn document_xml(docx: &[u8]) -> String {
+    let at = docx.windows(17).position(|w| w == b"word/document.xml").expect("word/document.xml");
+    // The local header: the name is at 30, the data after the name and the extra field.
+    let h = at - 30;
+    let u16_at = |o: usize| usize::from(u16::from_le_bytes([docx[o], docx[o + 1]]));
+    let u32_at = |o: usize| u32::from_le_bytes([docx[o], docx[o + 1], docx[o + 2], docx[o + 3]]) as usize;
+    let (method, packed) = (u16_at(h + 8), u32_at(h + 18));
+    let data = &docx[h + 30 + u16_at(h + 26) + u16_at(h + 28)..][..packed];
+    let bytes = if method == 8 { miniz_oxide::inflate::decompress_to_vec(data).expect("deflate") } else { data.to_vec() };
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn the_document_with_its_unsaved_changes_is_exported_as_a_word_file() {
+    let engine = Engine::start(Box::new(|| {}));
+    super::tests::open(&engine, text_pdf(&["The first page|has two lines", "The second page"]));
+    // A change that is not saved: a line of text is changed; the Word file has the new text.
+    engine.add_text(1, 2, 0, [72.0, 300.0], "Added before the export", 12.0, [0, 0, 0]);
+    assert_eq!(edited_result(&engine, 2).status, EditStatus::Done);
+    let path = std::env::temp_dir().join(format!("qingpdf-export-{}.docx", std::process::id()));
+    engine.export_docx(1, 3, &path.to_string_lossy());
+    let (status, message, pages, bytes) = exported_result(&engine, 3);
+    assert_eq!(status, SaveStatus::Done, "{message}");
+    assert_eq!(pages, 2);
+    let docx = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(docx.len() as u64, bytes);
+    assert!(docx.starts_with(b"PK\x03\x04"));
+    let xml = document_xml(&docx);
+    assert!(xml.contains("The first page"), "{xml}");
+    assert!(xml.contains("Added before the export") && xml.contains("The second page"), "{xml}");
+    // The document is as it was after the export: it can be drawn, and another export gives the same file.
+    engine.render(request(4, 0, 0));
+    assert!(matches!(until(&engine, |e| if let Event::Rendered(r) = e { Some(r.status) } else { None }), RenderStatus::Complete));
+}
+
+#[test]
+fn a_cancelled_word_export_gives_no_answer_and_no_file_and_the_engine_goes_on() {
+    let engine = Engine::start(Box::new(|| {}));
+    let pages: Vec<String> = (0..600).map(|i| format!("Page {i} has some text|and a second line of it|and a third")).collect();
+    let refs: Vec<&str> = pages.iter().map(String::as_str).collect();
+    super::tests::open(&engine, text_pdf(&refs));
+    let path = std::env::temp_dir().join(format!("qingpdf-export-cancelled-{}.docx", std::process::id()));
+    engine.export_docx(1, 2, &path.to_string_lossy());
+    engine.cancel(2);
+    // The engine goes on with what comes after: when the page is drawn, the export is over, one way or the other.
+    engine.render(request(3, 0, 0));
+    let mut answer = None;
+    until(&engine, |e| match e {
+        Event::Exported { id: 2, status, .. } => {
+            answer = Some(status);
+            None
+        }
+        Event::Rendered(_) => Some(()),
+        _ => None,
+    });
+    // Stopped (the request is withdrawn: no answer and no file) or finished before the cancel was seen (done, a whole file); never
+    // a failure.
+    match answer {
+        None => assert!(!path.exists(), "a file was left behind"),
+        Some(status) => {
+            assert_eq!(status, SaveStatus::Done);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    // (No temporary file is left either.)
+    let leftovers = std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains(&format!("qingpdf-export-cancelled-{}.docx.qingpdf", std::process::id()))).count();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn an_export_that_cannot_be_written_says_so_and_leaves_no_file() {
+    let engine = Engine::start(Box::new(|| {}));
+    super::tests::open(&engine, text_pdf(&["Some text"]));
+    let missing = std::env::temp_dir().join(format!("qingpdf-no-such-folder-{}", std::process::id())).join("a.docx");
+    engine.export_docx(1, 2, &missing.to_string_lossy());
+    let (status, message, pages, _) = exported_result(&engine, 2);
+    assert_eq!((status, pages), (SaveStatus::Failed, 0));
+    assert!(!message.is_empty());
+    assert!(!missing.exists());
+}

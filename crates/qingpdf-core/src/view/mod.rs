@@ -297,6 +297,9 @@ pub enum Event {
     Edited(EditResult),
     /// The answer to [`Engine::save`].
     Saved { doc: u64, id: u64, status: SaveStatus, message: String, bytes: u64 },
+    /// The answer to [`Engine::export_docx`]: `Done` (`message` is what the conversion warned of, if anything; `pages` how many pages
+    /// are in the Word file) or `Failed` (`message` says why; no file was written).
+    Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, bytes: u64 },
 }
 
 /// What can be asked of the open document besides drawing.
@@ -321,6 +324,7 @@ pub(crate) enum Command {
     Undo { doc: u64, id: u64 },
     Redo { doc: u64, id: u64 },
     Save { doc: u64, id: u64, path: String, whole: bool },
+    Export { doc: u64, id: u64, path: String },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
@@ -579,6 +583,14 @@ impl Engine {
         let _ = self.commands.send(Command::Save { doc, id, path: path.to_string(), whole: true });
     }
 
+    /// Write the whole document, with the edits not yet saved, as a Word file (`.docx`) to `path` (5b; `qingpdf_core::docx`): into a
+    /// file of its own that replaces `path` only when it is whole. Answered by [`Event::Exported`]. A file whose author did not allow
+    /// copying text is refused unless the owner password opened it. Done at once, one at a time, before the drawing; [`Engine::cancel`]
+    /// stops it (it gets no result then).
+    pub fn export_docx(&self, doc: u64, id: u64, path: &str) {
+        let _ = self.commands.send(Command::Export { doc, id, path: path.to_string() });
+    }
+
     /// Withdraw a request: dropped if it has not started, stopped at its next operator if it is being worked on. A
     /// cancelled request gets no result (one that was finished already may still arrive; ignore it).
     pub fn cancel(&self, id: u64) {
@@ -643,6 +655,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Undo { .. }
             | Command::Redo { .. }
             | Command::Save { .. }
+            | Command::Export { .. }
             | Command::Swap
             | Command::PrintNext(_)
             | Command::Cancel(_)

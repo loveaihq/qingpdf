@@ -251,17 +251,31 @@ pub(crate) fn render_marked(glyphs: &[Glyph]) -> (String, Vec<Mark>) {
     (out, marks)
 }
 
+/// The lines of a page one by one: the text of each (without its line end) and where the text of each glyph is in it.
+pub(crate) fn lines_marked(glyphs: &[Glyph]) -> Vec<(String, Vec<Mark>)> {
+    let mut lines = Vec::new();
+    for line in build_lines(glyphs) {
+        let (mut text, mut marks) = (String::new(), Vec::new());
+        line_text(glyphs, &line, &mut text, Some(&mut marks));
+        // (`line_text` ends a line it keeps with a line feed, and keeps nothing for a line of spaces.)
+        if text.pop().is_some() {
+            lines.push((text, marks));
+        }
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::text::cmap::Uni;
 
     fn g(c: char, x: f64, y: f64) -> Glyph {
-        Glyph { uni: Uni::One(c), x, y, dx: 1.0, dy: 0.0, adv: 10.0, size: 10.0, vertical: false }
+        Glyph { uni: Uni::One(c), x, y, dx: 1.0, dy: 0.0, adv: 10.0, size: 10.0, vertical: false, style: 0 }
     }
 
     fn v(c: char, x: f64, y: f64) -> Glyph {
-        Glyph { uni: Uni::One(c), x, y, dx: 0.0, dy: -1.0, adv: 10.0, size: 10.0, vertical: true }
+        Glyph { uni: Uni::One(c), x, y, dx: 0.0, dy: -1.0, adv: 10.0, size: 10.0, vertical: true, style: 0 }
     }
 
     fn word(s: &str, x: f64, y: f64) -> Vec<Glyph> {

@@ -59,6 +59,8 @@ pub const CMD_FIND_PREV: u32 = 20;
 pub const CMD_COPY: u32 = 21;
 pub const CMD_SAVE: u32 = 30;
 pub const CMD_SAVE_AS: u32 = 31;
+/// Make a Word file of the document (5b).
+pub const CMD_EXPORT_DOCX: u32 = 29;
 pub const CMD_UNDO: u32 = 32;
 pub const CMD_REDO: u32 = 33;
 pub const CMD_REMOVE: u32 = 34;
@@ -832,6 +834,7 @@ impl App {
             },
             CMD_SAVE => self.save(),
             CMD_SAVE_AS => self.save_as(),
+            CMD_EXPORT_DOCX => self.export_word(),
             CMD_UNDO => self.undo(),
             CMD_REDO => self.redo(),
             CMD_REMOVE => self.remove_picked(),

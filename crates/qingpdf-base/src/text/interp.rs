@@ -17,6 +17,7 @@ use crate::render::work::{Work, cost};
 use super::cmap::{CMap, Uni};
 use super::font::{Font, Warnings};
 use super::editscan::{ActualSpan, CharRec, Part, Recorder, Show, ShowItem, ShowOp};
+use super::page::Gfx;
 use super::scan::{Item, Operand, Scanner};
 
 /// Most operators one page may run, forms included (a form shown many times counts every time).
@@ -149,6 +150,8 @@ pub struct Glyph {
     pub size: f64,
     /// The character was shown in vertical writing mode (the position is the top centre of its cell).
     pub vertical: bool,
+    /// The font's [`Font::style`](super::font::Font::style).
+    pub style: u8,
 }
 
 /// Resources of a page or form that text needs: the font and XObject entries by name
@@ -197,6 +200,8 @@ pub(crate) struct Shared {
     pub forms: FxMap<ObjRef, Rc<Form>>,
     pub form_bytes: usize,
     pub not_forms: FxSet<ObjRef>,
+    /// The ones of `not_forms` that are images (`page.rs` places them on the page).
+    pub image_refs: FxSet<ObjRef>,
     pub cmaps: HashMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
 }
@@ -294,6 +299,8 @@ pub(crate) struct Interp<'a> {
     /// The content stream being run (an index of the recorder's sources) and the bytes of the operator being run in it.
     cur_src: u32,
     stmt: (u32, u32),
+    /// The images and the ruled lines of the page, when the page is read for a word processor (`page.rs`).
+    pub(super) gfx: Option<Box<Gfx>>,
 }
 
 impl<'a> Interp<'a> {
@@ -317,6 +324,7 @@ impl<'a> Interp<'a> {
             rec: None,
             cur_src: 0,
             stmt: (0, 0),
+            gfx: None,
         }
     }
 
@@ -503,7 +511,11 @@ impl<'a> Interp<'a> {
                 self.begin_marked(watermark, span)?;
             }
             OP_EMC => self.end_marked(),
-            _ => {}
+            _ => {
+                if let Some(g) = self.gfx.as_mut() {
+                    g.operator(op, ops, &self.gs.ctm);
+                }
+            }
         }
         Ok(())
     }
@@ -764,6 +776,7 @@ impl<'a> Interp<'a> {
                 adv: if adv.is_finite() { adv } else { 0.0 },
                 size: if glyph_size.is_finite() { glyph_size } else { 0.0 },
                 vertical: ch.vertical.is_some(),
+                style: font.style,
             };
             self.glyphs.push(glyph);
             if let Some(rec) = self.rec.as_mut() {
@@ -791,12 +804,16 @@ impl<'a> Interp<'a> {
         let Some(Object::Ref(r)) = scope.xobjects.get(name) else { return Ok(()) };
         let r = *r;
         if self.shared.not_forms.contains(&r) {
+            self.place_image(r);
             return Ok(());
         }
         let form = match self.shared.forms.get(&r) {
             Some(f) => f.clone(),
             None => {
-                let Some(form) = self.load_form(r)? else { return Ok(()) };
+                let Some(form) = self.load_form(r)? else {
+                    self.place_image(r);
+                    return Ok(());
+                };
                 let form = Rc::new(form);
                 self.charge(cost::TEXT_FORM + form.content.len() as f64 * cost::TEXT_BYTE)?;
                 if self.shared.form_bytes.saturating_add(form.content.len()) <= MAX_FORM_CACHE_BYTES {
@@ -839,6 +856,16 @@ impl<'a> Interp<'a> {
         result
     }
 
+    /// An XObject that is not a form was drawn: when it is an image, the page remembers where.
+    fn place_image(&mut self, r: ObjRef) {
+        if self.hidden == 0
+            && self.shared.image_refs.contains(&r)
+            && let Some(g) = self.gfx.as_mut()
+        {
+            g.image(r, self.gs.ctm);
+        }
+    }
+
     /// Read a form XObject; `None` (and remembered) when it is not a form or cannot be read.
     fn load_form(&mut self, r: ObjRef) -> Result<Option<Form>> {
         let obj = match self.doc.get(r) {
@@ -860,6 +887,9 @@ impl<'a> Interp<'a> {
         };
         if !is_form {
             self.shared.not_forms.insert(r);
+            if s.dict.get_name("Subtype").is_some_and(|n| n == "Image") {
+                self.shared.image_refs.insert(r);
+            }
             return Ok(None);
         }
         let content = match self.doc.decode_stream(&s) {
@@ -899,7 +929,7 @@ fn is_watermark(dict: &[u8]) -> bool {
 }
 
 /// The last `N` operands as numbers.
-fn numbers<const N: usize>(ops: &[Operand]) -> Option<[f64; N]> {
+pub(super) fn numbers<const N: usize>(ops: &[Operand]) -> Option<[f64; N]> {
     let tail = ops.get(ops.len().checked_sub(N)?..)?;
     let mut out = [0.0; N];
     for (slot, o) in out.iter_mut().zip(tail) {
