@@ -14,7 +14,7 @@ impl App {
     /// The width of the bookmarks beside the pages (0 when there are none, or they are hidden).
     pub(super) fn sidebar_width(&self) -> i64 {
         if self.show_outline && !self.outline.is_empty() && self.bench.is_none() {
-            self.px(SIDEBAR_WIDTH).min(self.client_w / 2)
+            (self.px(self.sidebar_pref) + self.px(SPLIT_GAP)).min(self.client_w / 2)
         } else {
             0
         }
@@ -22,7 +22,8 @@ impl App {
 
     /// Where the tree of bookmarks and the find box go in the window now.
     pub(super) fn chrome(&self) -> Vec<Action> {
-        let side = Rect { x: 0, y: 0, w: clamp32(self.view_x), h: clamp32(self.view_h) };
+        // The tree stops short of the pages by the strip that is dragged to change its width.
+        let side = Rect { x: 0, y: 0, w: clamp32((self.view_x - self.px(SPLIT_GAP)).max(0)), h: clamp32(self.view_h) };
         let find = self.find_open.then(|| self.find_rect());
         vec![Action::Sidebar(side), Action::Find(find)]
     }
@@ -160,6 +161,9 @@ impl App {
     }
 
     pub(super) fn cursor_over(&self, x: i64, y: i64) -> Cursor {
+        if self.split_drag.is_some() || self.on_split(x, y) {
+            return Cursor::SizeWE;
+        }
         if let Some(shape) = self.annotation_cursor()
             && self.page_at_point(x, y).is_some()
         {

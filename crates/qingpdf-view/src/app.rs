@@ -5,6 +5,7 @@
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
 //! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans).
 
+mod chrome;
 mod editing;
 mod forms;
 mod menus;
@@ -25,13 +26,13 @@ use qingpdf_core::view::{Engine, Event as EngineEvent, Link, OpenFailure, Opened
 use crate::bench::Bench;
 use crate::cache::{BitmapCache, Entry, Focus, Key};
 use crate::find::SearchState;
-use crate::i18n::{self, Lang, Msg, t};
+use crate::i18n::{self, Lang, LangChoice, Msg, t};
 use crate::layout::Layout;
 use crate::recent;
 use crate::sched::{self, Scene, Want};
 use crate::select::Selection;
 use crate::tiles;
-use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, vk};
+use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
 use qingpdf_core::view::MarkupKind;
 use crate::zoom::{self, ZoomMode};
 
@@ -99,6 +100,16 @@ pub const CMD_WIDTH_BASE: u32 = 60;
 pub const CMD_SIZE_BASE: u32 = 70;
 /// The files in the list of recent ones are commands from here, one for each.
 pub const CMD_RECENT_BASE: u32 = 100;
+/// The page before and the page after the one in view, the toolbar, the languages, and the items of the menu on the page.
+pub const CMD_PREV_PAGE: u32 = 110;
+pub const CMD_NEXT_PAGE: u32 = 111;
+pub const CMD_TOOLBAR: u32 = 112;
+pub const CMD_LANG_SYSTEM: u32 = 113;
+pub const CMD_LANG_ZH: u32 = 114;
+pub const CMD_LANG_EN: u32 = 115;
+pub const CMD_CTX_HIGHLIGHT: u32 = 116;
+pub const CMD_CTX_NOTE: u32 = 117;
+pub const CMD_CTX_SELECT_ALL: u32 = 118;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
@@ -126,11 +137,13 @@ const DRAG_MS: u32 = 50;
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
 const MARGIN: i64 = 12;
-const STATUS_HEIGHT: i64 = 26;
+/// The strip between the bookmarks and the pages that can be dragged to change the bookmarks' width, and the usual width of them (at 96 dpi).
+const SPLIT_GAP: i64 = 6;
 const WHEEL_STEP: i64 = 96;
 const LINE_STEP: i64 = 48;
 /// The width of the bookmarks beside the pages.
 const SIDEBAR_WIDTH: i64 = 260;
+const SPLIT_COLOR: u32 = 0xA0A0A0;
 /// The find box: the edit box, the room for the count to its left, the gap to the top and right edges.
 const FIND_EDIT_W: i64 = 220;
 const FIND_EDIT_H: i64 = 24;
@@ -146,7 +159,6 @@ const STATUS_FG: u32 = 0x202020;
 const NOTICE_BG: u32 = 0xFFF1B8;
 const NOTICE_FG: u32 = 0x6B4E00;
 const HINT_FG: u32 = 0x505050;
-const NOTE_FG: u32 = 0x7A2E00;
 const HIT_COLOR: u32 = 0xFFD400;
 const HIT_ALPHA: u8 = 120;
 const CURRENT_HIT_COLOR: u32 = 0xFF7A00;
@@ -258,6 +270,27 @@ pub struct App {
     /// The run of text recognition that is going on, if one is; and (for tests) the recogniser to use instead of Windows' own.
     ocr: Option<crate::ocr::Run>,
     pub(crate) ocr_test_opener: Option<crate::ocr::Opener>,
+
+    // --- the interface (2026-10-14) ---
+    /// What the person chose in View > Language, and the language of Windows (what "follow the system" means).
+    lang_choice: LangChoice,
+    system_lang: Lang,
+    /// The toolbar is shown (View > Toolbar); it is told to the window with the next answer when `toolbar_dirty`.
+    toolbar_on: bool,
+    toolbar_dirty: bool,
+    /// What the toolbar and the status bar were last told to say, so that they are told only when it changes.
+    last_toolbar: Option<ToolbarState>,
+    last_status: Option<StatusText>,
+    /// The width of the bookmarks the person has made them (at 96 dpi), and the start of a drag of their edge: where the pointer was
+    /// and the width then.
+    sidebar_pref: i64,
+    split_drag: Option<(i64, i64)>,
+    /// The page and the place on it (points) the menu on the page was opened at, for "add note here" and "select all on the page".
+    ctx_at: Option<(u32, f32, f32)>,
+    /// A double click, a triple click or "select all" that waits for the characters of its page.
+    pending_select: Option<chrome::PendingSelect>,
+    /// Whether changes to the settings are written to the file (the tests do not).
+    pub(crate) persist: bool,
 }
 
 impl App {
@@ -325,6 +358,17 @@ impl App {
             edit: EditState::new(author),
             ocr: None,
             ocr_test_opener: None,
+            lang_choice: LangChoice::System,
+            system_lang: lang,
+            toolbar_on: true,
+            toolbar_dirty: true,
+            last_toolbar: None,
+            last_status: None,
+            sidebar_pref: SIDEBAR_WIDTH,
+            split_drag: None,
+            ctx_at: None,
+            pending_select: None,
+            persist: true,
         }
     }
 
@@ -335,10 +379,6 @@ impl App {
 
     fn px(&self, at96: i64) -> i64 {
         at96 * i64::from(self.dpi) / 96
-    }
-
-    fn status_height(&self) -> i64 {
-        self.px(STATUS_HEIGHT)
     }
 
     fn new_id(&mut self) -> u64 {
@@ -411,6 +451,8 @@ impl App {
         self.notices.clear();
         self.links.clear();
         self.boxes.clear();
+        // A double click that waited for the characters of a page of the file that has just gone is not for this one.
+        self.pending_select = None;
         self.outline.clear();
         self.press = None;
         self.selection = None;
@@ -860,12 +902,12 @@ impl App {
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
-            CMD_TOOL_HIGHLIGHT => self.set_tool(Tool::Markup(MarkupKind::Highlight)),
+            CMD_TOOL_HIGHLIGHT => self.toggle_tool(Tool::Markup(MarkupKind::Highlight)),
             CMD_TOOL_UNDERLINE => self.set_tool(Tool::Markup(MarkupKind::Underline)),
             CMD_TOOL_STRIKE => self.set_tool(Tool::Markup(MarkupKind::StrikeOut)),
             CMD_TOOL_SQUIGGLY => self.set_tool(Tool::Markup(MarkupKind::Squiggly)),
-            CMD_TOOL_INK => self.set_tool(Tool::Ink),
-            CMD_TOOL_NOTE => self.set_tool(Tool::Note),
+            CMD_TOOL_INK => self.toggle_tool(Tool::Ink),
+            CMD_TOOL_NOTE => self.toggle_tool(Tool::Note),
             CMD_TOOL_EDITTEXT => self.set_tool(Tool::EditText),
             c if (CMD_COLOR_BASE..CMD_COLOR_BASE + 6).contains(&c) => self.set_color((c - CMD_COLOR_BASE) as usize),
             c if (CMD_WIDTH_BASE..CMD_WIDTH_BASE + 4).contains(&c) => self.set_width((c - CMD_WIDTH_BASE) as usize),
@@ -878,6 +920,15 @@ impl App {
             CMD_FIT_PAGE => self.set_zoom(ZoomMode::FitPage, self.zoom, None),
             CMD_ACTUAL => self.set_zoom(ZoomMode::Custom, zoom::ACTUAL_SIZE, None),
             CMD_ROTATE => self.rotate(1),
+            CMD_PREV_PAGE => self.step_page(false),
+            CMD_NEXT_PAGE => self.step_page(true),
+            CMD_TOOLBAR => self.toggle_toolbar(),
+            CMD_LANG_SYSTEM => self.set_language(LangChoice::System),
+            CMD_LANG_ZH => self.set_language(LangChoice::Zh),
+            CMD_LANG_EN => self.set_language(LangChoice::En),
+            CMD_CTX_HIGHLIGHT => self.highlight_selection(),
+            CMD_CTX_NOTE => self.note_here(),
+            CMD_CTX_SELECT_ALL => self.select_all_here(),
             CMD_BOOKMARKS => self.toggle_outline(),
             CMD_COPY => self.copy_selection(),
             CMD_GOTO if self.doc.is_some() => {
@@ -919,6 +970,8 @@ impl App {
                 vk::NUM0 | vk::NUMPAD0 => self.command(CMD_ACTUAL),
                 vk::NUM1 => self.command(CMD_FIT_WIDTH),
                 vk::NUM2 => self.command(CMD_FIT_PAGE),
+                vk::PRIOR => self.command(CMD_PREV_PAGE),
+                vk::NEXT => self.command(CMD_NEXT_PAGE),
                 _ => Vec::new(),
             };
         }
@@ -1024,26 +1077,6 @@ impl App {
         }
         drew
     }
-
-    /// The status bar: the page, a note, the zoom.
-    fn draw_status(&self, p: &mut dyn Painter, full_w: i32) {
-        let bar = clamp32(self.status_height());
-        p.fill_rect(Rect { x: 0, y: clamp32(self.view_h), w: full_w, h: bar }, STATUS_BG);
-        if self.doc.is_none() {
-            return;
-        }
-        let y = clamp32(self.view_h) + (bar - p.line_height()) / 2;
-        let page_text = i18n::page_of(self.lang, self.current_page() + 1, self.page_count());
-        let x = clamp32(self.px(10));
-        p.text(x, y, &page_text, STATUS_FG);
-        let z = format!("{}%", (f64::from(self.zoom) / 10.0).round() as u32);
-        let w = p.text_width(&z);
-        p.text(full_w - w - clamp32(self.px(10)), y, &z, STATUS_FG);
-        if let Some(note) = &self.note {
-            let from = x + p.text_width(&page_text) + clamp32(self.px(24));
-            p.text(from, y, note, NOTE_FG);
-        }
-    }
 }
 
 fn clamp32(v: i64) -> i32 {
@@ -1070,7 +1103,7 @@ impl Handler for App {
                 self.client_w = i64::from(w);
                 self.view_x = self.sidebar_width();
                 self.view_w = (i64::from(w) - self.view_x).max(0);
-                self.view_h = (i64::from(h) - self.status_height()).max(0);
+                self.view_h = i64::from(h).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
                 let mut actions = self.after_view_change(false);
@@ -1158,7 +1191,13 @@ impl Handler for App {
                 _ => Vec::new(),
             },
             Event::Text { .. } => Vec::new(),
-            Event::MouseDown { x, y, ctrl, shift } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift),
+            Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
+            Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),
+            Event::FindFocus => self.find_focused(),
+            Event::PageBox(text) => match crate::toolbar::parse_page_box(&text, self.page_count()) {
+                Some(page) => self.go_to_page(page),
+                None => Vec::new(),
+            },
             Event::MouseMove { x, y } => self.mouse_move(i64::from(x), i64::from(y)),
             Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
             Event::MouseLost => self.mouse_lost(),
@@ -1183,6 +1222,7 @@ impl Handler for App {
             self.menus_dirty = false;
             actions.push(Action::SetMenus(self.menus()));
         }
+        actions.extend(self.chrome_updates());
         if let Some(mut bench) = self.bench.take() {
             actions.extend(bench.step(self));
             self.bench = Some(bench);
@@ -1191,8 +1231,13 @@ impl Handler for App {
     }
 
     fn paint(&mut self, p: &mut dyn Painter) -> bool {
-        let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h + self.status_height()));
+        let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h));
         p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, BACKGROUND);
+        if self.view_x > 0 {
+            // The edge of the bookmarks, which can be dragged: a thin line in the middle of its strip.
+            let line = clamp32(self.px(1).max(1));
+            p.fill_rect(Rect { x: clamp32(self.view_x - self.px(SPLIT_GAP) / 2), y: 0, w: line, h: full_h }, SPLIT_COLOR);
+        }
         let mut drew = false;
         match &self.doc {
             Some(doc) => {
@@ -1219,14 +1264,17 @@ impl Handler for App {
             // The speed test looks at what was drawn after this picture is on the screen.
             (self.wake)();
         }
-        self.draw_status(p, full_w);
         // The speed test stops its clock when the page is drawn; it does not put the pictures before that on the
         // screen (Windows sometimes holds a BitBlt to the screen for half a second, whatever is in it).
         self.bench.is_none() || self.sharp_on_screen
     }
 
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
-        self.cursor_over(i64::from(x), i64::from(y))
+        let (x, y) = (i64::from(x), i64::from(y));
+        match self.cursor_over(x, y) {
+            Cursor::Arrow => self.text_cursor(x, y),
+            shape => shape,
+        }
     }
 
     fn unsaved_reason(&self) -> Option<String> {

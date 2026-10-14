@@ -117,7 +117,8 @@ pub enum Event {
     /// The answer to [`Action::AskText`]: what was typed, or none if it was cancelled.
     Text { tag: u32, text: Option<String> },
     /// The left button went down, moved (with it down) or came up, at this place in the client area.
-    MouseDown { x: i32, y: i32, ctrl: bool, shift: bool },
+    /// `clicks` says which click in a row this is (1, 2 or 3: a double click selects a word, a triple click a line).
+    MouseDown { x: i32, y: i32, ctrl: bool, shift: bool, clicks: u8 },
     MouseMove { x: i32, y: i32 },
     MouseUp { x: i32, y: i32 },
     /// The window lost the mouse while the button was down (another window took it).
@@ -147,6 +148,12 @@ pub enum Event {
     FieldDone { text: String, exit: FieldExit },
     /// The answer to [`Action::Choose`]: the number of the item chosen, or none if the list was dismissed.
     Chosen(Option<usize>),
+    /// The right button was pressed (or the menu key) at this place of the page area: the reader may answer with an [`Action::ContextMenu`].
+    ContextMenu { x: i32, y: i32 },
+    /// The keyboard went into the search box of the toolbar.
+    FindFocus,
+    /// Enter in the page number box of the toolbar: what is in it.
+    PageBox(String),
 }
 
 /// How the person left the box a form field or a text box is typed in.
@@ -238,6 +245,8 @@ pub enum Cursor {
     Cross,
     /// Marking text.
     Text,
+    /// Over the edge of the bookmarks, which can be dragged to make them wider or narrower.
+    SizeWE,
 }
 
 /// What the reader asks the window to do (after it has finished with an event).
@@ -288,6 +297,50 @@ pub enum Action {
     FieldMove(Rect),
     /// Show a list of choices at this place of the client area; the answer is [`Event::Chosen`].
     Choose { items: Vec<String>, selected: Option<usize>, at: (i32, i32) },
+    /// Show a menu at this place of the page area; the item chosen comes as [`Event::Command`].
+    ContextMenu { entries: Vec<MenuEntry>, at: (i32, i32) },
+    /// The toolbar: its buttons and words (put again when the language changes), and whether it is shown.
+    Toolbar(ToolbarSpec),
+    /// What is greyed or pressed in the toolbar, and what its page box says.
+    ToolbarState(ToolbarState),
+    /// The words of the status bar.
+    Status(StatusText),
+}
+
+/// One thing in the toolbar, in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolItem {
+    /// A button that does the menu command `cmd`. `glyph` is its picture in the icon font of Windows, `label` is what it says when
+    /// there is no such font, `tip` the words of its tooltip (with the shortcut). A `toggle` stays pressed while its tool is in use.
+    Button { cmd: u32, glyph: char, label: String, tip: String, toggle: bool },
+    Separator,
+    /// The box with the page number ("3 / 120"); Enter in it goes to that page.
+    PageBox,
+    /// The box for the words to find; `hint` is what it says while it is empty.
+    SearchBox { hint: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolbarSpec {
+    pub visible: bool,
+    pub items: Vec<ToolItem>,
+}
+
+/// The state of the toolbar: for each button its command, whether it can be used and whether it is pressed; whether the boxes can be
+/// used; and what the page box says.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolbarState {
+    pub buttons: Vec<(u32, bool, bool)>,
+    pub boxes_enabled: bool,
+    pub page_text: String,
+}
+
+/// The three parts of the status bar.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatusText {
+    pub page: String,
+    pub note: String,
+    pub zoom: String,
 }
 
 #[derive(Debug)]

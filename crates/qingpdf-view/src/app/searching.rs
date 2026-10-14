@@ -5,9 +5,10 @@ use qingpdf_core::view::{SearchHit, SearchStatus};
 use super::*;
 
 impl App {
-    /// The find box (the edit control) in the window: at the top right of the pages.
+    /// The find box (the edit control) in the window: at the top right of the pages. With the toolbar the box is the toolbar's, and
+    /// only the count is shown over the pages: the rectangle has no width then.
     pub(super) fn find_rect(&self) -> Rect {
-        let (w, h, m) = (self.px(FIND_EDIT_W), self.px(FIND_EDIT_H), self.px(FIND_MARGIN));
+        let (w, h, m) = (if self.toolbar_visible() { 0 } else { self.px(FIND_EDIT_W) }, self.px(FIND_EDIT_H), self.px(FIND_MARGIN));
         Rect { x: clamp32((self.view_x + self.view_w - w - m).max(self.view_x)), y: clamp32(m), w: clamp32(w), h: clamp32(h) }
     }
 
@@ -24,7 +25,7 @@ impl App {
         actions
     }
 
-    fn close_find(&mut self) -> Vec<Action> {
+    pub(super) fn close_find(&mut self) -> Vec<Action> {
         self.find_open = false;
         if let Some(s) = self.search.take() {
             self.engine.cancel(s.id);
@@ -155,11 +156,6 @@ impl App {
         if !self.find_open {
             return;
         }
-        let e = self.find_rect();
-        let (pad, label_w) = (clamp32(self.px(8)), clamp32(self.px(FIND_LABEL_W)));
-        let panel = Rect { x: (e.x - label_w - pad).max(clamp32(self.view_x)), y: e.y - pad / 2, w: e.w + label_w + 2 * pad, h: e.h + pad };
-        p.fill_rect(Rect { x: panel.x - 1, y: panel.y - 1, w: panel.w + 2, h: panel.h + 2 }, BORDER);
-        p.fill_rect(panel, STATUS_BG);
         let label = match &self.search {
             None => String::new(),
             Some(s) if s.total() == 0 => t(self.lang, if s.running { Msg::FindSearching } else { Msg::FindNone }).to_string(),
@@ -168,6 +164,17 @@ impl App {
                 i18n::found(self.lang, s.current.map_or(0, |c| s.number_of(c)), s.total(), s.limit, progress)
             }
         };
+        // With the toolbar the count is all there is to show, and there is nothing to show before a search.
+        if label.is_empty() && self.toolbar_visible() {
+            return;
+        }
+        let e = self.find_rect();
+        // With the toolbar the panel is as wide as the count, and sits against the right side of the pages.
+        let label_w = if self.toolbar_visible() { p.text_width(&label) } else { clamp32(self.px(FIND_LABEL_W)) };
+        let pad = clamp32(self.px(8));
+        let panel = Rect { x: (e.x - label_w - pad).max(clamp32(self.view_x)), y: e.y - pad / 2, w: e.w + label_w + 2 * pad, h: e.h + pad };
+        p.fill_rect(Rect { x: panel.x - 1, y: panel.y - 1, w: panel.w + 2, h: panel.h + 2 }, BORDER);
+        p.fill_rect(panel, STATUS_BG);
         p.text(panel.x + pad, e.y + (e.h - p.line_height()) / 2, &label, STATUS_FG);
     }
 }

@@ -347,6 +347,28 @@ impl App {
         Vec::new()
     }
 
+    /// The menu on the page: mark the selected text as highlighted.
+    pub(super) fn highlight_selection(&mut self) -> Vec<Action> {
+        self.apply_markup(MarkupKind::Highlight)
+    }
+
+    /// The menu on the page: a note where the menu was opened (the text is asked for, as when a note is put with the tool).
+    pub(super) fn note_here(&mut self) -> Vec<Action> {
+        let Some(at) = self.ctx_at.take() else { return Vec::new() };
+        if !self.rights.annotate {
+            return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
+        }
+        self.edit.note_at = Some(at);
+        vec![Action::AskText {
+            tag: TAG_NOTE,
+            title: t(self.lang, Msg::NoteTitle).to_string(),
+            prompt: t(self.lang, Msg::NotePrompt).to_string(),
+            secret: false,
+            ok: t(self.lang, Msg::Ok).to_string(),
+            cancel: t(self.lang, Msg::Cancel).to_string(),
+        }]
+    }
+
     /// A drag with a marking tool is over: mark the text that was dragged over.
     pub(super) fn drag_finished(&mut self) -> Vec<Action> {
         match self.edit.tool {
@@ -813,14 +835,14 @@ mod tests {
         // A note where the page is, with text.
         app.event(Event::Command(CMD_TOOL_NOTE));
         let at = (300, 200);
-        app.event(Event::MouseDown { x: at.0, y: at.1, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: at.0, y: at.1, ctrl: false, shift: false, clicks: 1 });
         let ask = app.event(Event::MouseUp { x: at.0, y: at.1 });
         assert!(ask.iter().any(|a| matches!(a, Action::AskText { tag: TAG_NOTE, .. })), "no question about the text of the note");
         app.event(Event::Text { tag: TAG_NOTE, text: Some("a note".to_string()) });
         pump(&mut app, "the note", |a| a.edit.dirty && a.edit.annots.get(&0).is_some_and(|l| l.iter().any(|i| i.subtype == "Text")));
         // Back to selecting, click on the icon: it is picked.
         app.event(Event::Command(CMD_TOOL_SELECT));
-        app.event(Event::MouseDown { x: at.0 + 6, y: at.1 + 6, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: at.0 + 6, y: at.1 + 6, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseUp { x: at.0 + 6, y: at.1 + 6 });
         assert!(app.has_picked(), "the note under the pointer was not picked");
         // Taken out, undone (it is back), taken out again, saved (the file is then written and the title is clean).
@@ -837,7 +859,7 @@ mod tests {
         let quit = app.event(Event::CloseRequested);
         assert!(quit.iter().any(|a| matches!(a, Action::Quit)));
         app.event(Event::Command(CMD_TOOL_NOTE));
-        app.event(Event::MouseDown { x: 500, y: 300, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: 500, y: 300, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseUp { x: 500, y: 300 });
         app.event(Event::Text { tag: TAG_NOTE, text: Some("second".to_string()) });
         pump(&mut app, "the second note", |a| a.edit.dirty);

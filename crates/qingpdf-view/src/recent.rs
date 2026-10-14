@@ -101,8 +101,7 @@ pub fn forget(list: &mut Vec<Entry>, path: &str) {
 
 /// Where the list is kept: `%APPDATA%\qingpdf\recent.txt` (none if there is no `APPDATA`).
 pub fn file_path() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA")?;
-    (!base.is_empty()).then(|| Path::new(&base).join("qingpdf").join("recent.txt"))
+    Some(crate::settings::data_dir()?.join("recent.txt"))
 }
 
 /// The list in the file at `path`: empty if there is none or it cannot be read; at most [`MAX_FILE_BYTES`] of it are read.

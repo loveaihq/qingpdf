@@ -731,7 +731,7 @@ mod tests {
     }
 
     fn click(app: &mut App, at: (i32, i32)) -> Vec<Action> {
-        app.event(Event::MouseDown { x: at.0, y: at.1, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: at.0, y: at.1, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseUp { x: at.0, y: at.1 })
     }
 
@@ -796,7 +796,7 @@ mod tests {
         // A text box: drag out a box, type Chinese, leave it by clicking outside.
         app.event(Event::Command(CMD_TOOL_TEXTBOX));
         let r = app.window_rect(0, [150.0, 30.0, 150.0, 30.0]).unwrap();
-        app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseMove { x: r.x + 60, y: r.y + 30 });
         let boxed = app.event(Event::MouseUp { x: r.x + 120, y: r.y + 60 });
         assert!(boxed.iter().any(|a| matches!(a, Action::FieldEdit(Some(b)) if b.multiline && b.rect.w >= 100)), "{boxed:?}");
@@ -815,13 +815,13 @@ mod tests {
         };
         assert!(((before[2] - before[0]) / (before[3] - before[1]) - 2.0).abs() < 0.01, "the frame has the shape of the picture: {before:?}");
         let inside = app.window_rect(page, before).map(|r| (r.x + r.w / 2, r.y + r.h / 2)).unwrap();
-        app.event(Event::MouseDown { x: inside.0, y: inside.1, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: inside.0, y: inside.1, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseMove { x: inside.0 + 40, y: inside.1 + 30 });
         app.event(Event::MouseUp { x: inside.0 + 40, y: inside.1 + 30 });
         let moved = app.edit.forms.stamp.as_ref().unwrap().rect;
         assert!(moved[0] > before[0] && moved[1] > before[1] && ((moved[2] - moved[0]) - (before[2] - before[0])).abs() < 0.01, "{before:?} -> {moved:?}");
         let corner = app.window_rect(page, moved).map(|r| (r.x + r.w, r.y + r.h)).unwrap();
-        app.event(Event::MouseDown { x: corner.0, y: corner.1, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: corner.0, y: corner.1, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseMove { x: corner.0 - 30, y: corner.1 - 5 });
         app.event(Event::MouseUp { x: corner.0 - 30, y: corner.1 - 5 });
         let smaller = app.edit.forms.stamp.as_ref().unwrap().rect;
@@ -888,7 +888,7 @@ mod tests {
         // Text: the text box tool, a click, Chinese typed; it goes into the page, not into an annotation.
         app.event(Event::Command(CMD_INS_TEXT));
         let r = app.window_rect(0, [40.0, 60.0, 40.0, 60.0]).unwrap();
-        app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false });
+        app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false, clicks: 1 });
         app.event(Event::MouseUp { x: r.x, y: r.y });
         app.event(Event::FieldDone { text: "你好，世界".to_string(), exit: FieldExit::Blur });
         pump(&mut app, "the text", |a| a.edit.can_undo);

@@ -13,6 +13,44 @@ impl Lang {
     }
 }
 
+/// What the person chose in View > Language: the language of Windows, or one of the two.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LangChoice {
+    #[default]
+    System,
+    Zh,
+    En,
+}
+
+impl LangChoice {
+    /// The language to show: the chosen one, or `system` (the language of Windows) when the choice is to follow it.
+    pub fn resolve(self, system: Lang) -> Lang {
+        match self {
+            LangChoice::System => system,
+            LangChoice::Zh => Lang::Zh,
+            LangChoice::En => Lang::En,
+        }
+    }
+
+    /// The word kept in the settings file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LangChoice::System => "system",
+            LangChoice::Zh => "zh",
+            LangChoice::En => "en",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<LangChoice> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(LangChoice::System),
+            "zh" => Some(LangChoice::Zh),
+            "en" => Some(LangChoice::En),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Msg {
     File,
@@ -194,11 +232,21 @@ pub enum Msg {
     OcrNoLanguage,
     OcrAvailable,
     OcrNoneAvailable,
+    PrevPage,
+    NextPage,
+    ShowToolbar,
+    LanguageMenu,
+    LangSystem,
+    LangChinese,
+    LangEnglish,
+    CtxHighlight,
+    CtxNote,
+    CtxSelectAll,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 179] = [
+pub const ALL: [Msg; 189] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -378,6 +426,16 @@ pub const ALL: [Msg; 179] = [
     Msg::OcrNoLanguage,
     Msg::OcrAvailable,
     Msg::OcrNoneAvailable,
+    Msg::PrevPage,
+    Msg::NextPage,
+    Msg::ShowToolbar,
+    Msg::LanguageMenu,
+    Msg::LangSystem,
+    Msg::LangChinese,
+    Msg::LangEnglish,
+    Msg::CtxHighlight,
+    Msg::CtxNote,
+    Msg::CtxSelectAll,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -561,6 +619,16 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::OcrNoneAvailable => ("none", "没有"),
         Msg::NoteNothingUndo => ("Nothing to undo.", "没有可撤销的。"),
         Msg::NoteNothingRedo => ("Nothing to redo.", "没有可重做的。"),
+        Msg::PrevPage => ("Pre&vious page	Ctrl+PgUp", "上一页(&U)	Ctrl+PgUp"),
+        Msg::NextPage => ("&Next page	Ctrl+PgDn", "下一页(&N)	Ctrl+PgDn"),
+        Msg::ShowToolbar => ("&Toolbar", "工具栏(&T)"),
+        Msg::LanguageMenu => ("&Language", "语言(&L)"),
+        Msg::LangSystem => ("Follow &system", "跟随系统(&S)"),
+        Msg::LangChinese => ("中文", "中文"),
+        Msg::LangEnglish => ("English", "English"),
+        Msg::CtxHighlight => ("&Highlight selection", "高亮所选文字(&H)"),
+        Msg::CtxNote => ("Add &note here", "在此添加便签(&N)"),
+        Msg::CtxSelectAll => ("Select &all on this page", "选择本页全部文字(&A)"),
     };
     match lang {
         Lang::En => en,
@@ -623,7 +691,8 @@ mod tests {
     fn every_message_has_text_in_both_languages() {
         for m in ALL {
             assert!(!t(Lang::En, m).is_empty() && !t(Lang::Zh, m).is_empty(), "{m:?}");
-            assert!(t(Lang::En, m).is_ascii(), "{m:?}");
+            // The names of the languages are written in each language itself, in every language.
+            assert!(t(Lang::En, m).is_ascii() || m == Msg::LangChinese, "{m:?}");
         }
         // The Chinese ones are Chinese (except the name of the program).
         for m in ALL {
@@ -631,7 +700,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 179);
+        assert_eq!(ALL.len(), 189);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");
@@ -656,6 +725,19 @@ mod tests {
         assert_eq!(Lang::from_langid(0x0404), Lang::Zh);
         assert_eq!(Lang::from_langid(0x0409), Lang::En);
         assert_eq!(Lang::from_langid(0), Lang::En);
+    }
+
+    #[test]
+    fn a_chosen_language_wins_over_the_system_one() {
+        assert_eq!(LangChoice::System.resolve(Lang::Zh), Lang::Zh);
+        assert_eq!(LangChoice::System.resolve(Lang::En), Lang::En);
+        assert_eq!(LangChoice::Zh.resolve(Lang::En), Lang::Zh);
+        assert_eq!(LangChoice::En.resolve(Lang::Zh), Lang::En);
+        for c in [LangChoice::System, LangChoice::Zh, LangChoice::En] {
+            assert_eq!(LangChoice::parse(c.as_str()), Some(c));
+        }
+        assert_eq!(LangChoice::parse(" ZH "), Some(LangChoice::Zh));
+        assert_eq!(LangChoice::parse("fr"), None);
     }
 
     #[test]

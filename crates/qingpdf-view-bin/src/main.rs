@@ -88,7 +88,12 @@ fn main() {
     if bench_file.is_some() || print_test.is_some() || ocr_test.is_some() {
         win32::attach_console();
     }
-    let lang = Lang::from_langid(win32::ui_language());
+    let system_lang = Lang::from_langid(win32::ui_language());
+    // What was kept between runs (the language, the toolbar, the width of the bookmarks, the window's place). The hidden tests start
+    // from the usual and keep nothing.
+    let tests = bench_file.is_some() || print_test.is_some() || ocr_test.is_some();
+    let kept = if tests { settings::Settings::default() } else { settings::load_all() };
+    let lang = kept.lang.resolve(system_lang);
     if let Some((file, out, pages)) = ocr_test {
         let chinese = ocr_chinese.unwrap_or(lang == Lang::Zh);
         std::process::exit(qingpdf_view::ocr::ocr_test(&file.to_string_lossy(), &out.to_string_lossy(), pages, chinese));
@@ -99,11 +104,12 @@ fn main() {
     let (work_w, work_h) = win32::work_area_size();
     let screen = bench_size.unwrap_or((work_w, work_h));
     let max_view_pixels = u64::try_from(screen.0.max(0)).unwrap_or(0) * u64::try_from(screen.1.max(0)).unwrap_or(0);
-    let code = win32::run("qingpdf", &menus, bench_size, move |waker| {
+    let code = win32::run("qingpdf", &menus, bench_size, kept.window.filter(|_| !tests), !tests, move |waker| {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker.wake());
         // Who the annotations are by: the name that was chosen, else the Windows user's.
-        let author = settings::load().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
-        let mut app = App::new(lang, wake, started, max_view_pixels, author);
+        let author = kept.author.clone().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
+        let mut app = App::new(system_lang, wake, started, max_view_pixels, author);
+        app.apply_settings(&kept);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));
             app.open_when_ready(file);

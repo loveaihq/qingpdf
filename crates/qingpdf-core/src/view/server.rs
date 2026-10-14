@@ -933,28 +933,30 @@ impl Server<'_> {
 
     fn char_boxes(&mut self, id: u64, page: u32) -> Step {
         let doc = self.doc_id;
-        let reply = move |status: TextStatus, message: &str, boxes: Vec<[f32; 4]>| {
-            Event::CharBoxes(CharBoxes { doc, id, page, status, message: message.to_string(), boxes })
+        let reply = move |status: TextStatus, message: &str, boxes: Vec<[f32; 4]>, text: String| {
+            Event::CharBoxes(CharBoxes { doc, id, page, status, message: message.to_string(), boxes, text })
         };
         // Where the characters are, without what they are, is also what marking text needs: a file that forbids copying and allows
         // annotating gives the positions (copying stays refused).
         if !self.rights.copy && !self.rights.annotate {
-            self.tell(reply(TextStatus::Denied, DENIED_COPY, Vec::new()));
+            self.tell(reply(TextStatus::Denied, DENIED_COPY, Vec::new(), String::new()));
             return Step::Done;
         }
         let work = self.meter();
         match self.page_chars(page, &work, false) {
             None => {
-                self.tell(reply(TextStatus::Failed, "there is no such page", Vec::new()));
+                self.tell(reply(TextStatus::Failed, "there is no such page", Vec::new(), String::new()));
                 Step::Done
             }
             Some(Err(Error::Cancelled)) => Step::Cancelled,
             Some(Err(e)) => {
-                self.tell(reply(TextStatus::Failed, &e.to_string(), Vec::new()));
+                self.tell(reply(TextStatus::Failed, &e.to_string(), Vec::new(), String::new()));
                 Step::Done
             }
             Some(Ok(chars)) => {
-                self.tell(reply(TextStatus::Ok, "", chars.boxes.clone()));
+                // The characters go with the boxes only where copying is allowed.
+                let text = if self.rights.copy { chars.text.clone() } else { String::new() };
+                self.tell(reply(TextStatus::Ok, "", chars.boxes.clone(), text));
                 Step::Done
             }
         }

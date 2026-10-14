@@ -28,6 +28,9 @@ pub(super) struct MenuState {
     pub wm: Watermarking,
     /// Text of scans can be recognized (a file is open and no recognition is going on).
     pub can_ocr: bool,
+    /// The toolbar is shown, and the choice made in View > Language.
+    pub toolbar: bool,
+    pub lang_choice: LangChoice,
 }
 
 impl MenuState {
@@ -49,6 +52,8 @@ impl MenuState {
             can_modify: false,
             wm: Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false },
             can_ocr: false,
+            toolbar: true,
+            lang_choice: LangChoice::System,
         }
     }
 }
@@ -128,6 +133,15 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 item(CMD_ROTATE, Msg::Rotate, st.has_doc),
                 MenuEntry::Separator,
                 MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowBookmarks).to_string(), checked: st.show_outline, enabled: st.has_outline },
+                MenuEntry::Item { id: CMD_TOOLBAR, label: t(lang, Msg::ShowToolbar).to_string(), checked: st.toolbar, enabled: true },
+                MenuEntry::Separator,
+                MenuEntry::Submenu {
+                    title: t(lang, Msg::LanguageMenu).to_string(),
+                    entries: [(CMD_LANG_SYSTEM, Msg::LangSystem, LangChoice::System), (CMD_LANG_ZH, Msg::LangChinese, LangChoice::Zh), (CMD_LANG_EN, Msg::LangEnglish, LangChoice::En)]
+                        .into_iter()
+                        .map(|(id, m, c)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.lang_choice == c, enabled: true })
+                        .collect(),
+                },
             ],
         },
         Menu {
@@ -190,7 +204,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
         },
         Menu {
             title: t(lang, Msg::GoMenu).to_string(),
-            entries: vec![item(CMD_GOTO, Msg::PageNumber, st.has_doc)],
+            entries: vec![item(CMD_PREV_PAGE, Msg::PrevPage, st.has_doc), item(CMD_NEXT_PAGE, Msg::NextPage, st.has_doc), MenuEntry::Separator, item(CMD_GOTO, Msg::PageNumber, st.has_doc)],
         },
         Menu { title: t(lang, Msg::Help).to_string(), entries: vec![item(CMD_ABOUT, Msg::About, true)] },
     ]
@@ -202,8 +216,9 @@ impl App {
         build_menus(lang, &MenuState::idle())
     }
 
-    pub(super) fn menus(&self) -> Vec<Menu> {
-        let tool = match self.edit.tool {
+    /// The command of the tool in use.
+    pub(super) fn tool_command(&self) -> u32 {
+        match self.edit.tool {
             Tool::Select => CMD_TOOL_SELECT,
             Tool::Markup(MarkupKind::Highlight) => CMD_TOOL_HIGHLIGHT,
             Tool::Markup(MarkupKind::Underline) => CMD_TOOL_UNDERLINE,
@@ -214,7 +229,11 @@ impl App {
             Tool::TextBox => CMD_TOOL_TEXTBOX,
             Tool::Stamp => CMD_STAMP,
             Tool::EditText => CMD_TOOL_EDITTEXT,
-        };
+        }
+    }
+
+    pub(super) fn menus(&self) -> Vec<Menu> {
+        let tool = self.tool_command();
         let st = MenuState {
             has_doc: self.doc.is_some(),
             has_outline: !self.outline.is_empty(),
@@ -231,6 +250,8 @@ impl App {
             can_modify: self.doc.is_some() && self.rights.modify,
             wm: self.edit.forms.wm,
             can_ocr: self.doc.is_some() && self.ocr.is_none(),
+            toolbar: self.toolbar_on,
+            lang_choice: self.lang_choice,
         };
         build_menus(self.lang, &st)
     }
@@ -281,7 +302,7 @@ mod tests {
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.

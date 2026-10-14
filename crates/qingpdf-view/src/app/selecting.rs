@@ -15,20 +15,23 @@ const BOXES_BYTES: usize = 12 << 20;
 /// The boxes of the characters of a page, and what finds the character nearest to a point in them without looking at them all.
 pub(super) struct PageBoxes {
     pub(super) boxes: Vec<[f32; 4]>,
+    /// The characters, one for each box (none when the engine gave only the places: the file may not be copied).
+    pub(super) text: Vec<char>,
     index: CharIndex,
 }
 
 impl PageBoxes {
-    fn new(boxes: Vec<[f32; 4]>) -> PageBoxes {
+    fn new(boxes: Vec<[f32; 4]>, text: &str) -> PageBoxes {
         let index = CharIndex::new(&boxes);
-        PageBoxes { boxes, index }
+        let text: Vec<char> = text.chars().collect();
+        PageBoxes { boxes, text, index }
     }
 
     fn bytes(&self) -> usize {
-        self.boxes.len() * std::mem::size_of::<[f32; 4]>() + self.index.bytes()
+        self.boxes.len() * std::mem::size_of::<[f32; 4]>() + self.text.len() * std::mem::size_of::<char>() + self.index.bytes()
     }
 
-    fn nearest(&self, x: f32, y: f32) -> Option<usize> {
+    pub(super) fn nearest(&self, x: f32, y: f32) -> Option<usize> {
         self.index.nearest(&self.boxes, x, y)
     }
 }
@@ -46,9 +49,14 @@ pub(super) struct Press {
 }
 
 impl App {
-    pub(super) fn mouse_down(&mut self, x: i64, y: i64, _ctrl: bool, _shift: bool) -> Vec<Action> {
+    pub(super) fn mouse_down(&mut self, x: i64, y: i64, _ctrl: bool, _shift: bool, clicks: u8) -> Vec<Action> {
         self.mouse = (x, y);
         self.press = None;
+        // The edge of the bookmarks is taken hold of.
+        if self.on_split(x, y) {
+            self.split_drag = Some((x, self.sidebar_pref));
+            return Vec::new();
+        }
         // A drawing or a note takes the pointer for itself.
         if let Some(actions) = self.edit_mouse_down(x, y) {
             return actions;
@@ -60,6 +68,11 @@ impl App {
         let Some((page, px, py)) = self.page_at_point(x, y) else { return actions };
         let Some(map) = self.doc.as_ref().and_then(|d| d.layout.page_map(page)) else { return actions };
         let (xp, yp) = map.to_pt(px, py);
+        // A double click takes a word, a triple click a line (not where a field of a form is: that is for typing in).
+        if clicks >= 2 && self.field_at(page as u32, xp, yp).is_none() {
+            actions.extend(self.select_by_clicks(page as u32, xp, yp, clicks));
+            return actions;
+        }
         let link = self.link_at(page, xp, yp);
         self.press = Some(Press { page: page as u32, x: xp, y: yp, sx: x, sy: y, link, moved: false });
         actions
@@ -67,6 +80,9 @@ impl App {
 
     pub(super) fn mouse_move(&mut self, x: i64, y: i64) -> Vec<Action> {
         self.mouse = (x, y);
+        if self.split_drag.is_some() {
+            return self.split_drag_to(x);
+        }
         if let Some(actions) = self.edit_mouse_move(x, y) {
             return actions;
         }
@@ -88,6 +104,10 @@ impl App {
     pub(super) fn mouse_up(&mut self, x: i64, y: i64) -> Vec<Action> {
         self.mouse = (x, y);
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
+        if self.split_drag.is_some() {
+            actions.extend(self.split_drag_end());
+            return actions;
+        }
         if let Some(more) = self.edit_mouse_up(x, y) {
             actions.extend(more);
             return actions;
@@ -111,7 +131,9 @@ impl App {
     pub(super) fn mouse_lost(&mut self) -> Vec<Action> {
         self.press = None;
         self.edit.give_up_stroke();
-        vec![Action::KillTimer(TIMER_DRAG)]
+        let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
+        actions.extend(self.split_drag_end());
+        actions
     }
 
     /// The pointer is held outside the pages while dragging: scroll, and keep the selection with the pointer.
@@ -145,7 +167,7 @@ impl App {
         Some((page as u32, xp as f32, yp as f32))
     }
 
-    fn ask_for_boxes(&mut self, page: u32) -> Vec<Action> {
+    pub(super) fn ask_for_boxes(&mut self, page: u32) -> Vec<Action> {
         if !self.boxes_asked.values().any(|&p| p == page) {
             let id = self.new_id();
             self.engine.char_boxes(self.doc_id, id, page);
@@ -195,13 +217,13 @@ impl App {
             // A page that has no text to give: remembered as having none, so that it is not asked for again.
             TextStatus::Failed => {}
         }
-        self.boxes.insert(b.page, PageBoxes::new(b.boxes));
+        self.boxes.insert(b.page, PageBoxes::new(b.boxes, &b.text));
         // Few pages are kept, and not too many bytes of them: the ones nearest the window, and the ends of the selection (and the
         // page that has just come).
         let mut bytes: usize = self.boxes.values().map(PageBoxes::bytes).sum();
         if self.boxes.len() > BOXES_KEPT || bytes > BOXES_BYTES {
             let here = self.current_page() as u32;
-            let keep: Vec<u32> = self.selection.iter().flat_map(|s| [s.anchor.page, s.head.page]).chain(self.press.iter().map(|p| p.page)).chain([b.page]).collect();
+            let keep: Vec<u32> = self.selection.iter().flat_map(|s| [s.anchor.page, s.head.page]).chain(self.press.iter().map(|p| p.page)).chain(self.pending_select.map(|p| p.page())).chain([b.page]).collect();
             let mut pages: Vec<u32> = self.boxes.keys().copied().filter(|p| !keep.contains(p)).collect();
             qingpdf_core::order::sort_by_key(&mut pages, |p| !u64::from(p.abs_diff(here)));
             for far in pages {
@@ -213,6 +235,7 @@ impl App {
                 }
             }
         }
+        actions.extend(self.finish_pending_select(b.page));
         actions.extend(self.extend_selection());
         actions.push(Action::Invalidate);
         actions

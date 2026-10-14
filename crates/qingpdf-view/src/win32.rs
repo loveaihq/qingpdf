@@ -19,7 +19,10 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo};
+use crate::clicks::ClickCounter;
+use crate::placement::{self, Placement};
+use crate::toolbar::{self, IconFont};
+use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ToolItem, ToolbarSpec, ToolbarState};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -150,6 +153,52 @@ struct MinMaxInfo {
 struct InitCommonControlsEx {
     size: u32,
     icc: u32,
+}
+
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: WinRect,
+    work: WinRect,
+    flags: u32,
+}
+
+/// A button of a toolbar (the 64-bit layout of TBBUTTON).
+#[repr(C)]
+struct TbButton {
+    bitmap: i32,
+    command: i32,
+    state: u8,
+    style: u8,
+    reserved: [u8; 6],
+    data: usize,
+    string: isize,
+}
+
+/// What TB_SETBUTTONINFOW is given (the 64-bit layout of TBBUTTONINFOW).
+#[repr(C)]
+struct TbButtonInfo {
+    size: u32,
+    mask: u32,
+    command: i32,
+    image: i32,
+    state: u8,
+    style: u8,
+    width: u16,
+    param: usize,
+    text: *mut u16,
+    text_max: i32,
+}
+
+/// The ToolTip's request for the words of a tip (NMTTDISPINFOW).
+#[repr(C)]
+struct NmTtDispInfo {
+    hdr: NmHdr,
+    text: *mut u16,
+    buf: [u16; 80],
+    instance: isize,
+    flags: u32,
+    param: isize,
 }
 
 #[repr(C)]
@@ -328,6 +377,17 @@ unsafe extern "system" {
     fn MoveWindow(hwnd: isize, x: i32, y: i32, w: i32, h: i32, repaint: i32) -> i32;
     fn ShutdownBlockReasonCreate(hwnd: isize, reason: *const u16) -> i32;
     fn ShutdownBlockReasonDestroy(hwnd: isize) -> i32;
+    fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn GetDoubleClickTime() -> u32;
+    fn GetMessageTime() -> i32;
+    fn LoadImageW(instance: isize, name: *const u16, kind: u32, cx: i32, cy: i32, flags: u32) -> isize;
+    fn GetSysColorBrush(index: i32) -> isize;
+    fn WindowFromDC(hdc: isize) -> isize;
+    fn EnumDisplayMonitors(hdc: isize, clip: *const WinRect, callback: unsafe extern "system" fn(isize, isize, *const WinRect, isize) -> i32, data: isize) -> i32;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    fn IsZoomed(hwnd: isize) -> i32;
+    fn IsIconic(hwnd: isize) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -354,6 +414,10 @@ unsafe extern "system" {
     fn AbortDoc(hdc: isize) -> i32;
     fn StartPage(hdc: isize) -> i32;
     fn EndPage(hdc: isize) -> i32;
+    fn CreateDIBSection(hdc: isize, info: *const BitmapInfoHeader, usage: u32, bits: *mut *mut c_void, section: isize, offset: u32) -> isize;
+    fn GdiFlush() -> i32;
+    fn GetClipBox(hdc: isize, rect: *mut WinRect) -> i32;
+    fn GetTextFaceW(hdc: isize, count: i32, buffer: *mut u16) -> i32;
 }
 
 #[link(name = "msimg32")]
@@ -406,6 +470,9 @@ unsafe extern "system" {
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn InitCommonControlsEx(init: *const InitCommonControlsEx) -> i32;
+    fn ImageList_Create(cx: i32, cy: i32, flags: u32, initial: i32, grow: i32) -> isize;
+    fn ImageList_Add(list: isize, bitmap: isize, mask: isize) -> i32;
+    fn ImageList_Destroy(list: isize) -> i32;
 }
 
 // --- constants ---------------------------------------------------------------------------------------------------
@@ -444,15 +511,12 @@ const WS_CHILD: u32 = 0x4000_0000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_TABSTOP: u32 = 0x0001_0000;
 const WS_VSCROLL: u32 = 0x0020_0000;
-const WS_HSCROLL: u32 = 0x0010_0000;
 const WS_EX_ACCEPTFILES: u32 = 0x0000_0010;
 const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
 const WS_EX_CLIENTEDGE: u32 = 0x0000_0200;
 const CW_USEDEFAULT: i32 = i32::MIN;
 const SW_SHOWNORMAL: i32 = 1;
 const SW_SHOW: i32 = 5;
-const SB_HORZ: i32 = 0;
-const SB_VERT: i32 = 1;
 const SIF_RANGE: u32 = 0x1;
 const SIF_PAGE: u32 = 0x2;
 const SIF_POS: u32 = 0x4;
@@ -520,6 +584,12 @@ const ID_FIND: isize = 102;
 /// The boxes a form field or a text box is typed in (one line, several lines).
 const ID_FIELD1: isize = 103;
 const ID_FIELD2: isize = 104;
+const ID_TOOLBAR: isize = 105;
+const ID_STATUS: isize = 106;
+const ID_VBAR: isize = 107;
+const ID_HBAR: isize = 108;
+const ID_PAGE_BOX: isize = 109;
+const ID_SEARCH_BOX: isize = 110;
 const TVS_HASBUTTONS: u32 = 0x1;
 const TVS_HASLINES: u32 = 0x2;
 const TVS_LINESATROOT: u32 = 0x4;
@@ -565,6 +635,81 @@ const LOGPIXELSX: i32 = 88;
 const COINIT_APARTMENTTHREADED: u32 = 2;
 /// The most characters of the find box that are read.
 const MAX_FIND_CHARS: usize = 2000;
+const WM_MOVE: u32 = 0x0003;
+const WM_SETICON: u32 = 0x0080;
+const WM_CONTEXTMENU: u32 = 0x007B;
+const WM_USER: u32 = 0x0400;
+/// Posted to the window to select all the text of a box of the toolbar once the click that gave it the keyboard is done.
+const WM_SELECT_BOX: u32 = 0x8002;
+const EN_SETFOCUS: u32 = 0x0100;
+const ES_CENTER: u32 = 0x1;
+const EM_SETCUEBANNER: u32 = 0x1501;
+const ICC_BAR_CLASSES: u32 = 0x4;
+const SBS_HORZ: u32 = 0;
+const SBS_VERT: u32 = 1;
+const SB_CTL: i32 = 2;
+const SB_ENDSCROLL: u32 = 8;
+const SM_CXVSCROLL: i32 = 2;
+const SM_CYHSCROLL: i32 = 3;
+const SM_CXICON: i32 = 11;
+const SM_CYICON: i32 = 12;
+const SM_CXDOUBLECLK: i32 = 36;
+const SM_CYDOUBLECLK: i32 = 37;
+const SM_CXSMICON: i32 = 49;
+const SM_CYSMICON: i32 = 50;
+const IMAGE_ICON: u32 = 1;
+const LR_SHARED: u32 = 0x8000;
+/// The id of the program's icon in its resources (the group icon `build.rs` writes).
+const ICON_ID: usize = 1;
+const COLOR_BTNFACE: i32 = 15;
+const SW_SHOWMAXIMIZED: i32 = 3;
+const IDC_SIZEWE: usize = 32644;
+const TPM_RIGHTBUTTON: u32 = 0x2;
+const CCS_NORESIZE: u32 = 0x4;
+const CCS_NOPARENTALIGN: u32 = 0x8;
+const CCS_NODIVIDER: u32 = 0x40;
+const TBSTYLE_TOOLTIPS: u32 = 0x100;
+const TBSTYLE_FLAT: u32 = 0x800;
+const BTNS_SEP: u8 = 0x1;
+const BTNS_CHECK: u8 = 0x2;
+const BTNS_AUTOSIZE: u8 = 0x10;
+const BTNS_SHOWTEXT: u8 = 0x40;
+const TBSTATE_ENABLED: u8 = 0x4;
+const I_IMAGENONE: i32 = -2;
+const TB_ENABLEBUTTON: u32 = WM_USER + 1;
+const TB_CHECKBUTTON: u32 = WM_USER + 2;
+const TB_BUTTONCOUNT: u32 = WM_USER + 24;
+const TB_DELETEBUTTON: u32 = WM_USER + 22;
+const TB_GETITEMRECT: u32 = WM_USER + 29;
+const TB_BUTTONSTRUCTSIZE: u32 = WM_USER + 30;
+const TB_SETBUTTONSIZE: u32 = WM_USER + 31;
+const TB_AUTOSIZE: u32 = WM_USER + 33;
+const TB_SETIMAGELIST: u32 = WM_USER + 48;
+const TB_SETDISABLEDIMAGELIST: u32 = WM_USER + 54;
+const TB_GETBUTTONSIZE: u32 = WM_USER + 58;
+const TB_ADDBUTTONSW: u32 = WM_USER + 68;
+const TB_SETBUTTONINFOW: u32 = WM_USER + 64;
+const TBIF_SIZE: u32 = 0x40;
+/// The commands of the two buttons that hold the places of the boxes of the toolbar (no menu command is so big).
+const BOX_COMMAND: i32 = 0x7F01;
+const SB_SETPARTS: u32 = WM_USER + 4;
+const SB_SETTEXTW: u32 = WM_USER + 11;
+const TTN_GETDISPINFOW: u32 = -530i32 as u32;
+const ILC_COLOR32: u32 = 0x20;
+const DEFAULT_CHARSET: u32 = 1;
+const ANTIALIASED_QUALITY: u32 = 4;
+/// The height of the status bar at 96 dpi.
+const STATUS_HEIGHT: i32 = 26;
+/// The size of a toolbar picture at 96 dpi, and the room the buttons have round it.
+const TOOL_ICON: i32 = 16;
+/// The widths at 96 dpi of the gap between groups of buttons and of the page and search boxes.
+const TOOL_GAP: i32 = 10;
+const PAGE_BOX_W: i32 = 88;
+const SEARCH_BOX_W: i32 = 200;
+const BOX_H: i32 = 24;
+/// The colours of the pictures: ink, and the same greyed.
+const ICON_INK: u32 = 0x1F1F1F;
+const ICON_GREY: u32 = 0xA0A0A0;
 /// Most characters of the box of a form field or text box, and most items of a list of choices shown.
 const MAX_FIELD_CHARS: usize = 8000;
 const MAX_CHOICES: usize = 1000;
@@ -733,6 +878,32 @@ struct WindowState {
     /// destroying the menu bar under an open menu would close it under the person's hand.
     menu_open: Cell<bool>,
     menus_waiting: RefCell<Option<Vec<Menu>>>,
+    /// The toolbar, the boxes that lie over it (the page and the words to find), the status bar and the two scroll bars: children of
+    /// the window (0 if Windows would not make them). The scroll bars are controls and not the window's own so that the vertical one
+    /// ends above the status bar.
+    toolbar: Cell<isize>,
+    tb_page: Cell<isize>,
+    tb_search: Cell<isize>,
+    status: Cell<isize>,
+    vbar: Cell<isize>,
+    hbar: Cell<isize>,
+    /// The toolbar as the reader last described it, how it was told to look, and where its boxes are in the list of its buttons.
+    tb_spec: RefCell<Option<ToolbarSpec>>,
+    tb_state: RefCell<ToolbarState>,
+    tb_visible: Cell<bool>,
+    tb_height: Cell<i32>,
+    tb_boxes: Cell<(i32, i32)>,
+    /// The two image lists of the toolbar's pictures (inked and greyed), and the font they were drawn from (found the first time).
+    tb_lists: Cell<(isize, isize)>,
+    icon_font: Cell<Option<IconFont>>,
+    /// The horizontal scroll bar is shown (there is more across than the window shows).
+    hbar_on: Cell<bool>,
+    /// The page area as the reader was told: its top, width and height (the window less the toolbar, the scroll bar, the status bar).
+    content: Cell<(i32, i32, i32)>,
+    /// The window's place when it is neither maximized nor minimized, and whether it is kept for the next run.
+    normal: Cell<Option<WinRect>>,
+    remember_window: bool,
+    clicks: RefCell<ClickCounter>,
 }
 
 /// A printer's device context, and the file it writes if it was told to write one (zero-terminated UTF-16).
@@ -785,7 +956,7 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
         match action {
             Action::Invalidate => invalidate(hwnd),
             Action::SetTitle(t) => set_text(hwnd, &t),
-            Action::SetScroll { bar, info } => set_scroll(hwnd, bar, info),
+            Action::SetScroll { bar, info } => set_scroll(state, bar, info),
             Action::SetTimer { id, ms } => {
                 // SAFETY: a null timer procedure means the timer posts WM_TIMER to the window; plain numbers only.
                 unsafe { SetTimer(hwnd, id as usize, ms, null()) };
@@ -833,21 +1004,47 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
             }
             Action::SetMenus(menus) => set_menus(state, hwnd, menus),
             Action::Outline(nodes) => fill_tree(state.tree.get(), &nodes),
-            Action::Sidebar(r) => place_child(state.tree.get(), r),
-            Action::Find(rect) => show_find(state, hwnd, rect),
-            Action::FieldEdit(Some(b)) => show_field(state, hwnd, b),
+            Action::Sidebar(r) => place_child(state.tree.get(), to_client(state, r)),
+            Action::Find(rect) => show_find(state, hwnd, rect.map(|r| to_client(state, r))),
+            Action::FieldEdit(Some(b)) => show_field(state, hwnd, FieldBox { rect: to_client(state, b.rect), ..b }),
             Action::FieldEdit(None) => hide_field(state, hwnd),
             Action::FieldMove(r) => {
                 let edit = state.field_active.get();
                 if edit != 0 {
+                    let r = to_client(state, r);
                     // SAFETY: plain handle of a child window of ours and plain numbers.
                     unsafe { MoveWindow(edit, r.x, r.y, r.w.max(1), r.h.max(1), 1) };
                 }
             }
             Action::Choose { items, selected, at } => {
-                let chosen = choose(hwnd, &items, selected, at);
+                let chosen = choose(hwnd, &items, selected, (at.0, at.1.saturating_add(content_top(state))));
                 queue.extend(deliver(state, Event::Chosen(chosen)));
             }
+            Action::ContextMenu { entries, at } => {
+                let menu = build_popup(&entries);
+                if menu != 0 {
+                    let mut p = Point { x: at.0, y: at.1.saturating_add(content_top(state)) };
+                    // SAFETY: `p` is a live POINT turned into screen coordinates; the menu belongs to this window and is destroyed after
+                    // use; TPM_RETURNCMD answers with the item's command (0 if the menu was dismissed) instead of posting a message.
+                    let chosen = unsafe {
+                        ClientToScreen(hwnd, &mut p);
+                        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, null());
+                        DestroyMenu(menu);
+                        chosen
+                    };
+                    if let Ok(cmd) = u32::try_from(chosen)
+                        && cmd > 0
+                    {
+                        queue.extend(deliver(state, Event::Command(cmd)));
+                    }
+                }
+            }
+            Action::Toolbar(spec) => set_toolbar(state, spec),
+            Action::ToolbarState(st) => {
+                *state.tb_state.borrow_mut() = st;
+                apply_toolbar_state(state);
+            }
+            Action::Status(st) => set_status(state, &st),
             Action::OpenUri(uri) => {
                 // The reader has checked the address; it is checked again here, the last place before the system, so that nothing
                 // that is not a plain http, https or mailto address (an environment variable like %USERNAME%, say) reaches it.
@@ -877,6 +1074,7 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
                 Err(message) => queue.extend(deliver(state, Event::PrintError(message))),
             },
             Action::Quit => {
+                save_placement(state);
                 // SAFETY: destroys the window made by `run`; posts WM_DESTROY, which ends the loop. The window state is not
                 // freed by this (that is done after the loop), so `state` stays valid for the rest of this function.
                 unsafe { DestroyWindow(hwnd) };
@@ -887,22 +1085,34 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
     }
 }
 
-fn set_scroll(hwnd: isize, bar: Bar, info: ScrollInfo) {
-    let (which, extra) = match bar {
+fn set_scroll(state: &WindowState, bar: Bar, info: ScrollInfo) {
+    let (ctl, extra) = match bar {
         // The vertical bar stays (greyed when there is nothing to scroll) so that the window does not change its
         // width when a page is just too short; the horizontal one comes and goes.
-        Bar::Vertical => (SB_VERT, SIF_DISABLENOSCROLL),
-        Bar::Horizontal => (SB_HORZ, 0),
+        Bar::Vertical => (state.vbar.get(), SIF_DISABLENOSCROLL),
+        Bar::Horizontal => (state.hbar.get(), 0),
     };
+    if ctl == 0 {
+        return;
+    }
     let si = ScrollInfoW { size: std::mem::size_of::<ScrollInfoW>() as u32, mask: SIF_RANGE | SIF_PAGE | SIF_POS | extra, min: info.min, max: info.max, page: info.page, pos: info.pos, track_pos: 0 };
-    // SAFETY: `si` is a live SCROLLINFO of the size given in `size`; Windows copies it.
-    unsafe { SetScrollInfo(hwnd, which, &si, 1) };
+    // SAFETY: `si` is a live SCROLLINFO of the size given in `size`; Windows copies it. The bar is a scroll bar control of ours.
+    unsafe { SetScrollInfo(ctl, SB_CTL, &si, 1) };
+    if bar == Bar::Horizontal {
+        // As a window's own bar would, the horizontal one is shown when there is more across than the window shows.
+        let more = info.max > info.min && i64::from(info.max) - i64::from(info.min) + 1 > i64::from(info.page);
+        if more != state.hbar_on.get() {
+            state.hbar_on.set(more);
+            apply_layout(state);
+        }
+    }
 }
 
-fn track_pos(hwnd: isize, which: i32) -> i32 {
+fn track_pos(ctl: isize) -> i32 {
     let mut si = ScrollInfoW { size: std::mem::size_of::<ScrollInfoW>() as u32, mask: SIF_TRACKPOS, min: 0, max: 0, page: 0, pos: 0, track_pos: 0 };
-    // SAFETY: `si` is a live SCROLLINFO of the size given in `size`; Windows fills it in and does not keep it.
-    unsafe { GetScrollInfo(hwnd, which, &mut si) };
+    // SAFETY: `si` is a live SCROLLINFO of the size given in `size`; Windows fills it in and does not keep it. The bar is a scroll bar
+    // control of ours.
+    unsafe { GetScrollInfo(ctl, SB_CTL, &mut si) };
     si.track_pos
 }
 
@@ -935,16 +1145,33 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     };
     match msg {
-        WM_ERASEBKGND => return 1,
+        WM_ERASEBKGND => {
+            // The pages are drawn over their area in one go, with no erasing first (that would flicker). What a child window asks this
+            // window to draw behind it (the toolbar does, to show the colour of a window) is filled in the colour of a window.
+            let dc = wparam as isize;
+            let mut r = WinRect::default();
+            // SAFETY: `dc` is the device context that came with the message; `r` is a live RECT that Windows fills in; the brush is the
+            // system's own, shared and never freed. A DC that is this window's own is left alone.
+            unsafe {
+                if WindowFromDC(dc) != hwnd && GetClipBox(dc, &mut r) != 0 {
+                    FillRect(dc, &r, GetSysColorBrush(COLOR_BTNFACE));
+                }
+            }
+            return 1;
+        }
         WM_PAINT => {
             paint(state, hwnd);
             return 0;
         }
         WM_SIZE => {
             if wparam != 1 {
-                let (w, h) = (loword(lparam as usize) as i32, hiword(lparam as usize) as i32);
-                dispatch(state, Event::Size { w, h });
+                remember_normal(state);
+                apply_layout(state);
             }
+            return 0;
+        }
+        WM_MOVE => {
+            remember_normal(state);
             return 0;
         }
         WM_KEYDOWN => {
@@ -957,7 +1184,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             let mut p = Point { x: i32::from(loword(lparam as usize) as u16 as i16), y: i32::from(hiword(lparam as usize) as u16 as i16) };
             // SAFETY: `p` is a live POINT that Windows rewrites in place.
             unsafe { ScreenToClient(hwnd, &mut p) };
-            dispatch(state, Event::Wheel { delta, ctrl: keys & 0x8 != 0, shift: keys & 0x4 != 0, x: p.x, y: p.y });
+            dispatch(state, Event::Wheel { delta, ctrl: keys & 0x8 != 0, shift: keys & 0x4 != 0, x: p.x, y: p.y - content_top(state) });
             return 0;
         }
         WM_MOUSEHWHEEL => {
@@ -965,13 +1192,17 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 0;
         }
         WM_VSCROLL | WM_HSCROLL => {
-            let (bar, which) = if msg == WM_VSCROLL { (Bar::Vertical, SB_VERT) } else { (Bar::Horizontal, SB_HORZ) };
+            // The scroll bars are controls: lparam is the one that was used.
+            let (bar, ctl) = if msg == WM_VSCROLL { (Bar::Vertical, state.vbar.get()) } else { (Bar::Horizontal, state.hbar.get()) };
+            if ctl == 0 || lparam != ctl {
+                return 0;
+            }
             let code = match loword(wparam) {
                 0 => Some(ScrollCode::LineUp),
                 1 => Some(ScrollCode::LineDown),
                 2 => Some(ScrollCode::PageUp),
                 3 => Some(ScrollCode::PageDown),
-                4 | 5 => Some(ScrollCode::Thumb(track_pos(hwnd, which))),
+                4 | 5 => Some(ScrollCode::Thumb(track_pos(ctl))),
                 6 => Some(ScrollCode::Top),
                 7 => Some(ScrollCode::Bottom),
                 _ => None,
@@ -979,14 +1210,36 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             if let Some(code) = code {
                 dispatch(state, Event::Scroll { bar, code });
             }
+            if loword(wparam) == SB_ENDSCROLL {
+                // The pages get the keyboard back, so that the keys scroll them.
+                // SAFETY: plain handle of the main window.
+                unsafe { SetFocus(hwnd) };
+            }
             return 0;
         }
         WM_COMMAND => {
+            let code = hiword(wparam);
             if lparam == 0 {
                 dispatch(state, Event::Command(loword(wparam)));
-            } else if lparam == state.find.get() && hiword(wparam) == EN_CHANGE {
+            } else if lparam == state.toolbar.get() {
+                // A button of the toolbar.
+                dispatch(state, Event::Command(loword(wparam)));
+                // The pages get the keyboard back, so that the keys scroll them.
+                // SAFETY: plain handle of the main window.
+                unsafe { SetFocus(hwnd) };
+            } else if (lparam == state.find.get() || lparam == state.tb_search.get()) && code == EN_CHANGE {
                 let text = window_text(lparam, MAX_FIND_CHARS);
                 dispatch(state, Event::FindText(text));
+            } else if lparam == state.tb_search.get() && code == EN_SETFOCUS {
+                dispatch(state, Event::FindFocus);
+                // SAFETY: posts a message to this window; plain numbers (the box is selected once the click that gave it the keyboard is done).
+                unsafe { PostMessageW(hwnd, WM_SELECT_BOX, lparam as usize, 0) };
+            } else if lparam == state.tb_page.get() && code == EN_SETFOCUS {
+                // SAFETY: as above.
+                unsafe { PostMessageW(hwnd, WM_SELECT_BOX, lparam as usize, 0) };
+            } else if lparam == state.tb_page.get() && code == EN_KILLFOCUS {
+                // What was typed and not sent is not kept: the box says the page again.
+                set_text(lparam, &state.tb_state.borrow().page_text);
             } else if lparam == state.field_active.get() && hiword(wparam) == EN_KILLFOCUS {
                 // The keyboard went elsewhere (a click outside the box): what is typed is kept.
                 finish_field(state, FieldExit::Blur);
@@ -1000,13 +1253,14 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                 SetCapture(hwnd);
             }
             let (x, y) = mouse_place(lparam);
-            dispatch(state, Event::MouseDown { x, y, ctrl: modifier(0x11), shift: modifier(0x10) });
+            let clicks = click_count(state, x, y);
+            dispatch(state, Event::MouseDown { x, y: y - content_top(state), ctrl: modifier(0x11), shift: modifier(0x10), clicks });
             return 0;
         }
         WM_MOUSEMOVE => {
             if wparam & MK_LBUTTON != 0 {
                 let (x, y) = mouse_place(lparam);
-                dispatch(state, Event::MouseMove { x, y });
+                dispatch(state, Event::MouseMove { x, y: y - content_top(state) });
             }
             return 0;
         }
@@ -1014,7 +1268,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             // The reader hears the button come up first: giving the mouse back makes Windows say that the window lost it
             // (WM_CAPTURECHANGED), and the reader would take that for a drag cut short.
             let (x, y) = mouse_place(lparam);
-            dispatch(state, Event::MouseUp { x, y });
+            dispatch(state, Event::MouseUp { x, y: y - content_top(state) });
             // SAFETY: gives the mouse back; fine to call when it was not captured.
             unsafe { ReleaseCapture() };
             return 0;
@@ -1034,10 +1288,11 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                     ScreenToClient(hwnd, &mut p);
                 }
                 let shape = match state.handler.try_borrow_mut() {
-                    Ok(mut guard) => guard.as_mut().map_or(Cursor::Arrow, |h| h.cursor_at(p.x, p.y)),
+                    Ok(mut guard) => guard.as_mut().map_or(Cursor::Arrow, |h| h.cursor_at(p.x, p.y - content_top(state))),
                     Err(_) => Cursor::Arrow,
                 };
                 let id = match shape {
+                    Cursor::SizeWE => IDC_SIZEWE,
                     Cursor::Hand => IDC_HAND,
                     Cursor::Cross => IDC_CROSS,
                     Cursor::Text => IDC_IBEAM,
@@ -1058,6 +1313,41 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                 && hdr.from == state.tree.get()
             {
                 tree_notified(state, hwnd, hdr, lparam);
+            } else if let Some(hdr) = hdr
+                && hdr.code == TTN_GETDISPINFOW
+            {
+                // SAFETY: for TTN_GETDISPINFOW, lparam points to an NMTTDISPINFOW that is valid, and ours to fill in, for the duration of
+                // this message; the one reference made is used within it.
+                if let Some(info) = unsafe { (lparam as *mut NmTtDispInfo).as_mut() } {
+                    tooltip_text(state, info);
+                }
+            }
+            return 0;
+        }
+        WM_CONTEXTMENU => {
+            // The right button (or the menu key) over the pages: the reader may have a menu for the place. Over a child window the
+            // child's own menu is its business.
+            if wparam as isize == hwnd {
+                let (top, w, h) = state.content.get();
+                let mut p = Point { x: i32::from(loword(lparam as usize) as u16 as i16), y: i32::from(hiword(lparam as usize) as u16 as i16) };
+                if lparam as i32 == -1 {
+                    p = Point { x: w / 2, y: top.max(0) + h / 2 };
+                } else {
+                    // SAFETY: `p` is a live POINT that Windows rewrites in place.
+                    unsafe { ScreenToClient(hwnd, &mut p) };
+                }
+                let (x, y) = (p.x, p.y - top.max(0));
+                if x >= 0 && y >= 0 && x < w && y < h {
+                    dispatch(state, Event::ContextMenu { x, y });
+                }
+                return 0;
+            }
+        }
+        WM_SELECT_BOX => {
+            let edit = wparam as isize;
+            if edit != 0 && (edit == state.tb_page.get() || edit == state.tb_search.get()) {
+                // SAFETY: plain handle of a box of ours; the whole text is selected (a start of 0 and an end of -1).
+                unsafe { SendMessageW(edit, EM_SETSEL, 0, -1) };
             }
             return 0;
         }
@@ -1292,7 +1582,7 @@ fn new_dpi(state: &WindowState, dpi: u32) {
         // deleted only after the new one is selected in its place.
         unsafe { SelectObject(back.dc, state.font.get()) };
     }
-    for child in [state.tree.get(), state.find.get(), state.field_single.get(), state.field_multi.get()] {
+    for child in [state.tree.get(), state.find.get(), state.field_single.get(), state.field_multi.get(), state.tb_page.get(), state.tb_search.get(), state.status.get()] {
         if child != 0 && state.font.get() != 0 {
             // SAFETY: WM_SETFONT takes a font handle (the one just made) and a redraw flag; `child` is a window of ours.
             unsafe { SendMessageW(child, WM_SETFONT, state.font.get() as usize, 1) };
@@ -1302,6 +1592,12 @@ fn new_dpi(state: &WindowState, dpi: u32) {
         // SAFETY: `old` was a font made by `make_font`; it is no longer selected into a device context or set as a control's font.
         unsafe { DeleteObject(old) };
     }
+    // The pictures of the toolbar are drawn again at the size of the new screen, and everything is laid out again.
+    set_icons(state.hwnd.get(), dpi);
+    if state.tb_visible.get() {
+        rebuild_toolbar(state);
+    }
+    apply_layout(state);
 }
 
 fn free_back(state: &WindowState) {
@@ -1465,17 +1761,25 @@ fn paint(state: &WindowState, hwnd: isize) {
     // SAFETY: `ps` is a live PAINTSTRUCT; BeginPaint and EndPaint are paired below on every path.
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
     if hdc != 0 {
-        paint_to(state, hwnd, hdc);
+        paint_to(state, hdc);
     }
     // SAFETY: pairs the BeginPaint above with the same window and the same PAINTSTRUCT.
     unsafe { EndPaint(hwnd, &ps) };
 }
 
 /// Draw the reader on the back buffer and put that on the window's device context `hdc`.
-fn paint_to(state: &WindowState, hwnd: isize, hdc: isize) {
-    let (w, h) = client_size(hwnd);
+fn paint_to(state: &WindowState, hdc: isize) {
+    let (top, w, h) = state.content.get();
     if w <= 0 || h <= 0 {
         return;
+    }
+    let top = top.max(0);
+    if state.hbar_on.get() {
+        // Where the two scroll bars meet, nothing is drawn by either: the colour of the window.
+        let (vw, hh) = (metric(SM_CXVSCROLL, state.dpi.get()), metric(SM_CYHSCROLL, state.dpi.get()));
+        let corner = WinRect { left: w, top: top + h, right: w + vw, bottom: top + h + hh };
+        // SAFETY: `hdc` is the valid DC of this paint; `corner` is a live RECT; the brush is the system's own, shared and never freed.
+        unsafe { FillRect(hdc, &corner, GetSysColorBrush(COLOR_BTNFACE)) };
     }
     let Ok(mut back) = state.back.try_borrow_mut() else { return };
     if back.dc == 0 || back.w != w || back.h != h {
@@ -1493,7 +1797,7 @@ fn paint_to(state: &WindowState, hwnd: isize, hdc: isize) {
     }
     if present {
         // SAFETY: both DCs are valid and the memory DC holds a bitmap of at least w by h pixels.
-        unsafe { BitBlt(hdc, 0, 0, w, h, back.dc, 0, 0, SRCCOPY) };
+        unsafe { BitBlt(hdc, 0, top, w, h, back.dc, 0, 0, SRCCOPY) };
     }
 }
 
@@ -1634,13 +1938,13 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
         cls_extra: 0,
         wnd_extra: 0,
         instance,
-        icon: 0,
+        icon: load_icon(instance, dpi, false),
         // SAFETY: a small integer resource id in the pointer slot is how LoadCursorW names a stock cursor.
         cursor: unsafe { LoadCursorW(0, IDC_ARROW as *const u16) },
         background: 16, // COLOR_BTNFACE + 1: the same grey as the labels and buttons on it
         menu_name: null(),
         class_name: class.as_ptr(),
-        icon_small: 0,
+        icon_small: load_icon(instance, dpi, true),
     };
     // SAFETY: `wc` is a live WNDCLASSEXW whose strings outlive the call; registering twice fails harmlessly.
     unsafe { RegisterClassExW(&wc) };
@@ -1836,9 +2140,14 @@ fn place_child(child: isize, r: Rect) {
 
 /// Show the find box at a place and give it the keyboard (with its text selected), or hide it and take the keyboard back.
 fn show_find(state: &WindowState, hwnd: isize, rect: Option<Rect>) {
-    let edit = state.find.get();
+    let edit = find_edit(state);
     if edit == 0 {
         return;
+    }
+    let in_toolbar = edit == state.tb_search.get();
+    // The box over the pages is put away when the toolbar's is the one in use.
+    if in_toolbar {
+        place_child(state.find.get(), Rect { x: 0, y: 0, w: 0, h: 0 });
     }
     match rect {
         Some(r) => {
@@ -1846,7 +2155,9 @@ fn show_find(state: &WindowState, hwnd: isize, rect: Option<Rect>) {
                 // SAFETY: reads which window has the keyboard.
                 unsafe { GetFocus() == edit }
             };
-            place_child(edit, r);
+            if !in_toolbar {
+                place_child(edit, r);
+            }
             if !had_focus {
                 // SAFETY: plain handle of the edit box; the whole text is selected (a start of 0 and an end of -1).
                 unsafe {
@@ -1862,7 +2173,9 @@ fn show_find(state: &WindowState, hwnd: isize, rect: Option<Rect>) {
                     SetFocus(hwnd);
                 }
             }
-            place_child(edit, Rect { x: 0, y: 0, w: 0, h: 0 });
+            if !in_toolbar {
+                place_child(edit, Rect { x: 0, y: 0, w: 0, h: 0 });
+            }
         }
     }
 }
@@ -2168,13 +2481,518 @@ fn print_op(state: &WindowState, op: PrintOp) -> Result<bool, String> {
     }
 }
 
+// --- the toolbar, the status bar, the scroll bars and the layout --------------------------------------------------------
+
+fn scale(dpi: u32, v: i32) -> i32 {
+    (i64::from(v) * i64::from(dpi) / 96) as i32
+}
+
+fn metric(index: i32, dpi: u32) -> i32 {
+    // SAFETY: takes two plain numbers and reads a system setting.
+    unsafe { GetSystemMetricsForDpi(index, dpi) }
+}
+
+/// The top of the page area in the client area: the toolbar is above it when it is shown.
+fn content_top(state: &WindowState) -> i32 {
+    state.content.get().0.max(0)
+}
+
+/// A rectangle of the page area (as the reader says it) in the window's client area.
+fn to_client(state: &WindowState, r: Rect) -> Rect {
+    Rect { y: r.y.saturating_add(content_top(state)), ..r }
+}
+
+/// Move a child window and show it, or hide it.
+fn put(child: isize, x: i32, y: i32, w: i32, h: i32, show: bool) {
+    if child == 0 {
+        return;
+    }
+    // SAFETY: plain handle of a child window of ours and plain numbers.
+    unsafe {
+        MoveWindow(child, x, y, w.max(0), h.max(0), 1);
+        ShowWindow(child, if show { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+/// Put the toolbar, the scroll bars and the status bar in their places; what is left of the window is the page area, and the reader
+/// is told its size when that has changed.
+fn apply_layout(state: &WindowState) {
+    let hwnd = state.hwnd.get();
+    let dpi = state.dpi.get();
+    let (cw, ch) = client_size(hwnd);
+    if cw <= 0 || ch <= 0 {
+        return;
+    }
+    let tb_h = state.tb_height.get();
+    let top = if state.tb_visible.get() { tb_h } else { 0 };
+    let (vw, hh) = (metric(SM_CXVSCROLL, dpi), metric(SM_CYHSCROLL, dpi));
+    let sb_h = scale(dpi, STATUS_HEIGHT);
+    let hbar_h = if state.hbar_on.get() { hh } else { 0 };
+    let (w, h) = ((cw - vw).max(0), (ch - top - sb_h - hbar_h).max(0));
+    put(state.toolbar.get(), 0, 0, cw, tb_h, state.tb_visible.get());
+    put(state.vbar.get(), w, top, vw, h, true);
+    put(state.hbar.get(), 0, top + h, w, hh, state.hbar_on.get());
+    put(state.status.get(), 0, ch - sb_h, cw, sb_h, true);
+    set_status_parts(state, cw, dpi);
+    place_tool_boxes(state, dpi);
+    let now = (top, w, h);
+    if state.content.get() != now {
+        state.content.set(now);
+        dispatch(state, Event::Size { w, h });
+    }
+}
+
+/// The three parts of the status bar: the page, the note (what is left), the zoom.
+fn set_status_parts(state: &WindowState, cw: i32, dpi: u32) {
+    let bar = state.status.get();
+    if bar == 0 {
+        return;
+    }
+    let (left, right) = (scale(dpi, 200).min(cw / 3), scale(dpi, 90).min(cw / 3));
+    let edges: [i32; 3] = [left, (cw - right).max(left), -1];
+    // SAFETY: SB_SETPARTS takes the number of parts and a pointer to that many right edges, which `edges` is (the control copies them).
+    unsafe { SendMessageW(bar, SB_SETPARTS, edges.len(), edges.as_ptr() as isize) };
+}
+
+fn set_status(state: &WindowState, st: &StatusText) {
+    let bar = state.status.get();
+    if bar == 0 {
+        return;
+    }
+    // Two tabs right-align the text of the last part.
+    let zoom = if st.zoom.is_empty() { String::new() } else { format!("\t\t{}", st.zoom) };
+    for (part, text) in [&st.page, &st.note, &zoom].into_iter().enumerate() {
+        let w = wide(text);
+        // SAFETY: SB_SETTEXTW takes the part in the low word (drawn as it is) and a pointer to a zero-terminated UTF-16 string, which
+        // `w` outlives (the control copies it).
+        unsafe { SendMessageW(bar, SB_SETTEXTW, part, w.as_ptr() as isize) };
+    }
+}
+
+/// Is there a font with this name on this computer (when there is not, Windows gives another and says its name)?
+fn has_font(dc: isize, face: &str) -> bool {
+    let name = wide(face);
+    // SAFETY: plain numbers and `name`, a zero-terminated UTF-16 string that outlives the call (Windows copies it); the font is owned here.
+    let font = unsafe { CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, name.as_ptr()) };
+    if font == 0 {
+        return false;
+    }
+    let mut buf = [0u16; 64];
+    // SAFETY: `dc` is a device context of ours; the font is selected only for the call that asks for its name, the old one is put back
+    // and the font deleted after; `buf` has room for the 64 characters the call is told.
+    let n = unsafe {
+        let old = SelectObject(dc, font);
+        let n = GetTextFaceW(dc, buf.len() as i32, buf.as_mut_ptr());
+        SelectObject(dc, old);
+        DeleteObject(font);
+        n
+    };
+    // The count includes the closing zero.
+    let got = String::from_utf16_lossy(buf.get(..usize::try_from(n).unwrap_or(1).saturating_sub(1)).unwrap_or(&[]));
+    got.eq_ignore_ascii_case(face)
+}
+
+/// The font the toolbar's pictures come from (looked for the first time it is asked).
+fn icon_font(state: &WindowState) -> IconFont {
+    if let Some(font) = state.icon_font.get() {
+        return font;
+    }
+    // SAFETY: a null window gives a device context of the screen's kind; it is deleted below.
+    let dc = unsafe { CreateCompatibleDC(0) };
+    let font = if dc == 0 {
+        IconFont::Words
+    } else {
+        let found = toolbar::pick_icon_font(has_font(dc, toolbar::FLUENT), has_font(dc, toolbar::MDL2));
+        // SAFETY: the device context made above, not used again.
+        unsafe { DeleteDC(dc) };
+        found
+    };
+    state.icon_font.set(Some(font));
+    font
+}
+
+/// An image list of the pictures of `glyphs` from the font `face`, `px` wide and high, in the colour `ink` (0xRRGGBB); 0 if it could
+/// not be made. Each letter is drawn white on black with smooth edges on a 32-bit picture, and its brightness is made its opacity.
+fn icon_list(face: &str, glyphs: &[char], px: i32, ink: Rgb) -> isize {
+    if px <= 0 || glyphs.is_empty() {
+        return 0;
+    }
+    // SAFETY: plain numbers; the list is checked, and destroyed by whoever replaces it.
+    let list = unsafe { ImageList_Create(px, px, ILC_COLOR32, glyphs.len() as i32, 1) };
+    if list == 0 {
+        return 0;
+    }
+    // SAFETY: a null window gives a device context of the screen's kind; it is deleted below.
+    let dc = unsafe { CreateCompatibleDC(0) };
+    if dc == 0 {
+        // SAFETY: the list made above, not used again.
+        unsafe { ImageList_Destroy(list) };
+        return 0;
+    }
+    let name = wide(face);
+    // SAFETY: plain numbers and `name`, a zero-terminated UTF-16 string that outlives the call; the font is owned here and deleted below.
+    let font = unsafe { CreateFontW(-px, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, name.as_ptr()) };
+    // SAFETY: both handles are ours (a failed font is 0, and nothing is selected then).
+    let old_font = if font != 0 { unsafe { SelectObject(dc, font) } } else { 0 };
+    let (ink_r, ink_g, ink_b) = ((ink >> 16) & 0xFF, (ink >> 8) & 0xFF, ink & 0xFF);
+    for &glyph in glyphs {
+        let info = BitmapInfoHeader { size: std::mem::size_of::<BitmapInfoHeader>() as u32, width: px, height: -px, planes: 1, bit_count: 32, compression: 0, size_image: 0, x_pels: 0, y_pels: 0, clr_used: 0, clr_important: 0 };
+        let mut bits: *mut c_void = null_mut();
+        // SAFETY: `info` is a live header of a 32-bit top-down picture; `bits` is a live pointer that Windows fills with the address of
+        // the picture's memory (px by px by 4 bytes, zeroed), which lives until the bitmap is deleted.
+        let bitmap = unsafe { CreateDIBSection(dc, &info, 0, &mut bits, 0, 0) };
+        if bitmap == 0 || bits.is_null() {
+            if bitmap != 0 {
+                // SAFETY: the bitmap made above, not selected anywhere.
+                unsafe { DeleteObject(bitmap) };
+            }
+            continue;
+        }
+        let unit = [glyph as u16];
+        let mut size = Size { cx: 0, cy: 0 };
+        // SAFETY: the bitmap is selected into the DC only for the drawing and put out again before it is read or deleted; `unit` is a
+        // live array of one character (its length is passed); `size` is filled in; GdiFlush makes sure the drawing is done.
+        unsafe {
+            let old = SelectObject(dc, bitmap);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, 0x00FF_FFFF);
+            GetTextExtentPoint32W(dc, unit.as_ptr(), 1, &mut size);
+            TextOutW(dc, (px - size.cx) / 2, (px - size.cy) / 2, unit.as_ptr(), 1);
+            GdiFlush();
+            SelectObject(dc, old);
+        }
+        // SAFETY: `bits` points to px * px * 4 bytes of the bitmap's memory, which stay until the DeleteObject below; the bitmap is out of
+        // the DC and its drawing is flushed, so nothing else uses them.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(bits.cast::<u8>(), (px as usize) * (px as usize) * 4) };
+        for [b, g, r, a] in pixels.as_chunks_mut::<4>().0 {
+            let alpha = u32::from((*b).max(*g).max(*r));
+            // The picture is kept premultiplied: the colour is scaled by the opacity.
+            *b = (ink_b * alpha / 255) as u8;
+            *g = (ink_g * alpha / 255) as u8;
+            *r = (ink_r * alpha / 255) as u8;
+            *a = alpha as u8;
+        }
+        // SAFETY: the list and the bitmap are ours; the list copies the picture, and the bitmap is deleted after.
+        unsafe {
+            ImageList_Add(list, bitmap, 0);
+            DeleteObject(bitmap);
+        }
+    }
+    // SAFETY: the font is put out of the DC before it is deleted, and the DC after; all three are ours and not used again.
+    unsafe {
+        if old_font != 0 {
+            SelectObject(dc, old_font);
+        }
+        if font != 0 {
+            DeleteObject(font);
+        }
+        DeleteDC(dc);
+    }
+    list
+}
+
+fn make_long(low: i32, high: i32) -> isize {
+    (((high as u32) << 16) | (low as u32 & 0xFFFF)) as isize
+}
+
+fn separator(width: i32) -> TbButton {
+    TbButton { bitmap: width, command: 0, state: TBSTATE_ENABLED, style: BTNS_SEP, reserved: [0; 6], data: 0, string: 0 }
+}
+
+/// Make the toolbar's buttons from `tb_spec`: the pictures are drawn at the size the screen asks for (or the buttons say their names
+/// when there is no icon font), and the boxes of the page and the search get a gap of their own in the row.
+fn rebuild_toolbar(state: &WindowState) {
+    let bar = state.toolbar.get();
+    let spec_ref = state.tb_spec.borrow();
+    let Some(spec) = spec_ref.as_ref() else { return };
+    if bar == 0 {
+        return;
+    }
+    let dpi = state.dpi.get();
+    // SAFETY: plain messages to the toolbar: the size of its button structure is told first, then every button is taken out.
+    unsafe {
+        SendMessageW(bar, TB_BUTTONSTRUCTSIZE, std::mem::size_of::<TbButton>(), 0);
+        for _ in 0..SendMessageW(bar, TB_BUTTONCOUNT, 0, 0).max(0) {
+            SendMessageW(bar, TB_DELETEBUTTON, 0, 0);
+        }
+    }
+    let glyphs: Vec<char> = spec.items.iter().filter_map(|i| if let ToolItem::Button { glyph, .. } = i { Some(*glyph) } else { None }).collect();
+    let px = scale(dpi, TOOL_ICON).max(8);
+    let (mut normal, mut grey) = match icon_font(state).face() {
+        Some(face) => (icon_list(face, &glyphs, px, ICON_INK), icon_list(face, &glyphs, px, ICON_GREY)),
+        None => (0, 0),
+    };
+    if normal == 0 || grey == 0 {
+        // Both or neither: a button greyed with no picture of its own would show the other kind.
+        for list in [normal, grey].into_iter().filter(|&l| l != 0) {
+            // SAFETY: a list made just above and not given to anyone.
+            unsafe { ImageList_Destroy(list) };
+        }
+        (normal, grey) = (0, 0);
+    }
+    let words = normal == 0;
+    // SAFETY: TB_SETIMAGELIST and TB_SETDISABLEDIMAGELIST take the id of a set of lists (0) and a list (or 0 for none) and answer with the
+    // list that was there; those are ours and nobody uses them now, so they are destroyed. The new lists are kept to be destroyed at the end.
+    unsafe {
+        let old_normal = SendMessageW(bar, TB_SETIMAGELIST, 0, normal);
+        let old_grey = SendMessageW(bar, TB_SETDISABLEDIMAGELIST, 0, grey);
+        for list in [old_normal, old_grey].into_iter().filter(|&l| l != 0) {
+            ImageList_Destroy(list);
+        }
+    }
+    state.tb_lists.set((normal, grey));
+    // Without pictures the names go into the toolbar's string pool, and a button points at its name by its number.
+    let mut first_string = 0;
+    if words {
+        let mut pool: Vec<u16> = Vec::new();
+        for item in &spec.items {
+            if let ToolItem::Button { label, .. } = item {
+                pool.extend(label.encode_utf16().filter(|&c| c != 0));
+                pool.push(0);
+            }
+        }
+        pool.push(0);
+        // SAFETY: TB_ADDSTRINGW with no module takes a pointer to strings that each end with a zero and the last with two; `pool` is that and
+        // outlives the call (the toolbar copies it). The answer is the number of the first string.
+        first_string = unsafe { SendMessageW(bar, WM_USER + 77, 0, pool.as_ptr() as isize) };
+    }
+    let (gap, mut image, mut name) = (scale(dpi, TOOL_GAP), 0, first_string);
+    let mut boxes = (-1, -1);
+    let mut buttons: Vec<TbButton> = Vec::new();
+    for item in &spec.items {
+        let index = buttons.len() as i32;
+        match item {
+            ToolItem::Button { cmd, toggle, .. } => {
+                let mut style = if *toggle { BTNS_CHECK } else { 0 };
+                let (bitmap, string) = if words {
+                    style |= BTNS_SHOWTEXT | BTNS_AUTOSIZE;
+                    name += 1;
+                    (I_IMAGENONE, name - 1)
+                } else {
+                    image += 1;
+                    (image - 1, 0)
+                };
+                buttons.push(TbButton { bitmap, command: *cmd as i32, state: TBSTATE_ENABLED, style, reserved: [0; 6], data: 0, string });
+            }
+            ToolItem::Separator => buttons.push(separator(gap)),
+            // The place of a box is a button that has no picture, is greyed and is as wide as the box (a wide separator would draw a
+            // stray mark at its top); its width is set below, once it is in the toolbar.
+            ToolItem::PageBox => {
+                boxes.0 = index;
+                buttons.push(TbButton { bitmap: I_IMAGENONE, command: BOX_COMMAND, state: 0, style: BTNS_AUTOSIZE, reserved: [0; 6], data: 0, string: 0 });
+            }
+            ToolItem::SearchBox { .. } => {
+                boxes.1 = index;
+                buttons.push(TbButton { bitmap: I_IMAGENONE, command: BOX_COMMAND + 1, state: 0, style: BTNS_AUTOSIZE, reserved: [0; 6], data: 0, string: 0 });
+            }
+        }
+    }
+    state.tb_boxes.set(boxes);
+    // SAFETY: TB_ADDBUTTONSW takes the number of buttons and a pointer to that many TBBUTTON structures, which `buttons` is (the toolbar
+    // copies them).
+    unsafe {
+        SendMessageW(bar, TB_ADDBUTTONSW, buttons.len(), buttons.as_ptr() as isize);
+    }
+    for (command, width) in [(BOX_COMMAND, PAGE_BOX_W), (BOX_COMMAND + 1, SEARCH_BOX_W)] {
+        let info = TbButtonInfo { size: std::mem::size_of::<TbButtonInfo>() as u32, mask: TBIF_SIZE, command: 0, image: 0, state: 0, style: 0, width: scale(dpi, width) as u16, param: 0, text: null_mut(), text_max: 0 };
+        // SAFETY: TB_SETBUTTONINFOW takes the command of a button and a pointer to a live TBBUTTONINFOW of the size it declares, here
+        // setting only the width; a command the toolbar has no button for (a box that is not in this toolbar) is not an error.
+        unsafe { SendMessageW(bar, TB_SETBUTTONINFOW, command as usize, (&raw const info) as isize) };
+    }
+    // SAFETY: plain messages to the toolbar: the size of a button is the picture and the room round it (TB_SETBUTTONSIZE takes the width
+    // in the low word and the height in the high); TB_AUTOSIZE lets the toolbar settle its own size.
+    unsafe {
+        if !words {
+            SendMessageW(bar, TB_SETBUTTONSIZE, 0, make_long(px + scale(dpi, 16), px + scale(dpi, 14)));
+        }
+        SendMessageW(bar, TB_AUTOSIZE, 0, 0);
+    }
+    // SAFETY: asks the toolbar for the size of a button: width in the low word, height in the high.
+    let size = unsafe { SendMessageW(bar, TB_GETBUTTONSIZE, 0, 0) } as usize;
+    state.tb_height.set(hiword(size) as i32 + scale(dpi, 6));
+    drop(spec_ref);
+    apply_toolbar_state(state);
+}
+
+/// Grey or press the buttons as the reader says, enable the boxes, and put the page in its box (unless it is being typed in).
+fn apply_toolbar_state(state: &WindowState) {
+    let bar = state.toolbar.get();
+    let st = state.tb_state.borrow();
+    if bar != 0 {
+        for &(cmd, enabled, checked) in &st.buttons {
+            // SAFETY: plain messages to the toolbar: the button of this command is enabled or not, pressed or not (a command it has no
+            // button for is not an error).
+            unsafe {
+                SendMessageW(bar, TB_ENABLEBUTTON, cmd as usize, isize::from(enabled));
+                SendMessageW(bar, TB_CHECKBUTTON, cmd as usize, isize::from(checked));
+            }
+        }
+    }
+    for edit in [state.tb_page.get(), state.tb_search.get()] {
+        if edit != 0 {
+            // SAFETY: plain handle of a box of ours.
+            unsafe { EnableWindow(edit, i32::from(st.boxes_enabled)) };
+        }
+    }
+    let page = state.tb_page.get();
+    // SAFETY: reads which window has the keyboard.
+    if page != 0 && unsafe { GetFocus() } != page {
+        set_text(page, &st.page_text);
+    }
+}
+
+/// Lay the page box and the search box over their gaps in the toolbar's row.
+fn place_tool_boxes(state: &WindowState, dpi: u32) {
+    let bar = state.toolbar.get();
+    let show = bar != 0 && state.tb_visible.get();
+    let (page_index, search_index) = state.tb_boxes.get();
+    let h = scale(dpi, BOX_H);
+    let (y, inset) = (((state.tb_height.get() - h) / 2).max(0), scale(dpi, 2));
+    for (edit, index) in [(state.tb_page.get(), page_index), (state.tb_search.get(), search_index)] {
+        if edit == 0 {
+            continue;
+        }
+        let mut r = WinRect::default();
+        // SAFETY: TB_GETITEMRECT takes a button's number and a pointer to a live RECT, which it fills in (a number it has no button for
+        // fails and leaves the RECT zero).
+        let found = show && index >= 0 && unsafe { SendMessageW(bar, TB_GETITEMRECT, index as usize, (&raw mut r) as isize) } != 0;
+        if found {
+            put(edit, r.left + inset, y, r.right - r.left - 2 * inset, h, true);
+        } else {
+            put(edit, 0, 0, 0, 0, false);
+        }
+    }
+}
+
+/// Take the toolbar the reader describes (its buttons, its words, whether it is shown).
+fn set_toolbar(state: &WindowState, spec: ToolbarSpec) {
+    state.tb_visible.set(spec.visible && state.toolbar.get() != 0);
+    if let Some(ToolItem::SearchBox { hint }) = spec.items.iter().find(|i| matches!(i, ToolItem::SearchBox { .. })) {
+        let w = wide(hint);
+        // SAFETY: EM_SETCUEBANNER takes a flag (0: the words go once the box has the keyboard) and a zero-terminated UTF-16 string that
+        // outlives the call (the box copies it).
+        unsafe { SendMessageW(state.tb_search.get(), EM_SETCUEBANNER, 0, w.as_ptr() as isize) };
+    }
+    *state.tb_spec.borrow_mut() = Some(spec);
+    // A toolbar that is not shown is not drawn (the speed test has none); it is made when it is asked to be shown.
+    if state.tb_visible.get() {
+        rebuild_toolbar(state);
+    }
+    apply_layout(state);
+}
+
+/// The ToolTip control asks for the words of a tip: the toolbar button of that command has them in the toolbar's description.
+fn tooltip_text(state: &WindowState, info: &mut NmTtDispInfo) {
+    fill_tip(state.tb_spec.borrow().as_ref(), info);
+}
+
+/// Put the tip of the button whose command is `info.hdr.id` into the ToolTip's request (nothing if there is no such button).
+fn fill_tip(spec: Option<&ToolbarSpec>, info: &mut NmTtDispInfo) {
+    // When the tool is named by a window (flag 1) and not by a command, it is not one of ours.
+    if info.flags & 1 != 0 {
+        return;
+    }
+    let cmd = info.hdr.id as u32;
+    let tip = spec.and_then(|s| {
+        s.items.iter().find_map(|i| match i {
+            ToolItem::Button { cmd: c, tip, .. } if *c == cmd => Some(tip),
+            _ => None,
+        })
+    });
+    let Some(tip) = tip else { return };
+    info.buf = [0; 80];
+    for (to, unit) in info.buf.iter_mut().take(79).zip(tip.encode_utf16()) {
+        *to = unit;
+    }
+    info.text = info.buf.as_mut_ptr();
+}
+
+/// Remember where the window is while it is neither maximized nor minimized (that is the place that is kept for the next run).
+fn remember_normal(state: &WindowState) {
+    let hwnd = state.hwnd.get();
+    // SAFETY: plain handle of this window; reads its state.
+    if unsafe { IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 } {
+        return;
+    }
+    let mut r = WinRect::default();
+    // SAFETY: `r` is a live RECT that Windows fills in and does not keep.
+    if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
+        state.normal.set(Some(r));
+    }
+}
+
+/// Keep the window's place for the next run (not for the speed test or the other hidden tests).
+fn save_placement(state: &WindowState) {
+    let Some(r) = state.normal.get().filter(|_| state.remember_window) else { return };
+    // SAFETY: plain handle of this window; reads its state.
+    let maximized = unsafe { IsZoomed(state.hwnd.get()) } != 0;
+    let place = Placement { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top, maximized };
+    crate::settings::update(|s| s.window = Some(place));
+}
+
+unsafe extern "system" fn collect_monitor(monitor: isize, _dc: isize, _rect: *const WinRect, data: isize) -> i32 {
+    // SAFETY: `data` is the address of the Vec that `work_areas` hands to EnumDisplayMonitors, which calls this only during that call and
+    // on the same thread; nothing else uses the Vec meanwhile.
+    let Some(list) = (unsafe { (data as *mut Vec<(bool, Rect)>).as_mut() }) else { return 0 };
+    let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: WinRect::default(), work: WinRect::default(), flags: 0 };
+    // SAFETY: `info` is a live MONITORINFO of the size it declares; Windows fills it in and does not keep it.
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        let w = info.work;
+        list.push((info.flags & 1 != 0, Rect { x: w.left, y: w.top, w: w.right - w.left, h: w.bottom - w.top }));
+    }
+    1
+}
+
+/// The work areas of the screens (each less its task bar), the main screen first.
+fn work_areas() -> Vec<Rect> {
+    let mut list: Vec<(bool, Rect)> = Vec::new();
+    // SAFETY: a null device context and clip rectangle ask for every monitor; the callback is `collect_monitor`, given the address of
+    // `list`, which lives through the call.
+    unsafe { EnumDisplayMonitors(0, null(), collect_monitor, (&raw mut list) as isize) };
+    list.iter().filter(|(main, _)| *main).chain(list.iter().filter(|(main, _)| !*main)).map(|&(_, r)| r).collect()
+}
+
+/// The program's icon in the size the screen asks for (0 when the program has none: it is a resource that `build.rs` of the program writes).
+fn load_icon(instance: isize, dpi: u32, small: bool) -> isize {
+    let (cx, cy) = if small { (metric(SM_CXSMICON, dpi), metric(SM_CYSMICON, dpi)) } else { (metric(SM_CXICON, dpi), metric(SM_CYICON, dpi)) };
+    // SAFETY: a small integer resource id in the pointer slot is how LoadImageW names a resource of the program; LR_SHARED gives an icon
+    // that the system keeps and that is never destroyed by the caller, of the size asked or the nearest the file has.
+    unsafe { LoadImageW(instance, ICON_ID as *const u16, IMAGE_ICON, cx, cy, LR_SHARED) }
+}
+
+/// Give the window the icon (big for the task switcher, small for the title bar and task bar) at the size of its screen.
+fn set_icons(hwnd: isize, dpi: u32) {
+    // SAFETY: a null module name means the module of this program.
+    let instance = unsafe { GetModuleHandleW(null()) };
+    for (which, small) in [(1usize, false), (0, true)] {
+        let icon = load_icon(instance, dpi, small);
+        if icon != 0 {
+            // SAFETY: WM_SETICON takes the kind (big or small) and an icon handle, which is a shared icon of the system's.
+            unsafe { SendMessageW(hwnd, WM_SETICON, which, icon) };
+        }
+    }
+}
+
+/// Which click in a row (1, 2, 3) the button that has just gone down is, by the system's own measure of a double click.
+fn click_count(state: &WindowState, x: i32, y: i32) -> u8 {
+    // SAFETY: these read system settings and the time of the message being handled; they take and give plain numbers.
+    let (ms, w, h, time) = unsafe { (GetDoubleClickTime(), GetSystemMetrics(SM_CXDOUBLECLK), GetSystemMetrics(SM_CYDOUBLECLK), GetMessageTime()) };
+    state.clicks.borrow_mut().click(time as u32, x, y, ms, w / 2, h / 2)
+}
+
+/// The edit box that is the find box: the toolbar's when the toolbar is shown, else the one over the pages.
+fn find_edit(state: &WindowState) -> isize {
+    if state.tb_visible.get() && state.tb_search.get() != 0 { state.tb_search.get() } else { state.find.get() }
+}
+
 // --- starting up -------------------------------------------------------------------------------------------------
 
 /// Make the window and run it until it is closed. `make` is given the means to wake the window from another thread
 /// and builds the reader. `client`: a size for the window's client area, in pixels (the speed test uses it; it may be bigger
-/// than the screen); otherwise the window is most of the work area.
-pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl FnOnce(Waker) -> Box<dyn Handler>) -> i32 {
-    let icc = InitCommonControlsEx { size: std::mem::size_of::<InitCommonControlsEx>() as u32, icc: ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES };
+/// than the screen); otherwise the window is most of the work area, or where it was (`saved`, put back where it can be seen). With
+/// `remember` the window's place is kept for the next run when it is closed.
+pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Option<Placement>, remember: bool, make: impl FnOnce(Waker) -> Box<dyn Handler>) -> i32 {
+    let icc = InitCommonControlsEx { size: std::mem::size_of::<InitCommonControlsEx>() as u32, icc: ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES };
     // SAFETY: `icc` is a live struct of the size it declares; this makes the buttons and boxes use the new look.
     unsafe { InitCommonControlsEx(&icc) };
     // SAFETY: the print box needs COM on its thread (a single-threaded apartment); a failure only means the box may not open.
@@ -2182,6 +3000,8 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     let class = wide("QingpdfView");
     // SAFETY: a null module name means the module of this program.
     let instance = unsafe { GetModuleHandleW(null()) };
+    // SAFETY: no arguments; reads a system setting.
+    let system_dpi = unsafe { GetDpiForSystem() }.max(96);
     let wc = WndClassExW {
         size: std::mem::size_of::<WndClassExW>() as u32,
         style: 0,
@@ -2189,21 +3009,20 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
         cls_extra: 0,
         wnd_extra: 0,
         instance,
-        icon: 0,
+        icon: load_icon(instance, system_dpi, false),
         // SAFETY: a small integer resource id in the pointer slot is how LoadCursorW names a stock cursor.
         cursor: unsafe { LoadCursorW(0, IDC_ARROW as *const u16) },
         background: 0,
         menu_name: null(),
         class_name: class.as_ptr(),
-        icon_small: 0,
+        icon_small: load_icon(instance, system_dpi, true),
     };
     // SAFETY: `wc` is a live WNDCLASSEXW whose strings outlive the call (Windows copies what it needs).
     if unsafe { RegisterClassExW(&wc) } == 0 {
         return 1;
     }
-    // SAFETY: no arguments; reads a system setting.
-    let system_dpi = unsafe { GetDpiForSystem() }.max(96);
-    let style = WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_CLIPCHILDREN;
+    // The scroll bars are controls of their own (see `apply_layout`), not the window's.
+    let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     let mut frame = WinRect { left: 0, top: 0, right: DEFAULT_WIDTH * system_dpi as i32 / 96, bottom: DEFAULT_HEIGHT * system_dpi as i32 / 96 };
     // SAFETY: `frame` is a live RECT that is rewritten in place.
     unsafe { AdjustWindowRectExForDpi(&mut frame, style, 1, WS_EX_ACCEPTFILES, system_dpi) };
@@ -2229,13 +3048,53 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
         x = work.left + (aw - w) / 2;
         y = work.top + (ah - h) / 2;
     }
+    // Where the window was when it was last closed, if that can still be seen.
+    let mut maximized = false;
+    if client.is_none()
+        && let Some(at) = saved.and_then(|p| placement::restore(p, &work_areas()))
+    {
+        (x, y, w, h, maximized) = (at.x, at.y, at.w, at.h, at.maximized);
+    }
     let name = wide(title);
     // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; no parent, menu or creation parameter.
     let hwnd = unsafe { CreateWindowExW(WS_EX_ACCEPTFILES, class.as_ptr(), name.as_ptr(), style, x, y, w, h, 0, 0, instance, null_mut()) };
     if hwnd == 0 {
         return 1;
     }
-    let state = Box::new(WindowState { hwnd: Cell::new(hwnd), closing: Cell::new(false), handler: RefCell::new(None), back: RefCell::new(Back::default()), font: Cell::new(0), dpi: Cell::new(96), tree: Cell::new(0), find: Cell::new(0), field_single: Cell::new(0), field_multi: Cell::new(0), field_active: Cell::new(0), printer: RefCell::new(None), menu_open: Cell::new(false), menus_waiting: RefCell::new(None) });
+    let state = Box::new(WindowState {
+        hwnd: Cell::new(hwnd),
+        closing: Cell::new(false),
+        handler: RefCell::new(None),
+        back: RefCell::new(Back::default()),
+        font: Cell::new(0),
+        dpi: Cell::new(96),
+        tree: Cell::new(0),
+        find: Cell::new(0),
+        field_single: Cell::new(0),
+        field_multi: Cell::new(0),
+        field_active: Cell::new(0),
+        printer: RefCell::new(None),
+        menu_open: Cell::new(false),
+        menus_waiting: RefCell::new(None),
+        toolbar: Cell::new(0),
+        tb_page: Cell::new(0),
+        tb_search: Cell::new(0),
+        status: Cell::new(0),
+        vbar: Cell::new(0),
+        hbar: Cell::new(0),
+        tb_spec: RefCell::new(None),
+        tb_state: RefCell::new(ToolbarState::default()),
+        tb_visible: Cell::new(false),
+        tb_height: Cell::new(0),
+        tb_boxes: Cell::new((-1, -1)),
+        tb_lists: Cell::new((0, 0)),
+        icon_font: Cell::new(None),
+        hbar_on: Cell::new(false),
+        content: Cell::new((-1, -1, -1)),
+        normal: Cell::new(None),
+        remember_window: remember && client.is_none(),
+        clicks: RefCell::new(ClickCounter::default()),
+    });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize) };
@@ -2245,8 +3104,19 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
     state.find.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIND));
     state.field_single.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIELD1));
     state.field_multi.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, ID_FIELD2));
+    // The toolbar (and, made after it so that they lie over it, the boxes of the page and the search), the status bar and the two scroll
+    // bars. The toolbar and the status bar are put where they go by `apply_layout`, not by Windows.
+    state.toolbar.set(make_child(hwnd, instance, "ToolbarWindow32", 0, TBSTYLE_TOOLTIPS | TBSTYLE_FLAT | CCS_NODIVIDER | CCS_NORESIZE | CCS_NOPARENTALIGN, ID_TOOLBAR));
+    state.tb_page.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER, ID_PAGE_BOX));
+    state.tb_search.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_SEARCH_BOX));
+    state.status.set(make_child(hwnd, instance, "msctls_statusbar32", 0, CCS_NORESIZE | CCS_NOPARENTALIGN, ID_STATUS));
+    state.vbar.set(make_child(hwnd, instance, "SCROLLBAR", 0, SBS_VERT, ID_VBAR));
+    state.hbar.set(make_child(hwnd, instance, "SCROLLBAR", 0, SBS_HORZ, ID_HBAR));
+
     if let Some((cw, ch)) = client {
-        // The scroll bars and the like take some of the window: make the client area the size asked for.
+        // The page area is to be as wide as asked (the vertical scroll bar is beside it) and as tall as asked less the status bar, which
+        // is what the speed test has always measured; it has no toolbar. The window makes room for the rest.
+        let (cw, ch) = (cw + metric(SM_CXVSCROLL, system_dpi), ch);
         let (have_w, have_h) = client_size(hwnd);
         if (have_w, have_h) != (cw, ch) {
             // SAFETY: plain numbers and the handle of the window just made; no move, no restack.
@@ -2265,13 +3135,17 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, make: impl F
 
     // SAFETY: plain handle of the window just made.
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    set_icons(hwnd, dpi);
     new_dpi(state, dpi);
     dispatch(state, Event::Dpi(dpi));
-    let (w, h) = client_size(hwnd);
-    dispatch(state, Event::Size { w, h });
+    // The reader has not heard of the size yet (what was told before it was made is lost): it is told now.
+    state.content.set((-1, -1, -1));
+    apply_layout(state);
+    // The place it has now is the one kept for when it is closed (it is not shown yet, so it is not maximized).
+    remember_normal(state);
     // SAFETY: plain handle of the window just made.
     unsafe {
-        ShowWindow(hwnd, SW_SHOWNORMAL);
+        ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOWNORMAL });
         UpdateWindow(hwnd);
     }
 
@@ -2328,10 +3202,28 @@ fn forward_key(state: &WindowState, msg: &Msg) -> bool {
         }
         return false;
     }
-    if msg.hwnd == 0 || (msg.hwnd != tree && msg.hwnd != find) {
+    // The page box of the toolbar: Enter goes to the page typed, Esc gives up what was typed; either gives the keyboard to the pages.
+    let page = state.tb_page.get();
+    if msg.hwnd != 0 && msg.hwnd == page {
+        let exit = match msg.wparam as u32 {
+            0x0D => {
+                dispatch(state, Event::PageBox(window_text(page, 32)));
+                true
+            }
+            0x1B => true,
+            _ => false,
+        };
+        if exit {
+            // SAFETY: plain handle of the main window.
+            unsafe { SetFocus(state.hwnd.get()) };
+        }
+        return exit;
+    }
+    let search = state.tb_search.get();
+    if msg.hwnd == 0 || (msg.hwnd != tree && msg.hwnd != find && msg.hwnd != search) {
         return false;
     }
-    let in_find = msg.hwnd == find;
+    let in_find = msg.hwnd == find || msg.hwnd == search;
     let vk = msg.wparam as u32;
     let (ctrl, shift) = (modifier(0x11), modifier(0x10));
     let wanted = match vk {
@@ -2355,6 +3247,12 @@ fn free_state(raw: *mut WindowState) {
     // A print job that is still going (the window was closed during it) is stopped and the printer let go of.
     end_printer(&state, true);
     free_back(&state);
+    for list in [state.tb_lists.get().0, state.tb_lists.get().1] {
+        if list != 0 {
+            // SAFETY: the lists were made by `icon_list`; the toolbar that used them is gone with its window (or is no longer asked for them).
+            unsafe { ImageList_Destroy(list) };
+        }
+    }
     if state.font.get() != 0 {
         // SAFETY: the font was made by `make_font` and the device context that had it selected is gone.
         unsafe { DeleteObject(state.font.get()) };
@@ -2873,5 +3771,45 @@ impl Recognizer for Recogniser {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::Lang;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_structures_have_the_layout_windows_expects() {
+        // The 64-bit sizes of TBBUTTON, NMHDR, NMTTDISPINFOW and MONITORINFO (commctrl.h, winuser.h).
+        assert_eq!(std::mem::size_of::<TbButton>(), 32);
+        assert_eq!(std::mem::size_of::<NmHdr>(), 24);
+        assert_eq!(std::mem::size_of::<NmTtDispInfo>(), 216);
+        assert_eq!(std::mem::size_of::<MonitorInfo>(), 40);
+        assert_eq!(std::mem::size_of::<TbButtonInfo>(), 48);
+        assert_eq!(std::mem::offset_of!(NmTtDispInfo, buf), 32);
+        assert_eq!(std::mem::offset_of!(TbButton, string), 24);
+    }
+
+    fn request(cmd: u32) -> NmTtDispInfo {
+        NmTtDispInfo { hdr: NmHdr { from: 0, id: cmd as usize, code: TTN_GETDISPINFOW }, text: null_mut(), buf: [0; 80], instance: 0, flags: 0, param: 0 }
+    }
+
+    #[test]
+    fn a_tooltip_asked_for_by_its_command_gets_the_words_of_its_button() {
+        let spec = toolbar::spec(Lang::Zh, true);
+        let mut info = request(crate::app::CMD_PRINT);
+        fill_tip(Some(&spec), &mut info);
+        let end = info.buf.iter().position(|&u| u == 0).unwrap();
+        assert_eq!(String::from_utf16(&info.buf[..end]).unwrap(), "打印 (Ctrl+P)");
+        assert_eq!(info.text, info.buf.as_mut_ptr());
+        // A command with no button, a tip named by a window, and no toolbar: nothing is written.
+        for (cmd, flags, has_spec) in [(9999, 0, true), (crate::app::CMD_PRINT, 1, true), (crate::app::CMD_PRINT, 0, false)] {
+            let mut info = request(cmd);
+            info.flags = flags;
+            fill_tip(has_spec.then_some(&spec), &mut info);
+            assert!(info.text.is_null() && info.buf.iter().all(|&u| u == 0), "{cmd}");
+        }
     }
 }

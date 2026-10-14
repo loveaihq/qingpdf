@@ -200,6 +200,10 @@ pub struct CharBoxes {
     /// is shown (turned by its own `/Rotate`, not by the window's rotation; origin at the top left). A space between pieces
     /// and the end of a line have a box with no area. At most [`crate::text::MAX_PAGE_CHARS`] characters.
     pub boxes: Vec<[f32; 4]>,
+    /// The characters themselves, one `char` for each box and in the same order (a space the layout put between two pieces is a
+    /// space, the end of a line is a line feed): what a double or triple click needs to find a word or a line. Empty for a file that
+    /// may be annotated but not copied (the positions only, as for [`Engine::copy_text`]).
+    pub text: String,
 }
 
 /// One place where the words were found on a page.
