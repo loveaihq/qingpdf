@@ -81,12 +81,14 @@ type Resolver<'a> = &'a dyn Fn(&Object) -> Result<Object>;
 /// Apply all filters of a stream dictionary to its raw data (7.3.8.2, 7.4.1).
 /// `resolve` follows indirect references found in `/Filter` and
 /// `/DecodeParms`.
+#[cfg(test)]
 pub fn decode(dict: &Dict, data: &[u8], resolve: Resolver<'_>) -> Result<Vec<u8>> {
     decode_with_limit(dict, data, resolve, MAX_DECODED_SIZE, 0, &DecodeBudget::default())
 }
 
 /// Like [`decode`] when the dictionary is known to hold only direct objects
 /// (cross-reference streams, 7.5.8.2).
+#[cfg(test)]
 pub fn decode_direct(dict: &Dict, data: &[u8]) -> Result<Vec<u8>> {
     decode(dict, data, &|o| Ok(o.clone()))
 }

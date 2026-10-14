@@ -95,8 +95,6 @@ pub struct AcroForm {
     pub q: i64,
     /// `/DR /Font`: the fonts the form's `/DA` strings name.
     pub fonts: Dict,
-    #[allow(dead_code)]
-    pub need_appearances: bool,
     cache: RefCell<Cache>,
 }
 
@@ -171,7 +169,6 @@ pub fn acroform(doc: &Document, work: &Work) -> Option<AcroForm> {
         da: Rc::new(da.unwrap_or_else(|| layout::parse_da(b""))),
         q: res_int(doc, &form, "Q").unwrap_or(0),
         fonts,
-        need_appearances: matches!(res(doc, &form, "NeedAppearances"), Some(Object::Bool(true))),
         cache: RefCell::new(Cache::default()),
     })
 }
@@ -369,14 +366,10 @@ pub fn resolve_field(env: Env<'_>, widget_num: u32, widget: Dict) -> Option<Fiel
 fn decode_text(bytes: &[u8]) -> String {
     // (Only what can be kept is turned into text: four bytes a character is the most any of the encodings below uses.)
     let bytes = bytes.get(..MAX_VALUE_CHARS * 4 + 4).unwrap_or(bytes);
-    let utf16 = |rest: &[u8], big: bool| -> String {
-        let units = rest.as_chunks::<2>().0.iter().map(|p| if big { u16::from_be_bytes(*p) } else { u16::from_le_bytes(*p) });
-        char::decode_utf16(units).map(|r| r.unwrap_or('\u{FFFD}')).collect()
-    };
     let text: String = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        utf16(rest, true)
+        crate::info::decode_utf16(rest, true)
     } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        utf16(rest, false)
+        crate::info::decode_utf16(rest, false)
     } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(rest).into_owned()
     } else {

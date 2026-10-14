@@ -4,35 +4,12 @@
 
 #[path = "../../qingpdf-core/tests/common/mod.rs"]
 mod common;
+mod runner;
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::PathBuf;
 use std::time::Instant;
 
-fn run<I, S>(args: I) -> Output
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new(env!("CARGO_BIN_EXE_qingpdf")).args(args).output().expect("cannot run qingpdf")
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn code(o: &Output) -> i32 {
-    o.status.code().unwrap_or(-1)
-}
-
-fn s(p: &Path) -> &str {
-    p.to_str().unwrap()
-}
+use runner::{code, run, s, stderr, stdout};
 
 /// Takes the folder of a test away when the test is over, whether it passed or not.
 struct Cleanup(PathBuf);

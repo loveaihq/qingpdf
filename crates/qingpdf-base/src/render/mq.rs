@@ -6,7 +6,7 @@
 //! few of its contexts in other states and says so with [`context`].
 //!
 //! The decoder never fails and never reads past its data: where the data ends (or at a marker, a byte `0xFF`
-//! followed by more than `0x8F`) it goes on with 1-bits, as the standard says. [`Mq::past_end`] counts how many
+//! followed by more than `0x8F`) it goes on with 1-bits, as the standard says. The decoder counts how many
 //! bytes' worth of those it has taken, so that a caller can tell a stream that has run dry from one that is just
 //! coded in few bits (a blank page is a few dozen bytes).
 
@@ -153,12 +153,6 @@ impl<'a> Mq<'a> {
     #[inline]
     pub fn exhausted(&self) -> bool {
         self.past_end > MAX_PAST_END
-    }
-
-    /// Bytes of fill taken so far.
-    #[allow(dead_code)]
-    pub fn past_end(&self) -> u32 {
-        self.past_end
     }
 
     /// DECODE (E.3.2): one decision with the context `cx`.

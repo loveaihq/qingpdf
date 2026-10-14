@@ -97,7 +97,7 @@ pub(super) enum Src<'s, 'd> {
     Huff { r: &'s mut BitReader<'d>, t: &'s HuffTables<'s> },
 }
 
-fn number(v: Option<i64>) -> Result<i64> {
+pub(super) fn number(v: Option<i64>) -> Result<i64> {
     v.ok_or_else(|| bad("an out-of-band value where there must be a number"))
 }
 

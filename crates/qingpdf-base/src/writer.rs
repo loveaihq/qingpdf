@@ -434,11 +434,6 @@ impl<'a> Builder<'a> {
         self.root_metadata = Some((source, num));
     }
 
-    /// The PDF version the header will say.
-    pub fn set_version(&mut self, version: (u8, u8)) {
-        self.version = version;
-    }
-
     /// Allow importing from `doc`, whose pages have the object numbers in
     /// `pages`. Returns the index to pass to the import functions. The same
     /// document may be added again to get a separate copy of everything

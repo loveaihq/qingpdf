@@ -3,6 +3,8 @@
 //! string; a page of Type 3 text has ten tokens per character, and text extraction
 //! is mostly this loop.
 
+use crate::lexer::hex_value;
+
 /// Where the bytes of a string or name are: in the content stream itself, or in
 /// the scanner's buffer (strings with escapes, hexadecimal strings, names with `#`).
 #[derive(Clone, Copy, Debug)]
@@ -57,15 +59,6 @@ static CLASS: [u8; 256] = class_table();
 
 fn class(b: u8) -> u8 {
     CLASS.get(usize::from(b)).copied().unwrap_or(0)
-}
-
-fn hex_value(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 enum Tok<'a> {

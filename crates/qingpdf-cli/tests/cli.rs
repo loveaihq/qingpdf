@@ -6,30 +6,11 @@
 
 #[path = "../../qingpdf-core/tests/common/mod.rs"]
 mod common;
+mod runner;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn run<I, S>(args: I) -> Output
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    Command::new(env!("CARGO_BIN_EXE_qingpdf")).args(args).output().expect("cannot run qingpdf")
-}
-
-fn stdout(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout).into_owned()
-}
-
-fn stderr(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stderr).into_owned()
-}
-
-fn code(o: &Output) -> i32 {
-    o.status.code().unwrap_or(-1)
-}
+use runner::{code, run, stderr, stdout};
 
 fn fixtures() -> PathBuf {
     common::workspace_root().join("crates").join("qingpdf-core").join("tests").join("fixtures")

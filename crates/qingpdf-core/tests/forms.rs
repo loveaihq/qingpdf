@@ -7,54 +7,16 @@
 
 mod common;
 
+use common::Viewer;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use qingpdf_core::Document;
 use qingpdf_core::object::Object;
-use qingpdf_core::view::{EditResult, EditStatus, Engine, Event, FieldInfo, FieldKind, FillValue, Opened, RenderRequest, Rendered, SaveStatus, TOTAL_BYTES};
-
-struct Viewer {
-    engine: Engine,
-    opened: Opened,
-    next: u64,
-}
+use qingpdf_core::view::{EditResult, EditStatus, Event, FieldInfo, FieldKind, FillValue, RenderRequest, Rendered, SaveStatus};
 
 impl Viewer {
-    fn open(path: &Path, password: &str) -> Viewer {
-        let engine = Engine::start(Box::new(|| {}));
-        engine.open_file(1, &path.to_string_lossy(), password, TOTAL_BYTES, 1920 * 1080);
-        match engine.wait(20_000) {
-            Some(Event::Opened(opened)) => Viewer { engine, opened, next: 100 },
-            other => panic!("{}: not opened: {other:?}", path.display()),
-        }
-    }
-
-    fn id(&mut self) -> u64 {
-        self.next += 1;
-        self.next
-    }
-
-    fn until<T>(&self, mut pick: impl FnMut(Event) -> Option<T>) -> T {
-        loop {
-            match self.engine.wait(30_000) {
-                Some(e) => {
-                    if let Some(t) = pick(e) {
-                        return t;
-                    }
-                }
-                None => panic!("the engine said nothing for thirty seconds"),
-            }
-        }
-    }
-
-    fn edited(&self, id: u64) -> EditResult {
-        self.until(|e| match e {
-            Event::Edited(r) if r.id == id => Some(r),
-            _ => None,
-        })
-    }
-
     fn fields(&mut self, page: u32) -> Vec<FieldInfo> {
         let id = self.id();
         self.engine.fields(1, id, page);

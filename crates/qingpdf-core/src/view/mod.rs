@@ -346,6 +346,7 @@ pub(crate) enum Command {
 
 pub(crate) enum Source {
     Path(String),
+    #[cfg(test)]
     Bytes(Vec<u8>),
 }
 
@@ -398,6 +399,7 @@ impl Engine {
     }
 
     /// [`Engine::open_file`] for a file already in memory (the engine keeps the vector).
+    #[cfg(test)]
     pub fn open_bytes(&self, doc: u64, bytes: Vec<u8>, password: &str, total: u64, view_pixels: u64) {
         let _ = self.commands.send(Command::Open { doc, source: Source::Bytes(bytes), password: password.to_string(), total, view_pixels });
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -756,6 +758,7 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
             std::io::Read::read_to_end(&mut file, &mut bytes).map_err(unreadable)?;
             bytes
         }
+        #[cfg(test)]
         Source::Bytes(b) => b,
     };
     let plan = plan(total, bytes.len() as u64, view_pixels).ok_or_else(too_large)?;

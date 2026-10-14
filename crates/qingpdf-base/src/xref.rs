@@ -193,10 +193,12 @@ impl XrefTable {
     }
 
     /// How many object numbers have an entry (free ones included).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.defined
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.defined == 0
     }
@@ -212,6 +214,7 @@ impl XrefTable {
     }
 
     /// All entries by object number, lowest first.
+    #[cfg(any(test, feature = "testutil"))]
     pub fn iter(&self) -> impl Iterator<Item = (u32, XrefEntry)> + '_ {
         let last = self.max.map_or(0, |m| u64::from(m) + 1);
         (0..last).filter_map(|n| {
@@ -290,6 +293,7 @@ impl RowBudget {
 /// points to, then (for each section) its `/XRefStm` and its `/Prev`, newest
 /// first. The first definition of an object number wins, free entries
 /// included, which makes later updates override earlier ones (7.5.6).
+#[cfg(test)]
 pub fn read_xref(data: &[u8]) -> Result<XrefData> {
     read_xref_budgeted(data, &DecodeBudget::default())
 }
@@ -628,10 +632,12 @@ impl ObjStm {
         Ok(ObjStm { data, pairs, by_num: OnceCell::new() })
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.pairs.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
@@ -643,6 +649,7 @@ impl ObjStm {
     }
 
     /// Object numbers in stream order.
+    #[cfg(test)]
     pub fn object_numbers(&self) -> impl Iterator<Item = u32> + '_ {
         self.pairs.iter().map(|&(n, _)| n)
     }

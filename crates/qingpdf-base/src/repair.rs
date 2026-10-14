@@ -159,6 +159,7 @@ fn type_is(dict: &Dict, name: &str) -> bool {
 /// Scan `data` and rebuild what the cross-reference section and trailer would
 /// have said. Linear in the size of the file: the work spent on parses that
 /// fail is capped, after which objects are only indexed, not parsed.
+#[cfg(test)]
 pub fn rebuild(data: &[u8]) -> Result<Repaired> {
     rebuild_budgeted(data, &DecodeBudget::default(), None)
 }

@@ -19,7 +19,8 @@ use crate::object::{Dict, Object};
 use crate::text::interp::{Matrix, mul};
 
 use super::color::ColorSpace;
-use super::func::{Function, Meter};
+use super::func::{Function, Meter, numbers};
+use super::interp::apply;
 use super::work::{Work, cost};
 
 /// Largest data of a mesh read (decoded).
@@ -112,11 +113,6 @@ pub(crate) struct Shading {
     bbox: Option<[f64; 4]>,
     /// About how much memory it holds.
     pub bytes: usize,
-}
-
-fn numbers(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f64>> {
-    let obj = doc.resolve(dict.get(key)?).ok()?;
-    obj.as_array()?.iter().map(|o| doc.resolve(o).ok().and_then(|o| o.as_f64()).filter(|v| v.is_finite())).collect()
 }
 
 fn int(doc: &Document, dict: &Dict, key: &str) -> Option<i64> {
@@ -432,10 +428,6 @@ impl Shading {
             }
         }
     }
-}
-
-fn apply(m: &Matrix, x: f64, y: f64) -> (f64, f64) {
-    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
 }
 
 fn invert(m: &Matrix) -> Option<Matrix> {

@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use qingpdf_core::view::{EditResult, Engine, Event, Opened, TOTAL_BYTES};
+
 /// The workspace root (this file is included from crates two levels down).
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
@@ -515,4 +517,49 @@ pub fn qpdf_accepts(qpdf: &Path, output: &Path, out_password: &str, inputs: &[(&
         .filter(|c| !known.contains(c) && !(merging && c.contains("widget annotation is not reachable from /acroform")))
         .collect();
     assert!(new.is_empty(), "{what}: qpdf complains about what the inputs do not give: {new:?}\n{}", verdict.text);
+}
+
+// --- the reader's engine with a file open in it ----------------------------------------------------------------
+
+/// Used by the tests of the reader's messages; a test file that needs more of it adds methods in an `impl Viewer` of its own.
+pub struct Viewer {
+    pub engine: Engine,
+    pub opened: Opened,
+    pub next: u64,
+}
+
+impl Viewer {
+    pub fn open(path: &Path, password: &str) -> Viewer {
+        let engine = Engine::start(Box::new(|| {}));
+        engine.open_file(1, &path.to_string_lossy(), password, TOTAL_BYTES, 1920 * 1080);
+        match engine.wait(20_000) {
+            Some(Event::Opened(opened)) => Viewer { engine, opened, next: 100 },
+            other => panic!("{}: not opened: {other:?}", path.display()),
+        }
+    }
+
+    pub fn id(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    pub fn until<T>(&self, mut pick: impl FnMut(Event) -> Option<T>) -> T {
+        loop {
+            match self.engine.wait(30_000) {
+                Some(e) => {
+                    if let Some(t) = pick(e) {
+                        return t;
+                    }
+                }
+                None => panic!("the engine said nothing for thirty seconds"),
+            }
+        }
+    }
+
+    pub fn edited(&self, id: u64) -> EditResult {
+        self.until(|e| match e {
+            Event::Edited(r) if r.id == id => Some(r),
+            _ => None,
+        })
+    }
 }

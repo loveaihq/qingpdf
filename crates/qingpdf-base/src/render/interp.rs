@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::text::cmap::{CMap, Uni};
 use crate::text::font::{Font, Warnings};
-use crate::text::interp::{FxMap, Matrix, mul};
+use crate::text::interp::{FxMap, IDENTITY, Matrix, finite, mul, numbers};
 use crate::text::scan::{Item, Operand, Scanner};
 
 use super::color::ColorSpace;
@@ -64,7 +64,6 @@ const MAX_LIVE_MASK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STROKE_DASHES: f64 = 1_000_000.0;
 const MAX_PAGE_DASHES: f64 = 4_000_000.0;
 
-const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 // Operators as numbers (their length and bytes), so that dispatching is a jump.
 #[allow(clippy::indexing_slicing)] // `i < op.len()`
@@ -102,24 +101,8 @@ ops! {
     OP_QUOTE = b"'"; OP_DQUOTE = b"\""; OP_D0 = b"d0"; OP_D1 = b"d1";
 }
 
-fn finite(m: &Matrix) -> bool {
-    m.iter().all(|v| v.is_finite())
-}
-
-fn apply(m: &Matrix, x: f64, y: f64) -> (f64, f64) {
+pub(super) fn apply(m: &Matrix, x: f64, y: f64) -> (f64, f64) {
     (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
-}
-
-fn numbers<const N: usize>(ops: &[Operand]) -> Option<[f64; N]> {
-    let tail = ops.get(ops.len().checked_sub(N)?..)?;
-    let mut out = [0.0; N];
-    for (slot, o) in out.iter_mut().zip(tail) {
-        match o {
-            Operand::Num(v) => *slot = *v,
-            _ => return None,
-        }
-    }
-    Some(out)
 }
 
 // --- resources ----------------------------------------------------------------------------------------

@@ -510,6 +510,7 @@ impl Security {
     }
     /// The file key, if a password has been accepted. Tests compare it with
     /// the one qpdf shows.
+    #[cfg(any(test, feature = "testutil"))]
     pub fn file_key(&self) -> Option<&[u8]> {
         self.key.as_deref()
     }

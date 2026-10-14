@@ -153,7 +153,7 @@ pub fn decode_text_string(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
+pub(crate) fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
     // A trailing odd byte is ignored.
     let (pairs, _) = bytes.as_chunks::<2>();
     let units = pairs.iter().map(|&pair| if big_endian { u16::from_be_bytes(pair) } else { u16::from_le_bytes(pair) });

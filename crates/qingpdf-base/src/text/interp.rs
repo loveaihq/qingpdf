@@ -111,7 +111,7 @@ const OP_EMC: u32 = key3(b'E', b'M', b'C');
 
 
 pub(crate) type Matrix = [f64; 6];
-const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+pub(crate) const IDENTITY: Matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// `a` then `b` (row vectors, 8.3.4): the matrix that does a's transformation first.
 pub(crate) fn mul(a: &Matrix, b: &Matrix) -> Matrix {
@@ -131,7 +131,7 @@ fn norm(x: f64, y: f64) -> f64 {
     (x * x + y * y).sqrt()
 }
 
-fn finite(m: &Matrix) -> bool {
+pub(crate) fn finite(m: &Matrix) -> bool {
     m.iter().all(|v| v.is_finite())
 }
 
@@ -939,7 +939,7 @@ fn is_watermark(dict: &[u8]) -> bool {
 }
 
 /// The last `N` operands as numbers.
-pub(super) fn numbers<const N: usize>(ops: &[Operand]) -> Option<[f64; N]> {
+pub(crate) fn numbers<const N: usize>(ops: &[Operand]) -> Option<[f64; N]> {
     let tail = ops.get(ops.len().checked_sub(N)?..)?;
     let mut out = [0.0; N];
     for (slot, o) in out.iter_mut().zip(tail) {

@@ -29,7 +29,7 @@ use std::rc::Rc;
 use miniz_oxide::deflate::compress_to_vec_zlib;
 
 use super::appearance::num;
-use super::content::{check_content_allowed, contents_list};
+use super::content::{charge, check_content_allowed, contents_list};
 use super::fontsub;
 use super::ocr::OCR_MARK;
 use super::{Ctx, TOO_BIG, commit, replay, save_section, text_string};
@@ -70,10 +70,6 @@ const REACH: f64 = 0.7;
 const NOT_THERE: &str = "the text is not where it should be";
 /// How many forms inside forms are followed when looking for a mark (the reader's own limit is 32).
 const MAX_FORM_NESTING: usize = 32;
-
-fn charge(ctx: &Ctx<'_>, units: f64) -> Result<()> {
-    if ctx.work.charge(units) { Ok(()) } else { Err(Error::Limit("the change took too much work".to_string())) }
-}
 
 // --- the text of a line ------------------------------------------------------------------------------------------
 

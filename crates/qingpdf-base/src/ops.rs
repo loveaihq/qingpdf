@@ -669,6 +669,7 @@ pub fn decrypt(doc: &Document, password: &str) -> Result<Output> {
 // --- images to PDF ---------------------------------------------------------------------
 
 /// One image file: its name (for messages) and bytes.
+#[cfg(test)]
 pub struct ImageInput<'a> {
     pub name: &'a str,
     pub data: &'a [u8],
@@ -690,6 +691,7 @@ fn content_number(v: f64) -> String {
 /// One page per image, in order. JPEG files are embedded as they are
 /// (`DCTDecode`); PNG files are decoded and stored with Flate, transparency as
 /// a soft mask. See [`PageMode`] for the page size.
+#[cfg(test)]
 pub fn images_to_pdf(images: &[ImageInput<'_>], mode: PageMode) -> Result<Output> {
     images_to_pdf_with(
         images.len(),

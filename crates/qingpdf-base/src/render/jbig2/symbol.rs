@@ -10,7 +10,7 @@ use super::arith::{IntCtx, decode_iaid};
 use super::bitmap::{Bitmap, Op};
 use super::generic::{self, GENERIC_CONTEXTS, GenericParams, REFINE_CONTEXTS, RefineParams};
 use super::huffman::{BitReader, Table};
-use super::text::{self, Corner, HuffTables, Src, TextIa, TextParams, ceil_log2};
+use super::text::{self, Corner, HuffTables, Src, TextIa, TextParams, ceil_log2, number};
 use super::{Ctx, MAX_DIM, at_pairs, bad, be32};
 use crate::error::Result;
 use crate::render::mq::Mq;
@@ -37,10 +37,6 @@ pub(super) struct SymbolDict {
     /// What the dictionary itself holds, apart from the bitmaps (those are shared and counted when they are made): the
     /// list of exported symbols and the retained statistics. Taken from the image's memory when it is made.
     pub held: u64,
-}
-
-fn number(v: Option<i64>) -> Result<i64> {
-    v.ok_or_else(|| bad("an out-of-band value where there must be a number"))
 }
 
 /// Decode a symbol dictionary segment. `inputs`: the symbols of the dictionaries it refers to; `custom`: the tables

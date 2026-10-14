@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::{Ctx, Warnings, bad};
+use super::{Ctx, Warnings, bad, be16, be32};
 use crate::error::{Error, Result};
 use crate::render::work::cost;
 
@@ -148,16 +148,6 @@ pub(super) struct Header {
     pub ppm: Vec<u8>,
     pub tiles: HashMap<u64, Tile>,
     pub warnings: Warnings,
-}
-
-fn be16(d: &[u8], at: usize) -> Option<u16> {
-    let b: [u8; 2] = d.get(at..at.checked_add(2)?)?.try_into().ok()?;
-    Some(u16::from_be_bytes(b))
-}
-
-fn be32(d: &[u8], at: usize) -> Option<u32> {
-    let b: [u8; 4] = d.get(at..at.checked_add(4)?)?.try_into().ok()?;
-    Some(u32::from_be_bytes(b))
 }
 
 fn short() -> Error {

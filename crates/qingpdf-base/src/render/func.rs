@@ -78,7 +78,7 @@ fn pairs(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<(f64, f64)>> {
     Some(nums.chunks_exact(2).filter_map(|c| Some((*c.first()?, *c.get(1)?))).collect())
 }
 
-fn numbers(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f64>> {
+pub(super) fn numbers(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f64>> {
     let obj = doc.resolve(dict.get(key)?).ok()?;
     obj.as_array()?.iter().map(|o| doc.resolve(o).ok().and_then(|o| o.as_f64()).filter(|v| v.is_finite())).collect()
 }

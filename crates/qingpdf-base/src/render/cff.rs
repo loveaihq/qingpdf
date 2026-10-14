@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use crate::text::data;
+use crate::text::interp::mul;
 use crate::text::fontprog::{self, Index, Res, u8_at, u16_at};
 
 use super::glyf::Cmap;
@@ -56,17 +57,6 @@ pub(crate) struct CffFont {
 fn matrix_of(args: &[f64]) -> Option<[f64; 6]> {
     let m: [f64; 6] = args.get(..6)?.try_into().ok()?;
     (m.iter().all(|v| v.is_finite()) && (m[0] * m[3] - m[1] * m[2]).abs() > 1e-12).then_some(m)
-}
-
-fn mul(a: &[f64; 6], b: &[f64; 6]) -> [f64; 6] {
-    [
-        a[0] * b[0] + a[1] * b[2],
-        a[0] * b[1] + a[1] * b[3],
-        a[2] * b[0] + a[3] * b[2],
-        a[2] * b[1] + a[3] * b[3],
-        a[4] * b[0] + a[5] * b[2] + b[4],
-        a[4] * b[1] + a[5] * b[3] + b[5],
-    ]
 }
 
 impl CffFont {

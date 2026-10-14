@@ -1444,3 +1444,24 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **一个表一个工作表：** 跨页接表只认"上页表停在页底、下页表在页上部、列边一致"（见"审查后的修补"），其他跨页表（页中间换页、列有偏移、中间隔了别的页）仍是每页一张；1000 张表封顶。
 - **整数的 `(5)` 和 `5-` 在没有小数、千分位、货币符号的整数列里是文本**（该列真有括号负数时也被当文本，见"审查后的修补"）；**日期只认四位年份在前**（`05/01/2024`、`1/5/24` 这类写法当文本）。
 - **只给有表格的页出表；图表、图片里的表不认**（扫描页先用 5c 识别出文字，再转 Excel 就是普通的文字层，能找到没框线的表）。
+
+## 瘦身（2026-10-14）
+
+只清理，不改行为。方法：给 `qingpdf-base`、`qingpdf-core`、`qingpdf-view` 在临时副本里把"别的 crate 没按名字用过"的 `pub` 改成 `pub(crate)`，让 rustc 自己报"没用到"（再对照别的 crate 里的名字出现次数）；加上"测试里才用到的"、`#[allow(dead_code)]`、`unused_crate_dependencies`、枚举变体和提示语的引用计数；重复用克隆检测脚本（连续 6–8 行相同、函数体相同）找；体积用链接器 `/MAP` 看。
+
+- **删掉的（零引用，或只有一个 `allow(dead_code)` 挡着）：** `Document::object_stream_cache_bytes`、`clear_object_stream_cache`；`Builder::set_version`；`AcroForm::need_appearances`（读出来存着，没人读）；`Mq::past_end()`（字段本身还在用）。
+- **改成只在测试里编译的：** `filter::decode`、`decode_direct`；`ops::ImageInput`、`images_to_pdf`（真正用的是 `images_to_pdf_with`）；`repair::rebuild`、`xref::read_xref`（真正用的是带 `_budgeted` 的）；`XrefTable::len`/`is_empty`、`ObjStm::len`/`is_empty`/`object_numbers`；`Engine::open_bytes` 和 `Source::Bytes`。别的 crate 的测试才用的（`Document::object_refs`、`XrefTable::iter`、`Encryption::file_key`）用 `#[cfg(any(test, feature = "testutil"))]`，`qingpdf-core` 的开发依赖本来就打开这个特性。
+- **合并的重复（每处只留一份）：** jpx 的 `be16`/`be32`（两份）；jbig2 的 `number`（两份）；`edit` 的 `charge`（`content.rs` 和 `retext.rs`）；`hex_value`（`lexer.rs` 和 `text/scan.rs`）；`numbers`（`render/func.rs` 和 `shading.rs`，另有 `render/interp.rs` 和 `text/interp.rs` 的 `numbers::<N>`）；矩阵的 `mul`（`render/cff.rs`）、`apply`（`shading.rs`）、`finite` 和 `IDENTITY`（`render/interp.rs`）都改用已有的；表单的 UTF-16 解码改用 `info::decode_utf16`。测试里：命令行测试的 `run`/`stdout`/`stderr`/`code`/`s`（5 个文件各一份）放进 `qingpdf-cli/tests/runner/mod.rs`；引擎测试的 `Viewer`（`content`、`forms`、`editing` 三个文件各一份，40 行）放进 `qingpdf-core/tests/common/mod.rs`。
+- **行数：** 引擎和阅读器代码 −71 行（删 109、加 38），测试 −176 行，新文件 `runner/mod.rs` +31 行，合计约 −216 行。
+- **体积：** `qingpdf-view.exe` 3,559,424 → 3,558,912 字节；`qingpdf.exe` 3,419,648 → 3,419,136（各少 512，就是一个对齐块）。原因：LTO 本来就把没人调用的函数丢掉了，删的这些源码不占体积。
+- **验证：** `cargo build --release` 没有警告；`cargo clippy --workspace --all-targets -- -D warnings` 干净；`cargo test --release --no-fail-fast` 1062 通过、3 个 ignored，另有 1 个失败是计时测试 `the_meter_is_charged_in_proportion_to_the_time_a_watermark_takes`（整批并行跑、电池供电时会超界，**改之前的代码一样失败**，单独跑通过，所以和改之前一样是 1063 全过加它）；`render_compare.py --engine-compare` 平均 2.346，输出除了"用时"一行和改之前逐行相同；四个样例（tracemonkey、公文目录、wps 论文、word-tc 论文）的 `info`、`text`、`render`（PNG）、`split` 输出和改之前**逐字节相同**，`docx`/`xlsx` 除了 `docProps/core.xml` 里的时间以外每个部件相同，`docx_check.py` / `xlsx_check.py` 的结果一字不差（只有压缩后文件字节数差 1，是那个时间戳）；新旧 `qingpdf.exe` 交替各跑 9 次（渲染 4 页、取文字、转 Word），最快和中位数相差 ±2%，在噪声里。`perf` 例子的各行相对第一行（tracemonkey）的倍数没有系统性变化（电池供电，毫秒数不可比：改之前慢很多，是节能状态）。
+- **体积大头（链接器 `/MAP`，阅读器；都是真功能，没有意外大的）：** `.text` 约 2.8 MB：`qingpdf_base` 1.12 MB（`render` 680 KB：JPX 约 160、画页解释器和图层 130、JBIG2 110；`text` 154 KB）、`qingpdf_core` 346 KB（`edit` 158、`view` 84、`docx` 51、`xlsx` 29）、标准库 `core` 334 KB（其中排序实例 141 KB）、`qingpdf_view` 198 KB、`tiny_skia` 193 KB、`std` 143 KB、`zune_jpeg` 129 KB；`.rdata` 446 KB：内嵌表约 144 KB（CJK 的 CMap 和 cid→Unicode 各四份、AGL、CJK 归一共 125 KB，CMYK 表 19,683 字节，各一份，全部用到），`crc32fast` 的表 16 KB。最大的单个函数：`edit::apply_noted` 47 KB、JBIG2 `Decoder::stream` 44 KB、`view::server::serve_once` 37 KB、`retext::replace_line` 36 KB（命令行里最大的是 `qingpdf::run` 54 KB）。
+- **找到了但没动：**
+  - 排序：约 45 处 `.sort*`，实例化出 190 个符号共 141 KB。换成一个共用的稳定排序估计省 50–80 KB，但要保持"稳定"和"不稳定排序里相同键的次序"，还要重测大输入的速度，不是"不改行为"的清理。
+  - `png` 库链（`png`、`fdeflate`、`crc32fast` 带 16 KB 的表）约 65 KB，只为解 PNG。用已有的 `miniz_oxide` 自己写解码器能省，但那是新代码；`Cargo.lock` 里有两个 `miniz_oxide`（0.8.9 来自 `png`、0.9.1 是我们的），映射表里只有 0.9.1，没有重复。
+  - 渲染和取文字两个内容流解释器（`render/interp.rs`、`text/interp.rs`）里约 120 行并行的算子处理（`Tc`/`Tw`/`Tz`/`TL`/`Ts`、`move_line`、`adjust`），`cff.rs` 和 `type1.rs` 里的字符串解释器也一样：状态类型不同，在热路径上，合并是大重构。
+  - 跨 crate 的：`edit/content.rs` 的 `mul`/`Matrix` 和 base 的那份；`is_wide`（`text/layout.rs` 和 `tables/mod.rs`）。要把 base 里的东西变成公开接口才能共用。
+  - PDF 数字格式：`layout::num`（4 位小数）、`ops::content_number`（5 位）、`writer::format_real`（最短形式）输出不同，合并会改文件内容。页码范围：`ops::parse_page_ranges`、`printing::pages_of`、`qingpdf-view-bin` 的 `parse_pages` 格式和用途都不同，不是重复。XML 转义、PNG 写出、zip 写出各只有一份。
+  - `Opened.file_bytes` 没人读，但写在 `docs/view-api.md` 的事件字段里，留着；`RawObject.obj_ref` 只有测试读。
+  - 例子 `perf.rs` 里约 80 行 JBIG2 MQ 编码器和 base 的 `jbig2/test_enc.rs` 重复（测试代码在 `#[cfg(test)]` 里，例子是另一个 crate，共用要新开特性）；`box_census.rs` 是 3b 的诊断例子（94 行），文档里提到，留着。
+  - 阅读器隐藏的 `--bench`、`--print-test`、`--ocr-test`（验收用，合计约 15 KB）留着。

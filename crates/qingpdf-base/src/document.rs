@@ -905,16 +905,6 @@ impl Document {
         self.objstms.borrow_mut().set_capacity(max_bytes);
     }
 
-    /// Bytes of decoded object streams that are kept for reuse now.
-    pub fn object_stream_cache_bytes(&self) -> usize {
-        self.objstms.borrow().bytes
-    }
-
-    /// Let go of the decoded object streams that are kept for reuse.
-    pub fn clear_object_stream_cache(&self) {
-        self.objstms.borrow_mut().clear();
-    }
-
     fn load(&self, r: ObjRef) -> Result<Object> {
         let entry = self.xref.borrow().get(r.num);
         match entry {
@@ -1100,6 +1090,7 @@ impl Document {
     }
 
     /// Every object number that is in use, with its generation, in order.
+    #[cfg(any(test, feature = "testutil"))]
     pub fn object_refs(&self) -> Vec<ObjRef> {
         self.xref
             .borrow()
