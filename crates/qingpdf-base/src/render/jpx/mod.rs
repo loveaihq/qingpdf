@@ -473,7 +473,7 @@ fn plan_channels(jp2: &Jp2<'_>, ncomp: usize, siz: &codestream::Siz, opts: &Opti
         if skipped {
             warnings.push(format!("the channel definitions name more colour channels than the colour space has; {cap} are used"));
         }
-        named.sort();
+        crate::order::sort_by_key(&mut named, |&(asoc, ch)| u64::from(asoc) << 32 | ch as u64);
         colour = named.into_iter().map(|(_, ch)| ch).collect();
     }
     if colour.is_empty() {
@@ -637,7 +637,7 @@ impl<'a> Walk<'a> {
         }
         // The tile-parts' bodies, and where the packet headers are if they are not in them.
         let mut ppt: Vec<(u8, usize, usize)> = entry.ppt.clone();
-        ppt.sort_by_key(|p| p.0);
+        crate::order::sort_by_key(&mut ppt, |p| u64::from(p.0));
         for part in &entry.parts {
             let (a, b) = part.body;
             let hdr = part.ppm.map(|(x, y)| h.ppm.get(x..y).unwrap_or(&[]).to_vec());
@@ -801,7 +801,7 @@ pub(crate) fn decode(data: &[u8], opts: &Options, work: &Work) -> Result<Decoded
     }
     let mut walk = Walk { ctx: &ctx, data: jp2.codestream, h: &hdr, needed: &needed, reduce, warnings };
     let mut order: Vec<u64> = hdr.tiles.keys().copied().collect();
-    order.sort_unstable();
+    crate::order::sort_u64(&mut order);
     let mut good = 0usize;
     for t in order {
         match walk.tile(t, &mut planes) {

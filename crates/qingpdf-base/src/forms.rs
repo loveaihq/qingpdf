@@ -709,7 +709,7 @@ impl CjkFace {
         cid_font.set("CIDSystemInfo", Object::Dict(info));
         cid_font.set("DW", Object::Integer(1000));
         let mut widths: Vec<(u32, u16)> = self.cids.values().copied().collect();
-        widths.sort_unstable();
+        crate::order::sort_by_key(&mut widths, |w| u64::from(w.0) << 16 | u64::from(w.1));
         widths.dedup_by_key(|w| w.0);
         cid_font.set("W", Object::Array(widths.iter().flat_map(|&(cid, w)| [Object::Integer(i64::from(cid)), Object::Array(vec![Object::Integer(i64::from(w))])]).collect()));
         let mut font = Dict::new();

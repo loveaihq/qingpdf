@@ -1,15 +1,15 @@
 //! Reading just enough of JPEG and PNG files to put them on PDF pages
 //! (images to PDF). JPEG data is embedded as it is, with `DCTDecode`
-//! (ISO 32000-1 7.4.8); only the header is read. PNG is decoded with the
-//! `png` crate, row by row, and stored with `FlateDecode`, transparency as a
+//! (ISO 32000-1 7.4.8); only the header is read. PNG is decoded by our own
+//! reader (`pngdec`), row by row, and stored with `FlateDecode`, transparency as a
 //! soft mask (11.6.5.2, 8.9.5): the rows are compressed as they come, so the
 //! decoded image is never held in memory.
-
-use std::io::Cursor;
 
 use crate::error::{Error, Result};
 use crate::object::{Dict, ObjRef, Object};
 use crate::writer::{Builder, FlateWriter};
+
+mod pngdec;
 
 /// A4 in points (595.276 x 841.89, ISO 216 rounded the way PDF tools do).
 pub const A4_WIDTH: f64 = 595.276;
@@ -25,8 +25,8 @@ const MAX_PNG_PIXELS: u64 = 1 << 28;
 /// An interlaced PNG (Adam7) cannot be turned into rows without holding the
 /// whole decoded image; one needing more than this is refused.
 const MAX_INTERLACED_BYTES: usize = 128 * 1024 * 1024;
-/// What the `png` crate itself may allocate besides the image: a few rows and
-/// its decompression buffers.
+/// What reading a PNG may hold besides the image: a few rows and the window of
+/// the decompression.
 const PNG_WORKING_BYTES: usize = 32 * 1024 * 1024;
 
 /// How big the page is.
@@ -263,7 +263,6 @@ struct RowSink {
     opaque: bool,
     colour_row: Vec<u8>,
     alpha_row: Vec<u8>,
-    rows: u64,
 }
 
 impl RowSink {
@@ -277,14 +276,12 @@ impl RowSink {
             opaque: true,
             colour_row: Vec::new(),
             alpha_row: Vec::new(),
-            rows: 0,
         }
     }
 
     fn push_row(&mut self, row: &[u8]) -> Result<()> {
         let wanted = self.width.checked_mul(self.channels).ok_or_else(png_too_large)?;
         let row = row.get(..wanted).ok_or_else(|| bad_png("a row is shorter than the header says"))?;
-        self.rows += 1;
         let Some(alpha) = self.alpha.as_mut() else {
             return self.colour.write(row);
         };
@@ -325,53 +322,15 @@ pub fn decode_png(data: &[u8]) -> Result<PngImage> {
 
 /// [`decode_png`] refusing an image of more than `max_pixels` pixels (before any of it is decoded).
 pub fn decode_png_limited(data: &[u8], max_pixels: u64) -> Result<PngImage> {
-    let mut decoder = png::Decoder::new(Cursor::new(data));
-    decoder.set_transformations(png::Transformations::normalize_to_color8());
-    decoder.set_limits(png::Limits { bytes: PNG_WORKING_BYTES });
-    let mut reader = decoder.read_info().map_err(bad_png)?;
-    let (width, height) = reader.info().size();
+    let png = pngdec::read(data, false)?;
+    let (width, height) = (png.width, png.height);
     if u64::from(width) * u64::from(height) > max_pixels.min(MAX_PNG_PIXELS) {
         return Err(png_too_large());
     }
-    let (color_type, bit_depth) = reader.output_color_type();
-    if bit_depth != png::BitDepth::Eight {
-        return Err(bad_png("unexpected bit depth after conversion"));
-    }
-    let channels = match color_type {
-        png::ColorType::Grayscale => 1usize,
-        png::ColorType::GrayscaleAlpha => 2,
-        png::ColorType::Rgb => 3,
-        png::ColorType::Rgba => 4,
-        png::ColorType::Indexed => return Err(bad_png("palette was not expanded")),
-    };
-    let gray = matches!(color_type, png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha);
-    let mut sink = RowSink::new(channels, usize::try_from(width).map_err(|_| png_too_large())?);
-    if reader.info().interlaced {
-        // The passes of an interlaced image come in pieces that have to be
-        // put together, so it must be held whole.
-        let line = reader.output_line_size(width).ok_or_else(png_too_large)?;
-        let size = reader.output_buffer_size().filter(|&n| n <= MAX_INTERLACED_BYTES).ok_or_else(|| {
-            Error::Limit(format!("the interlaced PNG image needs more than {MAX_INTERLACED_BYTES} bytes to decode"))
-        })?;
-        let mut buf = vec![0u8; size];
-        reader.next_frame(&mut buf).map_err(bad_png)?;
-        for row in buf.chunks_exact(line.max(1)) {
-            sink.push_row(row)?;
-        }
-    } else {
-        while let Some(row) = reader.next_row().map_err(bad_png)? {
-            sink.push_row(row.data())?;
-        }
-    }
-    if sink.rows != u64::from(height) {
-        return Err(bad_png("the pixel data is shorter than the header says"));
-    }
+    let mut sink = RowSink::new(png.channels(), usize::try_from(width).map_err(|_| png_too_large())?);
+    png.rows(|row| sink.push_row(row))?;
     let (pixels_flate, alpha_flate) = sink.finish()?;
-    let dpi = reader.info().pixel_dims.and_then(|p| match p.unit {
-        png::Unit::Meter if p.xppu > 0 && p.yppu > 0 => Some((f64::from(p.xppu) * 0.0254, f64::from(p.yppu) * 0.0254)),
-        _ => None,
-    });
-    Ok(PngImage { width, height, gray, pixels_flate, alpha_flate, dpi })
+    Ok(PngImage { width, height, gray: png.gray(), pixels_flate, alpha_flate, dpi: png.dpi })
 }
 
 // --- placing an image on a page ---------------------------------------------------
@@ -517,9 +476,8 @@ pub fn probe(data: &[u8]) -> Result<(u32, u32, Format)> {
             Ok((w, h, Format::Jpeg))
         }
         Some(Format::Png) => {
-            let reader = png::Decoder::new(Cursor::new(data)).read_info().map_err(bad_png)?;
-            let (w, h) = reader.info().size();
-            Ok((w, h, Format::Png))
+            let png = pngdec::read(data, true)?;
+            Ok((png.width, png.height, Format::Png))
         }
         None => Err(Error::Invalid("this is neither a JPEG nor a PNG file".to_string())),
     }

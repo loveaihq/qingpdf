@@ -84,7 +84,12 @@ impl Row {
 
 /// Sort pairs by the number, and then by the index.
 fn sort_pairs(v: &mut [(f32, u32)]) {
-    v.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    // As numbers: the number of the float in the order of `total_cmp` above, the index below.
+    let mut keys: Vec<u64> = v.iter().map(|p| crate::order::f32_key(p.0) << 32 | u64::from(p.1)).collect();
+    crate::order::sort_u64(&mut keys);
+    for (slot, key) in v.iter_mut().zip(keys) {
+        *slot = (crate::order::f32_from_key(key >> 32), key as u32);
+    }
 }
 
 /// The fragments of the text of a page (not of the lines whose middle is inside one of `taken`). `None`: more than `MAX_FRAGMENTS`.

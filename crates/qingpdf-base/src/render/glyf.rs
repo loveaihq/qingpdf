@@ -121,7 +121,7 @@ impl Cmap {
                 Some((rank, s.off))
             })
             .collect();
-        unicode.sort_by_key(|e| e.0);
+        crate::order::sort_by_key(&mut unicode, |e| u64::from(e.0));
         let find = |p: u16, e: u16| subs.iter().find(|s| s.platform == p && s.encoding == e).map(|s| s.off);
         let (symbol, mac) = (find(3, 0), find(1, 0));
         Cmap { unicode: unicode.into_iter().map(|e| e.1).collect(), symbol, mac, data }

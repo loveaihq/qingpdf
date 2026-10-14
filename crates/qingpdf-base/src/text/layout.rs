@@ -124,7 +124,7 @@ fn repeats(glyphs: &[Glyph], line: &Line, order: &[usize]) -> Option<Vec<bool>> 
             (!c.is_whitespace()).then(|| (dot((g.x, g.y), line.dir), dot((g.x, g.y), normal), i))
         })
         .collect();
-    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    crate::order::sort_by_key(&mut pts, |p| crate::order::f64_key(p.0));
     let mut gone = vec![false; glyphs.len().min(line.end)];
     let mut any = false;
     for (k, &(along, across, i)) in pts.iter().enumerate() {
@@ -170,7 +170,7 @@ fn line_text(glyphs: &[Glyph], line: &Line, out: &mut String, mut marks: Option<
     }
     let slack = 0.5 * line.size;
     if runs.windows(2).any(|w| matches!(w, [a, b] if b.0 < a.0 - slack)) {
-        runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        crate::order::sort_by_key(&mut runs, |r| crate::order::f64_key(r.0));
     }
     let begin = out.len();
     let mut prev: Option<&Glyph> = None;

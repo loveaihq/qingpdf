@@ -201,7 +201,7 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
                 }
             }
         }
-        near.sort_by_key(|(d, _)| *d);
+        qingpdf_core::order::sort_by_key(&mut near, |(d, _)| qingpdf_core::order::i64_key(*d));
         for (rank, (_, mut w)) in near.into_iter().enumerate() {
             w.priority = P_PREVIEW_IN_VIEW + rank.min(900) as u32;
             out.push(w);
@@ -225,7 +225,7 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
             in_view.push(((cx - centre.0).abs() + (cy - centre.1).abs(), w));
         }
     }
-    in_view.sort_by_key(|(d, _)| *d);
+    qingpdf_core::order::sort_by_key(&mut in_view, |(d, _)| qingpdf_core::order::i64_key(*d));
     for (rank, (_, mut w)) in in_view.into_iter().enumerate() {
         w.priority = P_IN_VIEW + rank.min(900) as u32;
         total = total.saturating_add(w.bytes());
@@ -271,7 +271,7 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
         add(4, page_top(last + 2));
     }
     add(5, band(above.saturating_sub(scene.view_h), above));
-    ring.sort_by_key(|w| w.priority);
+    qingpdf_core::order::sort_by_key(&mut ring, |w| u64::from(w.priority));
     for w in ring {
         if seen.contains(&w.key) {
             continue;
@@ -293,7 +293,7 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
             out.push(w);
         }
     }
-    out.sort_by_key(|w| w.priority);
+    qingpdf_core::order::sort_by_key(&mut out, |w| u64::from(w.priority));
     out
 }
 
@@ -310,7 +310,7 @@ pub struct Plan {
 pub fn plan(wanted: &[Want], cache: &BitmapCache, in_flight: &HashMap<Key, u64>) -> Plan {
     let wanted_keys: HashSet<Key> = wanted.iter().map(|w| w.key).collect();
     let mut cancel: Vec<u64> = in_flight.iter().filter(|(k, _)| !wanted_keys.contains(k)).map(|(_, id)| *id).collect();
-    cancel.sort_unstable();
+    qingpdf_core::order::sort_u64(&mut cancel);
     let issue = wanted.iter().filter(|w| !cache.contains(&w.key) && !in_flight.contains_key(&w.key)).cloned().collect();
     Plan { cancel, issue }
 }

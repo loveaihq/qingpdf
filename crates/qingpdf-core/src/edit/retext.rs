@@ -392,8 +392,8 @@ fn order_few(list: &mut [Change]) {
     }
 }
 
-fn order_many(list: &mut [Change]) {
-    list.sort_by_key(|c| (c.0, c.1));
+fn order_many(list: &mut Vec<Change>) {
+    crate::order::sort_by(list, |a, b| (a.0, a.1).cmp(&(b.0, b.1)));
 }
 
 impl PageEdits {
@@ -412,14 +412,14 @@ impl PageEdits {
 
     /// Put the lists in order (what came first stays first among equals) and take out repeats.
     fn seal(&mut self) {
-        self.deleted.sort_by_key(|e| (e.0, e.1));
+        crate::order::sort_by_key(&mut self.deleted, |e| u64::from(e.0) << 32 | u64::from(e.1));
         self.deleted.dedup_by_key(|e| (e.0, e.1));
-        self.inserted.sort_by_key(|e| (e.0, e.1));
-        self.shows.sort_unstable();
+        crate::order::sort_by_key(&mut self.inserted, |e| u64::from(e.0) << 32 | u64::from(e.1));
+        crate::order::sort_by_key(&mut self.shows, |&s| u64::from(s));
         self.shows.dedup();
-        self.fallbacks.sort_unstable();
+        crate::order::sort_by(&mut self.fallbacks, |a, b| a.cmp(b));
         self.fallbacks.dedup();
-        self.spans.sort_by_key(|e| e.0);
+        crate::order::sort_by_key(&mut self.spans, |e| u64::from(e.0));
         let mut merged: Vec<(u32, Option<String>)> = Vec::with_capacity(self.spans.len());
         for e in std::mem::take(&mut self.spans) {
             match merged.last_mut() {
@@ -481,7 +481,7 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
             font_index: ByKey::new(),
             fallbacks: Vec::new(),
             failed: Vec::new(),
-            new_chars: new_text.chars().collect(),
+            new_chars: crate::order::set_of(new_text.chars()),
             missing_sets: Vec::new(),
             res_copies: Vec::new(),
             form_copies: Vec::new(),
@@ -587,7 +587,7 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
             return Err(Error::Invalid(why.clone()));
         }
         charge(ctx, FONT_COST)?;
-        let chars: std::collections::BTreeSet<char> = self.missing_sets.get(missing).map(|m| m.iter().copied().collect()).unwrap_or_default();
+        let chars: std::collections::BTreeSet<char> = self.missing_sets.get(missing).map(|m| crate::order::set_of(m.iter().copied())).unwrap_or_default();
         let (from, next) = (ctx.objects.len(), ctx.next);
         match Self::make_fallback(ctx, &chars, request, matrix, vertical) {
             Ok((font_ref, codes)) => {
@@ -1164,7 +1164,7 @@ fn span_changes(scan: &Scan, hit: &Hit, text: &str) -> std::result::Result<Vec<(
             at = scan.spans.get(i).map(|s| s.parent as usize).filter(|&p| p < scan.spans.len());
         }
     }
-    ids.sort_unstable();
+    crate::order::sort_by_key(&mut ids, |&i| u64::from(i));
     ids.dedup();
     let mut out = Vec::with_capacity(ids.len());
     for id in ids {
@@ -1342,7 +1342,7 @@ pub(super) fn replace_line(ctx: &mut Ctx<'_>, page: &Page, at: [f32; 2], old: &s
     if middle.is_empty() && hit.del.is_empty() {
         return Err(Error::Invalid("the text is the same".to_string()));
     }
-    run.new_chars = middle.chars().collect();
+    run.new_chars = crate::order::set_of(middle.chars());
     let mut edits = PageEdits::default();
     if let Some(why) = run.plan(ctx, &scan, &mut edits, &hit, &middle)? {
         return Err(Error::Invalid(why));

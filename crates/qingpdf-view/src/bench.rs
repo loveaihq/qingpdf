@@ -178,7 +178,7 @@ fn summary(v: &[f64]) -> String {
         return "none".to_string();
     }
     let mut s = v.to_vec();
-    s.sort_by(f64::total_cmp);
+    qingpdf_core::order::sort_by_key(&mut s, |&x| qingpdf_core::order::f64_key(x));
     let at = |q: f64| s.get(((s.len() - 1) as f64 * q).round() as usize).copied().unwrap_or(0.0);
     format!("n = {}, median {:.1} ms, 95th percentile {:.1} ms, max {:.1} ms", s.len(), at(0.5), at(0.95), at(1.0))
 }

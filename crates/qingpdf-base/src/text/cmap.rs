@@ -365,7 +365,7 @@ const MAX_OVERLAP_SCAN: usize = 4096;
 impl ToUni {
     pub fn new(entries: Vec<UEntry>) -> ToUni {
         let mut sorted = entries.clone();
-        sorted.sort_by_key(|e| e.lo);
+        crate::order::sort_by_key(&mut sorted, |e| u64::from(e.lo));
         let overlap = sorted.windows(2).any(|w| matches!(w, [a, b] if b.lo <= a.hi));
         let in_file_order = (overlap && entries.len() <= MAX_OVERLAP_SCAN).then_some(entries);
         ToUni { sorted, in_file_order, by_char: OnceCell::new() }
@@ -406,7 +406,7 @@ impl ToUni {
                     }
                 }
             }
-            pairs.sort_unstable();
+            crate::order::sort_u64(&mut pairs);
             pairs
         });
         let want = u64::from(c) << 32;
@@ -667,7 +667,7 @@ pub(crate) fn parse(data: &[u8]) -> Parsed {
         }
     }
     p.damaged |= cur.damaged;
-    p.cid.sort_by_key(|r| (r.n, r.lo));
+    crate::order::sort_by_key(&mut p.cid, |r| u64::from(r.n) << 32 | u64::from(r.lo));
     p
 }
 

@@ -352,9 +352,10 @@ pub(super) fn layer(ctx: &mut Ctx<'_>, pages: &[Page], ocr: &[OcrPage]) -> Resul
     counts.insert(' ', u32::MAX);
     if counts.len() > MAX_GLYPH_CHARS {
         let mut by_use: Vec<(char, u32)> = counts.iter().map(|(&c, &n)| (c, n)).collect();
-        by_use.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        crate::order::sort_by_key(&mut by_use, |&(c, n)| u64::from(u32::MAX - n) << 32 | u64::from(c));
         by_use.truncate(MAX_GLYPH_CHARS);
-        counts = by_use.into_iter().collect();
+        counts.clear();
+        counts.extend(by_use);
     }
     let (font, usable) = fontsub::choose_covering(&counts)?;
     let embedded = fontsub::embed(&font, &usable, ctx.work)?;
@@ -451,7 +452,10 @@ pub fn page_chars(page: &OcrPage, width: f64, height: f64) -> Result<crate::text
 /// The pages of a layer that is to be used in memory only (a file that is signed, or whose author did not allow changing it): the
 /// number of the pages with words, so that the reader can say how many pages the text is for.
 pub fn pages_with_words(pages: &[OcrPage]) -> usize {
-    pages.iter().filter(|p| p.word_count() > 0).map(|p| p.page).collect::<BTreeSet<u32>>().len()
+    pages.iter().filter(|p| p.word_count() > 0).map(|p| p.page).fold(BTreeSet::new(), |mut set, page| {
+        set.insert(page);
+        set
+    }).len()
 }
 
 #[cfg(test)]

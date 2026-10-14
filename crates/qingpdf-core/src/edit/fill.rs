@@ -140,7 +140,7 @@ fn fill_text(ctx: &mut Ctx<'_>, env: Env<'_>, field: &Field, text: &str) -> Resu
     };
 
     // The font: a subset of a system font, for the characters shown.
-    let mut chars: BTreeSet<char> = shown.chars().filter(|&c| c != '\n').collect();
+    let mut chars: BTreeSet<char> = crate::order::set_of(shown.chars().filter(|&c| c != '\n'));
     if field.kind == FieldKind::List {
         // A list shows its options, not just the one chosen.
         for (_, display) in opts.items.iter().skip(field.top_index).take(MAX_LISTED_OPTIONS) {

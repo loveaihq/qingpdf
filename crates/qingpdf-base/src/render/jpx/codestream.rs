@@ -367,7 +367,7 @@ pub(super) fn parse(ctx: &Ctx, data: &[u8]) -> Result<Header> {
         pos += 2 + len;
     }
     // Packed packet headers: the pieces in order of their index, joined.
-    ppm_parts.sort_by_key(|p| p.0);
+    crate::order::sort_by_key(&mut ppm_parts, |p| u64::from(p.0));
     let mut ppm = Vec::new();
     for (_, a, b) in &ppm_parts {
         ppm.extend_from_slice(data.get(*a..*b).unwrap_or(&[]));

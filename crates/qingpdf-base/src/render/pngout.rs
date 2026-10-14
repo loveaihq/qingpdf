@@ -83,19 +83,42 @@ pub fn png(width: u32, height: u32, channels: u8, data: &[u8]) -> Vec<u8> {
             raw.extend_from_slice(cands.get(best).map_or(&[][..], |v| v));
         }
     }
-    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
     let (depth, color) = match (bilevel, channels) {
         (true, _) => (1, 0),
         (_, 1) => (8, 0),
         (_, 3) => (8, 2),
         _ => (8, 6),
     };
+    assemble(width, height, depth, color, &raw, 6)
+}
+
+/// The page `qingpdf render` draws (`rgba`: 4 bytes a pixel, the fourth is not written) as a PNG of RGB: the filter Sub on every row and
+/// the quickest level of the compression, which is what a page of some megabytes needs (the pictures of a Word file are worth the time
+/// to find the filters, this is not).
+pub(super) fn page(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let stride = (width as usize * 4).max(1);
+    let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
+    for row in rgba.chunks_exact(stride) {
+        raw.push(1);
+        let mut left = [0u8; 3];
+        for &[r, g, b, _] in row.as_chunks::<4>().0 {
+            let here = [r, g, b];
+            raw.extend(here.iter().zip(&left).map(|(&v, &l)| v.wrapping_sub(l)));
+            left = here;
+        }
+    }
+    assemble(width, height, 8, 2, &raw, 1)
+}
+
+/// The signature, the header, the data (`raw`: the rows with their filter bytes, compressed with zlib at `level`) and the end.
+fn assemble(width: u32, height: u32, depth: u8, color: u8, raw: &[u8], level: u8) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
     ihdr.extend_from_slice(&[depth, color, 0, 0, 0]);
     chunk(&mut out, b"IHDR", &ihdr);
-    chunk(&mut out, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6));
+    chunk(&mut out, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(raw, level));
     chunk(&mut out, b"IEND", &[]);
     out
 }
@@ -133,6 +156,17 @@ mod tests {
         let (_, _, ct, bd, back) = decode(&png(5, 4, 1, &grey));
         assert_eq!((ct, bd), (::png::ColorType::Grayscale, ::png::BitDepth::Eight));
         assert_eq!(back, grey);
+    }
+
+    #[test]
+    fn a_page_is_rgb_without_the_fourth_byte() {
+        for (w, h) in [(7usize, 5usize), (1, 1), (300, 40), (1, 90)] {
+            let rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * 37 + i / 11) % 251) as u8).collect();
+            let (width, height, ct, bd, back) = decode(&page(w as u32, h as u32, &rgba));
+            assert_eq!((width as usize, height as usize, ct, bd), (w, h, ::png::ColorType::Rgb, ::png::BitDepth::Eight));
+            let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| p.iter().take(3).copied()).collect();
+            assert_eq!(back, rgb, "{w} x {h}");
+        }
     }
 
     #[test]

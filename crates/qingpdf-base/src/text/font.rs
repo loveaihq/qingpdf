@@ -488,12 +488,12 @@ impl Font {
         if let Some(Object::Array(items)) = resolved(doc, cid_font.get("W")) {
             read_w(doc, &items, &mut w);
         }
-        w.sort_by_key(|e| e.0);
+        crate::order::sort_by_key(&mut w, |e| u64::from(e.0));
         let mut w2 = Vec::new();
         if let Some(Object::Array(items)) = resolved(doc, cid_font.get("W2")) {
             read_w2(doc, &items, &mut w2);
         }
-        w2.sort_by_key(|e| e.0);
+        crate::order::sort_by_key(&mut w2, |e| u64::from(e.0));
         let dw = cid_font.get("DW").and_then(Object::as_f64).unwrap_or(1000.0);
         let dw2 = match resolved(doc, cid_font.get("DW2")) {
             Some(Object::Array(a)) if a.len() >= 2 => (

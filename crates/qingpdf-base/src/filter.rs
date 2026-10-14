@@ -373,7 +373,7 @@ fn png_unpredict(data: &[u8], row_bytes: usize, bpp: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn paeth(a: u8, b: u8, c: u8) -> u8 {
+pub(crate) fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let (ia, ib, ic) = (i32::from(a), i32::from(b), i32::from(c));
     let p = ia + ib - ic;
     let pa = (p - ia).abs();

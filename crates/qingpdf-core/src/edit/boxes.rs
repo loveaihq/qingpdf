@@ -94,7 +94,7 @@ pub(super) fn freetext(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], text: &
     if !ctx.work.charge(BOX_COST + 600.0 * clean.chars().count() as f64) {
         return Err(Error::Limit("the text box took too much work".to_string()));
     }
-    let chars: BTreeSet<char> = clean.chars().filter(|&c| c != '\n').collect();
+    let chars: BTreeSet<char> = crate::order::set_of(clean.chars().filter(|&c| c != '\n'));
     let font = fontsub::choose(&chars, Look::Sans)?;
     let embedded = fontsub::embed(&font, &chars, ctx.work)?;
     let font_ref = fontsub::add_objects(ctx, &embedded)?;

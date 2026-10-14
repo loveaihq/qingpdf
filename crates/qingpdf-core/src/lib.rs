@@ -13,7 +13,7 @@ pub mod xlsx;
 mod xml;
 mod zip;
 
-pub use qingpdf_base::{document, error, filter, image, info, lexer, object, ops, parser, render, repair, security, text, writer, xref};
+pub use qingpdf_base::{document, error, filter, image, info, lexer, object, ops, order, parser, render, repair, security, text, writer, xref};
 // (Used inside this crate only.)
 use qingpdf_base::{dests, forms, layout};
 

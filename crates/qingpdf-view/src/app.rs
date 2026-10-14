@@ -995,7 +995,8 @@ impl App {
             entries.retain(|e| !e.preview && e.key.scale == want);
         }
         // Coarse first, so that the sharp pieces come over them.
-        entries.sort_by_key(|e| (e.key.scale == want && !e.preview, e.key.scale, e.key.ty, e.key.tx));
+        let rank = |e: &&Entry| (e.key.scale == want && !e.preview, e.key.scale, e.key.ty, e.key.tx);
+        qingpdf_core::order::sort_by(&mut entries, |a, b| rank(a).cmp(&rank(b)));
         let drew = !entries.is_empty();
         for e in entries {
             // The piece is put where the same part of the page is now: one drawn at the page's own size lands on its

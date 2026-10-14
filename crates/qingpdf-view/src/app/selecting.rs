@@ -203,7 +203,7 @@ impl App {
             let here = self.current_page() as u32;
             let keep: Vec<u32> = self.selection.iter().flat_map(|s| [s.anchor.page, s.head.page]).chain(self.press.iter().map(|p| p.page)).chain([b.page]).collect();
             let mut pages: Vec<u32> = self.boxes.keys().copied().filter(|p| !keep.contains(p)).collect();
-            pages.sort_by_key(|p| std::cmp::Reverse(p.abs_diff(here)));
+            qingpdf_core::order::sort_by_key(&mut pages, |p| !u64::from(p.abs_diff(here)));
             for far in pages {
                 if self.boxes.len() <= BOXES_KEPT && bytes <= BOXES_BYTES {
                     break;

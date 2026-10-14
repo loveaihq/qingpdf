@@ -87,16 +87,7 @@ pub struct Bitmap {
 impl Bitmap {
     /// The page as a PNG file (RGB; there is no transparency to keep).
     pub fn to_png(&self) -> Result<Vec<u8>> {
-        let rgb: Vec<u8> = self.rgba.chunks_exact(4).flat_map(|p| p.iter().take(3).copied()).collect();
-        let mut out = Vec::with_capacity(rgb.len() / 4 + 1024);
-        let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder.set_compression(png::Compression::Fast);
-        let mut writer = encoder.write_header().map_err(|e| Error::Invalid(format!("cannot write the PNG: {e}")))?;
-        writer.write_image_data(&rgb).map_err(|e| Error::Invalid(format!("cannot write the PNG: {e}")))?;
-        writer.finish().map_err(|e| Error::Invalid(format!("cannot write the PNG: {e}")))?;
-        Ok(out)
+        Ok(pngout::page(self.width, self.height, &self.rgba))
     }
 }
 

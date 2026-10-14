@@ -400,7 +400,9 @@ impl<'a> TileDec<'a> {
                         }
                     }
                 }
-                list.sort_unstable_by_key(|e| e.0);
+                // (The keys are all different. They are 128 bits: sorted by the low half, and then, stable, by the high half.)
+                crate::order::sort_by_key(&mut list, |e| e.0 as u64);
+                crate::order::sort_by_key(&mut list, |e| (e.0 >> 64) as u64);
                 let mut flow = Flow::More;
                 'all: for (key, cr) in &list {
                     let (c, r, k) = ((cr >> 8) as usize, (cr & 0xFF) as usize, (key & 0xFFFF_FFFF) as usize);

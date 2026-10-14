@@ -151,7 +151,7 @@ pub(crate) fn choose(chars: &BTreeSet<char>, look: Look) -> Result<Arc<TtFont>> 
 /// font); when no font has a single character that is not white space, the error is the one `choose` gave: which characters no
 /// installed font has, or that there is no font to embed.
 pub(crate) fn choose_covering(counts: &BTreeMap<char, u32>) -> Result<(Arc<TtFont>, BTreeSet<char>)> {
-    let all: BTreeSet<char> = counts.keys().copied().collect();
+    let all: BTreeSet<char> = crate::order::set_of(counts.keys().copied());
     let none_has_all = match choose(&all, Look::Sans) {
         Ok(font) => return Ok((font, all)),
         Err(e) => e,
@@ -163,7 +163,7 @@ pub(crate) fn choose_covering(counts: &BTreeMap<char, u32>) -> Result<(Arc<TtFon
         if embedding_allowed(font.fs_type()).is_err() {
             continue;
         }
-        let has: BTreeSet<char> = all.iter().copied().filter(|&c| cmap.unicode(c as u32).is_some_and(|g| g != 0)).collect();
+        let has: BTreeSet<char> = crate::order::set_of(all.iter().copied().filter(|&c| cmap.unicode(c as u32).is_some_and(|g| g != 0)));
         let score: u64 = has.iter().filter(|c| !c.is_whitespace()).map(|c| u64::from(counts.get(c).copied().unwrap_or(0))).sum();
         if best.as_ref().is_none_or(|(most, ..)| score > *most) {
             best = Some((score, font, has));
@@ -299,7 +299,7 @@ fn checksum(d: &[u8]) -> u32 {
 
 /// The tables as an sfnt file: sorted by tag, each padded to four bytes, with their checksums and the font's.
 fn assemble(mut tables: Vec<([u8; 4], Vec<u8>)>) -> Result<Vec<u8>> {
-    tables.sort_by_key(|t| t.0);
+    crate::order::sort_by_key(&mut tables, |t| u64::from(u32::from_be_bytes(t.0)));
     let n = tables.len();
     let mut out = Vec::new();
     out.extend_from_slice(&[0, 1, 0, 0]);
@@ -520,7 +520,7 @@ pub(crate) fn embed(font: &TtFont, chars: &BTreeSet<char>, work: &Work) -> Resul
 /// The `/ToUnicode` CMap (9.10.3): every character used, by its character code.
 fn to_unicode(cid: &HashMap<char, u16>) -> String {
     let mut entries: Vec<(u16, char)> = cid.iter().map(|(&c, &id)| (id, c)).collect();
-    entries.sort_unstable();
+    crate::order::sort_by_key(&mut entries, |e| u64::from(e.0) << 32 | u64::from(e.1));
     let mut s = String::from(
         "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
     );

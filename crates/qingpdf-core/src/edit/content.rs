@@ -431,7 +431,7 @@ fn line_width(face: &dyn Face, line: &str) -> f64 {
 fn make_mark(ctx: &mut Ctx<'_>, m: &Mark<'_>) -> Result<Made> {
     let mut resources = Dict::new();
     let size = m.size;
-    let chars: BTreeSet<char> = m.lines.iter().flat_map(|l| l.chars()).collect();
+    let chars: BTreeSet<char> = crate::order::set_of(m.lines.iter().flat_map(|l| l.chars()));
     let font = if chars.is_empty() {
         None
     } else {

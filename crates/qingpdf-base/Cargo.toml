@@ -14,10 +14,13 @@ testutil = []
 aes = "0.9.3"
 md-5 = "0.11.0"
 miniz_oxide = "0.9.1"
-png = "0.18.1"
 sha2 = "0.11.0"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86"] }
+
+[dev-dependencies]
+# The development dependency: the other PNG reader and writer that the tests are made against.
+png = "0.18.1"
 
 [lints.rust]
 unsafe_code = "forbid"

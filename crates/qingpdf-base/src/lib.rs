@@ -19,6 +19,7 @@ pub mod layout;
 pub mod lexer;
 pub mod object;
 pub mod ops;
+pub mod order;
 pub mod parser;
 pub mod prune;
 pub mod render;

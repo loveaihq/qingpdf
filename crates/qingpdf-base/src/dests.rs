@@ -380,7 +380,7 @@ pub(crate) fn build_name_tree(
     mut entries: Vec<(Vec<u8>, Object)>,
     define: &mut dyn FnMut(Dict) -> Result<ObjRef>,
 ) -> Result<ObjRef> {
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    crate::order::sort_by(&mut entries, |a, b| a.0.cmp(&b.0));
     let limits = |first: &[u8], last: &[u8]| {
         Object::Array(vec![
             Object::String(PdfString::literal(first.to_vec())),

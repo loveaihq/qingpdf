@@ -47,7 +47,7 @@ pub(crate) fn section(doc: &Document, objects: &[(u32, Rc<Object>)]) -> Result<V
         let enc = crypt.as_ref().map(|c| c.object_with_generation(num, generation, false));
         write_indirect_gen(&mut out, num, generation, object, enc.as_ref())?;
     }
-    entries.sort_unstable_by_key(|e| e.0);
+    crate::order::sort_by_key(&mut entries, |e| e.0 as u64);
     if entries.windows(2).any(|w| matches!(w, [a, b] if a.0 == b.0)) {
         return Err(Error::Invalid("an object is written twice in one update".to_string()));
     }
