@@ -1,7 +1,7 @@
 //! What the reader keeps between runs, in one small UTF-8 text file, `%APPDATA%\qingpdf\author.txt` (the name it has had since the
 //! name put on the annotations, 4a, was kept there). The first line is that name, as it always was, so that an older build still reads
 //! it; the lines after it are `key=value` settings: `lang` (`system`, `zh` or `en`), `toolbar` (`1` or `0`), `sidebar` (the width of
-//! the bookmarks, in pixels at 96 dpi) and `window` (`x,y,w,h,maximized`, see [`Placement`]). Nothing is sent anywhere. The file is
+//! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks` or `pages`: the tab of the sidebar last used) and `window` (`x,y,w,h,maximized`, see [`Placement`]). Nothing is sent anywhere. The file is
 //! not trusted (another program may have written it): a name that is too long or has control characters in it is not used, a setting
 //! that is not understood or is out of range is ignored.
 
@@ -12,6 +12,7 @@ use qingpdf_core::view::MAX_AUTHOR_CHARS;
 
 use crate::i18n::LangChoice;
 use crate::placement::Placement;
+use crate::thumbs::Tab;
 
 /// Most bytes of the file that are read.
 const MAX_FILE_BYTES: u64 = 4096;
@@ -52,12 +53,14 @@ pub struct Settings {
     pub toolbar: bool,
     /// The width of the bookmarks beside the pages, at 96 dpi (none: the usual).
     pub sidebar: Option<i32>,
+    /// The tab of the sidebar last used (none: the bookmarks).
+    pub tab: Option<Tab>,
     pub window: Option<Placement>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { author: None, lang: LangChoice::System, toolbar: true, sidebar: None, window: None }
+        Settings { author: None, lang: LangChoice::System, toolbar: true, sidebar: None, tab: None, window: None }
     }
 }
 
@@ -73,6 +76,7 @@ impl Settings {
                 "lang" => s.lang = LangChoice::parse(value).unwrap_or_default(),
                 "toolbar" => s.toolbar = value.trim() != "0",
                 "sidebar" => s.sidebar = value.trim().parse::<i32>().ok().filter(|w| SIDEBAR_RANGE.contains(w)),
+                "tab" => s.tab = Tab::parse(value),
                 "window" => s.window = Placement::parse(value),
                 _ => {}
             }
@@ -85,6 +89,9 @@ impl Settings {
         let mut out = format!("{}\nlang={}\ntoolbar={}\n", self.author.as_deref().unwrap_or(""), self.lang.as_str(), i32::from(self.toolbar));
         if let Some(w) = self.sidebar {
             out.push_str(&format!("sidebar={w}\n"));
+        }
+        if let Some(t) = self.tab {
+            out.push_str(&format!("tab={}\n", t.as_str()));
         }
         if let Some(w) = self.window {
             out.push_str(&format!("window={}\n", w.to_text()));
@@ -160,6 +167,7 @@ mod tests {
             lang: LangChoice::Zh,
             toolbar: false,
             sidebar: Some(310),
+            tab: Some(Tab::Pages),
             window: Some(Placement { x: -1500, y: 20, w: 1100, h: 760, maximized: true }),
         };
         let text = s.render();
@@ -182,6 +190,8 @@ mod tests {
         assert_eq!(s.window, None);
         assert_eq!(Settings::parse("N\nsidebar=200\nsidebar=oops\n").sidebar, None);
         assert_eq!(Settings::parse("N\nsidebar=200\n").sidebar, Some(200));
+        assert_eq!(Settings::parse("N\ntab=pages\n").tab, Some(Tab::Pages));
+        assert_eq!(Settings::parse("N\ntab=thumbnails\n").tab, None);
         // Too long a first line is not a name, and does not stop the rest.
         let long = format!("{}\nlang=en\n", "x".repeat(MAX_AUTHOR_CHARS + 1));
         let s = Settings::parse(&long);

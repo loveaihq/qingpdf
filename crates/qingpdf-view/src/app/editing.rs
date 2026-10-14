@@ -541,6 +541,7 @@ impl App {
                 let changed = if r.page == ALL_PAGES { 0..self.page_count() as u32 } else { r.page..r.page + 1 };
                 for page in changed {
                     self.cache.remove_page(page);
+                    self.forget_thumb(page);
                     self.failed.retain(|k| k.page != page);
                     self.notices.remove(&page);
                     self.links.remove(&page);

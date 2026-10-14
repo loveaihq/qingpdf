@@ -4,7 +4,7 @@
 //!
 //! Run `qingpdf-view [file.pdf]`. The hidden `--bench <file.pdf>` opens the file, goes through its pages by itself,
 //! prints times and the memory peak and quits; `--bench-size WxH` gives the window of that test a client area of that
-//! many pixels (it may be bigger than the screen). The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
+//! many pixels (it may be bigger than the screen); `--bench-thumbs` opens the sidebar on the thumbnails in it. The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
 //! (the first three by default) to the printer "Microsoft Print to PDF", which writes `out.pdf`, with no box, says how it went
 //! and the memory peak, and quits. The hidden `--ocr-test <in.pdf> <out.pdf> [--ocr-pages first-last] [--ocr-lang zh|en]` recognises the text of
 //! the scanned pages with the same chain the window uses, saves the file with the text layer, prints how long each page took and quits.
@@ -56,6 +56,8 @@ fn main() {
     let mut args = std::env::args_os().skip(1);
     let mut bench_file: Option<PathBuf> = None;
     let mut bench_size: Option<(i32, i32)> = None;
+    // The speed test with the sidebar open on the thumbnails.
+    let mut bench_thumbs = false;
     let mut open: Option<PathBuf> = None;
     // The hidden print test: the file, the file to write, the pages.
     let mut print_test: Option<(PathBuf, PathBuf, (u32, u32))> = None;
@@ -65,6 +67,8 @@ fn main() {
     while let Some(arg) = args.next() {
         if arg == "--bench" {
             bench_file = args.next().map(PathBuf::from);
+        } else if arg == "--bench-thumbs" {
+            bench_thumbs = true;
         } else if arg == "--bench-size" {
             bench_size = args.next().and_then(|s| parse_size(&s.to_string_lossy()));
         } else if arg == "--print-test" {
@@ -112,6 +116,9 @@ fn main() {
         app.apply_settings(&kept);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));
+            if bench_thumbs {
+                app.bench_thumbs();
+            }
             app.open_when_ready(file);
         } else if let Some((file, output, (first, last))) = print_test {
             app.set_print_test(PrintTest { output, first, last });

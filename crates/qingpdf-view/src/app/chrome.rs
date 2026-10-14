@@ -48,6 +48,10 @@ impl App {
         if let Some(w) = s.sidebar {
             self.sidebar_pref = i64::from(w);
         }
+        if let Some(tab) = s.tab {
+            self.tab = tab;
+            self.thumbs_alone = tab == Tab::Pages;
+        }
         self.toolbar_dirty = true;
         self.menus_dirty = true;
     }

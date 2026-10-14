@@ -116,7 +116,7 @@ impl Bench {
             let following = match pass {
                 Pass::Reading => Pass::Rapid,
                 Pass::Rapid => Pass::Cold,
-                Pass::Cold => return self.finish(),
+                Pass::Cold => return self.finish(app),
             };
             self.state = State::Pass { pass: following, next: 1 };
             // Back to the first page for the next pass (not timed), then on.
@@ -150,7 +150,7 @@ impl Bench {
         actions
     }
 
-    fn finish(&mut self) -> Vec<Action> {
+    fn finish(&mut self, app: &App) -> Vec<Action> {
         self.state = State::Done;
         let ms = |d: Option<Duration>| d.map_or_else(|| "never".to_string(), |d| format!("{:.0} ms", d.as_secs_f64() * 1000.0));
         println!("file: {}", self.file);
@@ -158,6 +158,8 @@ impl Bench {
             Some((w, h)) => println!("window: {w} x {h} pixels (client area)"),
             None => println!("window: default size"),
         }
+        let (view_w, view_h) = app.page_area();
+        println!("page area: {view_w} x {view_h} pixels{}", if app.shows_sidebar() { " (the sidebar open on the thumbnails)" } else { "" });
         println!("pages: {}", self.pages);
         println!("time to the first page (something on the screen): {}", ms(self.first_any));
         println!("time to the first page (sharp): {}", ms(self.first_sharp));

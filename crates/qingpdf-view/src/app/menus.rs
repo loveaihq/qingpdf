@@ -1,4 +1,4 @@
-//! The menus (3d-2): File (open, recent files, print, exit), Edit (copy, find), View (zoom, turn, the bookmarks), Go (page) and Help
+//! The menus (3d-2): File (open, recent files, print, exit), Edit (copy, find), View (zoom, turn, the sidebar), Go (page) and Help
 //! (about).
 
 use super::editing::{COLORS, Tool, WIDTHS};
@@ -6,12 +6,11 @@ use super::forms::{TEXT_SIZES, WM_ANGLE, WM_OPACITY, Watermarking};
 use super::*;
 use crate::ui::MenuEntry;
 
-/// What decides how the menus look: whether a file is open (the items that need one are greyed otherwise), whether it has
-/// bookmarks and whether they are shown, and the files in the list of recent ones.
+/// What decides how the menus look: whether a file is open (the items that need one are greyed otherwise), whether the
+/// sidebar is shown, and the files in the list of recent ones.
 pub(super) struct MenuState {
     pub has_doc: bool,
-    pub has_outline: bool,
-    pub show_outline: bool,
+    pub show_sidebar: bool,
     pub recent: Vec<String>,
     /// Annotations may be added (the file allows it) and what can be undone, redone and taken out.
     pub can_edit: bool,
@@ -38,8 +37,7 @@ impl MenuState {
     pub(super) fn idle() -> MenuState {
         MenuState {
             has_doc: false,
-            has_outline: false,
-            show_outline: true,
+            show_sidebar: false,
             recent: Vec::new(),
             can_edit: false,
             can_undo: false,
@@ -132,7 +130,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 MenuEntry::Separator,
                 item(CMD_ROTATE, Msg::Rotate, st.has_doc),
                 MenuEntry::Separator,
-                MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowBookmarks).to_string(), checked: st.show_outline, enabled: st.has_outline },
+                MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowSidebar).to_string(), checked: st.show_sidebar, enabled: st.has_doc },
                 MenuEntry::Item { id: CMD_TOOLBAR, label: t(lang, Msg::ShowToolbar).to_string(), checked: st.toolbar, enabled: true },
                 MenuEntry::Separator,
                 MenuEntry::Submenu {
@@ -236,8 +234,7 @@ impl App {
         let tool = self.tool_command();
         let st = MenuState {
             has_doc: self.doc.is_some(),
-            has_outline: !self.outline.is_empty(),
-            show_outline: self.show_outline,
+            show_sidebar: self.sidebar_width() > 0,
             recent: self.recent.iter().map(|e| e.path.clone()).collect(),
             can_edit: self.doc.is_some() && self.rights.annotate,
             can_undo: self.edit.can_undo,
@@ -283,7 +280,6 @@ mod tests {
     fn there_are_eight_menus_and_every_command_is_in_one() {
         let st = MenuState {
             has_doc: true,
-            has_outline: true,
             recent: vec!["C:\\a.pdf".to_string(), "C:\\b&c.pdf".to_string()],
             can_edit: true,
             can_undo: true,

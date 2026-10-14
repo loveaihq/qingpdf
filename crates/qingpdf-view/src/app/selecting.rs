@@ -57,6 +57,11 @@ impl App {
             self.split_drag = Some((x, self.sidebar_pref));
             return Vec::new();
         }
+        // The tabs of the sidebar and the list of thumbnails.
+        if let Some(actions) = self.sidebar_mouse_down(x, y) {
+            return actions;
+        }
+        self.thumb_focus = false;
         // A drawing or a note takes the pointer for itself.
         if let Some(actions) = self.edit_mouse_down(x, y) {
             return actions;
@@ -83,6 +88,9 @@ impl App {
         if self.split_drag.is_some() {
             return self.split_drag_to(x);
         }
+        if self.thumb_drag {
+            return self.thumb_drag_to(y);
+        }
         if let Some(actions) = self.edit_mouse_move(x, y) {
             return actions;
         }
@@ -104,6 +112,10 @@ impl App {
     pub(super) fn mouse_up(&mut self, x: i64, y: i64) -> Vec<Action> {
         self.mouse = (x, y);
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
+        if self.thumb_drag {
+            actions.extend(self.thumb_drag_end());
+            return actions;
+        }
         if self.split_drag.is_some() {
             actions.extend(self.split_drag_end());
             return actions;
@@ -132,6 +144,7 @@ impl App {
         self.press = None;
         self.edit.give_up_stroke();
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
+        actions.extend(self.thumb_drag_end());
         actions.extend(self.split_drag_end());
         actions
     }

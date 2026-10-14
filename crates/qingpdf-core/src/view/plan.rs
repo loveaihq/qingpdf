@@ -35,6 +35,11 @@ const EDIT_BYTES: u64 = 16 * MIB;
 /// The lists of form fields the window keeps for the pages round about (at most `MAX_FIELDS_BYTES` for each of 25 pages), and the
 /// options of the one choice being made (at most `MAX_OPTION_BYTES`). Not cut when the file is big: a list is what it is.
 const FORM_BYTES: u64 = 8 * MIB;
+/// The small pictures of pages the window keeps for the thumbnails beside the pages (2026-10-14; 8 MB, counted in millions of bytes
+/// like the total). They are taken off the engine's caches (each cut by the same fraction: `MemoryPlan::make_room_for_thumbnails`), not off the
+/// window's bitmaps: how many pieces round the view those hold decides how deep the prefetch of a page turn goes, which is felt, and the
+/// speed test of a 1920 by 1080 window turned out to sit on the edge of it (docs/decisions.md, thumbnails).
+pub const THUMB_CACHE_BYTES: u64 = 8_000_000;
 /// The most pixels of one piece of a page drawn at once (16 MiB of canvas).
 const TILE_PIXELS: u64 = 4 * MIB;
 /// The window needs room for at least a few screens of bitmaps, or there is no plan.
@@ -57,6 +62,8 @@ pub struct MemoryPlan {
     pub file_bytes: u64,
     /// What the window may keep of drawn bitmaps (what is left of the total).
     pub bitmap_cache_bytes: u64,
+    /// What the window may keep of thumbnails, besides `bitmap_cache_bytes` ([`THUMB_CACHE_BYTES`]); the engine's caches gave it up.
+    pub thumb_cache_bytes: u64,
     /// The most pixels in one request to draw; the window cuts a bigger page into pieces. The engine refuses a
     /// request for more.
     pub max_tile_pixels: u32,
@@ -75,6 +82,34 @@ pub struct MemoryPlan {
 }
 
 impl MemoryPlan {
+    /// Make room for [`THUMB_CACHE_BYTES`] of thumbnails: the engine's caches (not the page canvas, not the lists of form fields) give it up, each in
+    /// proportion to what it has above the floor `MIN_SHARE` keeps for it; what they cannot give (a window so big that they are at the floor already)
+    /// comes off the window's bitmaps. In the usual case the bitmaps stay as they were.
+    fn make_room_for_thumbnails(&mut self) {
+        let floor = |full: u64| full * MIN_SHARE / 1000;
+        let mut parts = [
+            (&mut self.object_streams, floor(OBJECT_STREAMS)),
+            (&mut self.render_caches, floor(RENDER_CACHES)),
+            (&mut self.image_slot, floor(IMAGE_SLOT)),
+            (&mut self.layers, floor(LAYERS)),
+            (&mut self.masks, floor(MASKS)),
+            (&mut self.decoders, floor(DECODERS)),
+            (&mut self.text_cache, floor(TEXT_CACHE)),
+            (&mut self.edit_bytes, floor(EDIT_BYTES)),
+        ];
+        let spare: u64 = parts.iter().map(|(part, floor)| part.saturating_sub(*floor)).sum();
+        let cut = THUMB_CACHE_BYTES.min(spare);
+        let mut freed = 0u64;
+        for (part, floor) in &mut parts {
+            let above = part.saturating_sub(*floor);
+            let take = u64::try_from(u128::from(above) * u128::from(cut) / u128::from(spare.max(1))).unwrap_or(0).min(above);
+            **part -= take;
+            freed += take;
+        }
+        self.bitmap_cache_bytes = self.bitmap_cache_bytes.saturating_sub(THUMB_CACHE_BYTES - freed);
+        self.thumb_cache_bytes = THUMB_CACHE_BYTES;
+    }
+
     /// The most the engine can have at once: its caches, the work memory of a page, and the page (4 bytes a pixel).
     pub fn engine_bytes(&self) -> u64 {
         self.object_streams
@@ -110,6 +145,7 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
         let mut p = MemoryPlan {
             file_bytes,
             bitmap_cache_bytes: 0,
+            thumb_cache_bytes: 0,
             max_tile_pixels: u32::try_from(tile).unwrap_or(u32::MAX),
             object_streams: part(OBJECT_STREAMS),
             render_caches: part(RENDER_CACHES),
@@ -136,6 +172,8 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
         }
         share = share.saturating_sub(10).max(MIN_SHARE);
     };
+    let mut p = p;
+    p.make_room_for_thumbnails();
     (p.bitmap_cache_bytes >= MIN_BITMAP_CACHE.max(u64::from(p.max_tile_pixels) * 4)).then_some(p)
 }
 
@@ -153,7 +191,8 @@ mod tests {
         for file in [0, 1_000, 5_000_000, 40_000_000, 40_000_001, 70_000_000, MAX_FILE_BYTES] {
             for view in [0, HD, UHD, HUGE] {
                 let p = plan(TOTAL_BYTES, file, view).expect("a plan");
-                assert!(p.file_bytes + p.engine_bytes() + p.bitmap_cache_bytes <= TOTAL_BYTES, "{file} {view}: {p:?}");
+                assert!(p.file_bytes + p.engine_bytes() + p.bitmap_cache_bytes + p.thumb_cache_bytes <= TOTAL_BYTES, "{file} {view}: {p:?}");
+                assert_eq!(p.thumb_cache_bytes, THUMB_CACHE_BYTES, "{file} {view}");
                 // Room for a few screens of bitmaps at least.
                 assert!(p.bitmap_cache_bytes >= MIN_BITMAP_CACHE, "{file} {view}: {p:?}");
                 // A full-size piece of a page is held in the cache whole.
@@ -181,6 +220,9 @@ mod tests {
         let hd = plan(TOTAL_BYTES, 5_000_000, HD).expect("a plan");
         assert!(hd.bitmap_cache_bytes >= HD * 12 && hd.bitmap_cache_bytes >= u64::from(hd.max_tile_pixels) * 4 * 5 / 2 + PREVIEWS, "{hd:?}");
         assert!(hd.render_caches > RENDER_CACHES * 7 / 10, "{hd:?}");
+        // The thumbnails took their bytes from the engine, not from the window: the total is still used to the byte (less the rounding
+        // of the cut), and the bitmaps have what the plan gave them before the thumbnails.
+        assert!(TOTAL_BYTES - (hd.file_bytes + hd.engine_bytes() + hd.bitmap_cache_bytes + hd.thumb_cache_bytes) < 16, "{hd:?}");
         // A 4K window wants more than is left: the bitmaps get what they want and the engine's parts are cut.
         let uhd = plan(TOTAL_BYTES, 5_000_000, UHD).expect("a plan");
         assert!(uhd.bitmap_cache_bytes >= UHD * 12, "{uhd:?}");
@@ -197,3 +239,4 @@ mod tests {
         assert!(plan(TOTAL_BYTES, u64::MAX, HD).is_none());
     }
 }
+

@@ -270,6 +270,7 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
             pages: infos,
             file_bytes: plan.file_bytes,
             bitmap_cache_bytes: plan.bitmap_cache_bytes,
+            thumb_cache_bytes: plan.thumb_cache_bytes,
             max_tile_pixels: plan.max_tile_pixels,
             rights,
         }));

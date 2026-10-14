@@ -3,7 +3,8 @@
 //!
 //! The parts of it that came with 3d-2 are in the modules below, each an `impl App` of its own: `outline` (the bookmarks, links
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
-//! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans).
+//! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans), `sidebar` (the tabs, and the
+//! thumbnails: the list is drawn and handled there).
 
 mod chrome;
 mod editing;
@@ -15,6 +16,7 @@ mod printjob;
 mod recents;
 mod searching;
 mod selecting;
+mod sidebar;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ use crate::layout::Layout;
 use crate::recent;
 use crate::sched::{self, Scene, Want};
 use crate::select::Selection;
+use crate::thumbs::{self, Tab};
 use crate::tiles;
 use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
 use qingpdf_core::view::MarkupKind;
@@ -137,12 +140,10 @@ const DRAG_MS: u32 = 50;
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
 const MARGIN: i64 = 12;
-/// The strip between the bookmarks and the pages that can be dragged to change the bookmarks' width, and the usual width of them (at 96 dpi).
+/// The strip between the sidebar and the pages that can be dragged to change the sidebar's width (at 96 dpi; the usual width is `sidebar::DEFAULT_WIDTH`).
 const SPLIT_GAP: i64 = 6;
 const WHEEL_STEP: i64 = 96;
 const LINE_STEP: i64 = 48;
-/// The width of the bookmarks beside the pages.
-const SIDEBAR_WIDTH: i64 = 260;
 const SPLIT_COLOR: u32 = 0xA0A0A0;
 /// The find box: the edit box, the room for the count to its left, the gap to the top and right edges.
 const FIND_EDIT_W: i64 = 220;
@@ -228,9 +229,9 @@ pub struct App {
     // --- 3d-2 ---
     /// What the file allows (all of it when none is open).
     rights: Rights,
-    /// The bookmarks of the open file, and whether they are shown (when there are any).
+    /// The bookmarks of the open file, and whether the sidebar is wanted (it is shown when there are bookmarks, or when it is open on the thumbnails).
     outline: Vec<OutlineItem>,
-    show_outline: bool,
+    show_sidebar: bool,
     /// The links of the pages near the window, and the engine's requests for them (request, page).
     links: HashMap<u32, Vec<Link>>,
     links_asked: HashMap<u64, u32>,
@@ -291,6 +292,21 @@ pub struct App {
     pending_select: Option<chrome::PendingSelect>,
     /// Whether changes to the settings are written to the file (the tests do not).
     pub(crate) persist: bool,
+
+    // --- the thumbnails (2026-10-14) ---
+    /// The tab of the sidebar the person chose, and whether the sidebar is open on the thumbnails for a file without bookmarks.
+    tab: Tab,
+    thumbs_alone: bool,
+    /// The rows of the thumbnails, where they are scrolled to, the pictures and the requests for them.
+    thumbs: thumbs::Thumbs,
+    /// The keys belong to the list of thumbnails (it was clicked last), and its bar is being dragged.
+    thumb_focus: bool,
+    thumb_drag: bool,
+    /// The page the list of thumbnails moved to (it is the page shown as current while it is in view), and whether that move is going on.
+    thumb_target: Option<usize>,
+    thumb_nav: bool,
+    /// The speed test shows the sidebar on the thumbnails (`--bench-thumbs`).
+    bench_sidebar: bool,
 }
 
 impl App {
@@ -335,7 +351,7 @@ impl App {
             started,
             rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true },
             outline: Vec::new(),
-            show_outline: true,
+            show_sidebar: true,
             links: HashMap::new(),
             links_asked: HashMap::new(),
             boxes: HashMap::new(),
@@ -364,11 +380,19 @@ impl App {
             toolbar_dirty: true,
             last_toolbar: None,
             last_status: None,
-            sidebar_pref: SIDEBAR_WIDTH,
+            sidebar_pref: sidebar::DEFAULT_WIDTH,
             split_drag: None,
             ctx_at: None,
             pending_select: None,
             persist: true,
+            tab: Tab::Bookmarks,
+            thumbs_alone: false,
+            thumbs: thumbs::Thumbs::new(),
+            thumb_focus: false,
+            thumb_drag: false,
+            thumb_target: None,
+            thumb_nav: false,
+            bench_sidebar: false,
         }
     }
 
@@ -432,9 +456,13 @@ impl App {
         }
         let mut actions = self.cancel_print_for_new_document();
         self.drop_ocr();
-        for id in self.links_asked.drain().map(|(id, _)| id).chain(self.boxes_asked.drain().map(|(id, _)| id)) {
+        for id in self.links_asked.drain().map(|(id, _)| id).chain(self.boxes_asked.drain().map(|(id, _)| id)).chain(self.thumbs.asked.drain().map(|(id, _)| id)) {
             self.engine.cancel(id);
         }
+        self.thumbs.reset(0);
+        self.thumb_focus = false;
+        self.thumb_drag = false;
+        self.thumb_target = None;
         if let Some(s) = self.search.take() {
             self.engine.cancel(s.id);
         }
@@ -489,11 +517,15 @@ impl App {
         let sizes = o.pages.iter().map(|p| (p.width, p.height)).collect();
         self.doc = Some(Doc { layout: Layout::new(sizes), max_tile_pixels: o.max_tile_pixels });
         self.cache = BitmapCache::new(o.bitmap_cache_bytes);
+        self.thumbs.reset(o.thumb_cache_bytes);
         self.mode = ZoomMode::FitWidth;
         self.rotation = 0;
         self.scroll_x = 0;
         self.scroll_y = 0;
         let mut actions = vec![Action::SetTitle(self.title())];
+        // The sidebar is there from the start when it is open on the thumbnails (the bookmarks, if there are any, come later).
+        self.view_x = self.sidebar_width();
+        self.view_w = (self.client_w - self.view_x).max(0);
         self.relayout(0, 0, None);
         // Where the reader was in this file last time.
         let mut go_to = None;
@@ -510,6 +542,7 @@ impl App {
         if let Some(page) = go_to {
             actions.extend(self.go_to_page(page));
         }
+        actions.extend(self.chrome());
         self.remember_position();
         self.menus_dirty = true;
         if self.bench.is_none() {
@@ -623,6 +656,12 @@ impl App {
         } else {
             actions.push(Action::KillTimer(TIMER_SETTLE));
         }
+        // The list of thumbnails keeps its own place unless the page changed (then it shows the page); a page chosen in the list stays the
+        // current one while it is in view, but any other way of moving forgets it.
+        if !self.thumb_nav {
+            self.thumb_target = None;
+        }
+        self.sync_thumbs();
         self.sync_bars(&mut actions);
         self.schedule();
         self.ask_for_links();
@@ -693,6 +732,10 @@ impl App {
                 self.in_flight.remove(&w.key);
             }
         }
+        // What the pages need comes before the thumbnails: the ones being drawn are taken back (they are asked for again when the pages are in).
+        if !plan.issue.is_empty() {
+            self.cancel_thumbs();
+        }
         for w in plan.issue {
             let id = self.new_id();
             self.engine.render(RenderRequest {
@@ -710,6 +753,7 @@ impl App {
             self.in_flight.insert(w.key, id);
             self.asked.insert(id, w);
         }
+        self.schedule_thumbs();
     }
 
     // --- the engine's answers --------------------------------------------------------------------------------
@@ -725,6 +769,7 @@ impl App {
                 other => actions.extend(self.on_other_event(other)),
             }
         }
+        self.schedule_thumbs();
         if redraw {
             actions.push(Action::Invalidate);
         }
@@ -736,6 +781,9 @@ impl App {
     fn on_rendered(&mut self, r: Rendered) -> bool {
         if r.doc != self.doc_id {
             return false;
+        }
+        if let Some(page) = self.thumbs.asked.remove(&r.id) {
+            return self.on_thumb_rendered(page, r);
         }
         let Some(want) = self.asked.remove(&r.id) else { return false };
         self.in_flight.remove(&want.key);
@@ -824,6 +872,16 @@ impl App {
 
     pub fn has_document(&self) -> bool {
         self.doc.is_some()
+    }
+
+    /// The size of the area the pages are shown in, in pixels (the window less the toolbar, the status bar and the sidebar).
+    pub fn page_area(&self) -> (i64, i64) {
+        (self.view_w, self.view_h)
+    }
+
+    /// Is the sidebar beside the pages?
+    pub fn shows_sidebar(&self) -> bool {
+        self.view_x > 0
     }
 
     /// For the speed test: let go of every bitmap and every request.
@@ -929,7 +987,7 @@ impl App {
             CMD_CTX_HIGHLIGHT => self.highlight_selection(),
             CMD_CTX_NOTE => self.note_here(),
             CMD_CTX_SELECT_ALL => self.select_all_here(),
-            CMD_BOOKMARKS => self.toggle_outline(),
+            CMD_BOOKMARKS => self.toggle_sidebar(),
             CMD_COPY => self.copy_selection(),
             CMD_GOTO if self.doc.is_some() => {
                 let title = t(self.lang, Msg::GoToTitle).to_string();
@@ -946,6 +1004,10 @@ impl App {
     }
 
     fn key(&mut self, key: u32, ctrl: bool, shift: bool) -> Vec<Action> {
+        // The list of thumbnails has the keyboard: the arrow keys move from page to page.
+        if !ctrl && self.thumb_focus && self.thumbs_shown() && let Some(list_key) = sidebar::list_key(key) {
+            return self.thumb_key(list_key);
+        }
         let page_step = (self.view_h * 9 / 10).max(1);
         let line = self.px(LINE_STEP);
         if ctrl {
@@ -1127,7 +1189,9 @@ impl Handler for App {
             }
             Event::Key { vk, ctrl, shift } => self.key(vk, ctrl, shift),
             Event::Wheel { delta, ctrl, shift, x, y } => {
-                if ctrl {
+                if !ctrl && !shift && self.over_thumbs(i64::from(x), i64::from(y)) {
+                    self.thumb_wheel(delta)
+                } else if ctrl {
                     let z = zoom::wheel(self.zoom, f64::from(delta) / 120.0);
                     self.set_zoom(ZoomMode::Custom, z, Some((i64::from(x) - self.view_x, i64::from(y))))
                 } else if shift {
@@ -1138,7 +1202,12 @@ impl Handler for App {
             }
             Event::HWheel { delta } => self.scroll_by(i64::from(delta) * self.px(WHEEL_STEP) / 120, 0, true),
             Event::Scroll { bar, code } => self.scrolled_by_bar(bar, code),
-            Event::Command(cmd) => self.command(cmd),
+            Event::Command(cmd) => {
+                if cmd != CMD_BOOKMARKS {
+                    self.thumb_focus = false;
+                }
+                self.command(cmd)
+            }
             Event::Drop(files) => match files.first() {
                 Some(f) => self.open_path(f, ""),
                 None => Vec::new(),
@@ -1238,6 +1307,7 @@ impl Handler for App {
             let line = clamp32(self.px(1).max(1));
             p.fill_rect(Rect { x: clamp32(self.view_x - self.px(SPLIT_GAP) / 2), y: 0, w: line, h: full_h }, SPLIT_COLOR);
         }
+        self.draw_sidebar(p);
         let mut drew = false;
         match &self.doc {
             Some(doc) => {

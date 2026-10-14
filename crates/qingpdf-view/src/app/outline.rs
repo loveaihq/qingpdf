@@ -1,4 +1,4 @@
-//! The reader's bookmarks, links and moving to a place (3d-2), and the engine's answers about them and about text.
+//! The reader's bookmarks, links and moving to a place (3d-2), and the engine's answers about them and about text. (The sidebar they sit in is in `sidebar.rs`.)
 
 use qingpdf_core::view::{Event as EngineEvent, Link, LinkKind, OutlineItem, safe_uri};
 
@@ -11,44 +11,6 @@ const LINK_PAGES_KEPT: u32 = 12;
 const LINK_PAGES_ASKED: u32 = 8;
 
 impl App {
-    /// The width of the bookmarks beside the pages (0 when there are none, or they are hidden).
-    pub(super) fn sidebar_width(&self) -> i64 {
-        if self.show_outline && !self.outline.is_empty() && self.bench.is_none() {
-            (self.px(self.sidebar_pref) + self.px(SPLIT_GAP)).min(self.client_w / 2)
-        } else {
-            0
-        }
-    }
-
-    /// Where the tree of bookmarks and the find box go in the window now.
-    pub(super) fn chrome(&self) -> Vec<Action> {
-        // The tree stops short of the pages by the strip that is dragged to change its width.
-        let side = Rect { x: 0, y: 0, w: clamp32((self.view_x - self.px(SPLIT_GAP)).max(0)), h: clamp32(self.view_h) };
-        let find = self.find_open.then(|| self.find_rect());
-        vec![Action::Sidebar(side), Action::Find(find)]
-    }
-
-    /// The pages have to be laid out again because the bookmarks came, went or were shown or hidden.
-    fn apply_sidebar(&mut self) -> Vec<Action> {
-        let width = self.sidebar_width();
-        let mut actions = Vec::new();
-        if width != self.view_x {
-            self.view_x = width;
-            self.view_w = (self.client_w - width).max(0);
-            let (ax, ay) = (self.view_w / 2, self.view_h / 2);
-            self.relayout(ax, ay, None);
-            actions.extend(self.after_view_change(false));
-        }
-        actions.extend(self.chrome());
-        self.menus_dirty = true;
-        actions
-    }
-
-    pub(super) fn toggle_outline(&mut self) -> Vec<Action> {
-        self.show_outline = !self.show_outline;
-        self.apply_sidebar()
-    }
-
     pub(super) fn ask_for_outline(&mut self) -> Vec<Action> {
         let id = self.new_id();
         self.engine.outline(self.doc_id, id);

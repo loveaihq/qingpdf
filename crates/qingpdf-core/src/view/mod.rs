@@ -54,7 +54,7 @@ pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
 pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind};
-pub use plan::{MAX_FILE_BYTES, MemoryPlan, TOTAL_BYTES, plan};
+pub use plan::{MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
 pub use search::MAX_QUERY_CHARS;
 pub use server::{MAX_COPY_CHARS, MAX_COPY_PAGES, MAX_HITS_PER_PAGE, MAX_PRINT_DPI, MAX_PRINT_PAGES, MAX_SEARCH_HITS};
 
@@ -170,6 +170,8 @@ pub struct Opened {
     pub file_bytes: u64,
     /// What the window may keep of drawn bitmaps, so that the file, the engine and the bitmaps stay within the total.
     pub bitmap_cache_bytes: u64,
+    /// What the window may keep of thumbnails (small pictures of whole pages), besides `bitmap_cache_bytes`.
+    pub thumb_cache_bytes: u64,
     /// The most pixels one request should ask for (a bigger page is asked for in pieces).
     pub max_tile_pixels: u32,
     pub rights: Rights,

@@ -23,7 +23,7 @@ const PREVIEW_RANGE: usize = 8;
 const P_PREVIEW_IN_VIEW: u32 = 0;
 const P_IN_VIEW: u32 = 10;
 const P_RING: u32 = 1000;
-const P_PREVIEW_NEAR: u32 = 100_000;
+pub(crate) const P_PREVIEW_NEAR: u32 = 100_000;
 // What is in view is drawn before the engine's quick requests (links, bookmarks, boxes of characters), the ring round it after them.
 const _: () = assert!(P_RING == qingpdf_core::view::BACKGROUND_PRIORITY);
 

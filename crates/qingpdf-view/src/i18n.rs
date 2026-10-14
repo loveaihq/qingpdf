@@ -67,7 +67,9 @@ pub enum Msg {
     FitPage,
     ActualSize,
     Rotate,
-    ShowBookmarks,
+    ShowSidebar,
+    TabBookmarks,
+    TabPages,
     Edit,
     Copy,
     GoMenu,
@@ -246,7 +248,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 189] = [
+pub const ALL: [Msg; 191] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -261,7 +263,9 @@ pub const ALL: [Msg; 189] = [
     Msg::FitPage,
     Msg::ActualSize,
     Msg::Rotate,
-    Msg::ShowBookmarks,
+    Msg::ShowSidebar,
+    Msg::TabBookmarks,
+    Msg::TabPages,
     Msg::Edit,
     Msg::Copy,
     Msg::GoMenu,
@@ -454,7 +458,9 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::FitPage => ("Fit &page\tCtrl+2", "适合整页(&P)\tCtrl+2"),
         Msg::ActualSize => ("&Actual size\tCtrl+0", "实际大小(&A)\tCtrl+0"),
         Msg::Rotate => ("&Rotate clockwise\tCtrl+R", "顺时针旋转(&R)\tCtrl+R"),
-        Msg::ShowBookmarks => ("Show &bookmarks\tF4", "显示书签(&B)\tF4"),
+        Msg::ShowSidebar => ("Show &sidebar\tF4", "显示侧栏(&S)\tF4"),
+        Msg::TabBookmarks => ("Bookmarks", "书签"),
+        Msg::TabPages => ("Pages", "缩略图"),
         Msg::Edit => ("&Edit", "编辑(&E)"),
         Msg::Copy => ("&Copy\tCtrl+C", "复制(&C)\tCtrl+C"),
         Msg::GoMenu => ("&Go", "转到(&G)"),
@@ -700,7 +706,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 189);
+        assert_eq!(ALL.len(), 191);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");
