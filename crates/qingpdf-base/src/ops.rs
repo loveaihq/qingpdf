@@ -205,21 +205,7 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
     for (pick, &new) in picks.iter().zip(&out_pages) {
         let page = docs.get(pick.doc).and_then(|d| d.pages.get(pick.page)).ok_or_else(|| internal("bad page"))?;
         let source = source_of(pick.doc)?;
-        let mut dict: Dict = (*page.dict).clone();
-        // Article beads lead to threads at the document level (12.4.3); they
-        // would pull the rest of the file back in.
-        dict.remove("B");
-        dict.set("Type", Object::from("Page"));
-        // 7.7.3.3 Table 30: /MediaBox is required. A page with none (its own
-        // or inherited) gets US Letter, which is what every reader assumes
-        // for it anyway.
-        if page.media_box().is_none() {
-            dict.set("MediaBox", Object::Array([0, 0, 612, 792].into_iter().map(Object::Integer).collect()));
-        }
-        let Object::Dict(mut dict) = b.import(source, Object::Dict(dict))? else {
-            return Err(internal("a page did not stay a dictionary"));
-        };
-        inherit(&mut b, source, page, &mut dict)?;
+        let mut dict = import_page(&mut b, source, page)?;
         if pick.rotate_by != 0 {
             // 7.7.3.3: a multiple of 90, so keep it in 0..360 and drop zero.
             let turned = page.rotate().saturating_add(pick.rotate_by).rem_euclid(360);
@@ -301,6 +287,29 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
         }
     }
     Ok(Output { data, warnings, pages: out_pages.len() })
+}
+
+/// The dictionary of `page` of source `source` as a page of the output (or of a file the pages are put into): its references turned
+/// into the output's (what they lead to is imported), what it inherits from its page tree written onto it (7.7.3.4), the required
+/// `/Type`, `/MediaBox` and `/Resources` there, and without `/B` (the beads of an article thread, which lead to the document-level
+/// threads). It has no `/Parent`: the page tree it goes into gives that.
+pub fn import_page(b: &mut Builder<'_>, source: usize, page: &Page) -> Result<Dict> {
+    let mut dict: Dict = (*page.dict).clone();
+    // Article beads lead to threads at the document level (12.4.3); they
+    // would pull the rest of the file back in.
+    dict.remove("B");
+    dict.set("Type", Object::from("Page"));
+    // 7.7.3.3 Table 30: /MediaBox is required. A page with none (its own
+    // or inherited) gets US Letter, which is what every reader assumes
+    // for it anyway.
+    if page.media_box().is_none() {
+        dict.set("MediaBox", Object::Array([0, 0, 612, 792].into_iter().map(Object::Integer).collect()));
+    }
+    let Object::Dict(mut dict) = b.import(source, Object::Dict(dict))? else {
+        return Err(internal("a page did not stay a dictionary"));
+    };
+    inherit(b, source, page, &mut dict)?;
+    Ok(dict)
 }
 
 /// Put what `page` inherits from the page tree (7.7.3.4) onto its output
@@ -627,7 +636,7 @@ pub fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str)
 /// encrypted, its permissions do not grant everything, and it was not opened
 /// with the owner password? Such a file may only be the first of a merge, whose
 /// output carries its protection; and `decrypt` refuses it.
-fn restricts(doc: &Document, password: &str) -> bool {
+pub fn restricts(doc: &Document, password: &str) -> bool {
     let Some(encryption) = doc.encryption() else { return false };
     !encryption.permissions.allows_everything() && !has_owner_rights(doc, &encryption, password)
 }

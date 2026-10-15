@@ -1569,7 +1569,8 @@ struct Frame {
     inherited: Inherited,
 }
 
-enum NodeKind {
+/// What an entry of a page tree's `/Kids` is.
+pub enum NodeKind {
     Pages,
     Page,
     Skip,
@@ -1579,7 +1580,7 @@ enum NodeKind {
 /// a `/Type`, `/Kids` makes a page tree node, and any of `/Contents`,
 /// `/MediaBox`, `/Resources`, `/Parent` makes a page. A dictionary whose `/Type`
 /// is something else is not part of the page tree.
-fn classify(node: &Dict) -> NodeKind {
+pub fn classify(node: &Dict) -> NodeKind {
     match node.get("Type") {
         Some(Object::Name(n)) if n == "Pages" => NodeKind::Pages,
         Some(Object::Name(n)) if n == "Page" => NodeKind::Page,

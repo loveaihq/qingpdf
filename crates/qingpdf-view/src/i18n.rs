@@ -244,11 +244,30 @@ pub enum Msg {
     CtxHighlight,
     CtxNote,
     CtxSelectAll,
+    PgLeft,
+    PgRight,
+    PgDelete,
+    PgInsertBefore,
+    PgInsertAfter,
+    PgExtract,
+    PgInsertTitle,
+    PgExtractTitle,
+    NotePagesRotated,
+    NotePagesDeleted,
+    NotePagesMoved,
+    NotePagesInserted,
+    NotePagesDenied,
+    NoteLastPage,
+    NoteExtracted,
+    NoteExtractFailed,
+    NoteExtractSame,
+    NotePagesBusy,
+    NoteInsertTooBig,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 191] = [
+pub const ALL: [Msg; 210] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -440,6 +459,25 @@ pub const ALL: [Msg; 191] = [
     Msg::CtxHighlight,
     Msg::CtxNote,
     Msg::CtxSelectAll,
+    Msg::PgLeft,
+    Msg::PgRight,
+    Msg::PgDelete,
+    Msg::PgInsertBefore,
+    Msg::PgInsertAfter,
+    Msg::PgExtract,
+    Msg::PgInsertTitle,
+    Msg::PgExtractTitle,
+    Msg::NotePagesRotated,
+    Msg::NotePagesDeleted,
+    Msg::NotePagesMoved,
+    Msg::NotePagesInserted,
+    Msg::NotePagesDenied,
+    Msg::NoteLastPage,
+    Msg::NoteExtracted,
+    Msg::NoteExtractFailed,
+    Msg::NoteExtractSame,
+    Msg::NotePagesBusy,
+    Msg::NoteInsertTooBig,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -635,6 +673,25 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::CtxHighlight => ("&Highlight selection", "高亮所选文字(&H)"),
         Msg::CtxNote => ("Add &note here", "在此添加便签(&N)"),
         Msg::CtxSelectAll => ("Select &all on this page", "选择本页全部文字(&A)"),
+        Msg::PgLeft => ("Rotate &left\tCtrl+[", "向左旋转(&L)\tCtrl+["),
+        Msg::PgRight => ("Rotate &right\tCtrl+]", "向右旋转(&R)\tCtrl+]"),
+        Msg::PgDelete => ("&Delete\tDel", "删除(&D)\tDel"),
+        Msg::PgInsertBefore => ("Insert pages from a file &before...", "从文件插入页：之前(&B)..."),
+        Msg::PgInsertAfter => ("Insert pages from a file &after...", "从文件插入页：之后(&A)..."),
+        Msg::PgExtract => ("&Extract to a new PDF...", "提取为新 PDF(&E)..."),
+        Msg::PgInsertTitle => ("Insert pages from a file", "从文件插入页"),
+        Msg::PgExtractTitle => ("Extract to a new PDF", "提取为新 PDF"),
+        Msg::NotePagesRotated => ("Pages turned (Ctrl+Z undoes it).", "已旋转页面（Ctrl+Z 撤销）。"),
+        Msg::NotePagesDeleted => ("Pages deleted (Ctrl+Z undoes it). A saved file keeps them in its older part until Save As.", "已删除页面（Ctrl+Z 撤销）。保存后它们仍留在文件的旧版本部分里，用“另存为”才会真正去掉。"),
+        Msg::NotePagesMoved => ("Pages moved (Ctrl+Z undoes it).", "已调整页面顺序（Ctrl+Z 撤销）。"),
+        Msg::NotePagesInserted => ("Pages inserted (Ctrl+Z undoes it).", "已插入页面（Ctrl+Z 撤销）。"),
+        Msg::NotePagesDenied => ("The file's author does not allow inserting, deleting, moving or turning pages (the owner password is needed).", "文件作者不允许插入、删除、调整或旋转页面（需要所有者密码）。"),
+        Msg::NoteLastPage => ("A document needs at least one page.", "文档至少要留一页。"),
+        Msg::NoteExtracted => ("Extracted {n} page(s) to a new file.", "已把 {n} 页提取到新文件。"),
+        Msg::NoteExtractFailed => ("The pages could not be extracted:", "提取失败："),
+        Msg::NoteExtractSame => ("Choose a new file name: the open file is not overwritten.", "请换一个新的文件名：不会覆盖正在打开的文件。"),
+        Msg::NotePagesBusy => ("The pages are being changed: try again in a moment.", "正在改页面，请稍后再试。"),
+        Msg::NoteInsertTooBig => ("Those pages do not fit in the {n} MB kept for unsaved changes. Save the file first, or put in a smaller file.", "这些页放不进没保存的改动所占的 {n} MB 内存。先保存文件，或者插入小一点的文件。"),
     };
     match lang {
         Lang::En => en,
@@ -706,7 +763,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 191);
+        assert_eq!(ALL.len(), 210);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

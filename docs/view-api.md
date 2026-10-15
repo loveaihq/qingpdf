@@ -33,7 +33,7 @@
 
 ## 3d-2 的结果和限制
 
-- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms, modify }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，`modify` 是 4c 加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
+- `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms, modify, assemble }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，`modify` 是 4c 加的，`assemble` 是页面管理加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
 - `Outline { items: [{title, depth, page?, y?, open}], truncated }`：展平的前序列表，深度从 0 数；`page` 是页码（从 0），`y` 是该页上往下多少点（按页面显示后的样子）。最多 `MAX_OUTLINE_ITEMS`（20000）项、`MAX_OUTLINE_DEPTH`（32）层，标题最多 `MAX_TITLE_CHARS`（300）字，兄弟链或子链绕回已读过的项就在那里断。目标先看 `/Dest`，再看 `/A` 里的 GoTo，命名目标走 `dests.rs`。
 - `Links { links: [{rect, kind, page, y?, uri}] }`：`rect` 是页面显示后的点（左、上、右、下）；`kind` 是 `Page`（页内）或 `Uri`。每页最多 `MAX_LINKS`（2000）个；隐藏的、不显示的、没面积的不给。外部地址只留 http、https、mailto，并且全是 ASCII 可见字符、不含空格和 `" < > \ ^ ` { | }`、不超过 `MAX_URI_BYTES`（2048），`%` 只许作百分号转义（`%` 加两个十六进制数字，所以 `%USERNAME%` 这类会被系统当环境变量展开的写法不给），其余的丢掉；`view::safe_uri` 是同一套检查，界面在打开前再查一遍。
 - `CharBoxes { boxes, text }`（`text` 是和 `boxes` 一一对应的字符，空格是排版插的空格、行尾是换行符，双击选词、三击选行用；只许批注不许复制的文件 `text` 为空）：`boxes[i]` 是页文字（和 `text` 命令同一个顺序）第 i 个字符的 `[左, 上, 右, 下]`，单位点，**页面显示后的坐标（已按页自己的 /Rotate 转过，左上角为原点，y 向下）**，窗口再加的旋转由窗口自己转。排版插的空格和行尾是没有面积的点。每页最多 `text::MAX_PAGE_CHARS`（40 万）字。`view::line_rects` 把一段字的框并成每行一个矩形，`view::nearest_char` 找离某点最近的字（逐个看）；`view::CharIndex::new(&boxes)` 把一页的框切成一行一行，`nearest(&boxes, x, y)` 答案和 `nearest_char` 一样，但只看可能最近的几行，鼠标每动一下不必扫整页。
@@ -154,6 +154,27 @@
 排队、取消（`cancel(id)`，窗口里按 Esc）、临时文件、版权检查（`text::check_extraction_allowed`）、打印时答 `Failed` 都和 `export_docx` 一样（同一个引擎请求，只多一个"Word 还是 Excel"的标志）。命令行 `qingpdf xlsx` 用同一个函数 `qingpdf_core::xlsx::export_to_path`。窗口：文件菜单"导出为 Excel"（命令号 `CMD_EXPORT_XLSX` = 28），保存框起始名是 PDF 的名字换成 `.xlsx`。
 
 做法和限制见 `docs/decisions.md` 的"第 5 层 5d"。最多 5000 页（`xlsx::MAX_PAGES`）、800 万字、1000 个表格（工作表）、一个单元格 32,767 个字、共享字符串共 128 MiB、工作表 XML 共 256 MiB；每页一份 `PAGE_WORK` 的工作量，整次最多 40 页的量，一页读不下去的略过那页，写在 `message` 里。
+
+## 页面的请求和结果：转、删、调顺序、插入、提取（2026-10-15）
+
+改的是**页面的清单**（页面树和几个相关的对象），不碰页面上的内容：页上的批注、表单、已经做的改字都跟着页走（它们挂在页面对象上，不按页码）。页码都从 0 数。和别的编辑一样走同一条撤销记录（`undo`/`redo`）、同一段增量更新（`save`）、同一个整份重写（`save_as`）。
+
+| 调用 | 作用 |
+|---|---|
+| `rotate_pages(doc, id, pages, degrees)` | 把 `pages`（每页一次，顺序随便）按顺时针转 `degrees`（90 的倍数，负数反方向），加在页面自己的 `/Rotate` 上；转回页面本来（从页面树继承来）的方向时不写 `/Rotate`。答 `Edited`。 |
+| `delete_pages(doc, id, pages)` | 删页，**不许删光**。从各级 `/Kids` 里拿掉、`/Count` 一路改对，一个节点没页了就整个拿掉；只在被删页上有控件的表单字段从 `/AcroForm` 的 `/Fields`、`/CO` 和父字段的 `/Kids` 里去掉（`prune.rs` 那份逻辑）；`/PageLabels`（按页码编号）在有留下的页换了位置时去掉（`Edited.message` 里说一句），`/Threads`（文章线索，里面的珠子列着页）总是去掉。指向被删页的书签和链接留着，只是不再指到任何页（`Outline.page` 是 `None`，那个链接不出现在 `Links` 里，不能点）。**被删的页还在保存后文件的旧版本部分里，`save_as` 才真正去掉。** |
+| `move_pages(doc, id, pages, to)` | 把 `pages`（保持原来的先后）放到第 `to` 页前面（`to` 按移动前的页码，页数就是放到最后）。放得和原来一样答 `Failed`。页面树**保持形状**：树里放页的那些位置依次换成排好的页，所以平的树还是平的，节点里的页数不变；换了节点的页，原来从上面继承来的 `/Resources`、`/MediaBox`、`/CropBox`、`/Rotate` 写到页上，新节点给的不会改变它。`order_after_move(页数, pages, to)` 给出移动后每个位置原来是哪一页（界面用它算出移动后哪几页被选中）。 |
+| `insert_pages(doc, id, at, 路径, 密码)` | 把那个文件的**全部页**放到第 `at` 页前面（页数就是放到最后）。带进来的有：页的批注，表单字段（并进 `/AcroForm`，没有就新建；根字段的 `/T` 和本文档里已有的重名就改成 `名字_2`、`_3`……；`/DR` 里没有的资源并进来（只并 Font、XObject、ExtGState、ColorSpace、Pattern、Shading 六类，条目合计超过 1 万就一概不并），`/DA`、`/Q`、`/NeedAppearances` 取没有的；**签名字段不带签名**：`/FT /Sig` 的字段（根或子字段，类型可以从上面继承）去掉 `/V`，它和它的子控件的 `/AP`（签名的样子）也去掉，字段留着但是没签名，不然保存重开后这份文件会算“有签名”，页面和内容的改动都会被拒绝），链接，用名字指向目的地的链接（换成明确的目的地数组，和 `merge` 一样）；不带的有：书签、结构树（`/StructParents` 去掉）、对方的命名目的地和 `/Names`。导入走的是命令行合并同一份代码（`Builder`、`ops::import_page`）。文件要密码而没给（或给的不对）：`Edited.status` 是 `NeedsPassword`（`WrongPassword`），界面问了再调一次。对方有限制（权限不全）又没给所有者密码：`Failed`（和 `merge` 同一条 `ops::restricts`；两个文件加密一样的除外）。对方版本比本文档高，目录里写上它的 `/Version`。 |
+| `extract_pages(doc, id, pages, 路径)` | 把 `pages` 写成一个新文件，答 `Exported { pages: 写了几页, tables: 0, bytes }`。整份重写（`ops::extract_pages`，就是 `qingpdf split --pages`），算上还没保存的改动，加密的保持原来的加密；**不碰打开的文件**，路径是不是同一个文件由界面管。需要 `Rights.copy`（和 `text` 命令、导出 Word 同一条规矩）；正在打印时答 `Failed`。 |
+
+结果：
+
+- `Edited` 多一项 `pages: Option<Vec<PageInfo>>`：页面清单变了（上面四个调用，和它们的撤销、重做）时是新的整张清单（每页显示后的大小，和 `Opened.pages` 同一种），`page` 是 `ALL_PAGES`。界面据此把按页码存的东西全丢掉（位图、缩略图、链接、字框、批注和字段列表、搜索结果），按新清单重新排版，并重新要书签（书签的目标是页码）。没变的编辑里是 `None`。
+- `EditStatus` 多三个值：`NeedsPassword`、`WrongPassword`、`TooBig`（只有 `insert_pages` 会答；`TooBig` 是对方文件的页放不进没保存的改动所占的内存，不能分几次插，所以不用 `Failed` 的通用说法：界面有自己的中英文提示，意思是先保存文件或者插小一点的文件）。
+- `Rights` 多一项 `assemble`：权限位 11（修订版 3 以上）、修订版 2 看位 4；没加密或有所有者密码为真。四个改页面的调用看它，不让时答 `Denied`。**有签名的文件（任何签名、任何级别的认证）一律答 `Failed`，消息里写着 signed 或 certified。**
+- 页面清单在引擎线程里改完马上重读（`Document::pages()`）并检查页数：删了几页就少几页，转和调顺序不变，插入变多；对不上就把这次改动撤掉、答 `Failed`（文件不会因此坏）。重读之后，字框缓存、没保存的识别文字（只在窗口里用的那种）都按页码存，一并丢掉。
+
+限制（超了答 `Failed`，文件不变）：一次插入最多 `MAX_INSERT_PAGES`（5000）页、对方文件最多 `MAX_INSERT_FILE_BYTES`（16 MiB，就是没保存的改动的内存预算，两个数字是同一个：插进来的对象和文件差不多大，放不下的文件根本插不进；文件按剩下的预算和这个上限里小的那个读，多读一字节就知道超了，不看读之前量的长度），表单的字段最多 2 万个、对方的 `/DR` 条目合计最多 1 万个（超了：字段多了拒绝，`/DR` 不并）；改完全文最多 `MAX_PAGES_AFTER`（10 万）页；插进来的对象和这次改动的对象一起算在没保存的改动的内存预算里（16 MiB，超了答 `the change is too big`，后面写怎么办：先保存或分几次）；对方的命名目的地走原来的字节预算；工作量记在计量器里（每次改动 500 万单位加每页 2 万，插入再加对方每字节 8，所以一个会话里改页面的次数也受那 20 页的总额度限制）；页面树有一页或一个节点列了两遍、有环或超过 256 层，一律拒绝（读页面时那样的树能读，改它不行）。数字和理由见 `docs/decisions.md` 的“页面管理（2026-10-15）”。
 
 ## 对接别的语言
 

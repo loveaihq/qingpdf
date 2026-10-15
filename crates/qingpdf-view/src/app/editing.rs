@@ -71,6 +71,24 @@ pub(super) enum Asked {
     Line,
     /// The text layer of a run of text recognition was written (5c): the run says how it went.
     Ocr,
+    /// Pages were turned, taken out, moved, or put in from a file (2026-10-15).
+    Rotate,
+    Delete,
+    Move,
+    Insert,
+}
+
+impl Asked {
+    /// What is said when the change to the pages is done.
+    pub(super) fn pages_note(self) -> Option<Msg> {
+        match self {
+            Asked::Rotate => Some(Msg::NotePagesRotated),
+            Asked::Delete => Some(Msg::NotePagesDeleted),
+            Asked::Move => Some(Msg::NotePagesMoved),
+            Asked::Insert => Some(Msg::NotePagesInserted),
+            _ => None,
+        }
+    }
 }
 
 pub(super) struct EditState {
@@ -147,6 +165,17 @@ impl EditState {
         self.ink = None;
         self.note_press = None;
         self.forms.give_up_drag();
+    }
+
+    /// The pages are not the pages they were: everything kept by page goes. Gives the requests to take back; a box that is open for typing
+    /// in a field is closed (`actions`).
+    pub(super) fn forget_pages(&mut self, actions: &mut Vec<Action>) -> Vec<u64> {
+        self.annots.clear();
+        self.picked = None;
+        self.ink = None;
+        let mut ids: Vec<u64> = self.annots_asked.drain().map(|(i, _)| i).collect();
+        ids.extend(self.forms.forget_pages(actions));
+        ids
     }
 
     pub(super) fn drop_page(&mut self, page: u32) {
@@ -315,6 +344,9 @@ impl App {
             if !self.rights.annotate {
                 return Some(self.say(t(self.lang, Msg::NoteAnnotDenied).to_string()));
             }
+            if let Some(wait) = self.edit_wait() {
+                return Some(wait);
+            }
             let id = self.new_id();
             let width = WIDTHS.get(self.edit.width).map_or(2.0, |w| w.1);
             self.engine.add_ink(self.doc_id, id, draft.page, vec![draft.points], self.rgb(), width, &self.edit.author);
@@ -341,6 +373,9 @@ impl App {
     pub(super) fn note_answered(&mut self, text: Option<String>) -> Vec<Action> {
         let Some((page, x, y)) = self.edit.note_at.take() else { return Vec::new() };
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Vec::new() };
+        if let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let id = self.new_id();
         self.engine.add_note(self.doc_id, id, page, [x, y], &text, self.rgb(), &self.edit.author);
         self.edit.asked.insert(id, Asked::Add);
@@ -392,6 +427,9 @@ impl App {
         let Some(sel) = self.selection else { return Vec::new() };
         if !self.rights.annotate {
             return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
+        }
+        if let Some(wait) = self.edit_wait() {
+            return wait;
         }
         let (first, last) = sel.ordered();
         let color = self.rgb();
@@ -499,6 +537,9 @@ impl App {
         if !self.rights.annotate {
             return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
         }
+        if let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let id = self.new_id();
         self.engine.delete_annotation(self.doc_id, id, page, a.index, a.num);
         self.edit.asked.insert(id, Asked::Remove);
@@ -527,7 +568,7 @@ impl App {
         Vec::new()
     }
 
-    pub(super) fn on_edited(&mut self, r: EditResult) -> Vec<Action> {
+    pub(super) fn on_edited(&mut self, mut r: EditResult) -> Vec<Action> {
         let Some(what) = self.edit.asked.remove(&r.id) else { return Vec::new() };
         self.edit.can_undo = r.can_undo;
         self.edit.can_redo = r.can_redo;
@@ -537,8 +578,19 @@ impl App {
         let mut actions = vec![Action::SetTitle(self.title()), Action::Invalidate];
         match r.status {
             EditStatus::Done => {
+                // The list of pages changed (pages turned, taken out, moved, put in; or the undo of one): everything is by the new pages.
+                let listed = r.pages.take();
+                if let Some(infos) = listed.clone() {
+                    actions.extend(self.pages_changed(infos, r.id));
+                }
                 // What was drawn of the page is out of date (of every page, for a watermark); everything else is as it was.
-                let changed = if r.page == ALL_PAGES { 0..self.page_count() as u32 } else { r.page..r.page + 1 };
+                let changed = if listed.is_some() {
+                    0..0
+                } else if r.page == ALL_PAGES {
+                    0..self.page_count() as u32
+                } else {
+                    r.page..r.page + 1
+                };
                 for page in changed {
                     self.cache.remove_page(page);
                     self.forget_thumb(page);
@@ -563,6 +615,9 @@ impl App {
                     Some(Msg::NoteLineChanged)
                 } else if what == Asked::Ocr {
                     None
+                } else if let Some(m) = what.pages_note() {
+                    extra = r.message.clone();
+                    Some(m)
                 } else if !r.message.is_empty() {
                     Some(Msg::NoteSigned)
                 } else if r.rewrote && !self.edit.rewrote {
@@ -573,7 +628,7 @@ impl App {
                         Asked::Add => Some(Msg::NoteAdded),
                         Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
-                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr => None,
+                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert => None,
                     }
                 };
                 if let Some(m) = note {
@@ -582,7 +637,25 @@ impl App {
             }
             EditStatus::Denied if what == Asked::Ocr => {}
             EditStatus::Failed if what == Asked::Ocr => {}
-            EditStatus::Denied => actions.extend(self.say(t(lang, if what == Asked::Fill { Msg::NoteFillDenied } else { Msg::NoteAnnotDenied }).to_string())),
+            EditStatus::Denied => {
+                let m = if what.pages_note().is_some() {
+                    Msg::NotePagesDenied
+                } else if what == Asked::Fill {
+                    Msg::NoteFillDenied
+                } else {
+                    Msg::NoteAnnotDenied
+                };
+                actions.extend(self.say(t(lang, m).to_string()));
+            }
+            // The file the pages are to come from needs a password (or the one given was wrong).
+            EditStatus::NeedsPassword | EditStatus::WrongPassword if what == Asked::Insert => {
+                actions.extend(self.ask_source_password(r.status == EditStatus::WrongPassword));
+            }
+            EditStatus::NeedsPassword | EditStatus::WrongPassword => {}
+            EditStatus::TooBig => {
+                let mb = (qingpdf_core::view::MAX_INSERT_FILE_BYTES >> 20).to_string();
+                actions.extend(self.say(t(lang, Msg::NoteInsertTooBig).replace("{n}", &mb)));
+            }
             EditStatus::Failed => actions.extend(self.say(format!("{} {}", t(lang, Msg::NoteEditFailed), r.message))),
             EditStatus::Nothing => {
                 let m = if what == Asked::Redo { Msg::NoteNothingRedo } else { Msg::NoteNothingUndo };
@@ -659,6 +732,9 @@ impl App {
     }
 
     pub(super) fn save_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
+        if let Some(actions) = self.extract_picked(path.clone()) {
+            return actions;
+        }
         if let Some(excel) = self.edit.export_asked.take() {
             return self.export_picked(path, excel);
         }

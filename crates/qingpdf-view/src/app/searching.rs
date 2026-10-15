@@ -35,6 +35,9 @@ impl App {
 
     /// Esc: stops a print, else a Word export, else text recognition, else closes the find box, else lets go of the selection.
     pub(super) fn escape(&mut self) -> Vec<Action> {
+        if let Some(actions) = self.cancel_thumb_drag() {
+            return actions;
+        }
         if self.print.is_some() {
             let mut actions = self.cancel_print_for_new_document();
             actions.extend(self.say(t(self.lang, Msg::NotePrintCancelled).to_string()));

@@ -110,6 +110,18 @@ impl FormState {
         self.fields.remove(&page);
     }
 
+    /// The pages are not the pages they were: the fields kept by page go, and a box open for typing is closed (`actions`). Gives the
+    /// requests to take back.
+    pub(super) fn forget_pages(&mut self, actions: &mut Vec<Action>) -> Vec<u64> {
+        self.fields.clear();
+        self.choosing = None;
+        self.give_up();
+        if self.editing.take().is_some() {
+            actions.push(Action::FieldEdit(None));
+        }
+        self.asked.drain().map(|(i, _)| i).collect()
+    }
+
     pub(super) fn has_stamp(&self) -> bool {
         self.stamp.is_some()
     }
@@ -243,6 +255,9 @@ impl App {
     }
 
     fn send_fill(&mut self, page: u32, f: &FieldInfo, value: FillValue) -> Vec<Action> {
+        if let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let id = self.new_id();
         self.engine.fill_field(self.doc_id, id, page, f.index, f.num, value);
         self.edit.asked.insert(id, Asked::Fill);
@@ -297,6 +312,10 @@ impl App {
     /// The person has left the box: keep what was typed (unless it was Esc) and go on to the next field if Tab was pressed.
     pub(super) fn field_done(&mut self, text: String, exit: FieldExit) -> Vec<Action> {
         let Some(editing) = self.edit.forms.editing.take() else { return Vec::new() };
+        // (What was typed is not sent while a change to the pages is not answered: it would name a page of the pages as they were.)
+        if exit != FieldExit::Cancel && !matches!(editing, Editing::Field { .. }) && let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let mut actions = Vec::new();
         match editing {
             Editing::Field { page, index } => {
@@ -520,6 +539,10 @@ impl App {
 
     /// Enter: the picture is stamped where its frame is.
     pub(super) fn stamp_place(&mut self) -> Option<Vec<Action>> {
+        self.edit.forms.stamp.as_ref()?;
+        if let Some(wait) = self.edit_wait() {
+            return Some(wait);
+        }
         let draft = self.edit.forms.stamp.take()?;
         self.edit.tool = Tool::Select;
         self.menus_dirty = true;
@@ -569,6 +592,9 @@ impl App {
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return Vec::new() };
         let wm = self.edit.forms.wm;
         let pages: Vec<u32> = if wm.page_only { vec![self.current_page() as u32] } else { (0..self.page_count() as u32).collect() };
+        if let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let opacity = WM_OPACITY.get(wm.opacity).map_or(30, |&p| p) as f32 / 100.0;
         let angle = WM_ANGLE.get(wm.angle).map_or(0, |&a| a) as f32;
         let mark = Watermark { text, image: Vec::new(), opacity, angle, tile: wm.tile, under: wm.under, pages };

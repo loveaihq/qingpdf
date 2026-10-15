@@ -12,6 +12,7 @@ mod forms;
 mod menus;
 mod ocr;
 mod outline;
+mod pages;
 mod printjob;
 mod recents;
 mod searching;
@@ -42,6 +43,7 @@ use crate::zoom::{self, ZoomMode};
 pub use printjob::PrintTest;
 use printjob::PrintJob;
 use editing::{After, EditState, Tool};
+use pages::PageWork;
 use selecting::{PageBoxes, Press};
 
 // Menu commands.
@@ -113,6 +115,13 @@ pub const CMD_LANG_EN: u32 = 115;
 pub const CMD_CTX_HIGHLIGHT: u32 = 116;
 pub const CMD_CTX_NOTE: u32 = 117;
 pub const CMD_CTX_SELECT_ALL: u32 = 118;
+/// The menu on the list of thumbnails (2026-10-15): turn left and right, delete, put in pages from a file in front of or behind, extract.
+pub const CMD_PG_LEFT: u32 = 120;
+pub const CMD_PG_RIGHT: u32 = 121;
+pub const CMD_PG_DELETE: u32 = 122;
+pub const CMD_PG_INS_BEFORE: u32 = 123;
+pub const CMD_PG_INS_AFTER: u32 = 124;
+pub const CMD_PG_EXTRACT: u32 = 125;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
@@ -122,6 +131,7 @@ const TAG_NOTE: u32 = 4;
 const TAG_AUTHOR: u32 = 5;
 const TAG_UNSAVED: u32 = 6;
 const TAG_WATERMARK: u32 = 7;
+const TAG_SRC_PASSWORD: u32 = 8;
 
 // Timers.
 /// The view has stopped moving.
@@ -136,6 +146,8 @@ const NOTE_MS: u32 = 6000;
 /// The pointer is dragging a selection: scroll if it is outside the pages.
 const TIMER_DRAG: u32 = 4;
 const DRAG_MS: u32 = 50;
+/// The pointer is dragging thumbnails: scroll the list if it is held at an edge.
+const TIMER_THUMB_DRAG: u32 = 5;
 
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
@@ -307,6 +319,10 @@ pub struct App {
     thumb_nav: bool,
     /// The speed test shows the sidebar on the thumbnails (`--bench-thumbs`).
     bench_sidebar: bool,
+
+    // --- the pages (2026-10-15) ---
+    /// Which thumbnails are chosen, the drag of them, and the pages put in or extracted.
+    pg: PageWork,
 }
 
 impl App {
@@ -349,7 +365,7 @@ impl App {
             last_sharp: None,
             bench: None,
             started,
-            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true },
+            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true },
             outline: Vec::new(),
             show_sidebar: true,
             links: HashMap::new(),
@@ -393,6 +409,7 @@ impl App {
             thumb_target: None,
             thumb_nav: false,
             bench_sidebar: false,
+            pg: PageWork::new(),
         }
     }
 
@@ -460,6 +477,7 @@ impl App {
             self.engine.cancel(id);
         }
         self.thumbs.reset(0);
+        self.pg.reset();
         self.thumb_focus = false;
         self.thumb_drag = false;
         self.thumb_target = None;
@@ -485,7 +503,7 @@ impl App {
         self.press = None;
         self.selection = None;
         self.note = None;
-        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
+        self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.moving = false;
@@ -660,6 +678,10 @@ impl App {
         // current one while it is in view, but any other way of moving forgets it.
         if !self.thumb_nav {
             self.thumb_target = None;
+            // One page chosen is the page in view, and follows it; several chosen stay.
+            if self.pg.chosen.len() <= 1 {
+                self.pg.chosen.clear();
+            }
         }
         self.sync_thumbs();
         self.sync_bars(&mut actions);
@@ -987,6 +1009,11 @@ impl App {
             CMD_CTX_HIGHLIGHT => self.highlight_selection(),
             CMD_CTX_NOTE => self.note_here(),
             CMD_CTX_SELECT_ALL => self.select_all_here(),
+            CMD_PG_LEFT => self.rotate_pages(-90),
+            CMD_PG_RIGHT => self.rotate_pages(90),
+            CMD_PG_DELETE => self.delete_pages(),
+            CMD_PG_INS_BEFORE | CMD_PG_INS_AFTER => self.ask_insert_file(cmd == CMD_PG_INS_AFTER),
+            CMD_PG_EXTRACT => self.ask_extract(),
             CMD_BOOKMARKS => self.toggle_sidebar(),
             CMD_COPY => self.copy_selection(),
             CMD_GOTO if self.doc.is_some() => {
@@ -1017,6 +1044,12 @@ impl App {
                 vk::F => self.command(CMD_FIND),
                 vk::P => self.command(CMD_PRINT),
                 vk::C => self.command(CMD_COPY),
+                vk::A if self.thumb_focus && self.thumbs_shown() => {
+                    self.pg.chosen.all(self.page_count());
+                    vec![Action::Invalidate]
+                }
+                vk::OEM_4 => self.command(CMD_PG_LEFT),
+                vk::OEM_6 => self.command(CMD_PG_RIGHT),
                 vk::S => self.command(if shift { CMD_SAVE_AS } else { CMD_SAVE }),
                 vk::Z => self.command(CMD_UNDO),
                 vk::Y => self.command(CMD_REDO),
@@ -1045,6 +1078,8 @@ impl App {
             },
             vk::F3 => self.find_step(!shift),
             vk::F4 => self.command(CMD_BOOKMARKS),
+            // In the list of thumbnails Delete takes pages out; over the pages it takes the annotation picked out.
+            vk::DELETE if self.thumb_focus && self.thumbs_shown() => self.command(CMD_PG_DELETE),
             vk::DELETE => self.command(CMD_REMOVE),
             vk::NEXT => self.scroll_by(0, page_step, false),
             vk::PRIOR => self.scroll_by(0, -page_step, false),
@@ -1203,7 +1238,7 @@ impl Handler for App {
             Event::HWheel { delta } => self.scroll_by(i64::from(delta) * self.px(WHEEL_STEP) / 120, 0, true),
             Event::Scroll { bar, code } => self.scrolled_by_bar(bar, code),
             Event::Command(cmd) => {
-                if cmd != CMD_BOOKMARKS {
+                if cmd != CMD_BOOKMARKS && !pages::is_page_command(cmd) {
                     self.thumb_focus = false;
                 }
                 self.command(cmd)
@@ -1224,7 +1259,9 @@ impl Handler for App {
                 vec![Action::KillTimer(TIMER_NOTE), Action::Invalidate]
             }
             Event::Timer(TIMER_DRAG) => self.drag_timer(),
+            Event::Timer(TIMER_THUMB_DRAG) => self.thumb_drag_tick(),
             Event::Timer(_) => Vec::new(),
+            Event::FilePicked(path) if self.pg.insert_pending() => self.insert_picked(path).unwrap_or_default(),
             Event::FilePicked(Some(path)) => {
                 if std::mem::take(&mut self.edit.forms.picking) {
                     self.stamp_picked(&path)
@@ -1252,6 +1289,7 @@ impl Handler for App {
                     vec![Action::SetTitle(self.title()), Action::Invalidate]
                 }
             },
+            Event::Text { tag: TAG_SRC_PASSWORD, text } => self.source_password_answered(text),
             Event::Text { tag: TAG_NOTE, text } => self.note_answered(text),
             Event::Text { tag: TAG_AUTHOR, text } => self.author_answered(text),
             Event::Text { tag: TAG_WATERMARK, text } => self.watermark_answered(text),

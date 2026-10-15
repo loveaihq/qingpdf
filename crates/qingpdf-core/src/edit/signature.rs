@@ -46,6 +46,8 @@ impl Signatures {
             // The content of the pages is not among the changes any certification allows (12.8.2.2), and a signature over it would show it.
             (Some(_), EditClass::Content) => Policy::Refuse("the file is certified (DocMDP): changing the content of a page would break the certification"),
             (None, EditClass::Content) if self.signed => Policy::Refuse("the file is signed: changing the content of a page would break the signature"),
+            (Some(_), EditClass::Assemble) => Policy::Refuse("the file is certified (DocMDP): changing its pages would break the certification"),
+            (None, EditClass::Assemble) if self.signed => Policy::Refuse("the file is signed: changing its pages would break the signature"),
             (Some(1), EditClass::Annotate) => Policy::Refuse("the file is certified and allows no changes at all (DocMDP 1); adding annotations would break the certification"),
             (Some(1), EditClass::Fill) => Policy::Refuse("the file is certified and allows no changes at all (DocMDP 1); filling in a form would break the certification"),
             (Some(2), EditClass::Annotate) => Policy::Refuse("the file is certified and allows only filling in forms and signing (DocMDP 2); adding annotations would break the certification"),

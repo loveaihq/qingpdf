@@ -10,7 +10,7 @@ use super::*;
 use crate::thumbs::{Built, ListKey, Metrics, Strip, Thumb, tab_at};
 
 // Sizes at 96 dpi.
-const TAB_H: i64 = 28;
+pub(super) const TAB_H: i64 = 28;
 /// The width of a thumbnail, however wide the sidebar is; it is shrunk only when the sidebar is narrower than that and `THUMB_MARGIN` on each side.
 const THUMB_W: i64 = 130;
 const THUMB_MARGIN: i64 = 18;
@@ -31,7 +31,9 @@ const TAB_ON_BG: u32 = 0xFAFAFA;
 const TAB_LINE: u32 = 0x2B7CFF;
 const HEADER_EDGE: u32 = 0xB4B4B4;
 const SELECTED_BORDER: u32 = 0x3390FF;
-const SELECTED_BG: u32 = 0xD3E3FB;
+/// The page in view, when the chosen pages are others: a thin frame.
+const CURRENT_FRAME: u32 = 0x8FB8F0;
+pub(super) const SELECTED_BG: u32 = 0xD3E3FB;
 const THUMB_BORDER: u32 = 0x8C8C8C;
 const PLACEHOLDER: u32 = 0xF7F7F7;
 const DAMAGED: u32 = 0xCDCDCD;
@@ -75,7 +77,7 @@ impl App {
     }
 
     /// The height of the list under the tabs.
-    fn list_h(&self) -> i64 {
+    pub(super) fn list_h(&self) -> i64 {
         (self.view_h - self.px(TAB_H)).max(0)
     }
 
@@ -274,11 +276,12 @@ impl App {
         if count == 0 || to == current {
             return Vec::new();
         }
+        self.pg.chosen.only(to);
         self.go_to_thumb(to)
     }
 
     /// Go to a page that was chosen in the list: it is the current one while it is in view.
-    fn go_to_thumb(&mut self, page: usize) -> Vec<Action> {
+    pub(super) fn go_to_thumb(&mut self, page: usize) -> Vec<Action> {
         self.thumb_target = Some(page);
         self.thumb_nav = true;
         let actions = self.go_to_page(page);
@@ -287,7 +290,7 @@ impl App {
     }
 
     /// A press in the sidebar: on a tab, on the bar at the side of the list, or on a row. `None`: it is not in the sidebar.
-    pub(super) fn sidebar_mouse_down(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+    pub(super) fn sidebar_mouse_down(&mut self, x: i64, y: i64, ctrl: bool, shift: bool) -> Option<Vec<Action>> {
         let width = self.list_w();
         if self.view_x <= 0 || x < 0 || x >= width || y < 0 || y >= self.view_h {
             return None;
@@ -306,7 +309,7 @@ impl App {
         }
         let at = self.thumbs.scroll + y - tabs;
         Some(match self.thumbs.strip.row_at(at) {
-            Some(page) => self.go_to_thumb(page),
+            Some(page) => self.thumb_press(page, ctrl, shift, x, y),
             None => Vec::new(),
         })
     }
@@ -375,15 +378,21 @@ impl App {
         let (strip, scroll, list_h) = (&self.thumbs.strip, self.thumbs.scroll, self.list_h());
         p.fill_rect(rect(0, tabs, width, list_h), LIST_BG);
         let current = self.thumb_current();
+        let chosen = &self.pg.chosen;
         let (above, inset, edge) = (self.px(THUMB_ABOVE), self.px(4), self.px(2));
         let label_top = self.px(THUMB_GAP);
         let label_h = self.px(THUMB_LABEL_H);
         for i in strip.rows_in(scroll, scroll + list_h) {
             let Some(row) = strip.row(i) else { continue };
             let top = tabs + row.top - scroll;
-            if i == current {
+            // The chosen rows are marked; with none chosen the page in view is (as it always was), and when others are chosen it has a frame.
+            let picked = chosen.contains(i) || (chosen.is_empty() && i == current);
+            if picked {
                 p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), SELECTED_BORDER);
                 p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), SELECTED_BG);
+            } else if i == current {
+                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), CURRENT_FRAME);
+                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), LIST_BG);
             }
             let (x, y) = ((width - row.img_w) / 2, top + above);
             p.fill_rect(rect(x - 1, y - 1, row.img_w + 2, row.img_h + 2), THUMB_BORDER);
@@ -396,8 +405,9 @@ impl App {
             let number = (i + 1).to_string();
             let w = i64::from(p.text_width(&number));
             let ty = y + row.img_h + label_top + (label_h - i64::from(p.line_height())) / 2;
-            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if i == current { SELECTED_FG } else { NUMBER_FG });
+            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if picked { SELECTED_FG } else { NUMBER_FG });
         }
+        self.draw_drop_mark(p, width, tabs);
         if let Some((bar_top, bar_len)) = thumbs::bar(scroll, list_h, strip.total()) {
             p.fill_rect(rect(width - self.px(BAR_W + BAR_EDGE), tabs + bar_top, self.px(BAR_W), bar_len), BAR_COLOR);
         }
@@ -405,7 +415,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -414,10 +424,10 @@ mod tests {
 
     /// A painter that writes down what it was asked to draw.
     #[derive(Default)]
-    struct Rec {
-        fills: Vec<(Rect, u32)>,
-        pictures: Vec<(Rect, i32, i32)>,
-        texts: Vec<(i32, i32, String)>,
+    pub(in crate::app) struct Rec {
+        pub fills: Vec<(Rect, u32)>,
+        pub pictures: Vec<(Rect, i32, i32)>,
+        pub texts: Vec<(i32, i32, String)>,
     }
 
     impl Painter for Rec {
@@ -443,7 +453,7 @@ mod tests {
     }
 
     /// A PDF of pages of the given sizes and own turns (a rectangle drawn on each); the pages in `broken` have a content stream that is garbage.
-    fn pages_pdf(sizes: &[(u32, u32, u32)], broken: &[usize]) -> Vec<u8> {
+    pub(in crate::app) fn pages_pdf(sizes: &[(u32, u32, u32)], broken: &[usize]) -> Vec<u8> {
         let n = sizes.len() as u32;
         let mut objects: Vec<(u32, String)> = vec![(1, "<< /Type /Catalog /Pages 2 0 R >>".to_string())];
         let kids: String = (0..n).map(|i| format!("{} 0 R ", 3 + 2 * i)).collect();
@@ -473,7 +483,7 @@ mod tests {
         out
     }
 
-    fn app() -> App {
+    pub(in crate::app) fn app() -> App {
         let mut app = App::new(Lang::En, Arc::new(|| {}), Instant::now(), 1920 * 1080, "Tester".to_string());
         // The tests keep nothing: not the settings, not the list of recent files.
         app.persist = false;
@@ -481,7 +491,7 @@ mod tests {
         app
     }
 
-    fn pump(app: &mut App, what: &str, until: impl Fn(&App) -> bool) {
+    pub(in crate::app) fn pump(app: &mut App, what: &str, until: impl Fn(&App) -> bool) {
         for _ in 0..1500 {
             app.event(Event::Wake);
             if until(app) {
@@ -492,7 +502,7 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    fn open_pages(name: &str, sizes: &[(u32, u32, u32)], thumbs_tab: bool) -> App {
+    pub(in crate::app) fn open_pages(name: &str, sizes: &[(u32, u32, u32)], thumbs_tab: bool) -> App {
         open_broken(name, sizes, &[], thumbs_tab)
     }
 
@@ -510,7 +520,7 @@ mod tests {
         app
     }
 
-    fn letter(n: usize) -> Vec<(u32, u32, u32)> {
+    pub(in crate::app) fn letter(n: usize) -> Vec<(u32, u32, u32)> {
         vec![(612, 792, 0); n]
     }
 

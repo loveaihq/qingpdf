@@ -42,6 +42,9 @@ impl App {
         if self.ocr.is_some() {
             return self.say(t(self.lang, Msg::OcrBusy).to_string());
         }
+        if let Some(wait) = self.edit_wait() {
+            return wait;
+        }
         let scope = if current_page_only { Scope::Page(u32::try_from(self.current_page()).unwrap_or(0)) } else { Scope::Scans };
         let (doc, wake, opener) = (self.doc_id, self.wake.clone(), self.ocr_opener());
         let run = self.with_ids(|engine, ids| Run::start(engine, doc, scope, opener, ocr::PAGE_TIMEOUT, wake, ids));

@@ -155,6 +155,9 @@ impl App {
         if self.doc.is_none() {
             return Vec::new();
         }
+        if self.over_thumbs(x, y) {
+            return self.thumb_menu(x, y);
+        }
         let over = self.page_at_point(x, y).and_then(|(page, px, py)| {
             let (xp, yp) = self.doc.as_ref()?.layout.page_map(page)?.to_pt(px, py);
             Some((page as u32, xp as f32, yp as f32))

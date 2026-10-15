@@ -48,6 +48,13 @@ pub enum EditStatus {
     Nothing = 3,
     /// A print job is running; edit when it is over.
     Busy = 4,
+    /// Pages are to be put in from a file that is encrypted and needs a password (the empty one did not open it): ask for one and ask again.
+    NeedsPassword = 5,
+    /// ... and the password given does not open it.
+    WrongPassword = 6,
+    /// Pages are to be put in from a file whose pages do not fit in the memory set aside for what is not saved yet (the file is bigger than
+    /// what is left of it): not done, and doing it in parts is not possible, so the reader is told so in so many words.
+    TooBig = 7,
 }
 
 /// The answer to an edit, an undo or a redo.
@@ -68,6 +75,9 @@ pub struct EditResult {
     /// The file's cross-reference data was damaged (or it had something before its header), so it was written afresh as a
     /// whole and will be saved as a whole: the bytes of the original do not stay as they are.
     pub rewrote: bool,
+    /// After a change to the list of pages (pages turned, taken out, moved or put in; or the undo or redo of one): the whole list as it is
+    /// now, with `page` [`crate::edit::ALL_PAGES`]. `None` when the pages are the ones there were.
+    pub pages: Option<Vec<super::PageInfo>>,
 }
 
 /// How a save came out.
@@ -82,6 +92,8 @@ pub enum SaveStatus {
 /// One edit that can be undone.
 struct Step {
     page: u32,
+    /// The change is to the list of pages (undoing or doing it again changes the list the reader has).
+    pages: bool,
     /// The objects it changed, with what they were before and are after.
     changes: Vec<Change>,
     /// About how many bytes the objects of `changes` take.
@@ -233,36 +245,54 @@ impl Session {
 
     /// An edit has changed the document (`changes`, from `edit::commit`): it is the new state, and what was to be redone is gone.
     pub(crate) fn push(&mut self, page: u32, changes: Vec<Change>) -> u32 {
+        self.push_step(page, false, changes)
+    }
+
+    /// [`Session::push`] for a change to the list of pages. The text recognised for pages of a file that may not be written to is by page
+    /// number: it is let go of.
+    pub(crate) fn push_pages(&mut self, changes: Vec<Change>) -> u32 {
+        self.memory_text.clear();
+        self.memory_chars = 0;
+        self.push_step(crate::edit::ALL_PAGES, true, changes)
+    }
+
+    fn push_step(&mut self, page: u32, pages: bool, changes: Vec<Change>) -> u32 {
         let (before, after) = (self.state, self.next);
         self.next += 1;
         self.state = after;
         self.redo.clear();
         let bytes = weigh(&changes);
-        self.undo.push(Step { page, changes, bytes, before, after });
+        self.undo.push(Step { page, pages, changes, bytes, before, after });
         if self.undo.len() > MAX_UNDO_STEPS {
             self.undo.remove(0);
         }
         page
     }
 
-    /// Take the last edit back. Returns the page it concerns.
-    pub(crate) fn undo(&mut self, doc: &Document) -> Option<u32> {
+    /// Take the last edit back. Returns the page it concerns, and whether it changed the list of pages.
+    pub(crate) fn undo(&mut self, doc: &Document) -> Option<(u32, bool)> {
         let step = self.undo.pop()?;
         edit::replay(doc, &step.changes, false);
         self.state = step.before;
-        let page = step.page;
+        let done = (step.page, step.pages);
         self.redo.push(step);
-        Some(page)
+        Some(done)
     }
 
-    /// Do again what was taken back. Returns the page it concerns.
-    pub(crate) fn redo(&mut self, doc: &Document) -> Option<u32> {
+    /// Do again what was taken back. Returns the page it concerns, and whether it changed the list of pages.
+    pub(crate) fn redo(&mut self, doc: &Document) -> Option<(u32, bool)> {
         let step = self.redo.pop()?;
         edit::replay(doc, &step.changes, true);
         self.state = step.after;
-        let page = step.page;
+        let done = (step.page, step.pages);
         self.undo.push(step);
-        Some(page)
+        Some(done)
+    }
+
+    /// The pages changed under the recognised text kept by page: it is let go of.
+    pub(crate) fn forget_memory_text(&mut self) {
+        self.memory_text.clear();
+        self.memory_chars = 0;
     }
 
     /// The document was written afresh from nothing it can be taken back to: no history before it.
@@ -305,6 +335,7 @@ impl Session {
             can_redo: self.can_redo(),
             dirty: self.dirty(),
             rewrote: self.rewrote,
+            pages: None,
         }
     }
 }
@@ -381,6 +412,24 @@ mod tests {
     }
 
     #[test]
+    fn a_change_to_the_list_of_pages_is_told_as_one_by_its_undo_and_redo_and_lets_go_of_what_is_kept_by_page() {
+        let d = doc();
+        let mut s = Session::new("", 1 << 20);
+        assert!(s.keep_text(0, Rc::new(PageChars { text: "a".to_string(), boxes: vec![[0.0; 4]] })));
+        let c = change(&d, 50, 1);
+        let page = s.push_pages(c);
+        assert_eq!(page, crate::edit::ALL_PAGES);
+        assert!(s.kept_text(0).is_none(), "the recognised text is by page number: it is not the pages' any more");
+        assert_eq!(s.undo(&d), Some((crate::edit::ALL_PAGES, true)));
+        assert_eq!(s.redo(&d), Some((crate::edit::ALL_PAGES, true)));
+        // An edit of one page is told as that page, and not as a change to the list.
+        let c = change(&d, 51, 1);
+        s.push(2, c);
+        assert_eq!(s.undo(&d), Some((2, false)));
+        assert!(s.dirty());
+    }
+
+    #[test]
     fn the_history_is_bounded_and_the_saved_state_can_fall_out_of_it() {
         let d = doc();
         let mut s = Session::new("", 1 << 30);
@@ -438,10 +487,10 @@ mod tests {
         assert!(!d.has_overlay() && !s.dirty());
         assert_eq!(annots_count(&d), 1);
         // The edit can still be taken back (the page of the file as it was before the save comes back) and done again.
-        assert_eq!(s.undo(&d), Some(0));
+        assert_eq!(s.undo(&d), Some((0, false)));
         assert_eq!(annots_count(&d), 0);
         assert!(s.dirty());
-        assert_eq!(s.redo(&d), Some(0));
+        assert_eq!(s.redo(&d), Some((0, false)));
         assert_eq!(annots_count(&d), 1);
         assert!(!s.dirty());
     }

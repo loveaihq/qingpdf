@@ -189,8 +189,9 @@ fn a_file_that_does_not_allow_copying_gives_no_text_and_one_that_does_not_allow_
     let engine = Engine::start(Box::new(|| {}));
     // R2, "no modifying or extracting": opened with no password, it may be printed but not copied.
     let o = opened_file(&engine, 1, "two.r2-40-empty-modify-extract-none.pdf", "");
-    // (That file's author took away modifying and extracting; the annotation bit is still on.)
-    assert_eq!(o.rights, Rights { copy: false, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: false });
+    // (That file's author took away modifying and extracting; the annotation bit is still on. Revision 2 has no bit for assembling: it
+    // is the one for modifying.)
+    assert_eq!(o.rights, Rights { copy: false, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: false, assemble: false });
     // The positions of the characters are given (marking text needs them: annotating is allowed), the text is not.
     let boxes = boxes_of(&engine, 1, 0);
     assert!(boxes.status == TextStatus::Ok && boxes.boxes.len() > 3, "{:?} {}", boxes.status, boxes.boxes.len());
@@ -212,7 +213,7 @@ fn a_file_that_does_not_allow_copying_gives_no_text_and_one_that_does_not_allow_
     }
     // Everything denied, opened with the user password; the owner password lifts it.
     let o = opened_file(&engine, 4, "two.r6-aes256-user-everything-denied.pdf", "user");
-    assert_eq!(o.rights, Rights { copy: false, print: false, print_high_quality: false, annotate: false, fill_forms: false, modify: false });
+    assert_eq!(o.rights, Rights { copy: false, print: false, print_high_quality: false, annotate: false, fill_forms: false, modify: false, assemble: false });
     // Neither copying nor annotating: no positions either.
     engine.char_boxes(4, 40, 0);
     let denied = until(&engine, |e| match e {
@@ -221,7 +222,7 @@ fn a_file_that_does_not_allow_copying_gives_no_text_and_one_that_does_not_allow_
     });
     assert!(denied.status == TextStatus::Denied && denied.boxes.is_empty());
     let o = opened_file(&engine, 5, "two.r6-aes256-user-everything-denied.pdf", "owner");
-    assert_eq!(o.rights, Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true });
+    assert_eq!(o.rights, Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true });
 }
 
 #[test]

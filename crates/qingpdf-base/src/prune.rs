@@ -91,25 +91,7 @@ impl Index {
         let dict_pages = page_of(names.dict())?;
         let catalog = doc.catalog().unwrap_or_default();
 
-        // Which page lists which annotation.
-        let mut annot_pages: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut seen_pages: HashSet<u32> = HashSet::new();
-        for page in pages {
-            if !seen_pages.insert(page.obj_ref.num) {
-                continue;
-            }
-            let Some(Object::Array(annots)) = page.dict.get("Annots").and_then(|a| doc.resolve(a).ok()) else {
-                continue;
-            };
-            for annot in &annots {
-                if let Object::Ref(r) = annot {
-                    let owners = annot_pages.entry(r.num).or_default();
-                    if !owners.contains(&page.obj_ref.num) {
-                        owners.push(page.obj_ref.num);
-                    }
-                }
-            }
-        }
+        let annot_pages = annotation_owners(doc, pages);
 
         let outlines = match catalog.get("Outlines") {
             Some(o) => read_outlines(doc, o, &names, page_nums)?,
@@ -303,81 +285,127 @@ impl Index {
             warnings.push(Warning("the XFA form data was dropped because it cannot follow a subset of the pages".to_string()));
             changed = true;
         }
-        if let Some(form) = &self.form {
-            let fields = &form.fields;
-            // A widget is dead if only removed pages list it (or, unlisted,
-            // if its /P is a removed page); a field is dead if it has no
-            // living widget or sub-field. A field with nothing to show
-            // anywhere (a calculation field) lives.
-            let widget_dead = |f: &Field| match self.annot_pages.get(&f.r.num) {
-                Some(owners) => !owners.iter().any(|p| kept.contains(p)),
-                None => f.page.is_some_and(|p| !kept.contains(&p)),
-            };
-            let mut alive = vec![false; fields.len()];
-            for (i, f) in fields.iter().enumerate().rev() {
-                let any_child = f.children.iter().any(|&c| alive.get(c).copied().unwrap_or(false));
-                let live = if f.children.is_empty() { !widget_dead(f) } else { any_child };
-                if let Some(slot) = alive.get_mut(i) {
-                    *slot = live;
-                }
+        if let Some(form) = &self.form
+            && let Some(cut) = form.cut(doc, &acro, &self.annot_pages, kept)
+        {
+            changed = true;
+            // A dead field is not imported by anything that names it: not by a parent's /Kids, and not by an action's /Fields
+            // either (12.7.5.2: ResetForm, SubmitForm), which would bring its value and appearance back.
+            b.exclude_objects(source, cut.dead.iter().copied());
+            for (r, d) in cut.changed {
+                b.replace(source, r.num, Object::Dict(d));
             }
-            if alive.iter().any(|&a| !a) {
-                changed = true;
-                // A dead field is not imported by anything that names it: not
-                // by a parent's /Kids, and not by an action's /Fields either
-                // (12.7.5.2: ResetForm, SubmitForm), which would bring its
-                // value and appearance back.
-                b.exclude_objects(
-                    source,
-                    fields.iter().zip(&alive).filter(|(_, a)| !**a).map(|(f, _)| f.r.num),
-                );
-                // Fields that lost a kid are written with the kids that stay.
-                for (i, f) in fields.iter().enumerate() {
-                    let live = alive.get(i).copied().unwrap_or(false);
-                    if !live || f.children.iter().all(|&c| alive.get(c).copied().unwrap_or(false)) {
-                        continue;
-                    }
-                    let Some(Object::Dict(mut d)) = doc.get(f.r).ok() else {
-                        continue;
-                    };
-                    let kids: Vec<Object> = f
-                        .children
-                        .iter()
-                        .filter(|&&c| alive.get(c).copied().unwrap_or(false))
-                        .filter_map(|&c| fields.get(c))
-                        .map(|k| Object::Ref(k.r))
-                        .collect();
-                    d.set("Kids", Object::Array(kids));
-                    b.replace(source, f.r.num, Object::Dict(d));
-                }
-                let top: Vec<Object> = form
-                    .top
-                    .iter()
-                    .filter(|&&i| alive.get(i).copied().unwrap_or(false))
-                    .filter_map(|&i| fields.get(i))
-                    .map(|f| Object::Ref(f.r))
-                    .collect();
-                // The calculation order names fields; the dead ones go.
-                if let Some(Object::Array(order)) = acro.get("CO").and_then(|c| doc.resolve(c).ok()) {
-                    let dead: HashSet<u32> =
-                        fields.iter().zip(&alive).filter(|(_, a)| !**a).map(|(f, _)| f.r.num).collect();
-                    let order: Vec<Object> = order
-                        .into_iter()
-                        .filter(|o| !matches!(o, Object::Ref(r) if dead.contains(&r.num)))
-                        .collect();
-                    acro.set("CO", Object::Array(order));
-                }
-                if top.is_empty() {
-                    catalog.remove("AcroForm");
-                    return;
-                }
-                acro.set("Fields", Object::Array(top));
+            if let Some(order) = cut.order {
+                acro.set("CO", Object::Array(order));
             }
+            if cut.fields.is_empty() {
+                catalog.remove("AcroForm");
+                return;
+            }
+            acro.set("Fields", Object::Array(cut.fields));
         }
         if changed {
             put_catalog_entry(catalog, "AcroForm", Object::Dict(acro), b, source);
         }
     }
+}
+
+/// Which page lists which annotation: for an annotation object number, the object numbers of the pages whose `/Annots` has it.
+fn annotation_owners(doc: &Document, pages: &[Page]) -> HashMap<u32, Vec<u32>> {
+    let mut annot_pages: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut seen_pages: HashSet<u32> = HashSet::new();
+    for page in pages {
+        if !seen_pages.insert(page.obj_ref.num) {
+            continue;
+        }
+        let Some(Object::Array(annots)) = page.dict.get("Annots").and_then(|a| doc.resolve(a).ok()) else {
+            continue;
+        };
+        for annot in &annots {
+            if let Object::Ref(r) = annot {
+                // (A page is done with before the next one starts, so a page that lists an annotation twice is the last owner.)
+                let owners = annot_pages.entry(r.num).or_default();
+                if owners.last() != Some(&page.obj_ref.num) {
+                    owners.push(page.obj_ref.num);
+                }
+            }
+        }
+    }
+    annot_pages
+}
+
+/// What taking pages out does to the interactive form (12.7): the fields that lose all their widgets go, the ones that lose some
+/// keep the rest.
+pub struct FormCut {
+    /// The object numbers of the fields (and widgets) that go.
+    pub dead: Vec<u32>,
+    /// The fields that lose some of their kids, with their dictionaries as they are to be written: only the kids that stay.
+    pub changed: Vec<(ObjRef, Dict)>,
+    /// `/Fields` as it is to be written: the fields of the first level that stay. Empty: the form has no field left.
+    pub fields: Vec<Object>,
+    /// `/CO` (the calculation order, 12.7.3.2) without the fields that go, when the form has one.
+    pub order: Option<Vec<Object>>,
+}
+
+impl Form {
+    /// Which fields live when only the pages `kept` stay: a widget is dead if only removed pages list it (or, unlisted, if its `/P` is
+    /// a removed page); a field is dead if it has no living widget or sub-field. A field with nothing to show anywhere (a calculation
+    /// field) lives. `None` when none dies.
+    fn cut(&self, doc: &Document, acro: &Dict, annot_pages: &HashMap<u32, Vec<u32>>, kept: &HashSet<u32>) -> Option<FormCut> {
+        let fields = &self.fields;
+        let widget_dead = |f: &Field| match annot_pages.get(&f.r.num) {
+            Some(owners) => !owners.iter().any(|p| kept.contains(p)),
+            None => f.page.is_some_and(|p| !kept.contains(&p)),
+        };
+        let mut alive = vec![false; fields.len()];
+        for (i, f) in fields.iter().enumerate().rev() {
+            let any_child = f.children.iter().any(|&c| alive.get(c).copied().unwrap_or(false));
+            let live = if f.children.is_empty() { !widget_dead(f) } else { any_child };
+            if let Some(slot) = alive.get_mut(i) {
+                *slot = live;
+            }
+        }
+        if alive.iter().all(|&a| a) {
+            return None;
+        }
+        let is_alive = |i: usize| alive.get(i).copied().unwrap_or(false);
+        let dead: Vec<u32> = fields.iter().zip(&alive).filter(|(_, a)| !**a).map(|(f, _)| f.r.num).collect();
+        // Fields that lost a kid are written with the kids that stay.
+        let mut changed = Vec::new();
+        for (i, f) in fields.iter().enumerate() {
+            if !is_alive(i) || f.children.iter().all(|&c| is_alive(c)) {
+                continue;
+            }
+            let Some(Object::Dict(mut d)) = doc.get(f.r).ok() else {
+                continue;
+            };
+            let kids: Vec<Object> = f.children.iter().filter(|&&c| is_alive(c)).filter_map(|&c| fields.get(c)).map(|k| Object::Ref(k.r)).collect();
+            d.set("Kids", Object::Array(kids));
+            changed.push((f.r, d));
+        }
+        let top: Vec<Object> = self.top.iter().filter(|&&i| is_alive(i)).filter_map(|&i| fields.get(i)).map(|f| Object::Ref(f.r)).collect();
+        // The calculation order names fields; the dead ones go.
+        let order = match acro.get("CO").and_then(|c| doc.resolve(c).ok()) {
+            Some(Object::Array(order)) => {
+                let gone: HashSet<u32> = dead.iter().copied().collect();
+                Some(order.into_iter().filter(|o| !matches!(o, Object::Ref(r) if gone.contains(&r.num))).collect())
+            }
+            _ => None,
+        };
+        Some(FormCut { dead, changed, fields: top, order })
+    }
+}
+
+/// The form of `doc` once the pages whose object numbers are in `removed` are taken out of `pages`; `None` when no field goes (or
+/// there is no form).
+pub fn form_after_removal(doc: &Document, pages: &[Page], removed: &[u32]) -> Result<Option<FormCut>> {
+    let catalog = doc.catalog()?;
+    let Some(entry) = catalog.get("AcroForm") else { return Ok(None) };
+    let page_nums: HashSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
+    let (Some(form), Ok(Object::Dict(acro))) = (read_form(doc, entry, &page_nums), doc.resolve(entry)) else { return Ok(None) };
+    let removed: HashSet<u32> = removed.iter().copied().collect();
+    let kept: HashSet<u32> = page_nums.iter().copied().filter(|n| !removed.contains(n)).collect();
+    Ok(form.cut(doc, &acro, &annotation_owners(doc, pages), &kept))
 }
 
 /// How many items an open parent of `children` shows: each living child, and

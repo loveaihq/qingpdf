@@ -49,7 +49,7 @@ pub(super) struct Press {
 }
 
 impl App {
-    pub(super) fn mouse_down(&mut self, x: i64, y: i64, _ctrl: bool, _shift: bool, clicks: u8) -> Vec<Action> {
+    pub(super) fn mouse_down(&mut self, x: i64, y: i64, ctrl: bool, shift: bool, clicks: u8) -> Vec<Action> {
         self.mouse = (x, y);
         self.press = None;
         // The edge of the bookmarks is taken hold of.
@@ -58,7 +58,7 @@ impl App {
             return Vec::new();
         }
         // The tabs of the sidebar and the list of thumbnails.
-        if let Some(actions) = self.sidebar_mouse_down(x, y) {
+        if let Some(actions) = self.sidebar_mouse_down(x, y, ctrl, shift) {
             return actions;
         }
         self.thumb_focus = false;
@@ -91,6 +91,9 @@ impl App {
         if self.thumb_drag {
             return self.thumb_drag_to(y);
         }
+        if let Some(actions) = self.thumb_drag_move(x, y) {
+            return actions;
+        }
         if let Some(actions) = self.edit_mouse_move(x, y) {
             return actions;
         }
@@ -120,6 +123,10 @@ impl App {
             actions.extend(self.split_drag_end());
             return actions;
         }
+        if let Some(more) = self.thumb_drop() {
+            actions.extend(more);
+            return actions;
+        }
         if let Some(more) = self.edit_mouse_up(x, y) {
             actions.extend(more);
             return actions;
@@ -144,6 +151,7 @@ impl App {
         self.press = None;
         self.edit.give_up_stroke();
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
+        actions.extend(self.cancel_thumb_drag().unwrap_or_default());
         actions.extend(self.thumb_drag_end());
         actions.extend(self.split_drag_end());
         actions

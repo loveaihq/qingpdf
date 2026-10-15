@@ -75,6 +75,13 @@ impl TextCache {
         self.bytes += w;
     }
 
+    /// Let go of every page (they are not the pages they were).
+    pub(super) fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
     pub(super) fn forget(&mut self, page: u32) {
         if let Some(slot) = self.map.remove(&page) {
             self.order.remove(&slot.used);

@@ -48,6 +48,7 @@ pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use crate::edit::{LineView, MAX_TEXT_CHARS};
 pub use crate::edit::{ALL_PAGES, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark};
+pub use crate::edit::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, order_after_move};
 pub use crate::edit::{MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, TARGET_DPI};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
@@ -157,6 +158,9 @@ pub struct Rights {
     pub fill_forms: bool,
     /// The content of pages may be changed: text, pictures and watermarks added (permission bit 4; the owner password lifts it).
     pub modify: bool,
+    /// Pages may be turned, taken out, moved and put in (permission bit 11, "assemble", of revision 3 and later, bit 4 of revision 2; the
+    /// owner password lifts it).
+    pub assemble: bool,
 }
 
 /// The most dots per inch a page is printed at when the file allows only low-quality printing (Table 22, bit 12).
@@ -342,6 +346,7 @@ pub(crate) enum Command {
     Redo { doc: u64, id: u64 },
     Save { doc: u64, id: u64, path: String, whole: bool },
     Export { doc: u64, id: u64, path: String, excel: bool },
+    Extract { doc: u64, id: u64, pages: Vec<u32>, path: String },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
@@ -572,6 +577,44 @@ impl Engine {
         let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Watermark(Box::new(mark)) });
     }
 
+    /// Turn pages (from 0, each once, any order) clockwise by `degrees`, a multiple of 90 (a negative number turns them the other way): the
+    /// pages' `/Rotate`. Needs [`Rights::assemble`] and a file without signatures. Answered by [`Event::Edited`] with `page` [`ALL_PAGES`] and
+    /// `pages`, the new list of pages (here and in the three calls below, which change the list; one step to undo each).
+    pub fn rotate_pages(&self, doc: u64, id: u64, pages: Vec<u32>, degrees: i32) {
+        self.page_op(doc, id, crate::edit::PageOp::Rotate { pages, degrees });
+    }
+
+    /// Take pages out (not all of them). Their form fields go with them; bookmarks and links to them lead nowhere. The pages stay in the
+    /// older part of a saved file until [`Engine::save_as`].
+    pub fn delete_pages(&self, doc: u64, id: u64, pages: Vec<u32>) {
+        self.page_op(doc, id, crate::edit::PageOp::Delete { pages });
+    }
+
+    /// Put pages (in their order) in front of page `to`, counted as the pages are now (the number of pages: after the last).
+    pub fn move_pages(&self, doc: u64, id: u64, pages: Vec<u32>, to: u32) {
+        self.page_op(doc, id, crate::edit::PageOp::Move { pages, to });
+    }
+
+    /// Put all the pages of the file at `path` in front of page `at` (the number of pages: after the last), with their annotations, form
+    /// fields (with names changed where this document has them already), links and named destinations; not its bookmarks. A file that needs
+    /// a password is answered with [`EditStatus::NeedsPassword`] (or [`EditStatus::WrongPassword`] for one that does not open it): ask for
+    /// one and call again. A file that restricts what may be done with it is refused unless `password` is the owner's. At most
+    /// [`MAX_INSERT_PAGES`] pages and [`MAX_INSERT_FILE_BYTES`] bytes; the document may not come to more than [`MAX_PAGES_AFTER`] pages.
+    pub fn insert_pages(&self, doc: u64, id: u64, at: u32, path: &str, password: &str) {
+        self.page_op(doc, id, crate::edit::PageOp::Insert { at, path: path.to_string(), password: crate::edit::Password::new(password) });
+    }
+
+    fn page_op(&self, doc: u64, id: u64, op: crate::edit::PageOp) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Pages(Box::new(op)) });
+    }
+
+    /// Write the pages (from 0; each once, in page order) as a file of their own at `path`, the document as it is with the edits not yet
+    /// saved, written afresh as a whole (what `qingpdf split` writes, with the same encryption). The open file is not touched. Answered by
+    /// [`Event::Exported`] (`pages` is how many pages are in it, `tables` is 0). Needs [`Rights::copy`]; done in the order of the edits.
+    pub fn extract_pages(&self, doc: u64, id: u64, pages: Vec<u32>, path: &str) {
+        let _ = self.commands.send(Command::Extract { doc, id, pages, path: path.to_string() });
+    }
+
     /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by
     /// [`Event::Edited`].
     pub fn delete_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
@@ -705,6 +748,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Redo { .. }
             | Command::Save { .. }
             | Command::Export { .. }
+            | Command::Extract { .. }
             | Command::Swap
             | Command::PrintNext(_)
             | Command::Cancel(_)
@@ -785,10 +829,10 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
 fn rights_of(document: &Document, password: &str) -> Rights {
     let copy = text::check_extraction_allowed(document, password).is_ok();
     let Some(encryption) = document.encryption() else {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true };
     };
     if has_owner_rights(document, &encryption, password) {
-        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
+        return Rights { copy, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true };
     }
     Rights {
         copy,
@@ -797,6 +841,7 @@ fn rights_of(document: &Document, password: &str) -> Rights {
         annotate: encryption.permissions.annotate,
         fill_forms: encryption.permissions.fill_forms,
         modify: encryption.permissions.modify,
+        assemble: encryption.permissions.assemble,
     }
 }
 

@@ -287,7 +287,6 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
         canvas_pixels: u64::from(plan.max_tile_pixels),
     });
     renderer.set_cancel(Some(shared.stop.clone()));
-    let page_count = pages.len();
     let mut server = Server {
         doc_id,
         document: &document,
@@ -310,6 +309,8 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
     };
     let end = server.run();
     let Some(pending) = server.swap.take() else { return Exit::Done(end) };
+    // (The number of pages now: a change to the pages made while this document was served has changed it.)
+    let page_count = server.pages.len();
     if !matches!(end, Some(Command::Swap)) {
         return Exit::Done(end);
     }
@@ -431,9 +432,14 @@ impl Server<'_> {
                 }
                 None
             }
-            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. }) => {
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. }) => {
                 let doc = match &c {
-                    Command::Edit { doc, .. } | Command::Undo { doc, .. } | Command::Redo { doc, .. } | Command::Save { doc, .. } | Command::Export { doc, .. } => *doc,
+                    Command::Edit { doc, .. }
+                    | Command::Undo { doc, .. }
+                    | Command::Redo { doc, .. }
+                    | Command::Save { doc, .. }
+                    | Command::Export { doc, .. }
+                    | Command::Extract { doc, .. } => *doc,
                     _ => 0,
                 };
                 if doc == self.doc_id {
@@ -732,6 +738,21 @@ impl Server<'_> {
         self.chars.forget(page_no);
     }
 
+    /// The list of pages has changed (a change to the pages, or the undo or redo of one): read it again. `fits` says whether the number of
+    /// pages is the one it should be; if it is not, or the pages cannot be read, nothing here is changed and the reason is returned.
+    /// What is kept by page (the characters, the recognised text) is let go of; what the renderer keeps is by object and stays.
+    fn refresh_structure(&mut self, fits: impl Fn(usize) -> bool) -> Result<Vec<PageInfo>, String> {
+        let pages = self.document.pages().map_err(|e| format!("the pages cannot be read after the change: {e}"))?;
+        if !fits(pages.len()) {
+            return Err("the page tree did not come out as the change meant it to".to_string());
+        }
+        self.index = page_index(&pages);
+        self.pages = pages;
+        self.chars.clear();
+        self.session.forget_memory_text();
+        Ok(self.pages.iter().map(page_info).collect())
+    }
+
     /// Carry out an edit, an undo, a redo or a save. `Some(Command::Swap)`: the document is to be replaced (`self.swap` says how).
     fn do_edit(&mut self, command: Command) -> Option<Command> {
         let said = |this: &Self, doc: u64, id: u64, status: EditStatus, message: &str, page: u32| {
@@ -747,6 +768,7 @@ impl Server<'_> {
                     EditClass::Fill => (self.rights.fill_forms, DENIED_FILL),
                     EditClass::Content => (self.rights.modify, DENIED_MODIFY),
                     EditClass::Annotate => (self.rights.annotate, DENIED_ANNOTATE),
+                    EditClass::Assemble => (self.rights.assemble, DENIED_ASSEMBLE),
                 };
                 // Recognised text for a file that may not be changed is used in this window and not written (5c).
                 if let edit::Edit::OcrLayer(recognised) = &edit
@@ -793,13 +815,28 @@ impl Server<'_> {
                 let work = Work::with_allowance(self.session.work_left().min(crate::render::work::PAGE_WORK));
                 // (What the edit may take is what is left of the memory set aside, after what is in front of the file already.)
                 let room = self.session.budget().saturating_sub(self.document.overlay_bytes());
-                let made = edit::apply_noted(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work, room);
+                let made = edit::apply_any(self.document, &self.pages, &edit, &edit::pdf_date_now(), &work, room);
                 self.session.add_work(work.used());
                 let (objects, notes) = match made {
                     Ok(done) => done,
+                    // Pages from a file that do not fit: they cannot be put in in parts, so it is said with a status of its own (the reader
+                    // has the words for it).
+                    Err(Error::Limit(m)) if m == edit::TOO_BIG && matches!(&edit, edit::Edit::Pages(op) if matches!(**op, edit::PageOp::Insert { .. })) => {
+                        let message = format!("those pages do not fit in the {} MB set aside for what is not saved: save the file first, or put in a smaller file", edit::MAX_INSERT_FILE_BYTES >> 20);
+                        said(self, doc, id, EditStatus::TooBig, &message, page);
+                        return None;
+                    }
                     Err(Error::Limit(m)) if m == edit::TOO_BIG => {
                         let advice = if self.document.has_overlay() { "save the file first, or do it in parts" } else { "do it in parts (fewer pages at a time)" };
                         said(self, doc, id, EditStatus::Failed, &format!("{m}: {advice}"), page);
+                        return None;
+                    }
+                    Err(Error::PasswordRequired) => {
+                        said(self, doc, id, EditStatus::NeedsPassword, "the file the pages come from needs a password", page);
+                        return None;
+                    }
+                    Err(Error::WrongPassword) => {
+                        said(self, doc, id, EditStatus::WrongPassword, "that password does not open the file the pages come from", page);
                         return None;
                     }
                     Err(e) => {
@@ -813,10 +850,28 @@ impl Server<'_> {
                     return None;
                 }
                 let changes = edit::commit(self.document, objects);
-                let page = self.session.push(page, changes);
-                self.refresh_page(page);
                 let signed = if policy == Policy::Warn && self.session.take_warning() { SIGNED_WARNING } else { "" };
                 let message = std::iter::once(signed.to_string()).chain(notes).filter(|m| !m.is_empty()).collect::<Vec<_>>().join(" ");
+                if let edit::Edit::Pages(op) = &edit {
+                    // The list of pages: read again from the document, and only if it came out as the change meant is the step kept.
+                    let before = self.pages.len();
+                    let expected = op.count_after(before);
+                    let infos = match self.refresh_structure(|n| expected.map_or(n > before, |e| e == n)) {
+                        Ok(infos) => infos,
+                        Err(why) => {
+                            edit::replay(self.document, &changes, false);
+                            said(self, doc, id, EditStatus::Failed, &why, page);
+                            return None;
+                        }
+                    };
+                    self.session.push_pages(changes);
+                    let mut result = self.session.result(doc, id, EditStatus::Done, &message, edit::ALL_PAGES);
+                    result.pages = Some(infos);
+                    self.tell(Event::Edited(result));
+                    return None;
+                }
+                let page = self.session.push(page, changes);
+                self.refresh_page(page);
                 said(self, doc, id, EditStatus::Done, &message, page);
                 None
             }
@@ -829,7 +884,15 @@ impl Server<'_> {
                 let done = if undo { self.session.undo(self.document) } else { self.session.redo(self.document) };
                 match done {
                     None => said(self, doc, id, EditStatus::Nothing, "", 0),
-                    Some(page) => {
+                    Some((page, true)) => match self.refresh_structure(|_| true) {
+                        Ok(infos) => {
+                            let mut result = self.session.result(doc, id, EditStatus::Done, "", page);
+                            result.pages = Some(infos);
+                            self.tell(Event::Edited(result));
+                        }
+                        Err(why) => said(self, doc, id, EditStatus::Failed, &why, page),
+                    },
+                    Some((page, false)) => {
                         self.refresh_page(page);
                         said(self, doc, id, EditStatus::Done, "", page);
                     }
@@ -874,6 +937,33 @@ impl Server<'_> {
                 match result {
                     Ok((pages, tables, bytes, warnings)) => reply(self, SaveStatus::Done, warnings.join("; "), u32::try_from(pages).unwrap_or(u32::MAX), u32::try_from(tables).unwrap_or(u32::MAX), bytes),
                     Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0, 0),
+                }
+                None
+            }
+            Command::Extract { doc, id, pages, path } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, count: u32, bytes: u64| this.tell(Event::Exported { doc, id, status, message, pages: count, tables: 0, bytes });
+                if printing {
+                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0, 0);
+                    return None;
+                }
+                if !self.rights.copy {
+                    reply(self, SaveStatus::Failed, DENIED_EXTRACT.to_string(), 0, 0);
+                    return None;
+                }
+                let wanted: Vec<usize> = edit::unique_pages(&pages, self.pages.len()).into_iter().map(|p| p as usize).collect();
+                if wanted.is_empty() || pages.iter().any(|&p| p as usize >= self.pages.len()) {
+                    reply(self, SaveStatus::Failed, "there is no such page".to_string(), 0, 0);
+                    return None;
+                }
+                match ops::extract_pages(self.document, &wanted) {
+                    Ok(out) => match write_atomic(&path, &out.data) {
+                        Ok(()) => {
+                            let message = out.warnings.iter().map(|w| w.0.as_str()).collect::<Vec<_>>().join("; ");
+                            reply(self, SaveStatus::Done, message, u32::try_from(out.pages).unwrap_or(u32::MAX), out.data.len() as u64);
+                        }
+                        Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
+                    },
+                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
                 }
                 None
             }
@@ -1233,6 +1323,10 @@ fn print_dpi(asked: f64, rights: Rights) -> f64 {
 
 const DENIED_FILL: &str = "the file's author did not allow filling in form fields, and the file was not opened with the owner password";
 
+const DENIED_ASSEMBLE: &str = "the file's author did not allow inserting, deleting, moving or turning pages, and the file was not opened with the owner password";
+
+const DENIED_EXTRACT: &str = "the file's author did not allow copying or extracting, and the file was not opened with the owner password";
+
 const DENIED_MODIFY: &str = "the file's author did not allow changing its content, and the file was not opened with the owner password";
 const DENIED_ANNOTATE: &str = "the file's author did not allow adding annotations, and the file was not opened with the owner password";
 
@@ -1301,7 +1395,7 @@ mod tests {
 
     #[test]
     fn a_file_that_allows_only_low_quality_printing_is_drawn_at_150_dpi_at_most() {
-        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true };
+        let high = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true };
         let low = Rights { print_high_quality: false, ..high };
         assert_eq!((print_dpi(1000.0, high), print_dpi(1000.0, low)), (300.0, 150.0));
         assert_eq!((print_dpi(200.0, high), print_dpi(200.0, low)), (200.0, 150.0));

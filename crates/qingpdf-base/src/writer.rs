@@ -386,6 +386,21 @@ pub struct Builder<'a> {
     /// its number in the output once it is imported.
     root_metadata: Option<(usize, u32)>,
     root_metadata_out: Option<u32>,
+    /// Set by [`Builder::collecting`]: the objects are handed back, not written.
+    collect: Option<Collect>,
+}
+
+/// What a builder that makes no file gives back: its objects by number, and the warnings.
+pub type Collected = (Vec<(u32, Object)>, Vec<Warning>);
+
+/// Where the objects of a builder that makes no file go: a list, held to a number of bytes.
+struct Collect {
+    /// The number before the first one given out.
+    base: u32,
+    objects: Vec<(u32, Object)>,
+    bytes: usize,
+    room: usize,
+    too_big: String,
 }
 
 impl<'a> Builder<'a> {
@@ -412,7 +427,33 @@ impl<'a> Builder<'a> {
             crypt_source: None,
             root_metadata: None,
             root_metadata_out: None,
+            collect: None,
         }
+    }
+
+    /// A builder that makes objects for a file that exists (pages imported into it), not a file: the numbers start at `first`, and
+    /// [`Builder::into_collected`] gives the objects as they are made, with the references already the new file's own. The objects
+    /// may take `room` bytes in all (the sizes [`Object::approx_size`] says, and 48 for each); more is `Error::Limit(too_big)`.
+    /// Nothing is encrypted: whoever writes the objects does that.
+    pub fn collecting(first: u32, room: usize, too_big: &str) -> Self {
+        let mut b = Builder::new((1, 7));
+        b.collect = Some(Collect { base: first.saturating_sub(1), objects: Vec::new(), bytes: 0, room, too_big: too_big.to_string() });
+        b
+    }
+
+    /// The objects of a builder made by [`Builder::collecting`], and the warnings about the damaged ones that were left out.
+    pub fn into_collected(mut self) -> Result<Collected> {
+        let warning = self.unreadable_warning();
+        // A number taken and never given an object is a null object (as `finish` does).
+        let unwritten: Vec<u32> = match &self.collect {
+            Some(c) => self.offsets.iter().enumerate().filter(|(_, o)| o.is_none()).map(|(i, _)| c.base.saturating_add(u32::try_from(i + 1).unwrap_or(u32::MAX))).collect(),
+            None => Vec::new(),
+        };
+        for num in unwritten {
+            self.store(ObjRef::new(num, 0), Object::Null)?;
+        }
+        let objects = self.collect.map(|c| c.objects).unwrap_or_default();
+        Ok((objects, warning.into_iter().collect()))
     }
 
     /// Write the file encrypted the way `source` was: the same encryption
@@ -524,9 +565,12 @@ impl<'a> Builder<'a> {
     /// Take the next object number without writing anything yet. The object
     /// must be given later with [`Builder::put`].
     pub fn reserve(&mut self) -> Result<ObjRef> {
+        let base = self.collect.as_ref().map_or(0, |c| c.base);
+        let most = if self.collect.is_some() { MAX_OBJECT_NUMBER } else { u32::MAX / 2 - 1 };
         let num = u32::try_from(self.offsets.len().saturating_add(1))
             .ok()
-            .filter(|&n| n < u32::MAX / 2)
+            .and_then(|n| n.checked_add(base))
+            .filter(|&n| n <= most)
             .ok_or_else(|| Error::Limit("too many objects to write".to_string()))?;
         self.offsets.push(None);
         Ok(ObjRef::new(num, 0))
@@ -535,6 +579,9 @@ impl<'a> Builder<'a> {
     /// Write object `r` (obtained from [`Builder::reserve`]). All references
     /// inside `obj` must already be output object numbers.
     pub fn put(&mut self, r: ObjRef, obj: &Object) -> Result<()> {
+        if self.collect.is_some() {
+            return self.store(r, obj.clone());
+        }
         if self.buf.is_empty() {
             self.write_header();
         }
@@ -549,6 +596,27 @@ impl<'a> Builder<'a> {
         *slot = Some(u64::try_from(self.buf.len()).unwrap_or(u64::MAX));
         let enc = self.crypt.as_ref().map(|c| c.object(r.num, self.root_metadata_out == Some(r.num)));
         write_indirect(&mut self.buf, r.num, obj, enc.as_ref())
+    }
+
+    /// [`Builder::put`] for an object the builder may keep: not copied by a builder that collects.
+    fn store(&mut self, r: ObjRef, obj: Object) -> Result<()> {
+        let Some(c) = self.collect.as_mut() else { return self.put(r, &obj) };
+        let slot = r
+            .num
+            .checked_sub(c.base.saturating_add(1))
+            .and_then(|n| usize::try_from(n).ok())
+            .and_then(|i| self.offsets.get_mut(i))
+            .ok_or_else(|| Error::Invalid(format!("object {} was never reserved", r.num)))?;
+        if slot.is_some() {
+            return Err(Error::Invalid(format!("object {} written twice", r.num)));
+        }
+        *slot = Some(0);
+        c.bytes = c.bytes.saturating_add(obj.approx_size()).saturating_add(48);
+        if c.bytes > c.room {
+            return Err(Error::Limit(c.too_big.clone()));
+        }
+        c.objects.push((r.num, obj));
+        Ok(())
     }
 
     /// Reserve a number and write `obj` under it.
@@ -632,7 +700,7 @@ impl<'a> Builder<'a> {
     fn drain(&mut self) -> Result<()> {
         while let Some(Pending { source, new, object }) = self.pending.pop() {
             let translated = self.translate(source, object)?;
-            self.put(new, &translated)?;
+            self.store(new, translated)?;
         }
         Ok(())
     }
@@ -966,7 +1034,10 @@ fn strip_crypt_filter(dict: &mut Dict) {
 fn is_structural(obj: &Object) -> bool {
     match obj.as_dict().and_then(|d| d.get_name("Type")) {
         Some(t) => ["Pages", "Page", "Catalog", "XRef", "ObjStm"].iter().any(|k| t == k),
-        None => false,
+        // A page that does not say what it is (readers take it for one): a dictionary with a parent and a page's own entries, which is
+        // not an annotation (those say what they are with a /Subtype, and their /Contents is a text). One that stays out of the output
+        // when it was left out of the pages (a page taken out of the document that a bookmark still names) must not come in whole.
+        None => matches!(obj, Object::Dict(d) if d.contains_key("Parent") && !d.contains_key("Subtype") && (d.contains_key("Contents") || d.contains_key("MediaBox"))),
     }
 }
 
@@ -1255,6 +1326,45 @@ mod tests {
         let (bytes, _) = b.finish(catalog, None).unwrap();
         let doc = Document::from_bytes(bytes).unwrap();
         assert_eq!(doc.get(hole).unwrap(), Object::Null);
+    }
+
+    #[test]
+    fn a_builder_that_collects_numbers_from_where_it_is_told_hands_back_what_it_imported_and_keeps_to_its_room() {
+        use crate::testutil::PdfBuilder;
+        let mut pb = PdfBuilder::new();
+        pb.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        pb.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pb.obj(3, "<< /Type /Page /Parent 2 0 R /Resources 5 0 R /Contents 4 0 R >>");
+        pb.stream_obj(4, "", &[b'x'; 5000]);
+        pb.obj(5, "<< /Font << /F1 6 0 R >> >>");
+        pb.obj(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let source = Document::from_bytes(pb.finish_classic(7, "/Root 1 0 R")).unwrap();
+        let pages: HashSet<u32> = HashSet::from([3]);
+        // Numbers start at 100; the page the caller reserved is 100, what it leads to is numbered after it, nothing is encrypted or written.
+        let mut b = Builder::collecting(100, 1 << 20, "too big");
+        let s = b.add_source(&source, &pages);
+        let page = b.reserve().unwrap();
+        assert_eq!(page, ObjRef::new(100, 0));
+        b.register_page(s, ObjRef::new(3, 0), page);
+        let Object::Dict(mut d) = b.import(s, source.get(ObjRef::new(3, 0)).unwrap()).unwrap() else { panic!("not a dictionary") };
+        d.remove("Parent");
+        b.put(page, &Object::Dict(d)).unwrap();
+        let (objects, warnings) = b.into_collected().unwrap();
+        assert!(warnings.is_empty());
+        let mut numbers: Vec<u32> = objects.iter().map(|(n, _)| *n).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [100, 101, 102, 103], "the page, its contents, its resources, the font");
+        assert!(objects.iter().any(|(_, o)| matches!(o, Object::Stream(s) if s.data.len() == 5000)));
+        // A room too small for the 5,000 bytes of the contents: a limit, with the words it was given.
+        let mut b = Builder::collecting(100, 1000, "too big");
+        let s = b.add_source(&source, &pages);
+        let page = b.reserve().unwrap();
+        b.register_page(s, ObjRef::new(3, 0), page);
+        let refused = b.import(s, source.get(ObjRef::new(3, 0)).unwrap());
+        assert!(matches!(&refused, Err(Error::Limit(m)) if m == "too big"), "{refused:?}");
+        // Numbers past what a file can have are refused.
+        let mut b = Builder::collecting(MAX_OBJECT_NUMBER, 1 << 20, "x");
+        assert!(b.reserve().is_ok() && b.reserve().is_err());
     }
 
     #[test]

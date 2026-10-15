@@ -16,6 +16,7 @@ mod fill;
 pub(crate) mod fontsub;
 pub(crate) mod incremental;
 mod ocr;
+mod pages;
 mod retext;
 pub(crate) mod signature;
 
@@ -34,6 +35,8 @@ use crate::layout::reals;
 use appearance::{Appearance, Quad};
 pub use retext::{LineView, MAX_REPLACE_HITS, MAX_TEXT_CHARS, Replaced, replace_text, text_line};
 pub use ocr::{has_layer as has_ocr_layer, MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_SCAN_TEXT_CHARS, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_IMAGE_COVER, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, ScanState, TARGET_DPI, ocr_dpi, page_chars as ocr_page_chars, pages_with_words, scan_state, wants_text};
+pub use pages::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, PageOp, Password, order_after_move};
+pub(crate) use pages::unique as unique_pages;
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
 pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
@@ -109,6 +112,8 @@ pub enum Edit {
     /// An invisible text layer over scanned pages, from the words a recogniser found (5c, the pages' own content): one font for all
     /// the pages, one form for each.
     OcrLayer(Vec<OcrPage>),
+    /// Pages turned, taken out, moved, or put in from another file (the pages, not what is on them).
+    Pages(Box<PageOp>),
 }
 
 /// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
@@ -120,6 +125,8 @@ pub enum EditClass {
     Fill,
     /// The content of pages is written (permission bit 4; a signed file allows nothing of the kind).
     Content,
+    /// Pages are turned, taken out, moved or put in (permission bit 11, "assemble"; a signed file allows nothing of the kind).
+    Assemble,
 }
 
 impl Edit {
@@ -135,7 +142,7 @@ impl Edit {
             | Edit::AddText { page, .. }
             | Edit::AddImage { page, .. }
             | Edit::ReplaceLine { page, .. } => *page,
-            Edit::Watermark(_) | Edit::OcrLayer(_) => ALL_PAGES,
+            Edit::Watermark(_) | Edit::OcrLayer(_) | Edit::Pages(_) => ALL_PAGES,
         }
     }
 
@@ -143,6 +150,7 @@ impl Edit {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
             Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::ReplaceLine { .. } | Edit::OcrLayer(_) => EditClass::Content,
+            Edit::Pages(_) => EditClass::Assemble,
             _ => EditClass::Annotate,
         }
     }
@@ -310,6 +318,17 @@ pub(crate) fn apply_metered(doc: &Document, pages: &[Page], edit: &Edit, now: &s
 /// The objects an edit makes or changes, by number, and what the person is to be told about it.
 pub(crate) type Applied = (Vec<(u32, Object)>, Vec<String>);
 
+/// [`apply_noted`] for every kind of edit, those that turn, take out, move and put in pages too. (They are kept apart so that the command line,
+/// which makes the other edits through `apply_noted`, does not carry the code of the pages.)
+pub(crate) fn apply_any(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Applied> {
+    if let Edit::Pages(op) = edit {
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
+        pages::apply(&mut ctx, pages, op)?;
+        return Ok((ctx.objects, ctx.notes));
+    }
+    apply_noted(doc, pages, edit, now, work, room)
+}
+
 /// [`apply_metered`], and what the person is to be told about the change (a text that came out wider than the one it replaces).
 pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Applied> {
     if let Edit::Watermark(mark) = edit {
@@ -341,7 +360,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::OcrLayer(_) => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::OcrLayer(_) | Edit::Pages(_) => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));
@@ -753,6 +772,8 @@ pub(crate) fn save_section(doc: &Document) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod forms_tests;
+#[cfg(test)]
+mod pages_tests;
 #[cfg(test)]
 mod retext_tests;
 

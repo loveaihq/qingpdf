@@ -368,6 +368,8 @@ pub struct Thumbs {
     built: Option<Built>,
     /// The page the list was last moved to show.
     pub synced: Option<usize>,
+    /// The pages changed (turned, taken out, moved, put in): the rows are made again but the list stays about where it is.
+    keep_place: bool,
 }
 
 /// What the rows depend on: the room, the turn of the view, the number of pages.
@@ -380,7 +382,7 @@ pub struct Built {
 
 impl Thumbs {
     pub fn new() -> Thumbs {
-        Thumbs { strip: Strip::default(), scroll: 0, cache: ThumbCache::new(0), asked: HashMap::new(), failed: HashSet::new(), retried: HashSet::new(), built: None, synced: None }
+        Thumbs { strip: Strip::default(), scroll: 0, cache: ThumbCache::new(0), asked: HashMap::new(), failed: HashSet::new(), retried: HashSet::new(), built: None, synced: None, keep_place: false }
     }
 
     /// Forget everything (another file, or none), with room for `cap` bytes of pictures.
@@ -396,7 +398,7 @@ impl Thumbs {
             return false;
         }
         let anchor = self.strip.locate(self.scroll);
-        let same_file = self.built.is_some_and(|b| b.pages == now.pages);
+        let same_file = self.built.is_some_and(|b| b.pages == now.pages) || std::mem::take(&mut self.keep_place);
         if self.built.is_some_and(|b| b.rotation != now.rotation) {
             self.cache.keep_rotation(now.rotation);
         }
@@ -408,6 +410,15 @@ impl Thumbs {
         self.retried.clear();
         self.built = Some(now);
         true
+    }
+
+    /// The pages are not the pages they were: no picture is any good, and the rows are made again; the list stays where it is.
+    pub fn pages_changed(&mut self) {
+        self.cache.clear();
+        self.failed.clear();
+        self.retried.clear();
+        self.built = None;
+        self.keep_place = true;
     }
 
     /// The engine could not draw a page: it is asked for once more (it may have been a passing trouble), and after a second failure the
@@ -490,6 +501,123 @@ pub fn scroll_at_bar(y: i64, view_h: i64, total: i64) -> i64 {
     let Some((_, len)) = bar(0, view_h, total) else { return 0 };
     let room = (view_h - len).max(1);
     ((y - len / 2).clamp(0, room) * (total - view_h) / room).clamp(0, (total - view_h).max(0))
+}
+
+// --- choosing thumbnails and moving them (2026-10-15) ------------------------------------------------------------------------------
+
+/// The thumbnails that are chosen (ascending, each once), and the one the next Shift+click counts from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Chosen {
+    set: Vec<u32>,
+    anchor: u32,
+}
+
+impl Chosen {
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.set.len()
+    }
+
+    pub fn contains(&self, page: usize) -> bool {
+        u32::try_from(page).is_ok_and(|p| self.set.binary_search(&p).is_ok())
+    }
+
+    pub fn clear(&mut self) {
+        self.set.clear();
+    }
+
+    /// A click: this page and no other.
+    pub fn only(&mut self, page: usize) {
+        self.anchor = u32::try_from(page).unwrap_or(u32::MAX);
+        self.set.clear();
+        self.set.push(self.anchor);
+    }
+
+    /// Ctrl+click: this page is chosen if it was not, and not if it was.
+    pub fn toggle(&mut self, page: usize) {
+        let p = u32::try_from(page).unwrap_or(u32::MAX);
+        match self.set.binary_search(&p) {
+            Ok(i) => drop(self.set.remove(i)),
+            Err(i) => self.set.insert(i, p),
+        }
+        self.anchor = p;
+    }
+
+    /// Shift+click: the pages from the one last clicked to this one, and no others.
+    pub fn up_to(&mut self, page: usize) {
+        if self.set.is_empty() {
+            return self.only(page);
+        }
+        let p = u32::try_from(page).unwrap_or(u32::MAX);
+        self.set = (self.anchor.min(p)..=self.anchor.max(p)).collect();
+    }
+
+    /// Ctrl+A.
+    pub fn all(&mut self, count: usize) {
+        self.set = (0..u32::try_from(count).unwrap_or(u32::MAX)).collect();
+        self.anchor = 0;
+    }
+
+    /// These pages and no other.
+    pub fn set(&mut self, pages: impl IntoIterator<Item = u32>) {
+        let mut v: Vec<u64> = pages.into_iter().map(u64::from).collect();
+        qingpdf_core::order::sort_u64(&mut v);
+        v.dedup();
+        self.set = v.into_iter().map(|p| p as u32).collect();
+        self.anchor = self.set.first().copied().unwrap_or(0);
+    }
+
+    /// The chosen pages, in order.
+    pub fn pages(&self) -> Vec<u32> {
+        self.set.clone()
+    }
+}
+
+/// The place between two rows (0: above the first, the number of rows: below the last) that a place `y` of the list is nearest to.
+pub fn gap_at(strip: &Strip, y: i64) -> usize {
+    match strip.row_at(y) {
+        Some(i) => strip.row(i).map_or(i, |r| if y < r.top.saturating_add(r.height / 2) { i } else { i + 1 }),
+        None if y < 0 => 0,
+        None => strip.len(),
+    }
+}
+
+/// Where the line that marks a place between rows is drawn, in the list's own pixels.
+pub fn gap_top(strip: &Strip, gap: usize) -> i64 {
+    match strip.row(gap) {
+        Some(r) => r.top,
+        None => strip.total(),
+    }
+}
+
+/// Dropping the chosen pages (ascending) in front of row `gap` leaves them where they are: they are next to each other and the place is
+/// in front of the first, in front of the last, or between.
+pub fn leaves_in_place(chosen: &[u32], gap: usize) -> bool {
+    let (Some(&first), Some(&last)) = (chosen.first(), chosen.last()) else { return true };
+    let together = (last - first) as usize + 1 == chosen.len();
+    together && gap >= first as usize && gap <= last as usize + 1
+}
+
+/// Where the chosen pages are after they are put in front of row `gap`: their places in the order `qingpdf_core::view::order_after_move` gives.
+pub fn places_after_move(count: usize, chosen: &[u32], gap: usize) -> Vec<u32> {
+    let order = qingpdf_core::view::order_after_move(count, chosen, gap);
+    order.iter().enumerate().filter(|(_, p)| chosen.binary_search(p).is_ok()).map(|(j, _)| j as u32).collect()
+}
+
+/// How far to scroll a list that spans `top` to `bottom` while a drag holds the pointer at `y`: nothing in the middle, and more the
+/// nearer to (or past) an edge, within `edge` pixels of it. Negative scrolls up.
+pub fn edge_scroll(y: i64, top: i64, bottom: i64, edge: i64, speed: i64) -> i64 {
+    let (above, below) = (top + edge - y, y - (bottom - edge));
+    if above > 0 {
+        -(speed * above.min(edge * 2) / edge.max(1)).max(1)
+    } else if below > 0 {
+        (speed * below.min(edge * 2) / edge.max(1)).max(1)
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -848,5 +976,112 @@ mod tests {
         assert_eq!(Tab::parse(" Pages "), Some(Tab::Pages));
         assert_eq!(Tab::parse("thumbnails"), None);
         assert_eq!(Tab::default(), Tab::Bookmarks);
+    }
+
+    // --- choosing and moving ---
+
+    #[test]
+    fn clicks_choose_pages_the_way_a_list_does() {
+        let mut c = Chosen::default();
+        assert!(c.is_empty());
+        c.only(3);
+        assert_eq!(c.pages(), [3]);
+        c.toggle(5);
+        c.toggle(1);
+        assert_eq!(c.pages(), [1, 3, 5]);
+        c.toggle(3);
+        assert_eq!(c.pages(), [1, 5]);
+        assert!(c.contains(5) && !c.contains(3) && !c.contains(usize::MAX));
+        // Shift+click counts from the page last clicked, either way, and drops the others.
+        c.up_to(8);
+        assert_eq!(c.pages(), [3, 4, 5, 6, 7, 8], "from page 3, which was clicked last");
+        c.up_to(0);
+        assert_eq!(c.pages(), [0, 1, 2, 3]);
+        c.only(9);
+        c.up_to(7);
+        assert_eq!(c.pages(), [7, 8, 9]);
+        // With nothing chosen a Shift+click is a click.
+        c.clear();
+        c.up_to(4);
+        assert_eq!(c.pages(), [4]);
+        c.all(5);
+        assert_eq!((c.len(), c.pages()), (5, vec![0, 1, 2, 3, 4]));
+        c.set([6, 2, 6]);
+        assert_eq!(c.pages(), [2, 6]);
+        c.all(0);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn the_place_a_drop_goes_to_is_the_gap_nearest_the_pointer() {
+        let s = letter(4);
+        let h = s.row(0).map_or(1, |r| r.height);
+        assert_eq!(gap_at(&s, -50), 0);
+        assert_eq!(gap_at(&s, 0), 0);
+        assert_eq!(gap_at(&s, h / 2 - 1), 0);
+        assert_eq!(gap_at(&s, h / 2), 1);
+        assert_eq!(gap_at(&s, h + 5), 1);
+        assert_eq!(gap_at(&s, h + h / 2 + 1), 2);
+        assert_eq!(gap_at(&s, 4 * h - 1), 4);
+        assert_eq!(gap_at(&s, 4 * h + 100), 4);
+        assert_eq!((gap_top(&s, 0), gap_top(&s, 2), gap_top(&s, 4), gap_top(&s, 9)), (0, 2 * h, 4 * h, 4 * h));
+        assert_eq!(gap_at(&Strip::default(), 10), 0);
+    }
+
+    #[test]
+    fn a_drop_that_changes_nothing_is_known_and_the_places_after_a_move_are_worked_out() {
+        // The block 3..=4 dropped in front of 3, 4 or 5 stays; in front of 2 or 6 it moves.
+        for (gap, stays) in [(2, false), (3, true), (4, true), (5, true), (6, false), (0, false)] {
+            assert_eq!(leaves_in_place(&[3, 4], gap), stays, "gap {gap}");
+        }
+        // Pages that are apart are gathered by any drop; nothing chosen changes nothing.
+        assert!(!leaves_in_place(&[1, 4], 2) && !leaves_in_place(&[1, 4], 5));
+        assert!(leaves_in_place(&[], 3));
+        assert!(leaves_in_place(&[2], 2) && leaves_in_place(&[2], 3) && !leaves_in_place(&[2], 4));
+        // Where the pages that were moved are afterwards.
+        assert_eq!(places_after_move(6, &[1, 4], 0), [0, 1]);
+        assert_eq!(places_after_move(6, &[1, 2], 6), [4, 5]);
+        assert_eq!(places_after_move(6, &[0], 3), [2]);
+        assert_eq!(places_after_move(6, &[5], 2), [2]);
+    }
+
+    #[test]
+    fn the_list_scrolls_faster_the_nearer_the_pointer_is_to_an_edge_and_not_at_all_in_the_middle() {
+        let scroll = |y| edge_scroll(y, 100, 500, 40, 20);
+        assert_eq!(scroll(300), 0);
+        assert_eq!(scroll(140), 0);
+        assert!(scroll(130) < 0 && scroll(110) < scroll(130), "{} {}", scroll(130), scroll(110));
+        assert!(scroll(470) > 0 && scroll(495) > scroll(470));
+        // Past the edge it speeds up to a limit (twice the width of the edge zone), and never stops short of one step.
+        assert_eq!(scroll(-1000), -40);
+        assert_eq!(scroll(9000), 40);
+        assert_eq!(scroll(139), -1);
+        assert_eq!(edge_scroll(-5, 0, 10, 0, 5), -1, "an edge of nothing does not divide by zero");
+        assert_eq!(edge_scroll(5, 0, 10, 0, 5), 0);
+    }
+
+    #[test]
+    fn changed_pages_make_the_rows_again_and_the_list_stays_where_it_was() {
+        let mut t = Thumbs::new();
+        t.reset(1 << 20);
+        let built = |pages| Built { metrics: M, rotation: 0, pages };
+        assert!(t.ensure(built(100), || letter(100)));
+        t.scroll = t.strip.y_of(40, 0.0);
+        t.cache.insert(thumb(40, 400, 1), 40, 44);
+        t.failed.insert(2);
+        // The same file: the rows stay where they are (the number of pages is the same); after a change to the pages they are made again.
+        assert!(!t.ensure(built(100), || letter(100)));
+        t.pages_changed();
+        assert!(t.cache.is_empty() && t.failed.is_empty());
+        assert!(t.ensure(built(100), || letter(100)), "the rows are made again though the number of pages is the same");
+        assert_eq!(t.strip.locate(t.scroll).0, 40, "the list is where it was");
+        // Fewer pages: the list is where it was, as far as it can be.
+        t.pages_changed();
+        assert!(t.ensure(built(30), || letter(30)));
+        assert_eq!(t.strip.locate(t.scroll).0, 29);
+        // And a new file starts at the top again.
+        t.reset(1 << 20);
+        assert!(t.ensure(built(30), || letter(30)));
+        assert_eq!(t.scroll, 0);
     }
 }

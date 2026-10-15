@@ -74,6 +74,7 @@ pub mod vk {
     pub const NUM0: u32 = 0x30;
     pub const NUM1: u32 = 0x31;
     pub const NUM2: u32 = 0x32;
+    pub const A: u32 = 0x41;
     pub const C: u32 = 0x43;
     pub const F: u32 = 0x46;
     pub const G: u32 = 0x47;
@@ -90,6 +91,9 @@ pub mod vk {
     pub const F4: u32 = 0x73;
     pub const OEM_PLUS: u32 = 0xBB;
     pub const OEM_MINUS: u32 = 0xBD;
+    /// `[` and `]` of a US keyboard.
+    pub const OEM_4: u32 = 0xDB;
+    pub const OEM_6: u32 = 0xDD;
 }
 
 /// What happened, as the reader hears it. (No `Debug`: a [`Event::Text`] may be a password, which must not end up in
