@@ -549,3 +549,50 @@ fn the_replace_command_leaves_the_recognised_text_of_a_scan_as_it_is() {
     assert_eq!((done.count, done.pages, done.data.len()), (0, 0, 0));
     assert!(done.skipped.iter().any(|(why, n)| why.contains("recognised text") && *n == 1), "{:?}", done.skipped);
 }
+
+/// Six pages that share what a mark is put into: two share a `/Resources` object, two inherit one from the page tree, two have their own
+/// `/Resources` whose `/XObject` is a dictionary that is an object shared by both.
+fn sharing() -> Vec<u8> {
+    let objects = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R] /Count 6 /MediaBox [0 0 300 300] /Resources 20 0 R >>".to_string()),
+        (3, "<< /Type /Page /Parent 2 0 R /Resources 21 0 R >>".to_string()),
+        (4, "<< /Type /Page /Parent 2 0 R /Resources 21 0 R >>".to_string()),
+        (5, "<< /Type /Page /Parent 2 0 R >>".to_string()),
+        (6, "<< /Type /Page /Parent 2 0 R >>".to_string()),
+        (7, "<< /Type /Page /Parent 2 0 R /Resources << /XObject 22 0 R >> >>".to_string()),
+        (8, "<< /Type /Page /Parent 2 0 R /Resources << /XObject 22 0 R >> >>".to_string()),
+        (20, "<< /ProcSet [/PDF] >>".to_string()),
+        (21, "<< /ProcSet [/PDF] >>".to_string()),
+        (22, "<< >>".to_string()),
+    ];
+    pdf(&objects, "")
+}
+
+#[test]
+fn pages_that_share_their_resources_each_get_the_text_layer_of_their_own() {
+    let dir = out_dir();
+    let input = dir.join("sharing.pdf");
+    std::fs::write(&input, sharing()).unwrap();
+    let mut v = Viewer::open(&input);
+    let names = ["ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO", "FOXTROT"];
+    let page_of = |n: u32| OcrPage { page: n, width: 600, height: 600, lines: vec![words(&[(names[n as usize], [60.0, 80.0, 300.0, 120.0])])] };
+    let result = v.layer((0..6).map(page_of).collect());
+    assert_eq!((result.status, result.page), (EditStatus::Done, ALL_PAGES), "{}", result.message);
+    for n in 0..6u32 {
+        assert_eq!(v.chars(n).0, format!("{}\n", names[n as usize]), "page {n} of the open file");
+    }
+    let saved = dir.join("sharing-ocr.pdf");
+    assert_eq!(v.save(&saved).0, SaveStatus::Done);
+    check_saved(&input, &saved);
+    let again = Document::open(&saved).unwrap();
+    let mut extractor = TextExtractor::new(&again);
+    for (n, p) in again.pages().unwrap().iter().enumerate() {
+        assert_eq!(extractor.page_chars(p, &Work::new()).unwrap().text, format!("{}\n", names[n]), "page {n} of the saved file");
+    }
+    // What the pages share is not changed, and what they are given is a copy for each (the three kinds of sharing: 21, 20, 22).
+    for (num, same) in [(20u32, "<< /ProcSet [/PDF] >>"), (21, "<< /ProcSet [/PDF] >>")] {
+        let o = again.get(qingpdf_core::object::ObjRef::new(num, 0)).unwrap();
+        assert!(matches!(&o, qingpdf_core::object::Object::Dict(d) if d.len() == 1), "object {num} ({same}) is as it was: {o:?}");
+    }
+}

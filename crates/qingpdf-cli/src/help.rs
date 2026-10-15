@@ -19,6 +19,7 @@ Commands:
   render    Draw pages as PNG images (graphics and images; letters as boxes for now)
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
   watermark Put a text or picture watermark on pages
+  pagenum   Put page numbers, headers and footers on pages
   stamp     Put a picture (a signature, a logo) on a page
   addtext   Put text on a page
   replace   Find text in the pages and replace it with other text
@@ -38,7 +39,7 @@ copying ...) opens without a password. For one that needs a password, add
 one; a password that is given is tried first, then the empty one). Results keep
 the encryption of the input; only 'decrypt' removes it.
 
-watermark, stamp, addtext and replace write into the pages' own content, so every other
+watermark, pagenum, stamp, addtext and replace write into the pages' own content, so every other
 program and a printer show it too. The output is the input with the change
 appended (the input's bytes are kept as they are, and signatures stay valid for
 what they covered); they refuse a file that is signed, and an encrypted file whose
@@ -262,6 +263,48 @@ Options:
                         its encryption)
 ";
 
+const PAGENUM: &str = "\
+Usage:
+  qingpdf pagenum <file.pdf> [--header-left <t>] [--header-center <t>] [--header-right <t>]
+                  [--footer-left <t>] [--footer-center <t>] [--footer-right <t>]
+                  [--size <points>] [--color <rrggbb>] [--margin <mm>] [--pages <list>] [--start <N>]
+                  [--mirror] [--skip-first] -o <output.pdf> [--force] [--password <password>]
+
+Put page numbers, headers and footers on the pages: up to six pieces of text, at the left, middle and
+right of the head and of the foot of each page. With no place named the number goes in the middle of the
+foot (--footer-center '{page}'). The text is embedded as a font subset, so Chinese is shown by every
+reader; it stays at the top and the bottom of the page as it is shown, upright, on a page that has a
+/Rotate and on one whose box does not start at 0. It is marked as an artifact of the page (a header or a
+footer, ISO 32000-1 14.8.2.2): text extraction, search and the export to Word and Excel leave it out.
+Running the command again adds another set.
+
+The text of a place may have fields:
+  {page}    the number of the page
+  {pages}   the number of the last page of the run (the number of pages, when the run is the whole file
+            and starts at 1)
+  {date}    today, as 2026-10-15 (UTC)
+  {file}    the name of the file, without its folder
+For example '- {page} -', '{page} / {pages}', 'Page {page} of {pages}' (Chinese text works too).
+
+Options:
+  --header-left, --header-center, --header-right, --footer-left, --footer-center, --footer-right <text>
+                        The text of a place, at most 200 characters
+  --size <points>       The size, 4 to 144 (default 10.5)
+  --color <rrggbb>      The colour in hexadecimal (default 000000)
+  --margin <mm>         The distance from the edge of the page, 0 to 500 (default 15)
+  --pages <list>        The pages to number (default: all; at most 100000 at once). The first of them
+                        is the first of the run: a later page has the start number plus its distance
+                        from the first
+  --start <N>           The number of the first page of the run, 0 to 1000000 (default 1); with
+                        --pages 3- --start 1 page 3 reads 1
+  --mirror              On the second, fourth ... page of the file the left places and the right ones
+                        change sides (the number at the outer edge when the pages are printed on both sides)
+  --skip-first          Nothing on the first page of the run (it is still counted)
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file (the result keeps its encryption)
+";
+
 const STAMP: &str = "\
 Usage:
   qingpdf stamp <file.pdf> --image <file> --page <N> --at <X,Y> --width <W> -o <output.pdf> [--force] [--password <password>]
@@ -405,6 +448,7 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Render) => format!("{RENDER}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),
         Some(Command::Watermark) => format!("{WATERMARK}{PAGE_LIST}"),
+        Some(Command::Pagenum) => format!("{PAGENUM}{PAGE_LIST}"),
         Some(Command::Stamp) => STAMP.to_string(),
         Some(Command::Addtext) => ADDTEXT.to_string(),
         Some(Command::Replace) => format!("{REPLACE}{PAGE_LIST}"),

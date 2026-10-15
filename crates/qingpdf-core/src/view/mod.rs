@@ -47,7 +47,7 @@ pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
 pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use crate::edit::{LineView, MAX_TEXT_CHARS};
-pub use crate::edit::{ALL_PAGES, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark};
+pub use crate::edit::{ALL_PAGES, MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Pagination, SLOTS, Watermark};
 pub use crate::edit::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, order_after_move};
 pub use crate::edit::{MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, TARGET_DPI};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
@@ -575,6 +575,18 @@ impl Engine {
     /// [`Event::Edited`] with `page` [`ALL_PAGES`] (every page's picture is out of date), one step to undo.
     pub fn add_watermark(&self, doc: u64, id: u64, mark: Watermark) {
         let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Watermark(Box::new(mark)) });
+    }
+
+    /// Put page numbers, headers and footers on the pages `spec.pages` (their own content, marked as artifacts of the page). Like
+    /// [`Engine::add_watermark`] in what it needs and how it is answered, one step to undo.
+    pub fn add_pagination(&self, doc: u64, id: u64, spec: Pagination) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Pagination(Box::new(spec)) });
+    }
+
+    /// Take away the page numbers, headers and footers that [`Engine::add_pagination`] wrote (on every page, whenever it was done; the
+    /// ones other programs wrote are not touched). Answered by one [`Event::Edited`] with `page` [`ALL_PAGES`]; `Failed` when there are none.
+    pub fn remove_pagination(&self, doc: u64, id: u64) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Unpaginate });
     }
 
     /// Turn pages (from 0, each once, any order) clockwise by `degrees`, a multiple of 90 (a negative number turns them the other way): the

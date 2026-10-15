@@ -114,6 +114,7 @@ fn main() {
         let author = kept.author.clone().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
         let mut app = App::new(system_lang, wake, started, max_view_pixels, author);
         app.apply_settings(&kept);
+        app.set_clock(win32::local_date);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));
             if bench_thumbs {

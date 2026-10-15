@@ -20,6 +20,7 @@ qingpdf decrypt a.pdf -o plain.pdf --password P     write an unencrypted copy (o
 qingpdf text a.pdf -o a.txt                         text in reading order (a scan gives nothing here; recognise it in the viewer: Tools > Recognize text)
 qingpdf render a.pdf --pages 1-3 --dpi 150 -o page_%d.png  draw pages to PNG
 qingpdf watermark a.pdf --text "机密" --opacity 0.3 --angle 45 --tile -o out.pdf   text or picture watermark (--under the content, --pages 1-3)
+qingpdf pagenum a.pdf --footer-center "第 {page} 页 共 {pages} 页" --mirror -o out.pdf   page numbers, headers, footers (six places; {page} {pages} {date} {file}; --pages 3- --start 1 --skip-first)
 qingpdf stamp a.pdf --image sig.png --page 3 --at 72,100 --width 120 -o out.pdf  put a picture on a page (a PNG's transparency is kept)
 qingpdf addtext a.pdf --page 1 --at 72,720 --size 12 --text "你好" -o out.pdf     put text on a page (Chinese too)
 qingpdf replace a.pdf --find "旧词" --replace "新词" --pages 1-3 -o out.pdf        change text that is already on the pages
@@ -27,7 +28,7 @@ qingpdf docx a.pdf --pages 1-10 -o a.docx            make a Word file: paragraph
 qingpdf xlsx a.pdf --pages 1-10 -o a.xlsx            make an Excel file: a sheet for each table (with lines or without)
 ```
 
-`watermark`, `stamp` and `addtext` write into the pages' own content, so every other program and a printer show it too; the text is embedded as a font subset, so Chinese is shown everywhere. The output is the input with the change appended as an incremental update (the input's bytes stay exactly as they are; the input itself is never touched). Places are points from the lower left corner of the page as it is shown, and a watermark stays upright and centred on a turned page. A signed or certified file is refused, and so is an encrypted file whose author did not allow changing it (give the owner password).
+`watermark`, `pagenum`, `stamp` and `addtext` write into the pages' own content, so every other program and a printer show it too; the text is embedded as a font subset, so Chinese is shown everywhere. The output is the input with the change appended as an incremental update (the input's bytes stay exactly as they are; the input itself is never touched). Places are points from the lower left corner of the page as it is shown, and a watermark stays upright and centred on a turned page. A signed or certified file is refused, and so is an encrypted file whose author did not allow changing it (give the owner password).
 
 `replace` changes text that is already on the pages, one line at a time (a line is what `text` and the viewer's search and selection call one). The old letters are taken out of the page's drawing instructions (they are not covered over, so copying and searching give the new text only) and the new ones are drawn where they were, in the same size, colour and spacing, with the font of the old text when it has every letter and with a matching system font subset (Song, Hei, Kai, Fang for Chinese) when it has not. Nothing is moved to make room, and a warning says when the new text is wider. The old text stays in the earlier bytes of the output (write the result again with `split --pages 1-` to drop it). Text in a form that a page draws more than once is not changed. In the viewer, *Insert > Edit text on the page* clicks a line and types it again (Enter confirms, Ctrl+Z undoes).
 

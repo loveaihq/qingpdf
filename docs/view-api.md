@@ -88,13 +88,15 @@
 
 ## 4c 的请求和结果：往页面内容里加文字、图片、水印
 
-这三样写进页面**本身的内容**（不是批注）：打印、别的软件都看得到；文字和图片也是页面的内容，提取文字、查找、选择都包括；**水印除外**：它的画法标成 `/Artifact`（`/Type /Pagination /Subtype /Watermark`，ISO 32000-1 14.8.2.2），引擎的取字（`TextExtractor`、阅读器的查找和选择）跳过标成这种水印的内容，别的软件通常也一样。位置同样是"页面显示后的点"（左上角为原点、y 向下、已按页自己的 `/Rotate` 和裁剪框转过），引擎自己转回用户空间：页面有 `/Rotate`、裁剪框不从 0 起、有 `/UserUnit`（引擎不处理它）时，文字和图片照样正着摆在要的地方，水印照样正着、在裁剪框的正中。
+这三样写进页面**本身的内容**（不是批注）：打印、别的软件都看得到；文字和图片也是页面的内容，提取文字、查找、选择都包括；**水印除外**：它的画法标成 `/Artifact`（`/Type /Pagination /Subtype /Watermark`，ISO 32000-1 14.8.2.2），引擎的取字（`TextExtractor`、阅读器的查找和选择）跳过标成这种水印的内容，别的软件通常也一样；**页码和页眉页脚也一样**（`add_pagination`，`/Subtype /Header` 或 `/Footer`），取字现在跳过所有 `/Type /Pagination` 的 `/Artifact`，包括别的软件写的页眉页脚。位置同样是"页面显示后的点"（左上角为原点、y 向下、已按页自己的 `/Rotate` 和裁剪框转过），引擎自己转回用户空间：页面有 `/Rotate`、裁剪框不从 0 起、有 `/UserUnit`（引擎不处理它）时，文字和图片照样正着摆在要的地方，水印照样正着、在裁剪框的正中。
 
 | 调用 | 作用 |
 |---|---|
 | `add_text(doc, id, page, at, text, size, color)` | 文字：`at` 是**第一行基线的左端**，`text` 里的换行是换行（一行一行往下排，行距是字体的上升加下降），最多 `MAX_FREETEXT_CHARS`（4000）字、2000 行；`size` 夹在 `MIN_FONT_SIZE`..`MAX_FONT_SIZE`；字体是 4b 的系统字体子集（中文能显示，复制出来是对的）。答 `Edited`。 |
 | `add_image(doc, id, page, rect, 图片字节)` | 图片：放成在 `rect` 里最大、保持形状、居中的一块；不挪进页内（出页的部分被页面剪掉）。PNG 的透明保持，限制和 `add_stamp` 一样（1600 万像素、12 MB）。答 `Edited`。 |
 | `add_watermark(doc, id, Watermark)` | 水印，作用于 `pages`（从 0 数，最多 `MAX_WATERMARK_PAGES`=100000 页（再大由计量器和编辑的内存预算拦），同一页写几次只做一次）。`Watermark { text, image, opacity, angle, tile, under, pages }`：`text` 最多 `MAX_WATERMARK_CHARS`（200）字，`image` 是 PNG/JPEG 字节（可以为空；文字和图片都有时图片在上），两者不能都空；`opacity` 大于 0、不超过 1（`ca`/`CA`）；`angle` 是度数，按页面看到的样子逆时针；`tile` 铺满整页（错开排，每页最多 1600 个格子里取，格子大了就放粗）；`under` 垫在原内容下面（默认盖在上面）。一个水印一次撤销一步，`Edited.page` 是 `ALL_PAGES`（`u32::MAX`）：界面把每一页的位图都作废。 |
+| `add_pagination(doc, id, Pagination)` | 页码、页眉页脚，作用于 `pages`（从 0 数，最多 `MAX_PAGINATION_PAGES`=100000 页）。`Pagination { slots, size, color, margin, pages, start, mirror, skip_first, file, date }`：`slots` 是六处的模板（页眉左、中、右，页脚左、中、右；空白就是那处不写；每个最多 `MAX_TEMPLATE_CHARS`=200 字），模板里的 `{page}`（页码）、`{pages}`（范围里最后一页的页码）、`{date}`（用 `date` 的原文）、`{file}`（用 `file` 的原文）换成内容，别的字（包括花括号）原样写；`size` 点（夹在 4..144）；`margin` 毫米（0..`MAX_MARGIN_MM`=500），页眉的上沿、页脚的下沿、左右两处的外沿离页边这么远，中间那处居中；`start` 范围里第一页的编号（最大 `MAX_START`=1000000），范围里的第一页是 `pages` 里页号最小的一页，别的页是 `start` 加上它离第一页的页数；`mirror` 文件里第 2、4、6…页左右两处互换；`skip_first` 范围里的第一页不写（仍计数）。位置按页面显示后的样子（可见框、`/Rotate`），文字正着。字体是一个系统字体子集，所有页共用；每页一条自己的内容流，标成页眉或页脚的 `/Artifact`，页字典里用私有键 `/QpPagination` 记下这些流。答一个 `Edited`，`page` 是 `ALL_PAGES`，撤销一步。 |
+| `remove_pagination(doc, id)` | 删掉 `add_pagination` 写的页码和页眉页脚（所有页，不管哪次写的）：把页字典 `/QpPagination` 里记的流从 `/Contents` 拿掉；别的软件写的不动；一处也没找到答 `Failed`。需要的权限和 `add_pagination` 一样。 |
 
 字体、图片和水印的标记（一个带自己资源的 Form XObject）**只做一次**，每页只引用它；被几页共用或继承来的 `/Resources` 复制一份给这些页，不改原对象；原内容的流（共用的也一样）原样留着；盖在上面时，引擎把原内容的每个流读一次（按对象号缓存），数出它留着没关的 `q`、没有 `q` 对应的 `Q`、没结束的 `BT` 和没画的路径：前面补上同样多的 `q`，后面先补 `n`、`ET` 再补同样多的 `Q`，新内容就在页面开始时的图形状态里画（垫在下面的不用）。细节见 `docs/decisions.md` 的"第 4 层 4c"。
 

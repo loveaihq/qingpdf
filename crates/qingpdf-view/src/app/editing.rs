@@ -76,6 +76,9 @@ pub(super) enum Asked {
     Delete,
     Move,
     Insert,
+    /// Page numbers, headers and footers were put on, or taken away.
+    Pagenum,
+    Unpagenum,
 }
 
 impl Asked {
@@ -628,6 +631,8 @@ impl App {
                         Asked::Add => Some(Msg::NoteAdded),
                         Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
+                        Asked::Pagenum => Some(Msg::NotePagenum),
+                        Asked::Unpagenum => Some(Msg::NoteUnpagenum),
                         Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert => None,
                     }
                 };

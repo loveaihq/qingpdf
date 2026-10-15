@@ -158,6 +158,77 @@ pub enum Event {
     FindFocus,
     /// Enter in the page number box of the toolbar: what is in it.
     PageBox(String),
+    /// The answer to [`Action::AskForm`]: what was filled in, or none if it was cancelled.
+    Form { tag: u32, answer: Option<FormAnswer> },
+}
+
+/// One thing in a form box ([`Action::AskForm`]): what it is, what it says, and where it is in the box (`x, y, w, h` in units of a 96th of
+/// an inch from the box's top left corner; the height of a `Combo` is that of its list when it is open).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormItem {
+    pub kind: FormKind,
+    pub text: String,
+    pub rect: (i32, i32, i32, i32),
+    /// The entries of a `Combo` or a `Pick`.
+    pub choices: Vec<String>,
+    /// The entry a `Pick` starts with; for a `Check`, 1 when it starts ticked.
+    pub selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormKind {
+    /// Words (`text`).
+    Label,
+    /// A frame round some of the others, with `text` for its title.
+    Group,
+    /// A line of text that starts as `text`.
+    Edit,
+    /// A line of text that starts as `text`, with a list of `choices` to pick one from (what is picked replaces the line).
+    Combo,
+    /// A list of `choices` to pick one from.
+    Pick,
+    /// A tick box with `text` beside it.
+    Check,
+    /// A button with `text` on it that closes the box ([`FormAnswer::button`] says which).
+    Button,
+}
+
+/// A box with several things to fill in, in the place and the size the reader says; OK and Cancel are at its foot, right.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormSpec {
+    pub tag: u32,
+    pub title: String,
+    /// The size of what is inside the box, in units of a 96th of an inch; the last 44 units are the foot with the buttons.
+    pub size: (i32, i32),
+    pub items: Vec<FormItem>,
+    pub ok: String,
+    pub cancel: String,
+    /// A sketch of a page that shows what is typed, as it is typed.
+    pub preview: Option<FormPreview>,
+}
+
+/// A white page in a form box with the text of six places on it: the text of the six `Combo` or `Edit` items it is given, with the fields
+/// filled in (`{page}`, `{pages}`, `{date}`, `{file}` stand for `fields`, in that order), at the left, middle and right of the head and of
+/// the foot. When the tick box `mirror` is ticked and the page is a `left_page`, the left and right places change sides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormPreview {
+    /// Where the sketch is (units of a 96th of an inch, like the items'): the page is as big as fits in it.
+    pub rect: (i32, i32, i32, i32),
+    /// The shape of the page: its width and its height, in any unit.
+    pub shape: (i32, i32),
+    /// The numbers (in `FormSpec::items`) of the six places' items, head left first, and of the tick box.
+    pub slots: [usize; 6],
+    pub mirror: usize,
+    pub fields: [String; 4],
+    pub left_page: bool,
+}
+
+/// What was filled in: the value of each `Edit` and `Combo` (its text), `Pick` (the number of the entry) and `Check` (`1` or `0`), in
+/// the order of the items; and which `Button` closed the box (counting the buttons only), or none when it was OK.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormAnswer {
+    pub values: Vec<String>,
+    pub button: Option<usize>,
 }
 
 /// How the person left the box a form field or a text box is typed in.
@@ -273,6 +344,8 @@ pub enum Action {
     /// Ask for a line of text in a box of its own; the answer comes as [`Event::Text`] with the same `tag`. A
     /// `secret` is shown as dots, and what is typed is wiped from the window's memory once it has been handed over.
     AskText { tag: u32, title: String, prompt: String, secret: bool, ok: String, cancel: String },
+    /// Ask for several things in a box of its own; the answer comes as [`Event::Form`] with the same tag.
+    AskForm(FormSpec),
     Message { title: String, text: String },
     /// Ask a question that is answered yes or no (the answer is [`Event::Confirmed`] with the same `tag`); the answer is no
     /// unless the person says yes.

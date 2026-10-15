@@ -16,6 +16,7 @@ mod fill;
 pub(crate) mod fontsub;
 pub(crate) mod incremental;
 mod ocr;
+mod pagenum;
 mod pages;
 mod retext;
 pub(crate) mod signature;
@@ -38,6 +39,7 @@ pub use ocr::{has_layer as has_ocr_layer, MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_S
 pub use pages::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, PageOp, Password, order_after_move};
 pub(crate) use pages::unique as unique_pages;
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
+pub use pagenum::{MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, Pagination, SLOTS};
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
 pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
 /// Most points one drawing has (all its strokes together); a longer one is thinned out, its ends kept.
@@ -107,6 +109,10 @@ pub enum Edit {
     AddImage { page: u32, rect: [f32; 4], image: Vec<u8> },
     /// A watermark on several pages (their own content, 4c).
     Watermark(Box<Watermark>),
+    /// Page numbers, headers and footers on several pages (their own content).
+    Pagination(Box<Pagination>),
+    /// Take away the page numbers, headers and footers that a `Pagination` wrote (on every page).
+    Unpaginate,
     /// Change the line of text at `at` (points of the page as shown; it reads `old`) into `text` (5a, the page's own content).
     ReplaceLine { page: u32, at: [f32; 2], old: String, text: String },
     /// An invisible text layer over scanned pages, from the words a recogniser found (5c, the pages' own content): one font for all
@@ -142,14 +148,14 @@ impl Edit {
             | Edit::AddText { page, .. }
             | Edit::AddImage { page, .. }
             | Edit::ReplaceLine { page, .. } => *page,
-            Edit::Watermark(_) | Edit::OcrLayer(_) | Edit::Pages(_) => ALL_PAGES,
+            Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) => ALL_PAGES,
         }
     }
 
     pub fn class(&self) -> EditClass {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
-            Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::ReplaceLine { .. } | Edit::OcrLayer(_) => EditClass::Content,
+            Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::ReplaceLine { .. } | Edit::OcrLayer(_) => EditClass::Content,
             Edit::Pages(_) => EditClass::Assemble,
             _ => EditClass::Annotate,
         }
@@ -160,6 +166,12 @@ impl Edit {
 pub fn pdf_date_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     pdf_date(secs)
+}
+
+/// Today's date in UTC as `2026-10-15` (the date of a page number's `{date}` when nothing knows the person's time zone).
+pub fn today_utc() -> String {
+    let d = pdf_date_now();
+    format!("{}-{}-{}", d.get(2..6).unwrap_or(""), d.get(6..8).unwrap_or(""), d.get(8..10).unwrap_or(""))
 }
 
 /// A PDF date for `secs` seconds after 1970-01-01 00:00:00 UTC.
@@ -336,6 +348,14 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
         content::watermark(&mut ctx, pages, mark)?;
         return Ok((ctx.objects, ctx.notes));
     }
+    if let Edit::Pagination(_) | Edit::Unpaginate = edit {
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
+        match edit {
+            Edit::Pagination(spec) => pagenum::paginate(&mut ctx, pages, spec)?,
+            _ => pagenum::unpaginate(&mut ctx, pages)?,
+        }
+        return Ok((ctx.objects, ctx.notes));
+    }
     if let Edit::OcrLayer(recognised) = edit {
         let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
         ocr::layer(&mut ctx, pages, recognised)?;
@@ -360,7 +380,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::OcrLayer(_) | Edit::Pages(_) => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));

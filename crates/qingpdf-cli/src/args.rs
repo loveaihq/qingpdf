@@ -18,6 +18,7 @@ pub enum Command {
     Render,
     Img2pdf,
     Watermark,
+    Pagenum,
     Stamp,
     Addtext,
     Replace,
@@ -26,7 +27,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 15] = [
+    pub const ALL: [Command; 16] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -37,6 +38,7 @@ impl Command {
         Command::Render,
         Command::Img2pdf,
         Command::Watermark,
+        Command::Pagenum,
         Command::Stamp,
         Command::Addtext,
         Command::Replace,
@@ -56,6 +58,7 @@ impl Command {
             Command::Render => "render",
             Command::Img2pdf => "img2pdf",
             Command::Watermark => "watermark",
+            Command::Pagenum => "pagenum",
             Command::Stamp => "stamp",
             Command::Addtext => "addtext",
             Command::Replace => "replace",
@@ -92,6 +95,22 @@ pub enum Request {
         tile: bool,
         under: bool,
         pages: Option<String>,
+        output: PathBuf,
+        force: bool,
+        password: String,
+    },
+    /// Page numbers, headers and footers. `slots`: the templates (head left, middle, right; foot left, middle, right), `None` for a
+    /// place nothing was said of; `size` in points; `margin` in millimetres.
+    Pagenum {
+        input: PathBuf,
+        slots: Box<[Option<String>; 6]>,
+        size: f64,
+        color: [u8; 3],
+        margin: f64,
+        pages: Option<String>,
+        start: u32,
+        mirror: bool,
+        skip_first: bool,
         output: PathBuf,
         force: bool,
         password: String,
@@ -143,11 +162,24 @@ struct Allowed {
     password: bool,
     /// The options that put things on pages: `--text`, `--image`, `--opacity`, `--tile`, `--under`, `--at`, `--width`, `--size`.
     mark: bool,
+    /// The options of `pagenum`: the six places, `--color`, `--margin`, `--start`, `--mirror`, `--skip-first`.
+    pagenum: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
-    let none =
-        Allowed { output: false, force: false, pages: false, every: false, angle: false, page: false, dpi: false, no_annots: false, password: false, mark: false };
+    let none = Allowed {
+        output: false,
+        force: false,
+        pages: false,
+        every: false,
+        angle: false,
+        page: false,
+        dpi: false,
+        no_annots: false,
+        password: false,
+        mark: false,
+        pagenum: false,
+    };
     match c {
         Command::Info => Allowed { password: true, ..none },
         Command::Merge => Allowed { output: true, force: true, password: true, ..none },
@@ -159,6 +191,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
         Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
+        Command::Pagenum => Allowed { output: true, force: true, pages: true, password: true, mark: true, pagenum: true, ..none },
         Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
         Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
         Command::Docx | Command::Xlsx => Allowed { output: true, force: true, pages: true, password: true, ..none },
@@ -188,6 +221,13 @@ struct Collected {
     replace: Option<String>,
     tile: bool,
     under: bool,
+    /// `pagenum`: the templates by place, `--color`, `--margin`, `--start`, and the two switches.
+    slots: [Option<String>; 6],
+    color: Option<String>,
+    margin: Option<String>,
+    start: Option<String>,
+    mirror: bool,
+    skip_first: bool,
 }
 
 fn text(value: OsString, option: &str, command: Command) -> Result<String, UsageError> {
@@ -252,6 +292,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--dpi" if ok.dpi => {}
             "--password" if ok.password => {}
             "--text" | "--image" | "--opacity" | "--at" | "--width" | "--size" | "--find" | "--replace" if ok.mark && mark_option(command, &name) => {}
+            "--header-left" | "--header-center" | "--header-right" | "--footer-left" | "--footer-center" | "--footer-right" | "--color" | "--margin" | "--start" if ok.pagenum => {}
+            "--mirror" | "--skip-first" if ok.pagenum => {
+                if inline.is_some() {
+                    return Err(usage(c, format!("{name} does not take a value")));
+                }
+                if name == "--mirror" {
+                    got.mirror = true;
+                } else {
+                    got.skip_first = true;
+                }
+                continue;
+            }
             "--tile" | "--under" if ok.mark && mark_option(command, &name) => {
                 if inline.is_some() {
                     return Err(usage(c, format!("{name} does not take a value")));
@@ -324,6 +376,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                     return Err(slot_taken("--image"));
                 }
             }
+            "--color" | "--margin" | "--start" => {
+                let slot = match name.as_str() {
+                    "--color" => &mut got.color,
+                    "--margin" => &mut got.margin,
+                    _ => &mut got.start,
+                };
+                if slot.replace(text(value, &name, command)?).is_some() {
+                    return Err(slot_taken(&name));
+                }
+            }
+            n if PLACES.contains(&n) => {
+                let place = PLACES.iter().position(|p| *p == n).and_then(|i| got.slots.get_mut(i));
+                if let Some(slot) = place
+                    && slot.replace(text(value, &name, command)?).is_some()
+                {
+                    return Err(slot_taken(&name));
+                }
+            }
             "--text" | "--opacity" | "--at" | "--width" | "--size" | "--find" | "--replace" => {
                 let slot = match name.as_str() {
                     "--text" => &mut got.text,
@@ -348,10 +418,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
     finish(command, got).map(Parsed::Run)
 }
 
+/// The options that name the six places of `pagenum`, in the order of the engine's slots.
+const PLACES: [&str; 6] = ["--header-left", "--header-center", "--header-right", "--footer-left", "--footer-center", "--footer-right"];
+
 /// Which of the options that put things on pages a command takes.
 fn mark_option(command: Command, name: &str) -> bool {
     match command {
         Command::Watermark => matches!(name, "--text" | "--image" | "--opacity" | "--tile" | "--under"),
+        Command::Pagenum => name == "--size",
         Command::Stamp => matches!(name, "--image" | "--at" | "--width"),
         Command::Replace => matches!(name, "--find" | "--replace"),
         _ => matches!(name, "--text" | "--at" | "--size"),
@@ -388,9 +462,19 @@ fn place(c: Option<Command>, value: Option<&str>) -> Result<[f64; 2], UsageError
     Ok(parsed)
 }
 
+/// `rrggbb` (with or without a `#`) as a colour.
+fn hex_color(v: &str) -> Option<[u8; 3]> {
+    let v = v.trim().trim_start_matches('#');
+    if v.len() != 6 || !v.is_ascii() {
+        return None;
+    }
+    let part = |i: usize| v.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+    Some([part(0)?, part(2)?, part(4)?])
+}
+
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -486,6 +570,41 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 return Err(usage(c, format!("--angle must be from -{MAX_ANGLE} to {MAX_ANGLE} degrees, not '{}'", angle.as_deref().unwrap_or_default())));
             }
             Ok(Request::Watermark { input, text, image, opacity: opacity as f32, angle: degrees as f32, tile, under, pages, output, force, password })
+        }
+        Command::Pagenum => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let size = number(c, "--size", size.as_deref(), 10.5)?;
+            if size <= 0.0 {
+                return Err(usage(c, "--size must be more than 0 points"));
+            }
+            let margin = number(c, "--margin", margin.as_deref(), 15.0)?;
+            if !(0.0..=f64::from(qingpdf_core::edit::MAX_MARGIN_MM)).contains(&margin) {
+                return Err(usage(c, format!("--margin must be from 0 to {} millimetres", qingpdf_core::edit::MAX_MARGIN_MM)));
+            }
+            let start = match start.as_deref() {
+                None => 1,
+                Some(v) => v
+                    .trim()
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&n| n <= qingpdf_core::edit::MAX_START)
+                    .ok_or_else(|| usage(c, format!("--start needs a whole number from 0 to {}, not '{v}'", qingpdf_core::edit::MAX_START)))?,
+            };
+            let color = match color.as_deref() {
+                None => [0, 0, 0],
+                Some(v) => hex_color(v).ok_or_else(|| usage(c, format!("--color needs six hexadecimal digits like 1f3a93, not '{v}'")))?,
+            };
+            let mut slots = slots;
+            if slots.iter().all(Option::is_none) {
+                // Said nothing about the places: the number in the middle of the foot.
+                if let Some(slot) = slots.get_mut(4) {
+                    *slot = Some("{page}".to_string());
+                }
+            } else if slots.iter().flatten().all(|t| t.trim().is_empty()) {
+                return Err(usage(c, "pagenum needs some text for at least one of the six places"));
+            }
+            Ok(Request::Pagenum { input, slots: Box::new(slots), size, color, margin, pages, start, mirror, skip_first, output, force, password })
         }
         Command::Stamp => {
             let input = one_input(&mut inputs)?;
@@ -745,5 +864,58 @@ mod tests {
         // The error carries the command to point the user at.
         assert_eq!(p(&["rotate", "a.pdf"]).unwrap_err().command, Some(Command::Rotate));
         assert_eq!(p(&[]).unwrap_err().command, None);
+    }
+
+    #[test]
+    fn pagenum_in_its_documented_forms() {
+        // No place named: the number in the middle of the foot.
+        assert_eq!(
+            run(&["pagenum", "a.pdf", "-o", "out.pdf"]),
+            Request::Pagenum {
+                input: "a.pdf".into(),
+                slots: Box::new([None, None, None, None, Some("{page}".to_string()), None]),
+                size: 10.5,
+                color: [0, 0, 0],
+                margin: 15.0,
+                pages: None,
+                start: 1,
+                mirror: false,
+                skip_first: false,
+                output: "out.pdf".into(),
+                force: false,
+                password: String::new()
+            }
+        );
+        assert_eq!(
+            run(&["pagenum", "a.pdf", "--header-left", "{file}", "--header-center", "c", "--header-right", "{date}", "--footer-left", "l", "--footer-center=- {page} -", "--footer-right", "r", "--size", "12", "--color", "#1F3a93", "--margin", "20", "--pages", "3-", "--start", "0", "--mirror", "--skip-first", "-o", "out.pdf", "--force"]),
+            Request::Pagenum {
+                input: "a.pdf".into(),
+                slots: Box::new([Some("{file}".to_string()), Some("c".to_string()), Some("{date}".to_string()), Some("l".to_string()), Some("- {page} -".to_string()), Some("r".to_string())]),
+                size: 12.0,
+                color: [0x1f, 0x3a, 0x93],
+                margin: 20.0,
+                pages: Some("3-".to_string()),
+                start: 0,
+                mirror: true,
+                skip_first: true,
+                output: "out.pdf".into(),
+                force: true,
+                password: String::new()
+            }
+        );
+        for (args, word) in [
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--color", "12345"], "six hexadecimal digits"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--color", "gg0000"], "six hexadecimal digits"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--margin", "501"], "--margin must be from 0 to 500"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--start", "1000001"], "--start needs a whole number from 0 to 1000000"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--size", "0"], "--size must be more than 0"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--mirror=1"], "does not take a value"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--footer-left", "a", "--footer-left", "b"], "--footer-left given more than once"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--footer-left", " "], "some text"),
+            (vec!["pagenum", "a.pdf", "-o", "o.pdf", "--text", "x"], "unknown option '--text'"),
+            (vec!["watermark", "a.pdf", "--text", "x", "-o", "o.pdf", "--mirror"], "unknown option '--mirror'"),
+        ] {
+            assert!(fails(&args).contains(word), "{args:?}");
+        }
     }
 }

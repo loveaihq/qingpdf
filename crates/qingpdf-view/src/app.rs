@@ -12,6 +12,7 @@ mod forms;
 mod menus;
 mod ocr;
 mod outline;
+mod pagenum;
 mod pages;
 mod printjob;
 mod recents;
@@ -83,6 +84,8 @@ pub const CMD_STAMP: u32 = 36;
 pub const CMD_INS_TEXT: u32 = 37;
 pub const CMD_INS_IMAGE: u32 = 38;
 pub const CMD_INS_WM: u32 = 39;
+/// Insert > page numbers, headers and footers.
+pub const CMD_INS_PAGENUM: u32 = 91;
 pub const CMD_WM_OPACITY_BASE: u32 = 80;
 pub const CMD_WM_ANGLE_BASE: u32 = 84;
 pub const CMD_WM_TILE: u32 = 88;
@@ -132,6 +135,7 @@ const TAG_AUTHOR: u32 = 5;
 const TAG_UNSAVED: u32 = 6;
 const TAG_WATERMARK: u32 = 7;
 const TAG_SRC_PASSWORD: u32 = 8;
+const TAG_PAGENUM: u32 = 9;
 
 // Timers.
 /// The view has stopped moving.
@@ -323,6 +327,8 @@ pub struct App {
     // --- the pages (2026-10-15) ---
     /// Which thumbnails are chosen, the drag of them, and the pages put in or extracted.
     pg: PageWork,
+    /// What the box of Insert > Page numbers... holds.
+    pn: pagenum::Pagenum,
 }
 
 impl App {
@@ -410,6 +416,7 @@ impl App {
             thumb_nav: false,
             bench_sidebar: false,
             pg: PageWork::new(),
+            pn: pagenum::Pagenum::new(),
         }
     }
 
@@ -979,6 +986,7 @@ impl App {
             CMD_STAMP | CMD_INS_IMAGE => self.ask_for_stamp(cmd == CMD_INS_IMAGE),
             CMD_TOOL_TEXTBOX | CMD_INS_TEXT => self.text_tool(cmd == CMD_INS_TEXT),
             CMD_INS_WM => self.ask_watermark(),
+            CMD_INS_PAGENUM => self.ask_pagenum(),
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
@@ -1298,6 +1306,8 @@ impl Handler for App {
                 _ => Vec::new(),
             },
             Event::Text { .. } => Vec::new(),
+            Event::Form { tag: TAG_PAGENUM, answer } => self.pagenum_answered(answer),
+            Event::Form { .. } => Vec::new(),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
             Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),
             Event::FindFocus => self.find_focused(),

@@ -403,7 +403,8 @@ pub(super) fn layer(ctx: &mut Ctx<'_>, pages: &[Page], ocr: &[OcrPage]) -> Resul
         }
         let to_user = content::upright(&shown);
         let name = format!("Qo{}", form.num);
-        content::put_on_page(ctx, &mut shared, page, &name, form, false, &|n| format!("q {} /{n} Do Q\n", content::cm(to_user)))?;
+        let how = content::Placing { resource: content::Resource { category: "XObject", wanted: &name, object: form }, under: false, tag: None };
+        content::put_on_page(ctx, &mut shared, page, &how, &|n| format!("q {} /{n} Do Q\n", content::cm(to_user)))?;
     }
     if !any {
         return Err(Error::Invalid("no text was recognised".to_string()));

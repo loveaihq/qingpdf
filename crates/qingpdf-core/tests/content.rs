@@ -657,7 +657,7 @@ fn pages_that_share_big_resources_or_an_xobject_dictionary_share_one_copy_and_th
 }
 
 #[test]
-fn only_a_watermark_is_marked_as_an_artifact_and_only_a_watermark_artifact_is_left_out_of_the_text() {
+fn only_a_watermark_is_marked_as_an_artifact_and_only_watermark_and_pagination_artifacts_are_left_out_of_the_text() {
     let out = out_dir();
     let input = out.join("artifacts.pdf");
     std::fs::write(&input, shapes()).unwrap();
@@ -688,10 +688,14 @@ fn only_a_watermark_is_marked_as_an_artifact_and_only_a_watermark_artifact_is_le
         }
         check_saved(&input, &file, "");
     }
-    // The extractor: a header artifact, a span that merely carries a `/Subtype /Watermark`, and a watermark artifact (with a nested
-    // sequence, and one drawn by a form); text after the watermark and after a form that left a sequence open is text again.
+    // The extractor: a header and a footer artifact (`/Type /Pagination`), a span that merely carries a `/Subtype /Watermark`, a layout
+    // artifact, and a watermark artifact (with a nested sequence, and one drawn by a form); text after the watermark and after a form
+    // that left a sequence open is text again.
     let page = "BT /F1 12 Tf 20 150 Td (Body one) Tj ET\n\
         /Artifact <</Type /Pagination /Subtype /Header>> BDC BT /F1 12 Tf 20 130 Td (Header) Tj ET EMC\n\
+        /Artifact <</Type/Pagination/Subtype/Footer>> BDC BT /F1 12 Tf 20 120 Td (Footer) Tj ET EMC\n\
+        /Artifact <</Type /Layout>> BDC BT /F1 12 Tf 20 115 Td (Layout) Tj ET EMC\n\
+        /Artifact <</Type /PaginationX>> BDC BT /F1 12 Tf 20 112 Td (Near name) Tj ET EMC\n\
         /Span <</Subtype /Watermark>> BDC BT /F1 12 Tf 20 110 Td (Span) Tj ET EMC\n\
         /Artifact <</Type /Pagination\n/Subtype\n/Watermark>> BDC /P BMC BT /F1 12 Tf 20 90 Td (Hidden) Tj ET EMC BT /F1 12 Tf 20 70 Td (Hidden too) Tj ET /Fm0 Do EMC\n\
         /Artifact <</Subtype /WatermarkX>> BDC BT /F1 12 Tf 20 50 Td (Close name) Tj ET EMC\n\
@@ -710,11 +714,11 @@ fn only_a_watermark_is_marked_as_an_artifact_and_only_a_watermark_artifact_is_le
     std::fs::write(&file, pdf(&objects, "")).unwrap();
     let hand = Document::open(&file).unwrap();
     let got = TextExtractor::new(&hand).page_text(&hand.pages().unwrap()[0]).unwrap();
-    for shown in ["Body one", "Header", "Span", "Close name", "Body two"] {
+    for shown in ["Body one", "Layout", "Near name", "Span", "Close name", "Body two"] {
         assert!(got.contains(shown), "{shown} is text: {got:?}");
     }
-    for hidden in ["Hidden", "Form hidden", "Left open"] {
-        assert!(!got.contains(hidden), "{hidden} is a watermark: {got:?}");
+    for hidden in ["Header", "Footer", "Hidden", "Form hidden", "Left open"] {
+        assert!(!got.contains(hidden), "{hidden} is an artifact of the page: {got:?}");
     }
 }
 

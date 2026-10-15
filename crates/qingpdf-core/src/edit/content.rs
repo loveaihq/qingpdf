@@ -29,6 +29,7 @@ use miniz_oxide::deflate::compress_to_vec_zlib;
 use super::appearance::num;
 use super::boxes::{self, BOX_COST, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use super::fontsub::{self, Look};
+use super::pagenum::Pagination;
 use crate::layout::{self, Face};
 use super::signature::{self, Policy};
 use super::{Ctx, Edit, EditClass, MAX_FREETEXT_CHARS, apply_metered, commit, replay, save_section};
@@ -135,10 +136,13 @@ pub(super) struct Shared {
     /// Streams made, by their content.
     streams: Vec<(Vec<u8>, ObjRef)>,
     /// The copy made of a `/Resources` that pages share (its object number, or for one that the page tree gives them an address
-    /// that is the same for all of them), with the name the mark has in it.
-    resources: Vec<((bool, usize), String, ObjRef)>,
-    /// The copy made of an `/XObject` dictionary that is an object of its own (by its number), with the name the mark has in it.
-    xobjects: Vec<(u32, String, ObjRef)>,
+    /// that is the same for all of them) for a mark (the number of its object: pages that are given different marks, like the text
+    /// layers of 5c, each need a copy of their own), with the name the mark has in it.
+    resources: Vec<((bool, usize, u32), String, ObjRef)>,
+    /// The copy made of the dictionary of a kind of resource (`/XObject`, `/Font`) that is an object of its own (its number and the
+    /// number of the mark's object), with the name the mark has in it. (One `Shared` is for one kind of resource: an edit puts all its
+    /// marks in the same kind.)
+    dicts: Vec<((u32, u32), String, ObjRef)>,
     /// What the content streams (by object number) do to the graphics state, found once for each.
     balances: Vec<(u32, Balance)>,
     /// The page objects already changed (a page that the tree lists twice is changed once).
@@ -264,12 +268,12 @@ pub(super) fn contents_list(doc: &Document, contents: Option<&Object>) -> Vec<Ob
     Vec::new()
 }
 
-/// A name for the mark that `xobjects` does not have yet: `wanted`, or that with `x` added.
+/// A name for the mark that `entries` does not have yet: `wanted`, or that with `x` added.
 /// (A dictionary that has them all, made on purpose, is not worth the time.)
-fn free_name(xobjects: &Dict, wanted: &str) -> Result<String> {
+fn free_name(entries: &Dict, wanted: &str) -> Result<String> {
     let mut name = wanted.to_string();
     for _ in 0..=MAX_NAME_TRIES {
-        if !xobjects.contains_key(&name) {
+        if !entries.contains_key(&name) {
             return Ok(name);
         }
         name.push('x');
@@ -277,15 +281,33 @@ fn free_name(xobjects: &Dict, wanted: &str) -> Result<String> {
     Err(Error::Invalid("the page's resources have too many names like the one for the new mark".to_string()))
 }
 
-/// Put the mark `xobject` in the `/XObject` dictionary of `resources`, and give the name it has there. A dictionary of its own
-/// (an object) is copied once, for all the resources that have it; one inside the resources is changed where it is.
-fn add_xobject(ctx: &mut Ctx<'_>, shared: &mut Shared, resources: &mut Dict, wanted: &str, xobject: ObjRef) -> Result<String> {
-    match resources.remove("XObject") {
+/// What a page's resources get for a mark: `object`, listed under `category` (`XObject` or `Font`) with the name `wanted`, or another
+/// one if the page has that name already.
+pub(super) struct Resource<'a> {
+    pub category: &'static str,
+    pub wanted: &'a str,
+    pub object: ObjRef,
+}
+
+/// How a mark goes on a page: what the resources get, whether it is `under` the page's content, and the page key (`tag`) under which the
+/// streams that draw it are listed (a private key of the page, so that they can be found again and taken out).
+pub(super) struct Placing<'a> {
+    pub resource: Resource<'a>,
+    pub under: bool,
+    pub tag: Option<&'a str>,
+}
+
+/// Put the resource in the dictionary of its kind in `resources`, and give the name it has there. A dictionary of its own (an object)
+/// is copied once, for all the resources that have it; one inside the resources is changed where it is.
+fn add_resource(ctx: &mut Ctx<'_>, shared: &mut Shared, resources: &mut Dict, res: &Resource<'_>) -> Result<String> {
+    let (category, wanted, object) = (res.category, res.wanted, res.object);
+    match resources.remove(category) {
         Some(Object::Ref(x)) => {
-            let at = match shared.xobjects.binary_search_by(|(k, ..)| k.cmp(&x.num)) {
+            let key = (x.num, object.num);
+            let at = match shared.dicts.binary_search_by(|(k, ..)| k.cmp(&key)) {
                 Ok(i) => {
-                    let (_, name, copy) = shared.xobjects.get(i).cloned().unwrap_or_else(|| (0, wanted.to_string(), x));
-                    resources.set("XObject", Object::Ref(copy));
+                    let (_, name, copy) = shared.dicts.get(i).cloned().unwrap_or_else(|| ((0, 0), wanted.to_string(), x));
+                    resources.set(category, Object::Ref(copy));
                     return Ok(name);
                 }
                 Err(i) => i,
@@ -296,40 +318,43 @@ fn add_xobject(ctx: &mut Ctx<'_>, shared: &mut Shared, resources: &mut Dict, wan
             };
             charge(ctx, BYTE_COST * copy.approx_size() as f64)?;
             let name = free_name(&copy, wanted)?;
-            copy.set(name.as_str(), Object::Ref(xobject));
+            copy.set(name.as_str(), Object::Ref(object));
             let r = ctx.alloc()?;
             ctx.spend(copy.approx_size() + 48)?;
             ctx.objects.push((r.num, Object::Dict(copy)));
-            shared.xobjects.insert(at, (x.num, name.clone(), r));
-            resources.set("XObject", Object::Ref(r));
+            shared.dicts.insert(at, (key, name.clone(), r));
+            resources.set(category, Object::Ref(r));
             Ok(name)
         }
         other => {
-            let mut xobjects = match other {
+            let mut entries = match other {
                 Some(Object::Dict(d)) => d,
                 _ => Dict::new(),
             };
-            let name = free_name(&xobjects, wanted)?;
-            xobjects.set(name.as_str(), Object::Ref(xobject));
-            resources.set("XObject", Object::Dict(xobjects));
+            let name = free_name(&entries, wanted)?;
+            entries.set(name.as_str(), Object::Ref(object));
+            resources.set(category, Object::Dict(entries));
             Ok(name)
         }
     }
 }
 
-/// Make the page draw the mark `xobject`: `draw(name)` is the content that does it, `name` the one the mark has in the page's
-/// resources (`wanted` unless the page has that already). On top of the page (its own content between `q` and `Q`), or `under` it.
-pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, wanted: &str, xobject: ObjRef, under: bool, draw: &dyn Fn(&str) -> String) -> Result<()> {
+/// Make the page draw the mark: `draw(name)` is the content that does it, `name` the one the mark has in the page's resources (the
+/// wanted one unless the page has that already). On top of the page (its own content between `q` and `Q`), or `under` it. With a `tag`,
+/// the stream that draws the mark is a stream of its own, listed under that key of the page, and what balances the page's own content
+/// is kept apart from it: the drawing can be taken away again and the page stays as it was.
+pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, how: &Placing<'_>, draw: &dyn Fn(&str) -> String) -> Result<()> {
+    let under = how.under;
     let Object::Dict(mut dict) = ctx.doc.get(page.obj_ref)? else { return Err(Error::Invalid("the page is not a dictionary".to_string())) };
     charge(ctx, PAGE_COST + BYTE_COST * dict.approx_size() as f64)?;
 
     // The resources: a dictionary of the page's own is changed in place (the page is being written anyway); an object, or what the
     // page tree gives the page, is not changed: a copy is made, once for all the pages that have it (and only then is it read).
     let (key, inherited) = match dict.get("Resources") {
-        Some(Object::Ref(r)) => (Some((false, r.num as usize)), None),
+        Some(Object::Ref(r)) => (Some((false, r.num as usize, how.resource.object.num)), None),
         Some(_) => (None, None),
         None => match page.inherited("Resources") {
-            Some(a) => (Some((true, a.id)), Some(a.object)),
+            Some(a) => (Some((true, a.id, how.resource.object.num)), Some(a.object)),
             None => (None, None),
         },
     };
@@ -350,7 +375,7 @@ pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, w
             None => Dict::new(),
         };
         charge(ctx, BYTE_COST * base.approx_size() as f64)?;
-        let name = add_xobject(ctx, shared, &mut base, wanted, xobject)?;
+        let name = add_resource(ctx, shared, &mut base, &how.resource)?;
         match key {
             Some(k) => {
                 let r = ctx.alloc()?;
@@ -368,8 +393,12 @@ pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, w
     let existing = contents_list(ctx.doc, dict.get("Contents"));
     let drawn = draw(&name).into_bytes();
     let mut list: Vec<Object> = Vec::with_capacity(existing.len() + 3);
+    // The stream that draws the mark alone (when the tag asks to tell it from the rest).
+    let mut ours: Option<ObjRef> = None;
     if under || existing.is_empty() {
-        list.push(Object::Ref(stream(ctx, shared, drawn)?));
+        let r = stream(ctx, shared, drawn)?;
+        ours = Some(r);
+        list.push(Object::Ref(r));
         if under {
             list.extend(existing);
         }
@@ -393,9 +422,24 @@ pub(super) fn put_on_page(ctx: &mut Ctx<'_>, shared: &mut Shared, page: &Page, w
         closes.push_str(&"Q\n".repeat(1 + balance.depth.min(MAX_BALANCE) as usize));
         list.push(Object::Ref(stream(ctx, shared, opens.into_bytes())?));
         list.extend(existing);
-        let mut last = closes.into_bytes();
-        last.extend_from_slice(&drawn);
-        list.push(Object::Ref(stream(ctx, shared, last)?));
+        if how.tag.is_some() {
+            list.push(Object::Ref(stream(ctx, shared, closes.into_bytes())?));
+            let r = stream(ctx, shared, drawn)?;
+            ours = Some(r);
+            list.push(Object::Ref(r));
+        } else {
+            let mut last = closes.into_bytes();
+            last.extend_from_slice(&drawn);
+            list.push(Object::Ref(stream(ctx, shared, last)?));
+        }
+    }
+    if let (Some(key), Some(r)) = (how.tag, ours) {
+        let mut listed = match dict.get(key) {
+            Some(Object::Array(a)) => a.clone(),
+            _ => Vec::new(),
+        };
+        listed.push(Object::Ref(r));
+        dict.set(key, Object::Array(listed));
     }
     dict.set("Contents", Object::Array(list));
     dict.set("Resources", resources);
@@ -525,7 +569,8 @@ fn put_marks(ctx: &mut Ctx<'_>, pages: &[&Page], mark: &Mark<'_>, under: bool, w
         let to_user = upright(&shown);
         let each: Vec<Matrix> = places(&shown, &made).into_iter().map(|m| mul(m, to_user)).collect();
         charge(ctx, MARK_COST * each.len() as f64)?;
-        put_on_page(ctx, &mut shared, page, &name, made.form, under, &|n| {
+        let how = Placing { resource: Resource { category: "XObject", wanted: &name, object: made.form }, under, tag: None };
+        put_on_page(ctx, &mut shared, page, &how, &|n| {
             let draws: String = each.iter().map(|m| format!("q {} /{n} Do Q\n", cm(*m))).collect();
             if watermark { format!("{WATERMARK_OPEN}{draws}EMC\n") } else { draws }
         })?;
@@ -535,7 +580,7 @@ fn put_marks(ctx: &mut Ctx<'_>, pages: &[&Page], mark: &Mark<'_>, under: bool, w
 
 /// `text` with the line ends of every kind as `\n` (or, with `one_line`, as spaces), control characters left out, cut at `most`
 /// characters.
-fn clean(text: &str, one_line: bool, most: usize) -> String {
+pub(super) fn clean(text: &str, one_line: bool, most: usize) -> String {
     let mut out = String::new();
     let (mut after_cr, mut count) = (false, 0usize);
     for c in text.chars() {
@@ -688,6 +733,8 @@ pub enum ContentOp {
     /// A picture with its lower left corner at `at`, `width` points wide.
     Image { page: usize, at: [f64; 2], width: f64, image: Vec<u8> },
     Watermark(Watermark),
+    /// Page numbers, headers and footers.
+    Pagination(Pagination),
 }
 
 /// The file with the change appended to it.
@@ -764,6 +811,7 @@ pub fn add_content(doc: &Document, password: &str, op: &ContentOp) -> Result<Add
             Edit::AddImage { page: *page as u32, rect: [x as f32, (height - y - tall) as f32, (x + width) as f32, (height - y) as f32], image: image.clone() }
         }
         ContentOp::Watermark(mark) => Edit::Watermark(Box::new(mark.clone())),
+        ContentOp::Pagination(spec) => Edit::Pagination(Box::new(spec.clone())),
     };
     let work = Work::new();
     let objects = apply_metered(doc, &pages, &edit, "", &work, CLI_ROOM)?;

@@ -136,6 +136,31 @@ fn run(request: Request) -> Result<(), Failure> {
             let mark = edit::Watermark { text: text.unwrap_or_default(), image, opacity, angle, tile, under, pages };
             add_command(&doc, &password, &input, &output, &ContentOp::Watermark(mark))
         }
+        Request::Pagenum { input, slots, size, color, margin, pages, start, mirror, skip_first, output, force, password } => {
+            let doc = open_unlocked(&input, &password)?;
+            let wanted = match pages {
+                Some(list) => page_list(&doc, &input, &list)?,
+                None => (0..doc.page_count().map_err(|e| op_error(&input, &e))?).collect(),
+            };
+            check_output(&output, std::slice::from_ref(&input), force)?;
+            let shown = size.clamp(edit::MIN_FONT_SIZE, edit::MAX_FONT_SIZE);
+            if shown != size {
+                eprintln!("warning: the size {size} was changed to {shown} (the text is from {} to {} points high)", edit::MIN_FONT_SIZE, edit::MAX_FONT_SIZE);
+            }
+            let spec = edit::Pagination {
+                slots: (*slots).map(Option::unwrap_or_default),
+                size: shown as f32,
+                color,
+                margin: margin as f32,
+                pages: wanted.iter().map(|&p| u32::try_from(p).unwrap_or(u32::MAX)).collect(),
+                start,
+                mirror,
+                skip_first,
+                file: input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                date: edit::today_utc(),
+            };
+            add_command(&doc, &password, &input, &output, &ContentOp::Pagination(spec))
+        }
         Request::Stamp { input, image, page, at, width, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
             check_output(&output, std::slice::from_ref(&input), force)?;

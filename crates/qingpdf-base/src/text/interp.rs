@@ -289,7 +289,7 @@ pub(crate) struct Interp<'a> {
     basis: Option<Basis>,
     /// Characters shown that have no Unicode value, per font name.
     pub unmapped: HashMap<String, usize>,
-    /// The marked-content sequences open (14.6): true for one that is a watermark artifact (14.8.2.2), whose text is
+    /// The marked-content sequences open (14.6): true for one that is a watermark or pagination artifact (14.8.2.2), whose text is
     /// not content; how many of those are open; and how many sequences were opened past `MAX_MARKED_DEPTH` (only counted).
     marks: Vec<bool>,
     hidden: usize,
@@ -515,10 +515,10 @@ impl<'a> Interp<'a> {
             }
             OP_BMC => self.begin_marked(false, None)?,
             OP_BDC => {
-                // Only a watermark written in the operator itself is known; one named in `/Properties` is shown as text.
-                let watermark = matches!(ops, [.., Operand::Name(tag), Operand::Dict(d)] if sc.bytes(*tag) == b"Artifact" && is_watermark(sc.bytes(*d)));
+                // Only an artifact written in the operator itself is known; one named in `/Properties` is shown as text.
+                let artifact = matches!(ops, [.., Operand::Name(tag), Operand::Dict(d)] if sc.bytes(*tag) == b"Artifact" && is_left_out_artifact(sc.bytes(*d)));
                 let span = if self.rec.is_some() { self.actual_text(ops, sc) } else { None };
-                self.begin_marked(watermark, span)?;
+                self.begin_marked(artifact, span)?;
             }
             OP_EMC => self.end_marked(),
             _ => {
@@ -760,7 +760,7 @@ impl<'a> Interp<'a> {
                 }
             }
             if hidden {
-                // A watermark artifact: the text moves on, but is not part of the page's text.
+                // A watermark or pagination artifact: the text moves on, but is not part of the page's text.
                 tm[4] += step.0;
                 tm[5] += step.1;
                 return;
@@ -927,15 +927,23 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// Is this dictionary (the bytes of `<< ... >>`) the properties of a watermark artifact: has `/Subtype /Watermark` (Table 330)?
-fn is_watermark(dict: &[u8]) -> bool {
-    const KEY: &[u8] = b"/Subtype";
-    const VALUE: &[u8] = b"/Watermark";
-    let Some(at) = dict.windows(KEY.len()).position(|w| w == KEY) else { return false };
-    let rest = dict.get(at + KEY.len()..).unwrap_or(&[]);
-    let start = rest.iter().position(|&b| !crate::lexer::is_whitespace(b)).unwrap_or(rest.len());
-    let rest = rest.get(start..).unwrap_or(&[]);
-    rest.starts_with(VALUE) && rest.get(VALUE.len()).is_none_or(|&b| !crate::lexer::is_regular(b))
+/// Is this dictionary (the bytes of `<< ... >>`) the properties of an artifact whose text is not the page's content (Table 330): a
+/// watermark (`/Subtype /Watermark`) or anything of the kind `/Type /Pagination` (a header, a footer, a page number)?
+fn is_left_out_artifact(dict: &[u8]) -> bool {
+    has_name(dict, b"/Subtype", b"/Watermark") || has_name(dict, b"/Type", b"/Pagination")
+}
+
+/// Does the dictionary (its bytes) have the entry `key value`, the value a name? (A longer name that starts with the same letters is another.)
+fn has_name(dict: &[u8], key: &[u8], value: &[u8]) -> bool {
+    dict.windows(key.len()).enumerate().filter(|(_, w)| *w == key).any(|(at, _)| {
+        let rest = dict.get(at + key.len()..).unwrap_or(&[]);
+        if rest.first().is_some_and(|&b| crate::lexer::is_regular(b)) {
+            return false;
+        }
+        let start = rest.iter().position(|&b| !crate::lexer::is_whitespace(b)).unwrap_or(rest.len());
+        let rest = rest.get(start..).unwrap_or(&[]);
+        rest.starts_with(value) && rest.get(value.len()).is_none_or(|&b| !crate::lexer::is_regular(b))
+    })
 }
 
 /// The last `N` operands as numbers.

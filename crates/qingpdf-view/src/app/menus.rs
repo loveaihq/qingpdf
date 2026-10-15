@@ -193,6 +193,8 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     switch(CMD_WM_TILE, Msg::WmTile, st.wm.tile),
                     switch(CMD_WM_UNDER, Msg::WmUnder, st.wm.under),
                     switch(CMD_WM_PAGE, Msg::WmPage, st.wm.page_only),
+                    MenuEntry::Separator,
+                    item(CMD_INS_PAGENUM, Msg::InsertPagenum),
                 ]
             },
         },

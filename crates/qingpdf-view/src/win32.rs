@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::clicks::ClickCounter;
 use crate::placement::{self, Placement};
 use crate::toolbar::{self, IconFont};
-use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ToolItem, ToolbarSpec, ToolbarState};
+use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ToolItem, ToolbarSpec, ToolbarState};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -199,6 +199,16 @@ struct NmTtDispInfo {
     instance: isize,
     flags: u32,
     param: isize,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct LocalTime {
+    year: u16,
+    month: u16,
+    weekday: u16,
+    day: u16,
+    rest: [u16; 4],
 }
 
 #[repr(C)]
@@ -429,6 +439,7 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> isize;
+    fn GetLocalTime(time: *mut LocalTime);
     fn AttachConsole(pid: u32) -> i32;
     fn GetStdHandle(which: u32) -> isize;
     fn SetStdHandle(which: u32, handle: isize) -> i32;
@@ -542,6 +553,16 @@ const ES_AUTOVSCROLL: u32 = 0x40;
 const ES_WANTRETURN: u32 = 0x1000;
 const BS_PUSHBUTTON: u32 = 0;
 const BS_DEFPUSHBUTTON: u32 = 1;
+const BS_AUTOCHECKBOX: u32 = 3;
+const BS_GROUPBOX: u32 = 7;
+const CBS_DROPDOWN: u32 = 2;
+const CBS_DROPDOWNLIST: u32 = 3;
+const CBS_AUTOHSCROLL: u32 = 0x40;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_SETCURSEL: u32 = 0x014E;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
 const IDOK: usize = 1;
 const IDCANCEL: usize = 2;
 const SWP_NOZOMORDER: u32 = 0x4;
@@ -774,6 +795,14 @@ pub fn user_name() -> String {
     String::from_utf16_lossy(buf.get(..n).unwrap_or(&[]))
 }
 
+/// Today's date in the person's time zone, as `2026-10-15` (what a page number's `{date}` is).
+pub fn local_date() -> String {
+    let mut t = LocalTime::default();
+    // SAFETY: `t` is a live SYSTEMTIME of the size Windows expects (eight 16-bit numbers) that Windows fills in and keeps no pointer to.
+    unsafe { GetLocalTime(&mut t) };
+    format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)
+}
+
 /// The most memory this process has had in use, in bytes (0 if Windows will not say).
 pub fn peak_working_set() -> u64 {
     let mut c = ProcessMemoryCounters {
@@ -988,6 +1017,10 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
             Action::AskText { tag, title, prompt, secret, ok, cancel } => {
                 let text = input_dialog(hwnd, state.dpi.get(), state.font.get(), &title, &prompt, secret, &ok, &cancel);
                 queue.extend(deliver(state, Event::Text { tag, text }));
+            }
+            Action::AskForm(spec) => {
+                let answer = form_dialog(hwnd, state.dpi.get(), state.font.get(), &spec);
+                queue.extend(deliver(state, Event::Form { tag: spec.tag, answer }));
             }
             Action::Message { title, text } => {
                 let (t, c) = (wide(&text), wide(&title));
@@ -1900,14 +1933,93 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
 struct DialogState {
     done: Cell<bool>,
     accepted: Cell<bool>,
+    /// The button of a form box that closed it, counting from 1 (0: it was closed with OK or Cancel).
+    pressed: Cell<usize>,
+    /// The sketch of a page a form box draws, if it has one.
+    sketch: RefCell<Option<Sketch>>,
 }
 
+/// What a form box draws as a sketch of a page: where, the shape of the page, the controls that hold the six places and the tick box that
+/// mirrors them, what the fields stand for, and the font and line height to draw with.
+struct Sketch {
+    rect: Rect,
+    shape: (i32, i32),
+    slots: [isize; 6],
+    mirror: isize,
+    fields: [String; 4],
+    left_page: bool,
+    font: isize,
+    line: i32,
+}
+
+/// Draw the sketch (a white page with the text of the six places on it, each as typed with its fields filled in).
+fn paint_sketch(hwnd: isize, sketch: &Sketch) {
+    let mut ps = PaintStruct { hdc: 0, erase: 0, paint: WinRect::default(), restore: 0, inc_update: 0, reserved: [0; 32] };
+    // SAFETY: `ps` is a live PAINTSTRUCT; BeginPaint and EndPaint are paired below on every path.
+    let dc = unsafe { BeginPaint(hwnd, &mut ps) };
+    if dc != 0 {
+        // SAFETY: selects the dialog's font into the paint DC (and back below); plain handles.
+        let old = unsafe { SelectObject(dc, sketch.font) };
+        let mut g = Gdi { dc, line: sketch.line, tint: None };
+        let (r, (pw, ph)) = (sketch.rect, sketch.shape);
+        // The page: as big as fits, in the middle, with a grey edge.
+        let (w, h) = if r.w * ph <= r.h * pw { (r.w, r.w * ph / pw.max(1)) } else { (r.h * pw / ph.max(1), r.h) };
+        let page = Rect { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h };
+        g.fill_rect(page, 0x808080);
+        g.fill_rect(Rect { x: page.x + 1, y: page.y + 1, w: page.w - 2, h: page.h - 2 }, 0xFFFFFF);
+        // The six lines. (The left and the right ones change sides on a left-hand page when that is asked.)
+        // SAFETY: a plain query message to the tick box, which is alive while the box is.
+        let mirrored = sketch.left_page && unsafe { SendMessageW(sketch.mirror, BM_GETCHECK, 0, 0) } == 1;
+        let f = &sketch.fields;
+        for i in 0..6 {
+            let at = if mirrored && i % 3 != 1 { i / 3 * 3 + 2 - i % 3 } else { i };
+            let text = window_text(sketch.slots.get(at).copied().unwrap_or(0), 400).replace("{page}", &f[0]).replace("{pages}", &f[1]).replace("{date}", &f[2]).replace("{file}", &f[3]);
+            let tw = g.text_width(&text);
+            let x = match i % 3 {
+                0 => page.x + 6,
+                1 => page.x + (page.w - tw) / 2,
+                _ => page.x + page.w - 6 - tw,
+            };
+            g.text(x, if i < 3 { page.y + 6 } else { page.y + page.h - 6 - sketch.line }, &text, 0x303030);
+        }
+        // SAFETY: puts the DC's font back.
+        unsafe { SelectObject(dc, old) };
+    }
+    // SAFETY: pairs the BeginPaint above with the same window and the same PAINTSTRUCT.
+    unsafe { EndPaint(hwnd, &ps) };
+}
+
+/// The control ids in a form box: the number of an item from `FORM_ITEM` (`IDOK` and `IDCANCEL` are the buttons at the foot), the buttons of
+/// the form from `FORM_BUTTON`.
+const FORM_ITEM: usize = 100;
+const FORM_BUTTON: usize = 1000;
+
 unsafe extern "system" fn dialog_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
-    // SAFETY: the user-data slot holds 0 or the pointer to the `DialogState` on the stack of `input_dialog`, which
+    // SAFETY: the user-data slot holds 0 or the pointer to the `DialogState` on the stack of `make_dialog`'s caller, which
     // outlives the dialog window (it is destroyed before that function returns); used on the same thread only.
     let state = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DialogState).as_ref() };
     if let Some(state) = state {
         match msg {
+            WM_PAINT if state.sketch.borrow().is_some() => {
+                if let Some(sketch) = state.sketch.borrow().as_ref() {
+                    paint_sketch(hwnd, sketch);
+                }
+                return 0;
+            }
+            // Something in a form box was typed in or changed: the sketch is drawn again.
+            WM_COMMAND if (FORM_ITEM..FORM_BUTTON).contains(&(loword(wparam) as usize)) => {
+                if let Some(sketch) = state.sketch.borrow().as_ref() {
+                    let r = WinRect { left: sketch.rect.x, top: sketch.rect.y, right: sketch.rect.x + sketch.rect.w, bottom: sketch.rect.y + sketch.rect.h };
+                    // SAFETY: `r` is a live RECT; the window is the box itself.
+                    unsafe { InvalidateRect(hwnd, &r, 0) };
+                }
+            }
+            WM_COMMAND if loword(wparam) as usize >= FORM_BUTTON && wparam >> 16 == 0 => {
+                state.pressed.set(loword(wparam) as usize - FORM_BUTTON + 1);
+                state.accepted.set(true);
+                state.done.set(true);
+                return 0;
+            }
             WM_COMMAND if loword(wparam) as usize == IDOK || loword(wparam) as usize == IDCANCEL => {
                 state.accepted.set(loword(wparam) as usize == IDOK);
                 state.done.set(true);
@@ -1924,9 +2036,9 @@ unsafe extern "system" fn dialog_proc(hwnd: isize, msg: u32, wparam: usize, lpar
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// A box with a line of text to fill in. Modal: it handles messages itself until it is closed.
-#[allow(clippy::too_many_arguments)]
-fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, secret: bool, ok: &str, cancel: &str) -> Option<String> {
+/// A box of its own over `owner`, whose inside is `w` by `h` units of a 96th of an inch: its window and the module. `state` is what the
+/// box's procedure reads; the caller keeps it alive until it has called `end_modal`.
+fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &DialogState) -> Option<(isize, isize)> {
     let s = |v: i32| v * dpi as i32 / 96;
     let class = wide("QingpdfInput");
     // SAFETY: a null module name means the module of this program.
@@ -1950,7 +2062,7 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
     unsafe { RegisterClassExW(&wc) };
 
     let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    let mut frame = WinRect { left: 0, top: 0, right: s(380), bottom: s(138) };
+    let mut frame = WinRect { left: 0, top: 0, right: s(w), bottom: s(h) };
     // SAFETY: `frame` is a live RECT that is rewritten in place.
     unsafe { AdjustWindowRectExForDpi(&mut frame, style, 0, WS_EX_DLGMODALFRAME, dpi) };
     let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
@@ -1965,34 +2077,35 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
     if dialog == 0 {
         return None;
     }
-    let state = DialogState { done: Cell::new(false), accepted: Cell::new(false) };
-    // SAFETY: stores the address of `state` for `dialog_proc`; `state` lives until after the window is destroyed
-    // at the end of this function, and the slot is only read on this thread.
-    unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, std::ptr::addr_of!(state) as isize) };
+    // SAFETY: stores the address of `state` for `dialog_proc`; the caller keeps `state` alive until after the window is destroyed
+    // (`end_modal`, which clears the slot), and the slot is only read on this thread.
+    unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, std::ptr::from_ref(state) as isize) };
+    Some((dialog, instance))
+}
 
-    let child = |class: &str, text: &str, style: u32, ex: u32, x: i32, y: i32, w: i32, h: i32, id: usize| -> isize {
-        let (c, t) = (wide(class), wide(text));
-        // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; `dialog` is the parent window; the
-        // control id goes in the menu slot as Windows defines for child windows. 0 means failure and is checked.
-        let h = unsafe { CreateWindowExW(ex, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, s(x), s(y), s(w), s(h), dialog, id as isize, instance, null_mut()) };
-        if h != 0 && font != 0 {
-            // SAFETY: WM_SETFONT takes a font handle, which `font` is, and a redraw flag.
-            unsafe { SendMessageW(h, WM_SETFONT, font as usize, 1) };
-        }
-        h
-    };
-    child("STATIC", prompt, 0, 0, 16, 14, 348, 20, 100);
-    let edit = child("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL | if secret { ES_PASSWORD } else { 0 }, WS_EX_CLIENTEDGE, 16, 38, 348, 24, 101);
-    child("BUTTON", ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 176, 88, 90, 28, IDOK);
-    child("BUTTON", cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, 274, 88, 90, 28, IDCANCEL);
+/// A control inside a box made by `make_dialog`, at `(x, y, w, h)` units of a 96th of an inch, in the font of the program; 0 if it was not made.
+#[allow(clippy::too_many_arguments)]
+fn dialog_child(dialog: isize, instance: isize, dpi: u32, font: isize, class: &str, text: &str, style: u32, ex: u32, (x, y, w, h): (i32, i32, i32, i32), id: usize) -> isize {
+    let s = |v: i32| v * dpi as i32 / 96;
+    let (c, t) = (wide(class), wide(text));
+    // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; `dialog` is the parent window; the
+    // control id goes in the menu slot as Windows defines for child windows. 0 means failure and is checked.
+    let child = unsafe { CreateWindowExW(ex, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, s(x), s(y), s(w), s(h), dialog, id as isize, instance, null_mut()) };
+    if child != 0 && font != 0 {
+        // SAFETY: WM_SETFONT takes a font handle, which `font` is, and a redraw flag.
+        unsafe { SendMessageW(child, WM_SETFONT, font as usize, 1) };
+    }
+    child
+}
 
-    // SAFETY: plain handles of windows made above; the owner is disabled while the box is up and enabled again
-    // below on every path.
+/// Show the box and handle its messages until it is closed (the owner is disabled meanwhile); `focus` is the control the keyboard starts in.
+fn modal_loop(owner: isize, dialog: isize, state: &DialogState, focus: isize) {
+    // SAFETY: plain handles of windows made by the caller; the owner is enabled again by `end_modal` on every path.
     unsafe {
         EnableWindow(owner, 0);
         ShowWindow(dialog, SW_SHOW);
-        if edit != 0 {
-            SetFocus(edit);
+        if focus != 0 {
+            SetFocus(focus);
         }
     }
     let mut msg = Msg { hwnd: 0, message: 0, wparam: 0, lparam: 0, time: 0, pt: Point::default(), private: 0 };
@@ -2015,16 +2128,33 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
             }
         }
     }
+}
+
+/// Enable the owner again and destroy the box (its user-data slot is cleared first, so that nothing can reach the state after this).
+fn end_modal(owner: isize, dialog: isize) {
+    // SAFETY: plain handles; enables the owner again, and destroys the dialog window, which makes the state (still alive in the
+    // caller) unreachable: its slot is cleared first.
+    unsafe {
+        EnableWindow(owner, 1);
+        SetWindowLongPtrW(dialog, GWLP_USERDATA, 0);
+        DestroyWindow(dialog);
+        SetForegroundWindow(owner);
+    }
+}
+
+/// A box with a line of text to fill in. Modal: it handles messages itself until it is closed.
+#[allow(clippy::too_many_arguments)]
+fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, secret: bool, ok: &str, cancel: &str) -> Option<String> {
+    let state = DialogState { done: Cell::new(false), accepted: Cell::new(false), pressed: Cell::new(0), sketch: RefCell::new(None) };
+    let (dialog, instance) = make_dialog(owner, dpi, title, (380, 138), &state)?;
+    let child = |class: &str, text: &str, style: u32, ex: u32, at: (i32, i32, i32, i32), id: usize| dialog_child(dialog, instance, dpi, font, class, text, style, ex, at, id);
+    child("STATIC", prompt, 0, 0, (16, 14, 348, 20), 100);
+    let edit = child("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL | if secret { ES_PASSWORD } else { 0 }, WS_EX_CLIENTEDGE, (16, 38, 348, 24), 101);
+    child("BUTTON", ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (176, 88, 90, 28), IDOK);
+    child("BUTTON", cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (274, 88, 90, 28), IDCANCEL);
+    modal_loop(owner, dialog, &state, edit);
     let text = if state.accepted.get() && edit != 0 {
-        // SAFETY: the edit control is alive; `buf` has room for the length asked for plus the closing zero, which
-        // is what the call is told; the length is read just before.
-        let mut buf = unsafe {
-            let n = GetWindowTextLengthW(edit).max(0) as usize;
-            let mut buf = vec![0u16; n + 1];
-            let got = GetWindowTextW(edit, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
-            buf.truncate(got);
-            buf
-        };
+        let mut buf = text_units(edit);
         let text = String::from_utf16_lossy(&buf);
         // The typed characters are overwritten (they may be a password).
         buf.fill(0);
@@ -2033,18 +2163,105 @@ fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, 
     } else {
         None
     };
-    // SAFETY: clears the box's text before it goes, enables the owner again, and destroys the dialog window, which
-    // makes `state` (still alive here) unreachable: its slot is cleared first.
+    // SAFETY: clears the box's text before it goes (the edit control is alive).
     unsafe {
         if edit != 0 {
             SetWindowTextW(edit, [0u16].as_ptr());
         }
-        EnableWindow(owner, 1);
-        SetWindowLongPtrW(dialog, GWLP_USERDATA, 0);
-        DestroyWindow(dialog);
-        SetForegroundWindow(owner);
     }
+    end_modal(owner, dialog);
     text
+}
+
+/// The text of a control, as UTF-16 (without the closing zero), for text that is wiped after it is used.
+fn text_units(control: isize) -> Vec<u16> {
+    // SAFETY: the control is alive; `buf` has room for the length asked for plus the closing zero, which is what the call is told; the
+    // length is read just before.
+    unsafe {
+        let n = GetWindowTextLengthW(control).max(0) as usize;
+        let mut buf = vec![0u16; n + 1];
+        let got = GetWindowTextW(control, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+        buf.truncate(got);
+        buf
+    }
+}
+
+/// A box with several things to fill in, laid out as `spec` says (`Action::AskForm`). Modal. `None` if it was cancelled or could not be made.
+fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<FormAnswer> {
+    let state = DialogState { done: Cell::new(false), accepted: Cell::new(false), pressed: Cell::new(0), sketch: RefCell::new(None) };
+    let (dialog, instance) = make_dialog(owner, dpi, &spec.title, spec.size, &state)?;
+    let child = |class: &str, text: &str, style: u32, ex: u32, at: (i32, i32, i32, i32), id: usize| dialog_child(dialog, instance, dpi, font, class, text, style, ex, at, id);
+    let mut made: Vec<(FormKind, isize)> = Vec::with_capacity(spec.items.len());
+    let (mut buttons, mut focus) = (0usize, 0isize);
+    for (k, item) in spec.items.iter().enumerate() {
+        let (class, style, ex) = match item.kind {
+            FormKind::Label => ("STATIC", 0, 0),
+            FormKind::Group => ("BUTTON", BS_GROUPBOX, 0),
+            FormKind::Edit => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE),
+            FormKind::Combo => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0),
+            FormKind::Pick => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0),
+            FormKind::Check => ("BUTTON", WS_TABSTOP | BS_AUTOCHECKBOX, 0),
+            FormKind::Button => ("BUTTON", WS_TABSTOP | BS_PUSHBUTTON, 0),
+        };
+        let id = if item.kind == FormKind::Button { FORM_BUTTON + buttons } else { FORM_ITEM + k };
+        buttons += usize::from(item.kind == FormKind::Button);
+        let text = if matches!(item.kind, FormKind::Pick) { "" } else { item.text.as_str() };
+        let h = child(class, text, style, ex, item.rect, id);
+        if h != 0 {
+            if focus == 0 && matches!(item.kind, FormKind::Edit | FormKind::Combo) {
+                focus = h;
+            }
+            let units: Vec<Vec<u16>> = item.choices.iter().map(|c| wide(c)).collect();
+            for entry in units.iter().filter(|_| matches!(item.kind, FormKind::Combo | FormKind::Pick)) {
+                // SAFETY: CB_ADDSTRING takes a zero-terminated UTF-16 string, which `wide` makes and which outlives the call.
+                unsafe { SendMessageW(h, CB_ADDSTRING, 0, entry.as_ptr() as isize) };
+            }
+            // SAFETY: plain messages to a control that was just made: the entry a list starts at, a tick box ticked or not.
+            unsafe {
+                match item.kind {
+                    FormKind::Pick => SendMessageW(h, CB_SETCURSEL, item.selected, 0),
+                    FormKind::Check => SendMessageW(h, BM_SETCHECK, item.selected.min(1), 0),
+                    _ => 0,
+                };
+            }
+        }
+        made.push((item.kind, h));
+    }
+    if let Some(p) = &spec.preview {
+        let s = |v: i32| v * dpi as i32 / 96;
+        let handle = |k: usize| made.get(k).map_or(0, |m| m.1);
+        let (x, y, w, h) = p.rect;
+        *state.sketch.borrow_mut() = Some(Sketch {
+            rect: Rect { x: s(x), y: s(y), w: s(w), h: s(h) },
+            shape: p.shape,
+            slots: p.slots.map(handle),
+            mirror: handle(p.mirror),
+            fields: p.fields.clone(),
+            left_page: p.left_page,
+            font,
+            line: s(16),
+        });
+    }
+    let foot = spec.size.1 - 36;
+    child("BUTTON", &spec.ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (spec.size.0 - 202, foot, 90, 28), IDOK);
+    child("BUTTON", &spec.cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (spec.size.0 - 104, foot, 90, 28), IDCANCEL);
+    modal_loop(owner, dialog, &state, focus);
+    let answer = state.accepted.get().then(|| {
+        // SAFETY: plain query messages (the entry a list is at, whether a tick box is ticked) to a control that is alive; they take no arguments.
+        let ask = |h: isize, msg: u32| unsafe { SendMessageW(h, msg, 0, 0) };
+        let mut values = Vec::new();
+        for &(kind, h) in &made {
+            match kind {
+                FormKind::Edit | FormKind::Combo => values.push(window_text(h, 4_000)),
+                FormKind::Pick => values.push(ask(h, CB_GETCURSEL).max(0).to_string()),
+                FormKind::Check => values.push(String::from(if ask(h, BM_GETCHECK) == 1 { "1" } else { "0" })),
+                FormKind::Label | FormKind::Group | FormKind::Button => {}
+            }
+        }
+        FormAnswer { values, button: state.pressed.get().checked_sub(1) }
+    });
+    end_modal(owner, dialog);
+    answer
 }
 
 // --- menus, child windows, the clipboard ------------------------------------------------------------------------
