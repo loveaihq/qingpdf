@@ -2,7 +2,7 @@
 
 A small, fast, offline PDF tool with its own engine, written in Rust. *Qīng* (轻) means "light".
 
-Most PDF tools today are hundreds of megabytes. qingpdf is two small executables (the 3.4 MB reader and the 3.2 MB command-line tool) that need nothing installed, never go online, and are built to do Chinese PDFs right.
+Most PDF tools today are hundreds of megabytes. qingpdf is two small executables (the 3.5 MB reader and the 3.2 MB command-line tool) that need nothing installed, never go online, and are built to do Chinese PDFs right.
 
 **Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`, and putting and changing text on pages. There is no conversion yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off. Certificate (public-key) encryption is not supported.
 
