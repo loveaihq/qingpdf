@@ -17,7 +17,7 @@ fn quick(doc: &Document, seconds: u64) -> (Result<Bitmap>, Vec<String>) {
 
 fn quick_at(doc: &Document, dpi: f64, seconds: u64) -> (Result<Bitmap>, Vec<String>) {
     let start = Instant::now();
-    let mut r = Renderer::new(doc);
+    let mut r = Renderer::new(doc, Box::new(crate::render::NoWidgets));
     let pages = doc.pages().expect("pages");
     let bitmap = r.render_page(&pages[0], dpi);
     let taken = start.elapsed();
@@ -256,7 +256,7 @@ fn scan_book(pages: u32) -> Document {
 fn a_long_scan_renders_every_page() {
     // 45 pages of 26 MB: 1.17 GB decoded, more than the 1 GiB one budget for the whole document holds.
     let doc = scan_book(45);
-    let mut r = Renderer::new(&doc);
+    let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
     let pages = doc.pages().expect("pages");
     assert_eq!(pages.len(), 45);
     let start = Instant::now();
@@ -548,7 +548,7 @@ fn big_layers_nested_stay_under_the_memory_cap() {
 /// Draw the first page at `dpi`, say that it took less than `seconds`, and also give the units of work it used.
 fn quick_work(doc: &Document, dpi: f64, seconds: u64) -> (Result<Bitmap>, Vec<String>, f64) {
     let start = Instant::now();
-    let mut r = Renderer::new(doc);
+    let mut r = Renderer::new(doc, Box::new(crate::render::NoWidgets));
     let pages = doc.pages().expect("pages");
     let bitmap = r.render_page(&pages[0], dpi);
     let taken = start.elapsed();
@@ -762,7 +762,7 @@ fn patterns_are_kept_by_bytes_like_forms() {
     let dict = "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 2 2] /XStep 2 /YStep 2 /Resources << >> /Filter /FlateDecode";
     let streams: Vec<(u32, &str, &[u8])> = (0..40).map(|i| (10 + i, dict, big.as_slice())).collect();
     let doc = page_doc("", &format!("<< /Pattern << {names} >> >>"), content.as_bytes(), &[], &streams);
-    let mut r = Renderer::new(&doc);
+    let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
     let pages = doc.pages().expect("pages");
     r.render_page(&pages[0], 72.0).expect("renders");
     let (bytes, patterns, _) = r.object_cache_for_test();

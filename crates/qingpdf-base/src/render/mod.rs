@@ -8,7 +8,7 @@
 //! ```no_run
 //! # use qingpdf_base::{Document, render};
 //! let doc = Document::open("a.pdf")?;
-//! let mut renderer = render::Renderer::new(&doc);
+//! let mut renderer = render::Renderer::new(&doc, Box::new(render::NoWidgets));
 //! let page = &doc.pages()?[0];
 //! let bitmap = renderer.render_page(page, 150.0)?;
 //! std::fs::write("page.png", bitmap.to_png()?)?;
@@ -56,6 +56,7 @@ use tiny_skia::{Color, Pixmap};
 
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
+use crate::object::{Dict, Stream};
 use crate::text;
 
 use func::Meter;
@@ -122,6 +123,25 @@ pub struct MemoryLimits {
     pub canvas_pixels: u64,
 }
 
+/// What the renderer asks of the code that knows interactive forms (4b), which is in `qingpdf-core` (built for size, as it is no part of
+/// what decides how fast a page is drawn): the appearance of a form field that has none, as a form XObject to draw. A renderer
+/// is given one when it is made, and keeps it (and whatever it reads of the form of the document) for its own pages only.
+pub trait WidgetPainter {
+    /// The appearance stream of the widget annotation `widget` (object `widget_num`, or 0 when it is direct), and whether some of
+    /// the text of the field had more lines than are laid out; `None` when the widget is no field this can draw. `work` is the
+    /// meter of the page being drawn.
+    fn appearance(&self, doc: &Document, widget_num: u32, widget: &Dict, work: &work::Work) -> Option<(Stream, bool)>;
+}
+
+/// A [`WidgetPainter`] that draws no form field that has no appearance of its own (what the tests of the renderer alone use).
+pub struct NoWidgets;
+
+impl WidgetPainter for NoWidgets {
+    fn appearance(&self, _: &Document, _: u32, _: &Dict, _: &work::Work) -> Option<(Stream, bool)> {
+        None
+    }
+}
+
 /// Draws the pages of one document. Fonts, images and forms are kept between pages, so one
 /// renderer should do all the pages of a run.
 pub struct Renderer<'a> {
@@ -131,8 +151,11 @@ pub struct Renderer<'a> {
 }
 
 impl<'a> Renderer<'a> {
-    pub fn new(doc: &'a Document) -> Renderer<'a> {
-        Renderer { doc, shared: Shared::default(), annotations: true }
+    /// A renderer for `doc`; `widgets` draws the form fields that have no appearance (`qingpdf_core::forms::painter()`).
+    pub fn new(doc: &'a Document, widgets: Box<dyn WidgetPainter>) -> Renderer<'a> {
+        let mut shared = Shared::default();
+        shared.set_widgets(widgets);
+        Renderer { doc, shared, annotations: true }
     }
 
     /// Draw the annotations' appearances (12.5) on top of the page's content, or not. They are drawn by default.
@@ -329,7 +352,7 @@ mod tests {
     }
 
     pub(super) fn draw(doc: &Document) -> (Result<Bitmap>, Vec<String>) {
-        let mut r = Renderer::new(doc);
+        let mut r = Renderer::new(doc, Box::new(crate::render::NoWidgets));
         let pages = doc.pages().expect("pages");
         let bitmap = r.render_page(&pages[0], 72.0);
         (bitmap, r.take_warnings())
@@ -555,7 +578,7 @@ mod tests {
         assert!(w.iter().any(|m| m.contains("image is skipped")), "{w:?}");
         // Too many pixels for a page; a dpi that is not one.
         let doc = page_doc("/MediaBox [0 0 1000 1000]", "<< >>", b"", &[], &[]);
-        let mut r = Renderer::new(&doc);
+        let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         let pages = doc.pages().expect("pages");
         assert!(matches!(r.render_page(&pages[0], 2400.0), Err(Error::Limit(_))));
         assert!(matches!(r.render_page(&pages[0], 0.0), Err(Error::Invalid(_))));
@@ -688,7 +711,7 @@ mod tests {
         let doc = page_doc("", "<< >>", b"1 0 0 rg 10 10 30 30 re f 0 0 1 rg 60 60 20 20 re f", &[], &[]);
         let pages = doc.pages().expect("pages");
         let page = pages.first().expect("a page");
-        let mut r = Renderer::new(&doc);
+        let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         let flag = Arc::new(AtomicBool::new(true));
         r.set_cancel(Some(flag.clone()));
         assert!(matches!(r.render_partial(page, 72.0, 0, None), Err(Error::Cancelled)));
@@ -711,7 +734,7 @@ mod tests {
         // Turned a further 90 degrees on a page that is not square.
         let doc = page_doc("/CropBox [0 0 100 50]", "<< >>", b"1 0 0 rg 0 0 10 10 re f", &[], &[]);
         let pages = doc.pages().expect("pages");
-        let mut r = Renderer::new(&doc);
+        let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         let turned = r.render_partial(pages.first().expect("a page"), 72.0, 90, None).expect("turned").bitmap;
         assert_eq!((turned.width, turned.height), (50, 100));
     }
@@ -746,9 +769,9 @@ mod tests {
         let page = pages.first().expect("a page");
         // An image cache too small for the image: with no slot every piece decodes the image again, with one it is decoded once.
         let limits = |slot| MemoryLimits { caches: 100, layers: 1 << 20, masks: 1 << 20, decoders: 1 << 20, image_slot: slot, canvas_pixels: 1 << 20 };
-        let mut without = Renderer::new(&doc);
+        let mut without = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         without.set_memory_limits(limits(0));
-        let mut with = Renderer::new(&doc);
+        let mut with = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         with.set_memory_limits(limits(1 << 20));
         let whole = without.render_partial(page, 144.0, 0, None).expect("whole").bitmap;
         for r in [&mut without, &mut with] {
@@ -767,7 +790,7 @@ mod tests {
         let doc = page_doc("", "<< >>", b"1 0 0 rg 0 0 50 50 re f", &[], &[]);
         let pages = doc.pages().expect("pages");
         let page = pages.first().expect("a page");
-        let mut r = Renderer::new(&doc);
+        let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         r.set_memory_limits(MemoryLimits { caches: 1 << 20, layers: 1 << 20, masks: 1 << 20, decoders: 1 << 20, image_slot: 0, canvas_pixels: 100 * 100 });
         assert!(matches!(r.render_partial(page, 144.0, 0, None), Err(Error::Limit(_))));
         assert!(matches!(r.render_partial(page, 144.0, 0, Some([0, 0, 101, 100])), Err(Error::Limit(_))));

@@ -1149,8 +1149,8 @@ impl Document {
 
     /// Spend what is left of the decoding budget and forget the decoded object
     /// streams, so that the next one needed has to be decoded (and cannot be).
-    #[cfg(test)]
-    pub(crate) fn use_up_the_decoding_budget_for_test(&self) {
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn use_up_the_decoding_budget_for_test(&self) {
         self.budget.charge_for_test(self.budget.remaining());
         self.objstms.borrow_mut().clear();
     }

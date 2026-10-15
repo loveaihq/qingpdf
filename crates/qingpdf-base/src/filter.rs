@@ -65,8 +65,8 @@ impl DecodeBudget {
     }
 
     /// Spend `bytes` of the budget, to test what happens when it runs out.
-    #[cfg(test)]
-    pub(crate) fn charge_for_test(&self, bytes: u64) {
+    #[cfg(any(test, feature = "testutil"))]
+    pub fn charge_for_test(&self, bytes: u64) {
         self.left.set(self.left.get().saturating_sub(bytes));
     }
 }
@@ -373,7 +373,7 @@ fn png_unpredict(data: &[u8], row_bytes: usize, bpp: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn paeth(a: u8, b: u8, c: u8) -> u8 {
+pub fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let (ia, ib, ic) = (i32::from(a), i32::from(b), i32::from(c));
     let p = ia + ib - ic;
     let pa = (p - ia).abs();

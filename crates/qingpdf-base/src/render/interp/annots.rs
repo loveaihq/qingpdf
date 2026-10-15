@@ -263,10 +263,9 @@ impl Interp<'_> {
             }
             return Ok(None);
         }
-        let form = self.shared.acroform.get_or_insert_with(|| crate::forms::acroform(doc, &self.work).map(Rc::new)).clone();
-        let Some(form) = form else { return Ok(None) };
+        let Some(widgets) = self.shared.widgets.as_deref() else { return Ok(None) };
         let num = item.as_obj_ref().map_or(0, |r| r.num);
-        let Some((stream, lines_cut)) = crate::forms::synthesize(doc, &form, num, d, &self.work) else { return Ok(None) };
+        let Some((stream, lines_cut)) = widgets.appearance(doc, num, d, &self.work) else { return Ok(None) };
         self.synthesized += 1;
         if lines_cut {
             self.leave_out("a form field has more lines than are laid out; the rest of its text is not drawn".to_string());

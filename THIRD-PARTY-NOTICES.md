@@ -978,7 +978,7 @@ authorization of the copyright holder.
 
 - Licence: BSD-3-Clause
 - Upstream: https://pdfium.googlesource.com/pdfium/
-- Embedded in: crates/qingpdf-base/src/render/cmyk.bin
+- Embedded in: crates/qingpdf-base/src/render/cmyk.z (the same table, differences and zlib, packed from cmyk.bin by `tests/tools/pack_cmyk_table.py`)
 - Note: the table is 6561 colours of three bytes, made by `tests/tools/make_cmyk_table.py`, which draws a grid of DeviceCMYK swatches with PDFium (through pypdfium2 5.14.0) and writes down the colour PDFium shows for each. It holds measurements of PDFium's output, not PDFium's code. It is credited here because it reproduces PDFium's conversion of DeviceCMYK, which PDFium keeps as a table of its own.
 
 ```text

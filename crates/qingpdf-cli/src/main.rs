@@ -468,7 +468,7 @@ fn render_command(input: &Path, pages: Option<&str>, dpi: f64, annots: bool, tem
         check_output(name, std::slice::from_ref(&input.to_path_buf()), force)?;
     }
     let all = doc.pages().map_err(|e| op_error(input, &e))?;
-    let mut renderer = render::Renderer::new(&doc);
+    let mut renderer = render::Renderer::new(&doc, qingpdf_core::forms::painter());
     renderer.set_annotations(annots);
     // Each page is reported as soon as it is done, so that if a later page fails the pages written are known.
     for (&index, name) in wanted.iter().zip(&names) {

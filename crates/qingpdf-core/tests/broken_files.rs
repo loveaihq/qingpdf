@@ -66,7 +66,7 @@ fn exercise(bytes: Vec<u8>) -> Outcome {
             }
             // Layer 3a: the first pages drawn (content streams, images, colour spaces, fonts of a damaged file).
             if let Ok(pages) = doc.pages() {
-                let mut renderer = qingpdf_core::render::Renderer::new(&doc);
+                let mut renderer = qingpdf_core::render::Renderer::new(&doc, qingpdf_core::forms::painter());
                 for page in pages.iter().take(2) {
                     let _ = renderer.render_page(page, 24.0);
                 }

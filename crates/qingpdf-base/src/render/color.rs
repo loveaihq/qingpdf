@@ -3,7 +3,9 @@
 //! the same number of channels (no colour management); Lab, Indexed, Separation and
 //! DeviceN are converted through their base or alternate space.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
 
 use crate::document::Document;
 use crate::object::Object;
@@ -241,11 +243,42 @@ impl ColorSpace {
 /// is the conversion the other viewers show (Adobe's SWOP profile: a plain `(1 - c) (1 - k)` is far more
 /// saturated), measured from PDFium's output by `tests/tools/make_cmyk_table.py`. Against PDFium on random
 /// colours it is 0.5 off on average and 6 at worst (the polynomial of step 3a was 4 and 39).
-static CMYK_TABLE: &[u8; 9 * 9 * 9 * 9 * 3] = include_bytes!("cmyk.bin");
+///
+/// The program carries the table packed (`cmyk.z`, made by `tests/tools/pack_cmyk_table.py` from `cmyk.bin`: the difference along
+/// yellow, then along cyan, zlib: 7.6 KB for 19.7), and unpacks it the first time a colour is converted.
+static CMYK_PACKED: &[u8] = include_bytes!("cmyk.z");
+
+const CMYK_BYTES: usize = 9 * 9 * 9 * 9 * 3;
+/// Bytes between neighbours along each ink.
+const CMYK_STRIDE: [usize; 4] = [729 * 3, 81 * 3, 9 * 3, 3];
+
+/// (A reference to an array, not to a slice: the length is known where the table is read, as it was when the table was a constant.)
+fn cmyk_table() -> &'static [u8; CMYK_BYTES] {
+    static TABLE: OnceLock<Box<[u8; CMYK_BYTES]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = decompress_to_vec_zlib_with_limit(CMYK_PACKED, CMYK_BYTES).unwrap_or_default();
+        // Undo the differences, the cyan one first: each entry is restored after the one `stride` bytes before it.
+        for i in CMYK_STRIDE[0]..t.len() {
+            let before = t.get(i - CMYK_STRIDE[0]).copied().unwrap_or(0);
+            if let Some(v) = t.get_mut(i) {
+                *v = v.wrapping_add(before);
+            }
+        }
+        for i in CMYK_STRIDE[2]..t.len() {
+            if !(i / CMYK_STRIDE[2]).is_multiple_of(9) {
+                let before = t.get(i - CMYK_STRIDE[2]).copied().unwrap_or(0);
+                if let Some(v) = t.get_mut(i) {
+                    *v = v.wrapping_add(before);
+                }
+            }
+        }
+        t.into_boxed_slice().try_into().unwrap_or_else(|_| Box::new([0; CMYK_BYTES]))
+    })
+}
 
 pub(crate) fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [f32; 3] {
-    // Bytes between neighbours along each ink.
-    const STRIDE: [usize; 4] = [729 * 3, 81 * 3, 9 * 3, 3];
+    const STRIDE: [usize; 4] = CMYK_STRIDE;
+    let table = cmyk_table();
     let mut lo = [0usize; 4];
     let mut frac = [0f32; 4];
     for ((l, f), v) in lo.iter_mut().zip(frac.iter_mut()).zip([c, m, y, k]) {
@@ -268,7 +301,7 @@ pub(crate) fn cmyk_to_rgb(c: f64, m: f64, y: f64, k: f64) -> [f32; 3] {
         if w == 0.0 {
             continue;
         }
-        if let Some(px) = CMYK_TABLE.get(at..at + 3) {
+        if let Some(px) = table.get(at..at + 3) {
             for (slot, &v) in out.iter_mut().zip(px) {
                 *slot += w * f32::from(v);
             }
@@ -299,6 +332,14 @@ fn lab_to_rgb(l: f64, a: f64, b: f64) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The packed table, unpacked, is the table that was measured (`cmyk.bin`), byte for byte.
+    #[test]
+    fn the_packed_cmyk_table_is_the_measured_one() {
+        let measured: &[u8] = include_bytes!("cmyk.bin");
+        assert_eq!(measured.len(), CMYK_BYTES);
+        assert!(cmyk_table()[..] == *measured);
+    }
 
     #[test]
     fn device_spaces() {

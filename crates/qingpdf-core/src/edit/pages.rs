@@ -422,7 +422,7 @@ const LABELS_GONE: &str = "the page labels were removed because the pages no lon
 /// Take the fields that have no widget left out of `/AcroForm`.
 fn form_after_delete(ctx: &mut Ctx<'_>, pages: &[Page], gone: &[u32], catalog: &mut Catalog) -> Result<()> {
     let doc = ctx.doc;
-    let Some(cut) = qingpdf_base::prune::form_after_removal(doc, pages, gone)? else { return Ok(()) };
+    let Some(cut) = crate::prune::form_after_removal(doc, pages, gone)? else { return Ok(()) };
     ctx.objects.extend(cut.changed.into_iter().map(|(r, d)| (r.num, Object::Dict(d))));
     let Some(entry) = catalog.dict.get("AcroForm").cloned() else { return Ok(()) };
     let Object::Dict(mut acro) = doc.resolve(&entry)? else { return Ok(()) };

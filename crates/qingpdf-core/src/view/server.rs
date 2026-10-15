@@ -277,7 +277,7 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
     }
     let Carry { queue, jobs, edits } = carry.unwrap_or(Carry { queue: Vec::new(), jobs: VecDeque::new(), edits: VecDeque::new() });
     let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
-    let mut renderer = Renderer::new(&document);
+    let mut renderer = Renderer::new(&document, crate::forms::painter());
     renderer.set_memory_limits(MemoryLimits {
         caches: to_usize(plan.render_caches),
         layers: to_usize(plan.layers),

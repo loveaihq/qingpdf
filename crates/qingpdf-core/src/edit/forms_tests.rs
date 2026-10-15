@@ -269,8 +269,8 @@ fn text_boxes_and_stamps_stand_upright_on_a_turned_page() {
         make(&doc, &edit).unwrap();
         let (_, again) = saved(&base, &doc);
         let pages = again.pages().unwrap();
-        let before = Renderer::new(&Document::from_bytes(base).unwrap()).render_page(&pages[0], 72.0).unwrap();
-        let after = Renderer::new(&again).render_page(&pages[0], 72.0).unwrap();
+        let before = Renderer::new(&Document::from_bytes(base).unwrap(), crate::forms::painter()).render_page(&pages[0], 72.0).unwrap();
+        let after = Renderer::new(&again, crate::forms::painter()).render_page(&pages[0], 72.0).unwrap();
         // What changed lies inside the box, as the reader sees the page (red text on a white page).
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
         let mut red = 0usize;
@@ -301,7 +301,7 @@ fn a_field_without_an_appearance_is_drawn_from_its_value_even_when_it_is_chinese
     b.obj(30, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>");
     let doc = Document::from_bytes(b.finish_classic(40, "/Root 1 0 R")).unwrap();
     let pages = doc.pages().unwrap();
-    let drawn = Renderer::new(&doc).render_page(&pages[0], 144.0).unwrap();
+    let drawn = Renderer::new(&doc, crate::forms::painter()).render_page(&pages[0], 144.0).unwrap();
     let dark = |y0: u32, y1: u32| -> usize {
         let mut n = 0;
         for y in y0..y1 {

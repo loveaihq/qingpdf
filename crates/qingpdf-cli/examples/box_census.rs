@@ -46,7 +46,7 @@ fn main() {
             continue;
         }
         let Ok(list) = doc.pages() else { continue };
-        let mut renderer = Renderer::new(&doc);
+        let mut renderer = Renderer::new(&doc, qingpdf_core::forms::painter());
         let mut file_boxes = 0usize;
         let mut file_absent = 0usize;
         for page in &list {

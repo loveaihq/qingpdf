@@ -113,7 +113,7 @@ fn page_info(page: &Page) -> PageInfo {
 
 /// PDFDocEncoding (Annex D.3, Table D.2) above 0x7F and in 0x18-0x1F, as
 /// Unicode. Everything else is the same as Latin-1.
-pub(crate) fn pdf_doc_char(b: u8) -> char {
+pub fn pdf_doc_char(b: u8) -> char {
     const LOW: [char; 8] = ['\u{2D8}', '\u{2C7}', '\u{2C6}', '\u{2D9}', '\u{2DD}', '\u{2DB}', '\u{2DA}', '\u{2DC}'];
     const HIGH: [char; 31] = [
         '\u{2022}', '\u{2020}', '\u{2021}', '\u{2026}', '\u{2014}', '\u{2013}', '\u{192}', '\u{2044}', '\u{2039}',
@@ -153,7 +153,7 @@ pub fn decode_text_string(bytes: &[u8]) -> String {
         .collect()
 }
 
-pub(crate) fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
+pub fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
     // A trailing odd byte is ignored.
     let (pairs, _) = bytes.as_chunks::<2>();
     let units = pairs.iter().map(|&pair| if big_endian { u16::from_be_bytes(pair) } else { u16::from_le_bytes(pair) });

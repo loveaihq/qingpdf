@@ -13,7 +13,7 @@ pub(crate) fn is_whitespace(b: u8) -> bool {
 }
 
 /// Delimiter characters (7.2.2, Table 2).
-pub(crate) fn is_delimiter(b: u8) -> bool {
+pub fn is_delimiter(b: u8) -> bool {
     matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
 }
 
@@ -37,7 +37,7 @@ pub(crate) fn offset_u64(pos: usize) -> u64 {
 }
 
 /// First occurrence of `needle` in `haystack` at or after `from`.
-pub(crate) fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+pub fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let first = *needle.first()?;
     let mut i = from;
     loop {

@@ -23,8 +23,10 @@ panic = "abort"
 [profile.release.package.qingpdf-view]
 opt-level = "z"
 
-# The editing and the reader's server (qingpdf-core: edit/ and view/; everything that decides the speed of reading, text, drawing and
-# writing is in qingpdf-base, which stays at opt-level 3) are built for size like the reader's window: they run once for each thing
-# the person does, not for each pixel or each byte of a file (docs/decisions.md, 4c).
+# The operations on pages (`ops`, `prune`, `image`), the form fields (`forms`, `layout`), the editing and the reader's server
+# (qingpdf-core: everything in it runs once for each thing the person does, not for each pixel or each byte of a file; what decides
+# the speed of reading, text, drawing and writing is in qingpdf-base, which stays at opt-level 3) are built for size (docs/decisions.md,
+# 4c, and "瘦身第二次": moving `ops`, `prune`, `image` and the forms out of qingpdf-base took 64 KB off the programs; `writer`
+# stayed: at this setting `split` and `merge` took 8 to 12 % longer).
 [profile.release.package.qingpdf-core]
 opt-level = "z"

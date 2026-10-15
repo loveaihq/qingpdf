@@ -11,6 +11,7 @@
 //! objects of a new file under the same key ([`OutputCrypt`]).
 
 use crate::cipher::{self, CipherError, IvSource};
+use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::info::pdf_doc_char;
 use crate::object::{Dict, Name, ObjRef, Object};
@@ -109,6 +110,16 @@ impl Permissions {
         ]
     }
 }
+
+/// Does whoever opened the file have the owner's rights: the owner password
+/// opened it, or `password` (the one that was given) is the owner's, or the empty
+/// password is (an owner with no password)? The hash that decides that costs
+/// something for revisions 5 and 6, so callers ask only when it matters.
+pub fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str) -> bool {
+    encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
+        || doc.security().is_some_and(|s| (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password(""))
+}
+
 
 /// What `info` says about the encryption of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -963,7 +974,7 @@ pub(crate) fn crypt_filter_name(dict: &Dict) -> Option<Name> {
 /// a `/ByteRange` of any kind, direct or an indirect reference: qpdf wants
 /// `/Type /Sig` and `/ByteRange` and a string `/Contents`; `/Type` is optional
 /// in the standard and a reference is a legal value for the range.
-pub(crate) fn is_signature_dict(dict: &Dict) -> bool {
+pub fn is_signature_dict(dict: &Dict) -> bool {
     dict.contains_key("ByteRange")
         || matches!(dict.get("Type"), Some(Object::Name(n)) if n == "Sig" || n == "DocTimeStamp")
 }

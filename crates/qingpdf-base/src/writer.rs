@@ -55,20 +55,26 @@ const FLATE_LEVEL: u8 = 6;
 /// Flate compression (zlib, RFC 1950) of data that arrives in pieces: the
 /// compressed bytes are kept, the input is not, so a stream can be made of
 /// data too big to hold in memory all at once (the rows of a huge image).
-pub(crate) struct FlateWriter {
+pub struct FlateWriter {
     compressor: Box<CompressorOxide>,
     out: Vec<u8>,
     scratch: Vec<u8>,
 }
 
+impl Default for FlateWriter {
+    fn default() -> Self {
+        FlateWriter::new()
+    }
+}
+
 impl FlateWriter {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let flags = create_comp_flags_from_zip_params(i32::from(FLATE_LEVEL), 1, 0);
         FlateWriter { compressor: Box::new(CompressorOxide::new(flags)), out: Vec::new(), scratch: vec![0; 1 << 16] }
     }
 
     /// Compress `data` (more of the stream's input).
-    pub(crate) fn write(&mut self, mut data: &[u8]) -> Result<()> {
+    pub fn write(&mut self, mut data: &[u8]) -> Result<()> {
         loop {
             let (status, consumed, produced) = compress(&mut self.compressor, data, &mut self.scratch, TDEFLFlush::None);
             self.out.extend_from_slice(self.scratch.get(..produced).unwrap_or(&[]));
@@ -83,7 +89,7 @@ impl FlateWriter {
     }
 
     /// End the stream and give the compressed bytes.
-    pub(crate) fn finish(mut self) -> Result<Vec<u8>> {
+    pub fn finish(mut self) -> Result<Vec<u8>> {
         loop {
             let (status, _, produced) = compress(&mut self.compressor, &[], &mut self.scratch, TDEFLFlush::Finish);
             self.out.extend_from_slice(self.scratch.get(..produced).unwrap_or(&[]));

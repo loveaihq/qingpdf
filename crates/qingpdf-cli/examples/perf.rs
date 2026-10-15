@@ -387,11 +387,11 @@ render, one page at 150 dpi:");
         let page = pages.get(page_number - 1).ok_or("no such page")?;
         // The first drawing of the process: reads the system fonts this page needs (the files are in the system's cache).
         let started = Instant::now();
-        let mut first_renderer = qingpdf_core::render::Renderer::new(&doc);
+        let mut first_renderer = qingpdf_core::render::Renderer::new(&doc, qingpdf_core::forms::painter());
         let first_result = first_renderer.render_page(page, 150.0).map_err(|e| e.to_string())?;
         let first = started.elapsed().as_secs_f64() * 1000.0;
         let drawn = average(20, || {
-            let mut r = qingpdf_core::render::Renderer::new(&doc);
+            let mut r = qingpdf_core::render::Renderer::new(&doc, qingpdf_core::forms::painter());
             let _ = r.render_page(page, 150.0);
         });
         let png = out_dir.join("render.png");
@@ -426,7 +426,7 @@ fn book_case(corpus: &Path) -> Result<bool, String> {
     }
     let doc = Document::open(&book).map_err(|e| e.to_string())?;
     let pages = doc.pages().map_err(|e| e.to_string())?;
-    let mut renderer = qingpdf_core::render::Renderer::new(&doc);
+    let mut renderer = qingpdf_core::render::Renderer::new(&doc, qingpdf_core::forms::painter());
     let started = Instant::now();
     let mut slowest = Duration::ZERO;
     let count = pages.len().min(100);
@@ -643,7 +643,8 @@ fn main() -> Result<(), String> {
     let merged_pages = Document::open(&out).map_err(|e| e.to_string())?.page_count().map_err(|e| e.to_string())?;
     println!("  merged file: {merged_pages} pages, {:.1} MB", std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) as f64 / 1e6);
 
-    // size of the program.
+    // size of the program: 3,207,680 bytes before the second slimming (2026-10-15; over the 3 MB, as the slimming before it left it),
+    // 3,130,368 after it (docs/decisions.md, "瘦身第二次"). The reader, qingpdf-view.exe, has a limit of 3.6 MB of its own (3,447,296 after).
     let bytes = std::fs::metadata(&program).map_err(|e| e.to_string())?.len();
     let size_ok = bytes <= 3 * 1024 * 1024;
     println!("qingpdf.exe size:           {bytes} bytes = {:.2} MB  (target <= 3 MB)  {}", bytes as f64 / 1_048_576.0, verdict(size_ok));

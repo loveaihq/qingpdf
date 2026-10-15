@@ -909,7 +909,7 @@ fn glyph_and_program_caches_stay_within_their_budgets() {
     }
     content.push_str("ET");
     let doc = text_page(SIMPLE_TT, "/Flags 32", &test_truetype(), "FontFile2", &content);
-    let mut r = super::Renderer::new(&doc);
+    let mut r = super::Renderer::new(&doc, Box::new(crate::render::NoWidgets));
     let pages = doc.pages().unwrap();
     r.render_page(&pages[0], 300.0).unwrap();
     let (bitmaps, glyphs, programs) = r.cache_bytes_for_test();
@@ -1036,7 +1036,7 @@ fn glyph_bitmaps_are_held_to_their_budget_as_they_are_made_and_off_page_glyphs_m
     let codes = hex_codes(1..=(n - 1) as u32);
     let render = |content: String| {
         let doc = cid_page("CIDFontType2", "FontFile2", &font, 0, &content);
-        let mut r = super::Renderer::new(&doc);
+        let mut r = super::Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         r.render_page(&doc.pages().unwrap()[0], 72.0).unwrap();
         r.bitmap_peak_for_test()
     };
@@ -1101,7 +1101,7 @@ fn direct_font_dictionaries_and_shared_font_files_are_read_once() {
     content.push_str("ET");
     let descriptor = "<< /Type /FontDescriptor /FontName /Test /Flags 32 /FontFile2 7 0 R >>";
     let doc = page_doc("", &resources, content.as_bytes(), &[(5, dict), (6, descriptor)], &[(7, "", &font)]);
-    let mut r = super::Renderer::new(&doc);
+    let mut r = super::Renderer::new(&doc, Box::new(crate::render::NoWidgets));
     r.render_page(&doc.pages().unwrap()[0], 72.0).unwrap();
     // Three readers (one per font dictionary, the direct ones kept for the next Tf), one parse of the shared FontFile2.
     assert_eq!(r.font_entries_for_test(), 3);

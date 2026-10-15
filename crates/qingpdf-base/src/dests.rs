@@ -20,7 +20,7 @@ use crate::object::{Dict, Name, ObjRef, Object, PdfString};
 /// Most name tree nodes looked at, and most entries kept. Real files have
 /// thousands; the limit only stops hostile ones.
 const MAX_TREE_NODES: usize = 500_000;
-pub(crate) const MAX_NAMED_DESTS: usize = 2_000_000;
+pub const MAX_NAMED_DESTS: usize = 2_000_000;
 /// Deepest name tree followed (7.9.6 trees are a few levels deep).
 const MAX_TREE_DEPTH: usize = 64;
 /// Bytes of names and destinations that may be copied out of one file while
@@ -45,7 +45,7 @@ fn names_budget(file_size: usize) -> usize {
 const MAX_DEST_ARRAY: usize = 16;
 
 /// A name tree leaf holds at most this many entries when a tree is written.
-const LEAF_SIZE: usize = 64;
+pub const LEAF_SIZE: usize = 64;
 
 /// What a node of a name tree counts for beside its entries, in [`NamedDests::load_with`]'s steps.
 const NODE_STEPS: usize = 16;
@@ -56,7 +56,7 @@ const ENTRY_OVERHEAD: usize = 48;
 
 /// What is left of the bytes one document's named destinations may cost.
 #[derive(Debug)]
-pub(crate) struct Spend {
+pub struct Spend {
     left: Cell<usize>,
     total: usize,
     /// The indirect objects that have been resolved, with their sizes: the first
@@ -66,12 +66,12 @@ pub(crate) struct Spend {
 }
 
 impl Spend {
-    pub(crate) fn new(total: usize) -> Spend {
+    pub fn new(total: usize) -> Spend {
         Spend { left: Cell::new(total), total, seen: RefCell::new(HashMap::new()) }
     }
 
     /// Pay for `bytes` of copying; `Limit` when there is not enough left.
-    pub(crate) fn take(&self, bytes: usize) -> Result<()> {
+    pub fn take(&self, bytes: usize) -> Result<()> {
         match self.left.get().checked_sub(bytes) {
             Some(left) => {
                 self.left.set(left);
@@ -98,7 +98,7 @@ impl Spend {
     /// What cannot be resolved is `None`. A repeated reference whose copy the
     /// budget can no longer pay for is not read at all (3d-2 review: twenty
     /// thousand items naming one megabyte were each parsed before being refused).
-    pub(crate) fn resolved(&self, doc: &Document, obj: &Object) -> Result<Option<Object>> {
+    pub fn resolved(&self, doc: &Document, obj: &Object) -> Result<Option<Object>> {
         if let Object::Ref(r) = obj {
             let known = self.seen.borrow().get(&r.num).copied();
             if let Some(size) = known {
@@ -146,7 +146,7 @@ impl NamedDests {
     /// Read both places from the catalog of `doc`. Whatever cannot be read is
     /// left out; a file that makes this cost more than the budget is a
     /// [`Error::Limit`].
-    pub(crate) fn load(doc: &Document) -> Result<NamedDests> {
+    pub fn load(doc: &Document) -> Result<NamedDests> {
         NamedDests::load_with(doc, &|_| true)
     }
 
@@ -197,19 +197,19 @@ impl NamedDests {
     }
 
     /// The entries of the old `/Dests` dictionary.
-    pub(crate) fn dict(&self) -> &[(Vec<u8>, Object)] {
+    pub fn dict(&self) -> &[(Vec<u8>, Object)] {
         &self.dict
     }
 
     /// What everything done with these destinations is paid from.
-    pub(crate) fn spend(&self) -> &Spend {
+    pub fn spend(&self) -> &Spend {
         &self.spend
     }
 
     /// The explicit destination array called `key`. A name object (`is_name`)
     /// is looked up in the old dictionary first, a string in the tree first;
     /// the other place is tried too, as readers do.
-    pub(crate) fn lookup(&self, doc: &Document, key: &[u8], is_name: bool) -> Result<Option<Vec<Object>>> {
+    pub fn lookup(&self, doc: &Document, key: &[u8], is_name: bool) -> Result<Option<Vec<Object>>> {
         let from_tree = || self.tree_index.get(key).and_then(|&i| self.tree.get(i).map(|e| ((true, i), e)));
         let from_dict = || self.dict_index.get(key).and_then(|&i| self.dict.get(i).map(|e| ((false, i), e)));
         let found = if is_name { from_dict().or_else(from_tree) } else { from_tree().or_else(from_dict) };
@@ -301,7 +301,7 @@ fn read_tree(doc: &Document, root: &Object, spend: &Spend, charge: &dyn Fn(usize
 /// The explicit destination (12.3.2.2) a destination value stands for: an
 /// array, or a dictionary whose `/D` is one, followed through references.
 /// An array too long to be a destination is not one.
-pub(crate) fn explicit(doc: &Document, value: &Object, spend: &Spend) -> Result<Option<Vec<Object>>> {
+pub fn explicit(doc: &Document, value: &Object, spend: &Spend) -> Result<Option<Vec<Object>>> {
     let array = |o: Object| match o {
         Object::Array(items) if items.len() <= MAX_DEST_ARRAY => Some(items),
         _ => None,
@@ -318,7 +318,7 @@ pub(crate) fn explicit(doc: &Document, value: &Object, spend: &Spend) -> Result<
 
 /// The page (its object number) an explicit destination array points at, if
 /// it points at one of `pages`.
-pub(crate) fn array_page(array: &[Object], pages: &HashSet<u32>) -> Option<u32> {
+pub fn array_page(array: &[Object], pages: &HashSet<u32>) -> Option<u32> {
     match array.first()? {
         Object::Ref(r) if pages.contains(&r.num) => Some(r.num),
         _ => None,
@@ -361,7 +361,7 @@ pub fn item_array(doc: &Document, item: &Dict, names: &NamedDests) -> Result<Opt
 
 /// The page an outline item or link points at, through its `/Dest` or, failing that, a go-to action in `/A` (12.3.2,
 /// 12.6.4.2).
-pub(crate) fn item_page(
+pub fn item_page(
     doc: &Document,
     item: &Dict,
     names: &NamedDests,
@@ -376,7 +376,7 @@ pub(crate) fn item_page(
 /// `define` (which returns the reference to put in the parent): Table 36 says
 /// `/Kids` is an array of indirect references, and readers that look nothing
 /// up in direct kids (MuPDF) are right to. Returns the root.
-pub(crate) fn build_name_tree(
+pub fn build_name_tree(
     mut entries: Vec<(Vec<u8>, Object)>,
     define: &mut dyn FnMut(Dict) -> Result<ObjRef>,
 ) -> Result<ObjRef> {
@@ -433,7 +433,7 @@ fn flatten_pairs(entries: Vec<(Vec<u8>, Object)>) -> Vec<Object> {
 }
 
 /// The old-style `/Dests` dictionary for these entries.
-pub(crate) fn build_dests_dict(entries: Vec<(Vec<u8>, Object)>) -> Dict {
+pub fn build_dests_dict(entries: Vec<(Vec<u8>, Object)>) -> Dict {
     Dict::from_pairs(entries.into_iter().map(|(k, v)| (Name::new(k), v)).collect())
 }
 

@@ -249,7 +249,7 @@ fn a_jbig2_image_drawn_twice_is_decoded_once() {
     let used = |content: &str| {
         let dict = "/Type /XObject /Subtype /Image /Width 52 /Height 66 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /DecodeParms << /JBIG2Globals 6 0 R >>";
         let doc = page_doc("", "<< /XObject << /Im 5 0 R >> >>", content.as_bytes(), &[], &[(5, dict, &data), (6, "", &globals)]);
-        let mut r = Renderer::new(&doc);
+        let mut r = Renderer::new(&doc, Box::new(crate::render::NoWidgets));
         let pages = doc.pages().expect("pages");
         r.render_page(&pages[0], 72.0).expect("renders");
         assert!(r.take_warnings().is_empty());

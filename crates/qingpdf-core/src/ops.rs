@@ -22,7 +22,8 @@ use crate::error::{Error, Result};
 use crate::image::{self, Format, PageMode};
 use crate::object::{Dict, Name, ObjRef, Object};
 use crate::prune;
-use crate::security::{Encryption, PasswordKind};
+pub use crate::security::has_owner_rights;
+use crate::security::PasswordKind;
 use crate::writer::{Builder, Warning};
 
 /// A finished file and what to tell the user about it.
@@ -622,15 +623,6 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
 }
 
 // --- who may take protection off ---------------------------------------------------------
-
-/// Does whoever opened the file have the owner's rights: the owner password
-/// opened it, or `password` (the one that was given) is the owner's, or the empty
-/// password is (an owner with no password)? The hash that decides that costs
-/// something for revisions 5 and 6, so callers ask only when it matters.
-pub fn has_owner_rights(doc: &Document, encryption: &Encryption, password: &str) -> bool {
-    encryption.opened.is_some_and(|a| a.kind == PasswordKind::Owner)
-        || doc.security().is_some_and(|s| (!password.is_empty() && s.is_owner_password(password)) || s.is_owner_password(""))
-}
 
 /// Does the file restrict what may be done with it, for whoever opened it: it is
 /// encrypted, its permissions do not grant everything, and it was not opened

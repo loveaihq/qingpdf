@@ -23,6 +23,7 @@ use crate::layout::{self, Da, Face, Spec, Style, reals};
 use crate::document::Document;
 use crate::object::{Dict, Object, Stream};
 use crate::render::glyf::TtFont;
+use crate::render::WidgetPainter;
 use crate::render::sysfont;
 use crate::render::work::{Held, Work};
 
@@ -840,11 +841,81 @@ pub(crate) fn synthesize(doc: &Document, form: &AcroForm, widget_num: u32, widge
     Some((Stream { dict, data: body.into_bytes() }, cut))
 }
 
+/// What a renderer is given to draw the form fields that have no appearance (`render::Renderer::new`): the form of the document is
+/// read when the first such field is drawn, and kept for the pages that renderer draws.
+pub fn painter() -> Box<dyn WidgetPainter> {
+    Box::new(FormPainter { form: RefCell::new(None) })
+}
+
+struct FormPainter {
+    form: RefCell<Option<Option<Rc<AcroForm>>>>,
+}
+
+impl WidgetPainter for FormPainter {
+    fn appearance(&self, doc: &Document, widget_num: u32, widget: &Dict, work: &Work) -> Option<(Stream, bool)> {
+        let form = self.form.borrow_mut().get_or_insert_with(|| acroform(doc, work).map(Rc::new)).clone()?;
+        synthesize(doc, &form, widget_num, widget, work)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::{Name, ObjRef};
     use crate::testutil::PdfBuilder;
+
+    /// A 100 by 100 point page with these widgets, a red square form (object 5) and a green one (object 6), drawn at 72 dpi with the
+    /// painter of this module (one pixel a point, rows from the top); the pixel at the middle of the 10-point square at (x, y).
+    fn widget_page(catalog_extra: &str, annots: &str, objs: &[(u32, &str)]) -> crate::render::Bitmap {
+        let mut b = PdfBuilder::new();
+        b.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"));
+        b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.obj(3, &format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << >> /Contents 4 0 R {annots} >>"));
+        b.stream_obj(4, "", b"");
+        b.stream_obj(5, "/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"1 0 0 rg 0 0 10 10 re f");
+        b.stream_obj(6, "/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"0 1 0 rg 0 0 10 10 re f");
+        let mut top = 6;
+        for (n, body) in objs {
+            b.obj(*n, body);
+            top = top.max(*n);
+        }
+        let doc = Document::from_bytes(b.finish_classic(top + 1, "/Root 1 0 R")).expect("the test file opens");
+        let mut r = crate::render::Renderer::new(&doc, painter());
+        let pages = doc.pages().expect("pages");
+        let bitmap = r.render_page(&pages[0], 72.0).expect("renders");
+        assert!(r.take_warnings().is_empty());
+        bitmap
+    }
+
+    fn centre(b: &crate::render::Bitmap, x: u32, y: u32) -> [u8; 3] {
+        let i = (((99 - (y + 5)) * b.width + x + 5) * 4) as usize;
+        [b.rgba[i], b.rgba[i + 1], b.rgba[i + 2]]
+    }
+
+    #[test]
+    fn form_fields_without_an_appearance_are_drawn_from_what_they_hold() {
+        // With a form in the file: a field that has no normal appearance (one with only a down appearance too) is drawn as its `/MK` and
+        // value say (4b); a link and a hidden widget are not drawn; nothing is said.
+        let form = "/AcroForm << /Fields [10 0 R] /DA (/Helv 8 Tf 0 g) >>";
+        let objs = [
+            (10, "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /FT /Tx /T (a) /MK << /BG [1 0 0] >> >>"),
+            (11, "<< /Type /Annot /Subtype /Widget /Rect [20 0 30 10] /FT /Tx /T (b) /MK << /BG [0 1 0] >> /AP << /D 5 0 R >> >>"),
+            (12, "<< /Type /Annot /Subtype /Link /Rect [40 0 50 10] >>"),
+            (13, "<< /Type /Annot /Subtype /Widget /Rect [60 0 70 10] /F 2 /FT /Tx /T (c) /MK << /BG [0 0 1] >> >>"),
+        ];
+        let b = widget_page(form, "/Annots [10 0 R 11 0 R 12 0 R 13 0 R]", &objs);
+        // The first two are filled with their backgrounds; the link and the hidden widget are not drawn at all.
+        assert_eq!(centre(&b, 0, 0), [255, 0, 0]);
+        assert_eq!(centre(&b, 20, 0), [0, 255, 0]);
+        for x in [40, 60] {
+            assert_eq!(centre(&b, x, 0), [255, 255, 255], "{x}");
+        }
+        // A widget in a file that has no form is not drawn, and no annotation at all has nothing to say.
+        let b = widget_page("", "/Annots [10 0 R]", &objs[..1]);
+        assert_eq!(centre(&b, 0, 0), [255, 255, 255]);
+        let b = widget_page("", "", &[]);
+        assert_eq!(centre(&b, 0, 0), [255, 255, 255]);
+    }
 
     #[test]
     fn win_ansi_has_latin_one_and_the_extras_of_windows() {

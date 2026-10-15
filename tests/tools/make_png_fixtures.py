@@ -1,4 +1,4 @@
-"""Write the small PNG files that crates/qingpdf-base/src/image/pngdec.rs is tested against.
+"""Write the small PNG files that crates/qingpdf-core/src/image/pngdec.rs is tested against.
 
 Every colour type with every bit depth it may have, not interlaced and interlaced (Adam7), in several sizes (so that some of
 the passes of an interlaced image are empty), with the five filters used in turn on the rows, the pixels split over several
@@ -9,7 +9,7 @@ and requires the same result.
 
     python tests/tools/make_png_fixtures.py [output_dir]
 
-The default output directory is crates/qingpdf-base/tests/png. The files are the same every time (a fixed seed).
+The default output directory is crates/qingpdf-core/tests/png. The files are the same every time (a fixed seed).
 """
 
 import os
@@ -18,7 +18,7 @@ import sys
 import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_OUT = os.path.normpath(os.path.join(HERE, "..", "..", "crates", "qingpdf-base", "tests", "png"))
+DEFAULT_OUT = os.path.normpath(os.path.join(HERE, "..", "..", "crates", "qingpdf-core", "tests", "png"))
 
 SIGNATURE = b"\x89PNG\r\n\x1a\n"
 CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}

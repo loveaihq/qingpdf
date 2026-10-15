@@ -29,7 +29,7 @@ use std::rc::Rc;
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::{Object, Stream};
-use crate::ops::has_owner_rights;
+use crate::security::has_owner_rights;
 
 use crate::render::work::{Work, cost};
 

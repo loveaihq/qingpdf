@@ -1575,3 +1575,78 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 验证：clippy `-D warnings` 干净；全部测试 1201 通过；`--bench`（`ebook-wikisource-minfadian.pdf`，旧 exe 对新 exe 各两次，毫秒中位数）一页页读 6.7 / 6.7 对 6.8 / 6.7，冷翻页 54.9 / 54.8 对 55.5 / 54.7，峰值内存 93.3 到 94.1 MB，没有变慢。
 
 没做：画到一半的笔画、打到一半的字在页面改动没答复时松手会丢；表单里同名的第二层字段不改名（只改第一层，和以前一样）。
+
+
+## 瘦身第二次（2026-10-15）
+
+只为体积，行为和输出不变；用户列的热路径（画页、取文字、翻页、JPEG/JPX/JBIG2 解码、AES）都量过，除了 JBIG2 扫描页的画页慢 3.9%，其余在 ±3% 以内（见"验证"）。上一轮（"瘦身（2026-10-14）"）已经做了排序和 PNG 解码器，这里不重做。
+
+- **起点和终点（`cargo build --release`，同一份源码两次都一样）：** `qingpdf-view.exe` 3,524,096 → **3,447,296**（−76,800，离 3.6 MB 的上限还有 152,704）；`qingpdf.exe` 3,207,680 → **3,130,368**（−77,312）。（带第 1 项时是 3,316,736 / 2,999,296；第 1 项用户没要，见表下。）任务里写的起点是 3,523,584，差一个对齐块（512 字节）。`qingpdf.exe` 之前一直超过 `perf` 例子里的"≤ 3 MB"（3,145,728），现在回到线内。
+- **怎么体检：** 链接器 `/MAP`，单独的 `--target-dir`（`RUSTFLAGS` 加 `-C symbol-mangling-version=v0 -C link-arg=/MAP:…`；v0 符号带完整的类型参数，所以泛型实例能按类型数；加了这两样 exe 一个字节不变，普通构建没动）。用一个不入库的小脚本解析映射表：按符号（相邻地址相减，被 ICF 合并的只算一次）、按 crate 和模块、按"泛型根"（去掉类型参数后的路径，数实例）汇总；`.rdata` 另外按 PE 节和字符串扫描。ICF 本来就开着（`/OPT:REF,ICF` 是 rustc 默认给的）：改成 `/OPT:ICF=10` 一个字节不差。
+
+### 体检（阅读器，改之前，3,524,096 字节）
+
+| 项目 | 字节 | 说明 |
+|---|---:|---|
+| `.text` | 2,973,136 | 见下 |
+| `.rdata` | 426,648（另 `.xdata` 39,132，`.idata` 8,894） | 内嵌表 144 KB（zlib 块 124,753：CID→Unicode 四份 76 KB、CMap 四份 22 KB、AGL 24 KB、CJK 归一 3 KB；CMYK 表 19,683）；可打印字符串约 118 KB（菜单文字 12.5 KB 最大）；panic 位置里的源文件路径 171 条共 13.5 KB；C 运行库的表约 36 KB |
+| `.pdata` | 42,120 | x64 每个函数一条，必须有 |
+| `.rsrc` / `.reloc` | 20,048 / 6,800 | 图标（16/32/48 的 BMP 加 256 的 PNG）/ 地址随机化要用的重定位 |
+| `.text`：`qingpdf_base` | 约 1,240,000 | `render` 739,344（`interp` 189,072、`jpx` 172,160、`jbig2` 109,632、`image` 59,008、`fonts` 30,992、`ttvm` 28,912、`glyf` 24,416、`func` 24,112）、`text` 156,103、`document` 54,464、`security` 31,680、`prune` 30,304、`writer` 30,256、`forms` 27,150、`layout` 24,544、`ops` 19,472、`filter` 19,136、`xref` 18,368、`image` 16,325、`dests` 14,272、`cipher` 13,984 |
+| `.text`：`qingpdf_core` / `qingpdf_view` | 约 374,000 / 约 250,000 | `edit` 193,656、`view` 79,852、`docx` 50,491、`xlsx` 28,743；`app` 148,072、`win32` 59,833 |
+| `.text`：依赖 | 约 460,000 | `tiny_skia` 约 197,000（`pipeline` 105,648）、`zune_jpeg` 约 129,000、`miniz_oxide` 约 39,000、`sha2` 30,275、`aes` 约 33,000、`tiny_skia_path` 约 34,000 |
+| `.text`：标准库和它的泛型实例 | 约 514,000 | `core` 177 KB、`std` 139 KB、`hashbrown` 94 KB、`alloc` 84 KB、`rustc_demangle` 20 KB（回溯，std 自带的默认 panic 钩子拉进来的） |
+| C 运行库（`.text` 加 `.rdata`） | libucrt 141,721 + libvcruntime 19,737 + libcmt 7,073 | libucrt 里：区域名表 13.2 KB、`atan2` 11.3 KB、`pow` 12.6 KB（含表）、`powf` 6.1 KB、`log`/`log10` 约 14 KB（含表）、`fpexcept` 4.9 KB、`mbctype` 4.6 KB … |
+| 最大的单个函数 | | `App::event` 44,826、JBIG2 `Decoder::stream` 44,304、`edit::apply_noted` 44,229（里面是内联进来的 `markup`、`ink`、`note`、`freetext`、`stamp`、`add_text`…，不是膨胀）、`retext::replace_line` 36,217、`Interp::run` 35,472、`edit::pages::apply` 34,320、`Font::load` 33,808、`Server::run` 32,542 |
+
+**泛型根（实例数，合计字节）：** `drop_glue` 365 个 66,012（`App` 一个 13,264）；`hashbrown` 的 `reserve_rehash` 57 个 65,344（在速度档的 crate 里每个 1.3 到 2.3 KB，在体积档的 crate 里每个 0.5 KB）、`HashMap::insert` 27 个 12,091、`RandomState::hash_one` 20 个 5,915；`Once::call_once_force` 的闭包 23 个 22,752（都是懒加载的表，真有代码）；线程入口 7 个 18,890；`Rc::drop_slow` 34 个 8,485；`Vec::from_iter` 21 个 8,344；`RawVec::grow_one` 67 个 5,962；`BTreeMap::insert` 4 个 4,981。自己类型的 `Debug`/`Display` 一共 1.4 KB（没用到的 LTO 本来就丢了），所以"去掉 Debug 派生"没有东西可省。浮点的打印和解析（`flt2dec`/`dec2flt`，含 10.4 KB 的 `POWER_OF_FIVE`）约 23 KB：词法分析器用 `f64::from_str` 读实数，写出用 `{}`，换成别的写法输出会变，不动。
+
+**最大的发现：** 把整个 `qingpdf-base` 改成 `opt-level = "z"`，阅读器小 660 KB（3,370,496 → 2,710,016；上一轮写的"141 KB"是那时的数）。速度档的 `qingpdf-base` 里大部分是真热的（画页、取文字、解码），但冷的东西夹在里面：热和冷的界线是函数，不是模块，稳定版 Rust 没有每个函数的 `opt-level`（`#[optimize(size)]` 是 nightly），PGO 要 `llvm-profdata`（没装）。能做的只有把"接口窄、热代码不依赖它"的冷代码整块搬进体积档的 `qingpdf-core`，下面做了三块。
+
+### 做了的（每项在前面各项的基础上量；中间有一版带 `/x86-experimental-pref-innermost-loop-alignment=0`，见"试了、没留下的"，数字是那版的差，所以加起来和最终总数差约 1.5 KB）
+
+| # | 改动 | 阅读器 | 命令行 |
+|---|---|---:|---:|
+| 1 | **C 运行库的 UCRT 部分用 Windows 自带的 DLL**（`.cargo/config.toml`：`/NODEFAULTLIB:libucrt.lib` 加 `ucrt.lib`；VC 运行库 `vcruntime` 仍静态链进来）：`ucrtbase.dll` 和 `api-ms-win-crt-*` 在 Windows 10 和 11 的 System32 里，什么都不用装；Rust 的 Windows 目标从 1.78 起最低就是 Windows 10 | −130,560 | −131,072 |
+| 2 | **`ops`、`prune`、`image`（含 PNG 解码器）从 `qingpdf-base` 搬到 `qingpdf-core`**：没有一处读文件、画页的代码调用它们，只有 `text` 用了 `ops::has_owner_rights`（挪进 `security`，`ops` 里再导出，路径不变）；几个 `pub(crate)` 的小函数改成 `pub`；测试和夹具跟着走（`tests/png` 的 PNG 夹具搬到 `qingpdf-core/tests/png`，`make_png_fixtures.py` 改了路径）。`writer` 和 `dests` 也搬过，量到 `split`/`merge`/`delete`/`rotate` 慢 7 到 12%，搬回 base（再 +27,136），净 | −28,160 | −30,720 |
+| 3 | **`forms` 和 `layout`（表单字段长什么样）搬进 `qingpdf-core`：** 画页只要两样东西——文档的 `AcroForm` 和"没有外观的字段的外观流"。现在画页的程序拿一个 `render::WidgetPainter`（`Renderer::new(doc, widgets)` 的第二个参数，必填，漏了编译不过），`qingpdf-core` 的 `forms::painter()` 是真的实现，缓存 `AcroForm` 的方式和以前一样（每个 `Renderer` 一份）；`render::NoWidgets` 给只测渲染本身的单元测试用。`layout` 里只剩 `num` 和 `reals`（`render/outline.rs` 要）留在 base。有一个测试跟着走（`form_fields_without_an_appearance_are_drawn_from_what_they_hold`，现在在 `qingpdf-core/src/forms.rs`，用 `forms::painter()`） | −35,840 | −32,768 |
+| 4 | **CMYK 表打包：** 19,683 字节的 `cmyk.bin` 先沿黄色轴、再沿青色轴取差，再 zlib，7,623 字节（`cmyk.z`，`tests/tools/pack_cmyk_table.py` 做；`cmyk.bin` 留着，当单元测试里逐字节对照的原件），第一次转 CMYK 时用 `miniz_oxide` 解开。第一版返回切片，CMYK 图的页（`gongwen-wuhan-gazette`）慢 8 到 10%；改成返回数组引用（长度编译时已知，和原来的常量一样）后配对中位数 +0.8 到 +3.7%，在噪声里 | −11,264 | −11,776 |
+
+最终（上面都做了，没有带对齐旗标）：3,316,736 / 2,999,296。
+
+**第 1 项退回（2026-10-15 用户定）：** 用户选"全部打包"，程序不依赖系统的 C 运行库，`.cargo/config.toml` 和 `build_release.py` 仍是整个 C 运行库静态链进来（`+crt-static`）。只留第 2–4 项：3,447,296 / 3,130,368（`cargo build --release` 实测）。
+
+### 试了、没留下的
+
+- **`-C llvm-args=-x86-experimental-pref-innermost-loop-alignment=0`**（不给最内层循环补空指令对齐到 16 字节）：阅读器 −23,040，命令行 −24,576；但 JBIG2 画 4 页（`scan-jbig2-100`）慢 3.5 到 5.5%（六次测量都在 +3.4% 以上；不带旗标的同一份源码 +0.5 到 +2%）。循环的对齐变成碰运气，热核（MQ 解码、deflate）可能撞上坏的，去掉。
+- **机器码外提器 `-enable-machine-outliner`**（只对 `minsize` 的函数开）：x64 Windows 的结构化异常处理不认外提出来的块，编译不过（`Stray .seh_endepilogue`）。
+- **`sha2` 按 z：** 反而大 1,024（它的轮是宏展开的，z 并不缩）。**`aes` 按 z：** −2,048（阅读器）/−1,024，不值得碰 AES 的速度。**`tiny-skia-path` 按 z：** −3,584 / −2,048，是画线的路径，不值得。**`core`+`view` 按 `s`：** +215 KB（z 才是最小的）。
+- **`-C llvm-args=-enable-merge-functions`：** 一个字节不差（已经开着）。**`-inline-threshold=100`：** 命令行 −59 KB，阅读器 +15 KB（体积档的 crate 也被改了阈值），而且会动所有热路径，没量速度，放弃。
+- **跳过 `App` 的析构（`mem::forget`）**，想去掉 13 KB 的 `drop_glue::<App>`：一个字节不差——`dyn Handler` 的虚表引用着它。
+- **`trim-paths`**（去掉 panic 位置里的路径，约 6 KB）：Cargo 1.99 里还没稳定。发布包的 `build_release.py` 本来就用 `--remap-path-prefix`。
+- **把加密写出的那一半（`OutputCrypt`/`ObjectCrypt`）搬走：** `cbc_encrypt_in_place` 是 R6 口令哈希在用的，留在 base；只搬薄的一层不省东西。
+
+### 找到了但没做（估计的字节）
+
+- `writer` 和 `dests` 搬进 `qingpdf-core`：再省 27,136，但 `split`、`merge`、`delete`、`rotate` 慢 7 到 12%（`merge` 三个文件 331 → 367 毫秒）。如果这几个命令的速度不重要，一行 `git mv` 加改 `lib.rs` 的几行就是 27 KB。
+- 循环对齐旗标：再省约 22 KB，代价见上。
+- 同样的"接口窄的冷代码搬走"还有：系统字体查找 `render::sysfont`（14 KB → 8，约 6 KB，要同样的钩子）、`text::editscan`（约 3 KB）、`Security` 的口令验证（约 12 KB，打开文件时用，要钩子）。
+- `hashbrown`：速度档的 `qingpdf-base` 里还剩 32 个实例共约 45 KB。同类的 `(u32, u32)`、`(u16, u32)`、`(u32, ())`、`(usize, ())`、`(usize, u8)`、`(ObjRef, ())`（随机哈希和 Fx 各一份）每个 1.3 到 1.5 KB，合并八个约 10 KB，每处要改类型，而且换哈希器会让迭代次序可预测（现在随机），没做。
+- 图标的 32 和 48 像素帧改成 PNG：约 12 KB。Windows 对小于 256 的 PNG 帧是不是处处认没有把握，图标看起来变了就是退步，没做。
+- AGL 表前缀编码：约 2.2 KB（zlib 21,839 对 24,058）。CID→Unicode 表用 xz 也只小 7%，不值得。
+- `/DYNAMICBASE:NO` 去掉 `.reloc`（6.8 KB）：等于关掉地址随机化，读不可信文件的程序不该这么做，没做。
+- 动不了的：std 的回溯加 `rustc_demangle`（20 KB，默认 panic 钩子拉进来的）、`.pdata`/`.xdata`（77 KB，x64 要）、`vcruntime` 的 C++ 异常处理（20 KB，std 的预编译库是带展开的）、浮点打印解析（23 KB）。
+- 整个 `qingpdf-base` 的速度档代价是 660 KB（见上）；要拿回来得有每个函数的 `opt-level` 或 PGO。
+
+### 要注意的一处不是体积的改变
+
+**阅读器和命令行现在依赖 Windows 自带的 `ucrtbase.dll`**（Windows 10 起每台机器都有；Windows 7/8 本来就不在 Rust 的支持里）。数学函数（`pow`、`exp`、`log`、`sin`、`cos`、`atan2`、`acos`）因此来自系统那份，不再是静态链进来的那份：在这台机器（Windows 11 26300）上输出逐字节相同（见下），换一个 Windows 版本，这些函数的最后一位理论上可能不同。要退回去：删 `.cargo/config.toml` 和 `tests/tools/build_release.py` 里那两行，各加 131 KB。启动时间多 0.2 到 0.4 毫秒（`--version` 一百次的中位数 20.6 对 20.8 毫秒）。
+
+### 验证
+
+- `cargo build --release` 没有警告；`cargo clippy --workspace --all-targets --release -- -D warnings` 干净；`cargo test --release --no-fail-fast` **1202 通过**、0 失败、3 个 ignored（比改之前多一个：CMYK 打包表和原表逐字节相同；搬走的测试数目不变）。
+- 四个样例（`tracemonkey`、公文 `gongwen-guoban-mulu-2015`、wps 论文 `lunwen-arxiv-2503.12308-wps`、word-tc 论文 `lunwen-arxiv-2403.14268-word-tc`）：`info`、`text`（全部页）、`render`（1 到 4 页，PNG）、`split`（1 到 4 页）的输出和改之前**逐字节相同**；`docx`、`xlsx` 每个部件相同，只有 `docProps/core.xml`（里面的时间）不同，文件字节数差 1。命令行打印的"wrote …"行除了输出路径和这个字节数也相同。
+- `render_compare.py --engine-compare --all`：平均 2.346（改之前也是），232 行逐页输出和改之前除了"用时"一行逐字相同。
+- 速度（旧 exe 对新 exe；每轮新旧背靠背，次序轮换，取每轮比值的中位数）：接电源时量的（中途切到电池的几批只比比值，方向相同），每项 21 次，毫秒是中位数，括号里是每轮新/旧比值的中位数：画 4 页——tracemonkey 127.4 对 131.7（1.023）、wps 论文 148.3 对 152.3（1.009）、word-tc 论文 220.5 对 223.7（1.012）、公文 114.3 对 116.8（1.016）；468 页的书取文字（25 次，两遍）356.7 对 357.0（1.000）和 359.3 对 355.0（0.991）；docx 52.5 对 52.3（1.005）；xlsx 46.7 对 47.2（0.995）；解码——JPX 1439.7 对 1433.7（0.995）、JPEG 扫描 110.9 对 113.7（1.024）、**JBIG2 扫描 4 页 105.0 对 108.9（1.039）、25 页 506.4 对 525.8（1.039，四分位 1.035 到 1.048）**；带 CMYK 图的页 340.7 对 348.9（1.025）；split 1.005、merge 1.005、rotate 1.010、delete 1.006。**JBIG2 超出了 ±3%，其余都在线内。** 这不是 JBIG2 的代码变了：解码函数的字节数前后相差不到 1%（`Decoder::stream` 44,304 对 44,256，`decode_generic` 25,888 对 25,728）；只换 C 运行库的那一版（第 1 项）是 1.000；同一份 JBIG2 代码在我试过的几个构建里落在 +0.0% 到 +5.0%（只换运行库 1.000，加对齐旗标 1.011，搬模块 1.014，另一种搬法 1.050，最终 1.039），旧 exe 对它自己的拷贝是 1.000 到 1.010。原因没有证实；最像的解释是 `qingpdf-base` 里的代码被搬走后，所有函数的地址整体挪动，热循环落在了不同的位置（这台机器是 Skylake 系，分支跨 32 字节边界会掉速）；一改源码就会重新掷一次。要保住 JBIG2 画页的速度，只能退回第 1 项一项（−130 KB，实测 1.000）。
+- 阅读器 `--bench`（1920x1080，两个 100 页文件）：接电源时量，旧新交替各 7 次，每次 `--bench` 取各项的毫秒中位数，再取 7 次的中位数。ebook100：第一页 150 对 151、一页页读 4.7 对 4.7、冷翻页 59.6 对 60.3（1.012）、峰值内存 100.5 对 100.4 MB；"一页接一页翻"12.6 对 16.0——这一项每次运行都在 11.6 到 23.7 毫秒之间跳（同一个 exe 的 13 次：11.9 到 19.5），两批共 24 次的中位数是 12.95 对 13.45（+3.9%），在跳动的范围里，只换运行库的那版是 13.6，最终 13.4。scan-jbig2-100：第一页 122 对 123、一页页读 4.7 对 4.6、一页接一页 31.9 对 32.1、冷翻页 56.0 对 55.8、峰值内存 109.5 对 109.3。
+- 例子 `perf`（旧 exe 对新 exe）：AES-256 解密 3.17 → 3.10 GB/s，AES-128 3.87 → 3.95 GB/s（目标 ≥ 1 GB/s），打开 R6 加密文件 1.7 毫秒不变；`info` 1000 页 39.5 → 40.0 毫秒，两个 500 页 `merge` 105.9 → 107.8 毫秒；各页的"画一页"目标全部 PASS。示例里 `qingpdf.exe` 大小那行从 FAIL（3,207,680 字节，3.06 MB）变成 PASS（2,999,296，2.86 MB），"编辑增加"那行从 FAIL（410 KB）变成 PASS（202 KB）——这两行原来就超了，是上一轮留下的。取文字那行 338 对 356 毫秒是两次分开跑的，交替配对测是 1.000 和 0.991。示例里的大小常量不用改（都是上限），只改了注释。

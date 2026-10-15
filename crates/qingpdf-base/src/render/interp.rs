@@ -383,11 +383,15 @@ pub(crate) struct Shared {
     /// The optional content configuration of the document, and whether the content of an XObject is shown.
     oc: Option<Rc<OcConfig>>,
     xobject_shown: FxMap<ObjRef, bool>,
-    /// The form of the document, read when the first field without an appearance needs it (4b).
-    acroform: Option<Option<Rc<crate::forms::AcroForm>>>,
+    /// What draws the form fields that have no appearance (4b); given when the renderer is made.
+    widgets: Option<Box<dyn super::WidgetPainter>>,
 }
 
 impl Shared {
+    pub(crate) fn set_widgets(&mut self, widgets: Box<dyn super::WidgetPainter>) {
+        self.widgets = Some(widgets);
+    }
+
     pub(crate) fn set_caps(&mut self, caps: Caps) {
         self.caps = caps;
         self.budget.set_program_cap(caps.programs);
