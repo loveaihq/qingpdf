@@ -15,6 +15,7 @@ Commands:
   delete    Remove pages
   rotate    Turn pages by a multiple of 90 degrees
   decrypt   Write a copy of an encrypted PDF without the encryption
+  encrypt   Write a copy with passwords and permissions (AES-256, or AES-128)
   text      Extract the text of a PDF, in reading order
   render    Draw pages as PNG images (graphics and images; letters as boxes for now)
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
@@ -37,7 +38,7 @@ Encrypted PDFs: a file that only restricts what may be done with it (printing,
 copying ...) opens without a password. For one that needs a password, add
 --password <password> to the command (it is used for every input that needs
 one; a password that is given is tried first, then the empty one). Results keep
-the encryption of the input; only 'decrypt' removes it.
+the encryption of the input; only 'decrypt' removes it, and 'encrypt' sets or changes it.
 
 watermark, pagenum, stamp, addtext and replace write into the pages' own content, so every other
 program and a printer show it too. The output is the input with the change
@@ -156,13 +157,53 @@ when the file was opened with its owner password, or when its permissions
 allow everything (printing, copying, modifying, annotating, filling forms,
 assembling); otherwise the author's restrictions would be taken off a file you
 hold with limited rights, and the command refuses and says what is not allowed.
-A file that is not encrypted is an error.
+A file that is not encrypted is an error, and so is a signed one (the whole file
+is written again, which would break the signature).
 
 Options:
   --password <password> The owner password (or the user password, if the
                         file allows everything)
   -o, --output <file>   The file to write (required)
   --force               Overwrite the output file if it exists
+";
+
+const ENCRYPT: &str = "Usage:
+  qingpdf encrypt <file.pdf> -o <output.pdf> [--user-password <pw>] [--owner-password <pw>]
+                  [--password-file <file>] [--aes128] [--print none|low|high] [--no-copy] [--no-modify]
+                  [--no-annotate] [--no-forms] [--no-assemble] [--no-accessibility] [--cleartext-metadata]
+                  [--password <password of the input>] [--force]
+
+Write a copy of the PDF under a new encryption: AES-256 (the default; revision 6, read by current programs) or, with --aes128,
+AES-128 (revision 4, for old programs). The user password is what opens the file (none: anyone can open it, with the
+restrictions below). The owner password lifts the restrictions; it is required when a permission is turned off, and if only a
+user password is given the owner password is the same. Give the passwords with --password-file instead of on the command line when
+others can see your commands: line 1 of the file is the user password and line 2 the owner password (either may be empty).
+
+Passwords: AES-256 takes any text, at most 127 bytes of UTF-8 (a Chinese character is 3). AES-128 keeps passwords in PDFDocEncoding,
+at most 32 characters; one with Chinese in it is refused (use AES-256). Neither is ever printed or stored.
+
+Permissions are all on unless turned off: --print none|low|high (high: the best quality; low: a poor one), --no-copy (copying text
+and pictures), --no-modify (changing the content), --no-annotate (annotations), --no-forms (filling in forms), --no-assemble
+(inserting, turning and deleting pages), --no-accessibility (extracting for screen readers). --cleartext-metadata leaves the
+document's metadata unencrypted so that search programs can read it.
+
+The whole file is written again (the pages, bookmarks, forms and the rest are kept; the bytes are not), so the output is a
+new file: it may not be the input. An input that is encrypted needs --password and the owner's rights (the owner password, or a
+file that allows everything), as 'decrypt' does. A signed file is refused: writing it again would break the signature.
+To take the passwords off, use 'decrypt'.
+
+Options:
+  --user-password <pw>   The password that opens the file
+  --owner-password <pw>  The password that lifts the restrictions
+  --password-file <file> A text file with the user password on line 1 and the owner password on line 2
+  --aes128               AES-128 instead of AES-256
+  --print none|low|high  What printing is allowed (default: high)
+  --no-copy, --no-modify, --no-annotate, --no-forms, --no-assemble, --no-accessibility
+                         Turn that permission off
+  --cleartext-metadata   Do not encrypt the metadata
+  --password <password>  The password of the input, if it is encrypted
+  -o, --output <file>    The file to write (required)
+  --force                Overwrite the output file if it exists
 ";
 
 const TEXT: &str = "\
@@ -444,6 +485,7 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Delete) => format!("{DELETE}{PAGE_LIST}"),
         Some(Command::Rotate) => format!("{ROTATE}{PAGE_LIST}"),
         Some(Command::Decrypt) => DECRYPT.to_string(),
+        Some(Command::Encrypt) => ENCRYPT.to_string(),
         Some(Command::Text) => format!("{TEXT}{PAGE_LIST}"),
         Some(Command::Render) => format!("{RENDER}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),

@@ -12,7 +12,7 @@
 //! What was encrypted stays encrypted: the output has the first file's
 //! encryption dictionary, key, passwords and permissions (as qpdf does), and
 //! every string and stream is encrypted again under its new object number.
-//! Only [`decrypt`] writes a file without it.
+//! Only [`decrypt`] writes a file without it, and [`protect`] writes one under a new encryption.
 
 use std::cell::{Cell, OnceCell};
 use std::collections::HashSet;
@@ -23,7 +23,8 @@ use crate::image::{self, Format, PageMode};
 use crate::object::{Dict, Name, ObjRef, Object};
 use crate::prune;
 pub use crate::security::has_owner_rights;
-use crate::security::PasswordKind;
+use qingpdf_base::cipher::Drbg;
+use crate::security::{OutputCrypt, PasswordKind, Protection, Security};
 use crate::writer::{Builder, Warning};
 
 /// A finished file and what to tell the user about it.
@@ -102,6 +103,16 @@ pub fn parse_page_ranges(spec: &str, page_count: usize) -> Result<Vec<usize>> {
 
 // --- rewriting a document -----------------------------------------------------------
 
+/// How the output of [`build`] is encrypted.
+enum Encrypt {
+    /// As the first document is, if it is encrypted.
+    Keep,
+    /// Not at all.
+    Clear,
+    /// Under a new encryption.
+    New(Box<OutputCrypt>),
+}
+
 /// One page of the output: page `page` of document `doc`, turned a further
 /// `rotate_by` degrees.
 struct Pick {
@@ -151,15 +162,15 @@ const LABELS: (&str, &str) = ("PageLabels", "page labels");
 const THREADS: (&str, &str) = ("Threads", "article threads");
 
 /// Write a new file whose pages are `picks`, in that order, from the
-/// documents in `docs`; the catalog is the first document's. `encrypt` keeps the first document's
-/// encryption (when it has any); without it the output is written in the clear.
+/// documents in `docs`; the catalog is the first document's. `encrypt` says how the output is encrypted: as the first
+/// document is (when it is), not at all, or under a new encryption.
 ///
 /// When pages of the first document are left out, its bookmarks, forms and
 /// named destinations are cut down to the pages that stay ([`prune`]). The
 /// other documents bring only their pages: their named destinations are made
 /// explicit and their structure tree links are dropped, because the things
 /// they point into are not copied.
-fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
+fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt) -> Result<Output> {
     let base = docs.first().ok_or_else(|| internal("no documents"))?;
     let version = docs.iter().map(|d| d.doc.version()).max().unwrap_or((1, 4));
     // The pages of the first document that stay, by object number.
@@ -168,10 +179,17 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
     let subset = kept.len() < base.page_nums.len();
 
     let mut b = Builder::with_capacity(version, base.size_hint.get());
+    // A file that is written afresh under another encryption (or none) loses every signature it had.
+    let rewriting = matches!(encrypt, Encrypt::New(_) | Encrypt::Clear);
+    if rewriting {
+        b.watch_signatures();
+    }
     let sources: Vec<usize> = docs.iter().map(|d| b.add_source(d.doc, &d.page_nums)).collect();
     let source_of = |i: usize| sources.get(i).copied().ok_or_else(|| internal("unknown document"));
-    if encrypt {
-        b.keep_encryption_of(source_of(0)?);
+    match encrypt {
+        Encrypt::Keep => b.keep_encryption_of(source_of(0)?),
+        Encrypt::Clear => {}
+        Encrypt::New(crypt) => b.encrypt_with(*crypt),
     }
     for &later in sources.iter().skip(1) {
         b.resolve_named_destinations(later);
@@ -264,6 +282,9 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: bool) -> Result<Output> {
         _ => None,
     };
 
+    if rewriting && b.saw_signature() {
+        return Err(Error::Invalid(SIGNED.to_string()));
+    }
     let (data, more) = b.finish(catalog_ref, info_ref)?;
     base.size_hint.set(data.len());
     warnings.extend(more);
@@ -370,7 +391,7 @@ fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
 pub fn copy_all(doc: &Document) -> Result<Output> {
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks, true)
+    build(&[d], &picks, Encrypt::Keep)
 }
 
 /// A new file with just the pages `pages` (0-based indices, as returned by
@@ -381,7 +402,7 @@ pub fn extract_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     }
     let d = load(doc)?;
     let picks: Vec<Pick> = pages.iter().map(|&page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-    build(&[d], &picks, true)
+    build(&[d], &picks, Encrypt::Keep)
 }
 
 /// A new file without the pages `pages` (0-based indices).
@@ -392,7 +413,7 @@ pub fn delete_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     if picks.is_empty() {
         return Err(Error::Invalid("that would delete every page".to_string()));
     }
-    build(&[d], &picks, true)
+    build(&[d], &picks, Encrypt::Keep)
 }
 
 /// A new file in which the pages `pages` (0-based indices) are turned by
@@ -411,7 +432,7 @@ pub fn rotate_pages(doc: &Document, pages: &[usize], angle: i64) -> Result<Outpu
             p
         })
         .collect();
-    build(&[d], &picks, true)
+    build(&[d], &picks, Encrypt::Keep)
 }
 
 /// How much of a document `split_every` keeps parsed while it works.
@@ -461,7 +482,7 @@ pub fn split_every(
     for (i, start) in (0..count).step_by(every).enumerate() {
         let end = start.saturating_add(every).min(count);
         let picks: Vec<Pick> = (start..end).map(|page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-        let out = build(&loaded, &picks, true)?;
+        let out = build(&loaded, &picks, Encrypt::Keep)?;
         for w in &out.warnings {
             if !warnings.contains(w) {
                 warnings.push(w.clone());
@@ -573,7 +594,7 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
     for (i, d) in docs.iter().enumerate() {
         picks.extend(all_picks(i, d.pages.len()));
     }
-    let mut out = build(&docs, &picks, true)?;
+    let mut out = build(&docs, &picks, Encrypt::Keep)?;
     // The first file's encryption is the output's (qpdf does the same). If it
     // has none, the output has none, and the encrypted files that came after
     // it lose theirs.
@@ -649,22 +670,82 @@ pub fn decrypt(doc: &Document, password: &str) -> Result<Output> {
     if doc.is_locked() {
         return Err(Error::PasswordRequired);
     }
-    if !has_owner_rights(doc, &encryption, password) && !encryption.permissions.allows_everything() {
-        let denied: Vec<&str> =
-            encryption.permissions.list().iter().filter(|(_, allowed)| !allowed).map(|(what, _)| *what).collect();
-        let tampered = if encryption.perms_valid {
-            ""
-        } else {
-            " (its permission check value /Perms does not agree with its flags /P, which someone may have edited, so it is taken to allow nothing)"
-        };
-        return Err(Error::Invalid(format!(
-            "the encryption is not removed: the file was opened with the user password and its author did not allow: {}{tampered}. Give the owner password with --password to remove it",
-            denied.join(", ")
-        )));
-    }
+    require_owner(doc, &encryption, password, "the encryption is not removed", "remove it")?;
+    // (Written again as a whole, a signed file would no longer verify.)
+    ensure_unsigned(doc)?;
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks, false)
+    build(&[d], &picks, Encrypt::Clear)
+}
+
+/// Does whoever opened the file have the right to change its protection: the owner password opened it (or the one given, or the
+/// empty one, is the owner's), or the file allows everything anyway? If not, the error says what the author did not allow;
+/// `refusal` is how it starts and `then` what giving the owner password would do.
+fn require_owner(doc: &Document, encryption: &crate::security::Encryption, password: &str, refusal: &str, then: &str) -> Result<()> {
+    if has_owner_rights(doc, encryption, password) || encryption.permissions.allows_everything() {
+        return Ok(());
+    }
+    let denied: Vec<&str> =
+        encryption.permissions.list().iter().filter(|(_, allowed)| !allowed).map(|(what, _)| *what).collect();
+    let tampered = if encryption.perms_valid {
+        ""
+    } else {
+        " (its permission check value /Perms does not agree with its flags /P, which someone may have edited, so it is taken to allow nothing)"
+    };
+    Err(Error::Invalid(format!(
+        "{refusal}: the file was opened with the user password and its author did not allow: {}{tampered}. Give the owner password with --password to {then}",
+        denied.join(", ")
+    )))
+}
+
+// --- protect ------------------------------------------------------------------------------------------
+
+/// What is said of a file that is signed and would be written again as a whole.
+const SIGNED: &str = "the file is signed: writing it again would break the signature";
+
+/// Is the file signed or certified, by what its form and its certification say? Writing it again as a whole changes the bytes a signature
+/// covers. (A signature dictionary that hangs somewhere else, from an annotation's `/V` say, is met while the file is written: `build`
+/// refuses then, `protect` and `decrypt` have both ways.)
+pub fn ensure_unsigned(doc: &Document) -> Result<()> {
+    if crate::edit::signature::look(doc).any() {
+        return Err(Error::Invalid(SIGNED.to_string()));
+    }
+    Ok(())
+}
+
+/// A copy of the document under the new encryption `how` (passwords, permissions, AES-256 or AES-128), written afresh as a whole
+/// (classic cross-reference table, no object streams, renumbered, only what is reachable; every string and stream encrypted under
+/// its new number with a fresh vector). The input may be encrypted already: it is read with its own key and written under the new
+/// one. `password` is the one the user gave for the input, if any. Needs the owner's rights over an encrypted input (the owner
+/// password, or a file that allows everything: the rule of [`decrypt`]), and a file without signatures. `seed` is 32 bytes from the
+/// system's cryptographic generator, new for this call; all the randomness of the output (file key, salts, `/ID` when the input has
+/// none, every vector) is derived from it by [`Drbg`]. See [`Security::create`] for the rules the passwords and permissions must
+/// follow.
+pub fn protect(doc: &Document, password: &str, how: &Protection, seed: &[u8; 32]) -> Result<Output> {
+    if doc.is_locked() {
+        return Err(Error::PasswordRequired);
+    }
+    if let Some(encryption) = doc.encryption() {
+        require_owner(doc, &encryption, password, "the protection is not changed", "change it")?;
+    }
+    ensure_unsigned(doc)?;
+    // A seed of zeros is what a caller that forgot to fill it in passes.
+    if seed.iter().all(|&b| b == 0) {
+        return Err(Error::Invalid("internal error: no random seed was given".to_string()));
+    }
+    let mut drbg = Drbg::new(seed);
+    // The first part of /ID stays the file's own; a file without one is given one.
+    let mut id0 = doc.first_file_id();
+    if id0.is_empty() || id0.len() > 64 {
+        id0 = drbg.bytes::<16>().to_vec();
+    }
+    let sec = Security::create(how, &id0, &mut drbg)?;
+    let crypt = OutputCrypt::with_drbg(sec, drbg).ok_or_else(|| internal("the new encryption is not open"))?;
+    let d = load(doc)?;
+    // The output is about as big as the input: the buffer is made that big at once, not grown (and copied) over and over.
+    d.size_hint.set(doc.data().len());
+    let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
+    build(&[d], &picks, Encrypt::New(Box::new(crypt)))
 }
 
 // --- images to PDF ---------------------------------------------------------------------

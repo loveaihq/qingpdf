@@ -15,6 +15,7 @@ mod outline;
 mod pagenum;
 mod pages;
 mod printjob;
+mod protect;
 mod recents;
 mod searching;
 mod selecting;
@@ -65,6 +66,8 @@ pub const CMD_FIND: u32 = 18;
 pub const CMD_FIND_NEXT: u32 = 19;
 pub const CMD_FIND_PREV: u32 = 20;
 pub const CMD_COPY: u32 = 21;
+/// File > Passwords and permissions.
+pub const CMD_PROTECT: u32 = 22;
 /// Tools > Recognize text: in every scanned page, on this page.
 pub const CMD_OCR_ALL: u32 = 26;
 pub const CMD_OCR_PAGE: u32 = 27;
@@ -136,6 +139,7 @@ const TAG_UNSAVED: u32 = 6;
 const TAG_WATERMARK: u32 = 7;
 const TAG_SRC_PASSWORD: u32 = 8;
 const TAG_PAGENUM: u32 = 9;
+const TAG_PROTECT: u32 = 10;
 
 // Timers.
 /// The view has stopped moving.
@@ -329,6 +333,10 @@ pub struct App {
     pg: PageWork,
     /// What the box of Insert > Page numbers... holds.
     pn: pagenum::Pagenum,
+
+    // --- passwords and permissions (2026-10-16) ---
+    /// How the open file is protected, and the box that changes it.
+    pt: protect::Protect,
 }
 
 impl App {
@@ -417,6 +425,7 @@ impl App {
             bench_sidebar: false,
             pg: PageWork::new(),
             pn: pagenum::Pagenum::new(),
+            pt: protect::Protect::new(),
         }
     }
 
@@ -495,6 +504,7 @@ impl App {
             self.engine.cancel(id);
         }
         self.edit.reset();
+        self.pt.reset();
         let had_outline = !self.outline.is_empty();
         self.doc = None;
         self.cache.clear();
@@ -539,6 +549,7 @@ impl App {
         }
         self.opening = false;
         self.rights = o.rights;
+        self.pt.info = Some(o.protection);
         let sizes = o.pages.iter().map(|p| (p.width, p.height)).collect();
         self.doc = Some(Doc { layout: Layout::new(sizes), max_tile_pixels: o.max_tile_pixels });
         self.cache = BitmapCache::new(o.bitmap_cache_bytes);
@@ -987,6 +998,7 @@ impl App {
             CMD_TOOL_TEXTBOX | CMD_INS_TEXT => self.text_tool(cmd == CMD_INS_TEXT),
             CMD_INS_WM => self.ask_watermark(),
             CMD_INS_PAGENUM => self.ask_pagenum(),
+            CMD_PROTECT => self.ask_protect(),
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
@@ -1307,6 +1319,7 @@ impl Handler for App {
             },
             Event::Text { .. } => Vec::new(),
             Event::Form { tag: TAG_PAGENUM, answer } => self.pagenum_answered(answer),
+            Event::Form { tag: TAG_PROTECT, answer } => self.protect_answered(answer),
             Event::Form { .. } => Vec::new(),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
             Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),

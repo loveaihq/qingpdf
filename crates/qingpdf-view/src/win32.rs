@@ -471,6 +471,12 @@ unsafe extern "system" {
     fn GetUserNameW(buffer: *mut u16, size: *mut u32) -> i32;
 }
 
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    /// `NTSTATUS BCryptGenRandom(BCRYPT_ALG_HANDLE algorithm, PUCHAR buffer, ULONG size, ULONG flags)`: 0 for success.
+    fn BCryptGenRandom(algorithm: *mut c_void, buffer: *mut u8, size: u32, flags: u32) -> i32;
+}
+
 #[link(name = "comdlg32")]
 unsafe extern "system" {
     fn GetOpenFileNameW(ofn: *mut OpenFileNameW) -> i32;
@@ -793,6 +799,17 @@ pub fn user_name() -> String {
     }
     let n = (len as usize).saturating_sub(1).min(buf.len());
     String::from_utf16_lossy(buf.get(..n).unwrap_or(&[]))
+}
+
+/// Fill `buffer` with random bytes from the system's cryptographic generator (what an encryption is seeded with). `false`: Windows gave
+/// none, and nothing weaker is ever used instead.
+pub fn random_bytes(buffer: &mut [u8]) -> bool {
+    /// Use the system's preferred generator; the algorithm handle must then be null.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    let Ok(size) = u32::try_from(buffer.len()) else { return false };
+    // SAFETY: `buffer` is a live, writable slice of exactly `size` bytes, which is what Windows is told; the algorithm handle is null as the
+    // flag requires; Windows writes into the buffer during the call and keeps no pointer to it. A status of 0 is success.
+    unsafe { BCryptGenRandom(null_mut(), buffer.as_mut_ptr(), size, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 }
 }
 
 /// Today's date in the person's time zone, as `2026-10-15` (what a page number's `{date}` is).
@@ -2198,6 +2215,7 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
             FormKind::Label => ("STATIC", 0, 0),
             FormKind::Group => ("BUTTON", BS_GROUPBOX, 0),
             FormKind::Edit => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE),
+            FormKind::Secret => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, WS_EX_CLIENTEDGE),
             FormKind::Combo => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0),
             FormKind::Pick => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0),
             FormKind::Check => ("BUTTON", WS_TABSTOP | BS_AUTOCHECKBOX, 0),
@@ -2208,7 +2226,7 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
         let text = if matches!(item.kind, FormKind::Pick) { "" } else { item.text.as_str() };
         let h = child(class, text, style, ex, item.rect, id);
         if h != 0 {
-            if focus == 0 && matches!(item.kind, FormKind::Edit | FormKind::Combo) {
+            if focus == 0 && matches!(item.kind, FormKind::Edit | FormKind::Secret | FormKind::Combo) {
                 focus = h;
             }
             let units: Vec<Vec<u16>> = item.choices.iter().map(|c| wide(c)).collect();
@@ -2253,6 +2271,13 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
         for &(kind, h) in &made {
             match kind {
                 FormKind::Edit | FormKind::Combo => values.push(window_text(h, 4_000)),
+                FormKind::Secret => {
+                    let mut units = text_units(h);
+                    values.push(String::from_utf16_lossy(&units));
+                    // The typed characters are overwritten (they are a password).
+                    units.fill(0);
+                    std::hint::black_box(&units);
+                }
                 FormKind::Pick => values.push(ask(h, CB_GETCURSEL).max(0).to_string()),
                 FormKind::Check => values.push(String::from(if ask(h, BM_GETCHECK) == 1 { "1" } else { "0" })),
                 FormKind::Label | FormKind::Group | FormKind::Button => {}
@@ -2260,6 +2285,11 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
         }
         FormAnswer { values, button: state.pressed.get().checked_sub(1) }
     });
+    // What is left in a password box goes before the box does.
+    for &(_, h) in made.iter().filter(|m| m.0 == FormKind::Secret) {
+        // SAFETY: clears the text of an edit control that is alive.
+        unsafe { SetWindowTextW(h, [0u16].as_ptr()) };
+    }
     end_modal(owner, dialog);
     answer
 }

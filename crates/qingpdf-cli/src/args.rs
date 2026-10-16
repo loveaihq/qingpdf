@@ -14,6 +14,7 @@ pub enum Command {
     Delete,
     Rotate,
     Decrypt,
+    Encrypt,
     Text,
     Render,
     Img2pdf,
@@ -27,13 +28,14 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 16] = [
+    pub const ALL: [Command; 17] = [
         Command::Info,
         Command::Merge,
         Command::Split,
         Command::Delete,
         Command::Rotate,
         Command::Decrypt,
+        Command::Encrypt,
         Command::Text,
         Command::Render,
         Command::Img2pdf,
@@ -54,6 +56,7 @@ impl Command {
             Command::Delete => "delete",
             Command::Rotate => "rotate",
             Command::Decrypt => "decrypt",
+            Command::Encrypt => "encrypt",
             Command::Text => "text",
             Command::Render => "render",
             Command::Img2pdf => "img2pdf",
@@ -82,6 +85,8 @@ pub enum Request {
     Delete { input: PathBuf, pages: String, output: PathBuf, force: bool, password: String },
     Rotate { input: PathBuf, pages: Option<String>, angle: i64, output: PathBuf, force: bool, password: String },
     Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
+    /// Write a copy under a new encryption; `password` opens the input.
+    Encrypt { input: PathBuf, output: PathBuf, force: bool, password: String, how: Box<Protect> },
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
     Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
@@ -126,6 +131,46 @@ pub enum Request {
     Xlsx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
 }
 
+/// How `encrypt` is to protect the file, as it was written on the command line.
+#[derive(Clone, PartialEq)]
+pub struct Protect {
+    /// `--user-password` and `--owner-password`; `None`: not given (empty).
+    pub user_password: Option<String>,
+    pub owner_password: Option<String>,
+    /// `--password-file`: line 1 the user password, line 2 the owner password.
+    pub password_file: Option<PathBuf>,
+    pub aes128: bool,
+    pub print: PrintLevel,
+    pub no_copy: bool,
+    pub no_modify: bool,
+    pub no_annotate: bool,
+    pub no_forms: bool,
+    pub no_assemble: bool,
+    pub no_accessibility: bool,
+    pub cleartext_metadata: bool,
+}
+
+impl std::fmt::Debug for Protect {
+    /// Never shows a password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Protect")
+            .field("user_password", &self.user_password.as_ref().map(|_| "..."))
+            .field("owner_password", &self.owner_password.as_ref().map(|_| "..."))
+            .field("password_file", &self.password_file)
+            .field("aes128", &self.aes128)
+            .field("print", &self.print)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `--print`: what printing the author allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintLevel {
+    None,
+    Low,
+    High,
+}
+
 /// What `parse` found.
 #[derive(Debug, PartialEq)]
 pub enum Parsed {
@@ -164,6 +209,8 @@ struct Allowed {
     mark: bool,
     /// The options of `pagenum`: the six places, `--color`, `--margin`, `--start`, `--mirror`, `--skip-first`.
     pagenum: bool,
+    /// The options of `encrypt`: the passwords, `--aes128`, `--print` and the `--no-...` switches.
+    protect: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
@@ -179,6 +226,7 @@ fn allowed(c: Command) -> Allowed {
         password: false,
         mark: false,
         pagenum: false,
+        protect: false,
     };
     match c {
         Command::Info => Allowed { password: true, ..none },
@@ -187,6 +235,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Delete => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
         Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
+        Command::Encrypt => Allowed { output: true, force: true, password: true, protect: true, ..none },
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
@@ -228,6 +277,25 @@ struct Collected {
     start: Option<String>,
     mirror: bool,
     skip_first: bool,
+    /// `encrypt`: the passwords and the file they may be in, the print level and the switches.
+    user_password: Option<String>,
+    owner_password: Option<String>,
+    password_file: Option<PathBuf>,
+    print: Option<String>,
+    switches: Switches,
+}
+
+/// The switches of `encrypt` that take no value.
+#[derive(Default)]
+struct Switches {
+    aes128: bool,
+    no_copy: bool,
+    no_modify: bool,
+    no_annotate: bool,
+    no_forms: bool,
+    no_assemble: bool,
+    no_accessibility: bool,
+    cleartext_metadata: bool,
 }
 
 fn text(value: OsString, option: &str, command: Command) -> Result<String, UsageError> {
@@ -304,6 +372,24 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 }
                 continue;
             }
+            "--aes128" | "--no-copy" | "--no-modify" | "--no-annotate" | "--no-forms" | "--no-assemble" | "--no-accessibility" | "--cleartext-metadata" if ok.protect => {
+                if inline.is_some() {
+                    return Err(usage(c, format!("{name} does not take a value")));
+                }
+                let sw = &mut got.switches;
+                match name.as_str() {
+                    "--aes128" => sw.aes128 = true,
+                    "--no-copy" => sw.no_copy = true,
+                    "--no-modify" => sw.no_modify = true,
+                    "--no-annotate" => sw.no_annotate = true,
+                    "--no-forms" => sw.no_forms = true,
+                    "--no-assemble" => sw.no_assemble = true,
+                    "--no-accessibility" => sw.no_accessibility = true,
+                    _ => sw.cleartext_metadata = true,
+                }
+                continue;
+            }
+            "--user-password" | "--owner-password" | "--password-file" | "--print" if ok.protect => {}
             "--tile" | "--under" if ok.mark && mark_option(command, &name) => {
                 if inline.is_some() {
                     return Err(usage(c, format!("{name} does not take a value")));
@@ -369,6 +455,21 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--password" => {
                 if got.password.replace(text(value, "--password", command)?).is_some() {
                     return Err(slot_taken("--password"));
+                }
+            }
+            "--user-password" | "--owner-password" | "--print" => {
+                let slot = match name.as_str() {
+                    "--user-password" => &mut got.user_password,
+                    "--owner-password" => &mut got.owner_password,
+                    _ => &mut got.print,
+                };
+                if slot.replace(text(value, &name, command)?).is_some() {
+                    return Err(slot_taken(&name));
+                }
+            }
+            "--password-file" => {
+                if got.password_file.replace(PathBuf::from(value)).is_some() {
+                    return Err(slot_taken("--password-file"));
                 }
             }
             "--image" => {
@@ -474,7 +575,7 @@ fn hex_color(v: &str) -> Option<[u8; 3]> {
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -532,6 +633,35 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
         Command::Decrypt => {
             let input = one_input(&mut inputs)?;
             Ok(Request::Decrypt { input, output: need_output(output)?, force, password })
+        }
+        Command::Encrypt => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            if password_file.is_some() && (user_password.is_some() || owner_password.is_some()) {
+                return Err(usage(c, "use either --password-file or --user-password and --owner-password, not both"));
+            }
+            let print = match print.as_deref() {
+                None | Some("high") => PrintLevel::High,
+                Some("low") => PrintLevel::Low,
+                Some("none") => PrintLevel::None,
+                Some(_) => return Err(usage(c, "--print must be none, low or high")),
+            };
+            let Switches { aes128, no_copy, no_modify, no_annotate, no_forms, no_assemble, no_accessibility, cleartext_metadata } = switches;
+            let how = Protect {
+                user_password,
+                owner_password,
+                password_file,
+                aes128,
+                print,
+                no_copy,
+                no_modify,
+                no_annotate,
+                no_forms,
+                no_assemble,
+                no_accessibility,
+                cleartext_metadata,
+            };
+            Ok(Request::Encrypt { input, output, force, password, how: Box::new(how) })
         }
         Command::Text => {
             let input = one_input(&mut inputs)?;
@@ -917,5 +1047,44 @@ mod tests {
         ] {
             assert!(fails(&args).contains(word), "{args:?}");
         }
+    }
+
+    #[test]
+    fn encrypt_takes_the_passwords_the_method_and_the_permissions() {
+        let Request::Encrypt { input, output, force, password, how } = run(&["encrypt", "a.pdf", "-o", "out.pdf", "--user-password", "u", "--owner-password=o"]) else { panic!("not encrypt") };
+        assert_eq!((input, output, force, password), ("a.pdf".into(), "out.pdf".into(), false, String::new()));
+        assert_eq!((how.user_password.as_deref(), how.owner_password.as_deref(), how.print, how.aes128), (Some("u"), Some("o"), PrintLevel::High, false));
+        assert!(!how.no_copy && !how.no_modify && !how.no_annotate && !how.no_forms && !how.no_assemble && !how.no_accessibility && !how.cleartext_metadata);
+        let Request::Encrypt { password, how, force, .. } = run(&[
+            "encrypt", "--aes128", "a.pdf", "--print", "none", "--no-copy", "--no-modify", "--no-annotate", "--no-forms", "--no-assemble", "--no-accessibility",
+            "--cleartext-metadata", "--password-file", "pw.txt", "--password", "old", "-o", "out.pdf", "--force",
+        ]) else {
+            panic!("not encrypt")
+        };
+        assert_eq!((password.as_str(), force), ("old", true));
+        assert!(how.aes128 && how.no_copy && how.no_modify && how.no_annotate && how.no_forms && how.no_assemble && how.no_accessibility && how.cleartext_metadata);
+        assert_eq!((how.print, how.password_file), (PrintLevel::None, Some("pw.txt".into())));
+        for (word, level) in [("low", PrintLevel::Low), ("high", PrintLevel::High), ("none", PrintLevel::None)] {
+            let Request::Encrypt { how, .. } = run(&["encrypt", "a.pdf", "-o", "o.pdf", "--print", word, "--user-password", "u"]) else { panic!("not encrypt") };
+            assert_eq!(how.print, level);
+        }
+        for (args, word) in [
+            (vec!["encrypt", "a.pdf", "--user-password", "u"], "-o"),
+            (vec!["encrypt", "-o", "o.pdf", "--user-password", "u"], "no input file"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--print", "medium"], "--print must be none, low or high"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--aes128=1"], "does not take a value"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--no-copy=1"], "does not take a value"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--password-file", "p", "--owner-password", "o"], "not both"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--user-password", "a", "--user-password", "b"], "--user-password given more than once"),
+            (vec!["encrypt", "a.pdf", "-o", "o.pdf", "--owner-password"], "--owner-password needs a value"),
+            (vec!["decrypt", "a.pdf", "-o", "o.pdf", "--aes128"], "unknown option '--aes128'"),
+            (vec!["merge", "a.pdf", "b.pdf", "-o", "o.pdf", "--user-password", "x"], "unknown option '--user-password'"),
+        ] {
+            assert!(fails(&args).contains(word), "{args:?}");
+        }
+        // A mistyped option is shown without its value; a password in the debug form of the request is not shown at all.
+        assert!(!fails(&["encrypt", "a.pdf", "-o", "o.pdf", "--usr-password=secret-value"]).contains("secret-value"));
+        let request = run(&["encrypt", "a.pdf", "-o", "o.pdf", "--user-password", "very-secret", "--owner-password", "also-secret"]);
+        assert!(!format!("{request:?}").contains("secret"));
     }
 }

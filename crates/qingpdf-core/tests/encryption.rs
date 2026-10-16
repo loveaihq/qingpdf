@@ -693,6 +693,14 @@ fn decrypt_needs_the_owner_password_or_every_permission() {
         let as_user = open(&row.path, &row.user);
         let everything = as_user.encryption().unwrap().permissions.allows_everything();
         let by_owner = open(&row.path, &row.owner);
+        if label.contains("sig.") {
+            // Signed: written again as a whole it would no longer verify, so `decrypt` refuses it, whoever asks.
+            match ops::decrypt(&by_owner, &row.owner) {
+                Err(Error::Invalid(m)) => assert!(m.contains("signed"), "{label}: {m}"),
+                other => panic!("{label}: a signed file was decrypted: {:?}", other.map(|o| o.pages)),
+            }
+            continue;
+        }
         let result = ops::decrypt(&as_user, &row.user);
         if everything || row.owner.is_empty() {
             assert!(result.is_ok(), "{label}: the permissions allow everything, or the owner has no password");

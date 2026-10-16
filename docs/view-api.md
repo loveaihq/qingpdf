@@ -178,6 +178,18 @@
 
 限制（超了答 `Failed`，文件不变）：一次插入最多 `MAX_INSERT_PAGES`（5000）页、对方文件最多 `MAX_INSERT_FILE_BYTES`（16 MiB，就是没保存的改动的内存预算，两个数字是同一个：插进来的对象和文件差不多大，放不下的文件根本插不进；文件按剩下的预算和这个上限里小的那个读，多读一字节就知道超了，不看读之前量的长度），表单的字段最多 2 万个、对方的 `/DR` 条目合计最多 1 万个（超了：字段多了拒绝，`/DR` 不并）；改完全文最多 `MAX_PAGES_AFTER`（10 万）页；插进来的对象和这次改动的对象一起算在没保存的改动的内存预算里（16 MiB，超了答 `the change is too big`，后面写怎么办：先保存或分几次）；对方的命名目的地走原来的字节预算；工作量记在计量器里（每次改动 500 万单位加每页 2 万，插入再加对方每字节 8，所以一个会话里改页面的次数也受那 20 页的总额度限制）；页面树有一页或一个节点列了两遍、有环或超过 256 层，一律拒绝（读页面时那样的树能读，改它不行）。数字和理由见 `docs/decisions.md` 的“页面管理（2026-10-15）”。
 
+## 密码和权限的请求和结果（2026-10-16）
+
+给 文件 → 密码和权限… 用。引擎自己不产生随机数：随机数从界面来，界面从系统的密码学随机源取（Windows 的 `BCryptGenRandom`）。
+
+| 调用 | 作用 |
+|---|---|
+| `protect(doc, id, 路径, 改法, 种子)` | 把文档（连没保存的改动一起）整个重写成一个新文件写到路径（路径可以就是打开的那个文件），答 `Protected { doc, id, status, message, bytes }`（`status` 是 `Done` 或 `Failed`，`message` 在 `Failed` 时说原因、在 `Done` 时是提醒）。`改法` 是 `ProtectChange::Set(Box<Protection>)`（设新的保护，替换原来的，原来没有也行）或 `ProtectChange::Remove`（去掉加密，就是 `qingpdf decrypt`）。**不碰打开的文件，也不换掉引擎里的文档**：界面写成功后自己用 `open_file` 打开写出的文件（带上新密码）。写法和保存一样：先写同目录的临时文件、再改名替换，出错原文件不动。按改动的顺序做；打印在跑时答 `Failed`。 |
+
+`Protection { method, user_password, owner_password, permissions, encrypt_metadata }`（`qingpdf_core::security`）：`method` 是 `Method::AesV3`（AES-256，修订版 6，默认）或 `Method::AesV2`（AES-128，修订版 4）；密码是文本，空的是没有；`permissions` 是 `Permissions`（打印、高质量打印、修改内容、复制、批注、填表、组装、辅助功能提取，八个布尔）。规矩（`ops::protect`、`Security::create`，不合规矩答 `Failed`，文件没写）：关了任何一项权限就必须有所有者密码；没有任何密码又没关任何权限，什么也保护不了，拒绝；没给所有者密码时它等于用户密码；AES-256 的密码是 UTF-8（先做轻量的 SASLprep），最多 127 字节；AES-128 的密码是 PDFDocEncoding（汉字写不进去，消息里让用 AES-256），最多 32 字节；输入是加密的文件要有所有者的权利（所有者密码，或文件允许一切，和 `decrypt` 同一条）；有签名的文件（任何签名、任何级别的认证；表单之外挂着的签名字典，整个重写时也会碰到并拒绝；`Remove` 同样）拒绝。`Protection` 的 `Debug` 不显示密码，丢弃时把密码字节改写成零。`种子` 是 32 字节，来自系统随机源，每次调用新取一个，用完引擎把它改写成零；全零的种子（调用者忘了填）拒绝。同一个种子、同一个文件、同样的设置得到同样的字节（随机数全是从种子来的，所以测试可以复现）。
+
+`Opened` 多一项 `protection: Protected { cipher, needs_password, permissions, may_change, signed }`：`cipher` 是 `None`（没加密）、`Aes256`、`Aes128`、`Rc4`（不分位数）或 `Other`；`needs_password` 是空密码打不开；`permissions` 是文件里写的权限（不是打开的人有的权利：用所有者密码打开的，`Rights` 全开，这里仍照实写）；`may_change` 是没加密、或用所有者密码打开的、或文件允许一切（`protect` 和 `decrypt` 同一条规矩）；`signed` 是有签名或认证。界面用它画对话框的"现在的保护"，并在 `may_change` 为假或 `signed` 为真时只说明原因、不去问文件名。
+
 ## 对接别的语言
 
 接口里只有整数、浮点、字符串、字节数组和没有数据的枚举，没有 Rust 特有的东西（借用、闭包、泛型）。包成 C 接口：每个调用一个函数（`add_markup`、`add_ink`、`add_note`、`delete_annotation` 各是一个函数，不是一个带数据的 `Edit` 枚举），事件取出来摊平成一个结构（`kind` 加上各字段）、位图用"指针加长度"交出去并配一个释放函数，`notify` 换成"函数指针加一个 `void*`"。鸿蒙的 NAPI 同理：`poll` 的结果转成 JS 对象，`notify` 用线程安全函数回到主线程。**这两个包装 3d-1、3d-2、4a 都没有写。**

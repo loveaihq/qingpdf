@@ -10,7 +10,7 @@
 //! reader sees plain data), and the writer uses a copy of it to encrypt the
 //! objects of a new file under the same key ([`OutputCrypt`]).
 
-use crate::cipher::{self, CipherError, IvSource};
+use crate::cipher::{self, CipherError, Drbg, IvSource};
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::info::pdf_doc_char;
@@ -89,6 +89,27 @@ impl Permissions {
             assemble: if old { bit(4) } else { bit(11) },
             accessibility: if old { bit(5) } else { bit(10) },
         }
+    }
+
+    /// Everything is allowed.
+    pub fn all() -> Permissions {
+        Permissions::from_flags(u32::MAX, 3)
+    }
+
+    /// The flags `/P` of a file of revision 3 or later that allows just these things (7.6.3.2 Table 22): bits 1 and 2 clear, 7, 8 and
+    /// 13 to 32 set (reserved), and the others as the permissions say. Bit 12, printing at the best quality, goes with printing only.
+    pub fn to_flags(&self) -> u32 {
+        let bits = [
+            (self.print, 3),
+            (self.modify, 4),
+            (self.copy, 5),
+            (self.annotate, 6),
+            (self.fill_forms, 9),
+            (self.accessibility, 10),
+            (self.assemble, 11),
+            (self.print && self.print_high_quality, 12),
+        ];
+        bits.iter().filter(|(allowed, _)| *allowed).fold(0xFFFF_F0C0u32, |flags, (_, bit)| flags | (1u32 << (bit - 1)))
     }
 
     /// Is everything allowed?
@@ -1042,6 +1063,233 @@ pub(crate) fn prepare_password(text: &str) -> String {
         .collect()
 }
 
+// --- a new encryption --------------------------------------------------------------
+
+/// What a file is to be protected with ([`Security::create`]): written by us, so only the two methods we write.
+#[derive(Clone)]
+pub struct Protection {
+    /// [`Method::AesV3`]: AES-256 (V 5, revision 6, the default); [`Method::AesV2`]: AES-128 (V 4, revision 4, for old programs).
+    pub method: Method,
+    /// The password that opens the file; empty: none (anyone can open it, with the restrictions of `permissions`).
+    pub user_password: String,
+    /// The password that lifts the restrictions; empty: the user password. A permission turned off needs one.
+    pub owner_password: String,
+    pub permissions: Permissions,
+    /// `/EncryptMetadata`; false leaves the document's metadata stream in the clear (so that a search program can read it).
+    pub encrypt_metadata: bool,
+}
+
+/// Overwrite a password that is no longer needed (as far as the language lets us: the compiler is told the bytes are looked at).
+pub fn wipe(text: &mut String) {
+    let mut bytes = std::mem::take(text).into_bytes();
+    bytes.fill(0);
+    std::hint::black_box(&bytes);
+}
+
+impl Drop for Protection {
+    fn drop(&mut self) {
+        wipe(&mut self.user_password);
+        wipe(&mut self.owner_password);
+    }
+}
+
+impl std::fmt::Debug for Protection {
+    /// Never shows a password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Protection")
+            .field("method", &self.method)
+            .field("has_user_password", &!self.user_password.is_empty())
+            .field("has_owner_password", &!self.owner_password.is_empty())
+            .field("permissions", &self.permissions)
+            .field("encrypt_metadata", &self.encrypt_metadata)
+            .finish()
+    }
+}
+
+/// Why a password cannot be used with a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordProblem {
+    /// More bytes than the method keeps: 32 for AES-128, 127 (of UTF-8) for AES-256.
+    TooLong { most: usize },
+    /// AES-128 keeps a password in PDFDocEncoding (7.6.3.3 step a, Annex D), which has no Chinese, to name one.
+    NotInPdfDocEncoding,
+    /// Text that is nothing once prepared (only zero-width characters, say): written as it would be, the file would say it needs a password
+    /// and open with none.
+    NothingLeft,
+}
+
+impl std::fmt::Display for PasswordProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasswordProblem::TooLong { most } => write!(f, "is longer than the {most} bytes this kind of encryption keeps"),
+            PasswordProblem::NotInPdfDocEncoding => f.write_str(
+                "has characters AES-128 cannot keep (PDFDocEncoding has no Chinese, for one); use AES-256 for it",
+            ),
+            PasswordProblem::NothingLeft => f.write_str("is only characters that do not count (a zero-width one, say), so it would be no password"),
+        }
+    }
+}
+
+/// The bytes a password is written as under `method`, or why it cannot be. AES-256 (revision 6): UTF-8 after the light SASLprep
+/// of [`prepare_password`], at most 127 bytes. AES-128 (revision 4): PDFDocEncoding, at most 32 bytes (a longer one would be cut
+/// by every program that reads the file, and a prefix of it would open it). The empty password is empty.
+pub fn password_bytes(method: Method, password: &str) -> std::result::Result<Vec<u8>, PasswordProblem> {
+    // (Nothing is made of a text this long before it is refused: a character is at most four bytes, and the limit is 127.)
+    if password.len() > 1024 {
+        return Err(PasswordProblem::TooLong { most: if method == Method::AesV3 { MAX_PASSWORD_V5 } else { 32 } });
+    }
+    let (bytes, most) = if method == Method::AesV3 {
+        (prepare_password(password).into_bytes(), MAX_PASSWORD_V5)
+    } else {
+        (pdf_doc_bytes(password).ok_or(PasswordProblem::NotInPdfDocEncoding)?, 32)
+    };
+    if bytes.len() > most {
+        Err(PasswordProblem::TooLong { most })
+    } else if bytes.is_empty() && !password.is_empty() {
+        Err(PasswordProblem::NothingLeft)
+    } else {
+        Ok(bytes)
+    }
+}
+
+impl Security {
+    /// A new encryption for a file, made as `how` says: a random file key and salts from `drbg`, and the entries of the
+    /// encryption dictionary that go with the passwords (Algorithms 2, 3 and 5 of 7.6.3 for AES-128; Algorithms 2.B, 8, 9 and 10 of
+    /// ISO 32000-2 for AES-256, as qpdf writes them). `id0` is the first element of the file's `/ID` (the key of AES-128 depends on
+    /// it). The result is open, as with the owner password. Before it is given out, both passwords are tried against it: an
+    /// encryption that nobody could open is not made.
+    pub fn create(how: &Protection, id0: &[u8], drbg: &mut Drbg) -> Result<Security> {
+        let invalid = |what: &str| Error::Invalid(what.to_string());
+        if !matches!(how.method, Method::AesV2 | Method::AesV3) {
+            return Err(invalid("a file is protected with AES-256 or AES-128 only"));
+        }
+        if how.owner_password.is_empty() && !how.permissions.allows_everything() {
+            return Err(invalid("a permission is turned off, so an owner password is needed"));
+        }
+        let owner_text = if how.owner_password.is_empty() { &how.user_password } else { &how.owner_password };
+        if owner_text.is_empty() {
+            return Err(invalid("nothing would be protected: give a password or turn a permission off"));
+        }
+        let user = password_bytes(how.method, &how.user_password).map_err(|p| Error::Invalid(format!("the user password {p}")))?;
+        let owner = password_bytes(how.method, owner_text).map_err(|p| Error::Invalid(format!("the owner password {p}")))?;
+        let p = how.permissions.to_flags();
+        let v5 = how.method == Method::AesV3;
+        let (v, r) = if v5 { (5, 6) } else { (4, 4) };
+        let mut sec = Security {
+            params: Params {
+                v,
+                r,
+                key_bytes: if v5 { 32 } else { 16 },
+                p,
+                o: Vec::new(),
+                u: Vec::new(),
+                oe: Vec::new(),
+                ue: Vec::new(),
+                perms: None,
+                encrypt_metadata: how.encrypt_metadata,
+                id0: id0.to_vec(),
+                filters: vec![(Name::from("StdCF"), Some(how.method))],
+                stream: how.method,
+                string: how.method,
+                file: how.method,
+                dict: Dict::new(),
+            },
+            key: None,
+            auth: None,
+            encrypt_num: None,
+            root_metadata: None,
+            perms_valid: true,
+            password_needed: std::cell::Cell::new(None),
+        };
+        // The dictionary, but for the entries that come from the passwords. /P is written as the signed number most programs write
+        // (the low 32 bits are the flags).
+        let text = format!(
+            "<< /Filter /Standard /V {v} /R {r} /Length {} /P {} /CF << /StdCF << /CFM /{} /AuthEvent /DocOpen /Length {} >> >> /StmF /StdCF /StrF /StdCF {} >>",
+            if v5 { 256 } else { 128 },
+            p as i32,
+            if v5 { "AESV3" } else { "AESV2" },
+            if v5 { 32 } else { 16 },
+            if how.encrypt_metadata { "" } else { "/EncryptMetadata false" }
+        );
+        let Ok(Object::Dict(mut dict)) = crate::parser::Parser::new(text.as_bytes(), 0).parse_object() else {
+            return Err(invalid("internal error: the encryption dictionary does not read"));
+        };
+        let string = |b: Vec<u8>| Object::String(crate::object::PdfString::hex(b));
+        let file_key: Vec<u8>;
+        if v5 {
+            file_key = drbg.bytes::<32>().to_vec();
+            let [user_validation, user_key_salt, owner_validation, owner_key_salt] = [(); 4].map(|()| drbg.bytes::<8>());
+            // /U and /UE (Algorithm 8): the hash of the password and a validation salt, then the two salts; the file key under the
+            // hash of the password and the key salt.
+            let mut u = cipher::password_hash(6, &user, &user_validation, &[]);
+            u.extend_from_slice(&user_validation);
+            u.extend_from_slice(&user_key_salt);
+            let ue = wrap_key(&cipher::password_hash(6, &user, &user_key_salt, &[]), &file_key)?;
+            // /O and /OE (Algorithm 9): the same, with the owner password and the whole of /U in the hash.
+            let mut o = cipher::password_hash(6, &owner, &owner_validation, &u);
+            o.extend_from_slice(&owner_validation);
+            o.extend_from_slice(&owner_key_salt);
+            let oe = wrap_key(&cipher::password_hash(6, &owner, &owner_key_salt, &u), &file_key)?;
+            // /Perms (Algorithm 10): /P, ones, T or F for the metadata, `adb`, four bytes of anything; AES-256 in ECB mode.
+            let mut block = Vec::with_capacity(16);
+            block.extend_from_slice(&p.to_le_bytes());
+            block.extend_from_slice(&[0xFF; 4]);
+            block.push(if how.encrypt_metadata { b'T' } else { b'F' });
+            block.extend_from_slice(b"adb");
+            block.extend_from_slice(&drbg.bytes::<4>());
+            let block: [u8; 16] = block.try_into().map_err(|_| invalid("internal error: the permission block has the wrong size"))?;
+            let perms = cipher::aes256_encrypt_block(&file_key, block).map_err(|e| Error::Invalid(e.message().to_string()))?.to_vec();
+            for (key, value) in [("O", &o), ("U", &u), ("OE", &oe), ("UE", &ue), ("Perms", &perms)] {
+                dict.set(key, string(value.clone()));
+            }
+            (sec.params.u, sec.params.o, sec.params.ue, sec.params.oe, sec.params.perms) = (u, o, ue, oe, Some(perms));
+        } else {
+            // /O (Algorithm 3): the padded user password under RC4, twenty times over, with keys made of the owner password.
+            let mut digest = cipher::md5(&pad_password(&owner));
+            for _ in 0..50 {
+                digest = cipher::md5(&digest);
+            }
+            let mut o = pad_password(&user).to_vec();
+            for i in 0..=19u8 {
+                let k: Vec<u8> = digest.iter().map(|b| b ^ i).collect();
+                cipher::rc4(&k, &mut o);
+            }
+            sec.params.o.clone_from(&o);
+            // The file key (Algorithm 2) depends on /O, /P and the first part of /ID, so it comes after them; /U (Algorithm 5) is
+            // made with the file key.
+            file_key = sec.file_key_v4(&pad_password(&user));
+            let mut input = PAD.to_vec();
+            input.extend_from_slice(id0);
+            let mut u = cipher::md5(&input).to_vec();
+            for i in 0..=19u8 {
+                let k: Vec<u8> = file_key.iter().map(|b| b ^ i).collect();
+                cipher::rc4(&k, &mut u);
+            }
+            u.resize(32, 0);
+            dict.set("O", string(o));
+            dict.set("U", string(u.clone()));
+            sec.params.u = u;
+        }
+        sec.params.dict = dict;
+        // A reader must open what was made, with the key that was made: read the dictionary back as one does and try both passwords.
+        let opens = |password: &str| {
+            Security::from_dict(sec.params.dict.clone(), id0.to_vec(), None).ok().is_some_and(|mut again| again.authenticate(password) && again.key.as_deref() == Some(&file_key))
+        };
+        if !opens(&how.user_password) || !opens(owner_text) {
+            return Err(invalid("internal error: the passwords do not open the encryption that was made"));
+        }
+        // It is open, as with the owner password.
+        sec.auth = Some(Auth { kind: PasswordKind::Owner, empty: false });
+        sec.key = Some(file_key);
+        Ok(sec)
+    }
+}
+
+/// The file key under `key`, for `/UE` and `/OE`.
+fn wrap_key(key: &[u8], file_key: &[u8]) -> Result<Vec<u8>> {
+    cipher::aes256_encrypt_no_padding(key, file_key).map_err(|e| Error::Invalid(e.message().to_string()))
+}
+
 // --- the writer's side ----------------------------------------------------------
 
 /// What a writer needs to keep a file's encryption: the same dictionary and
@@ -1062,6 +1310,20 @@ impl OutputCrypt {
     pub fn new(sec: &Security) -> Option<OutputCrypt> {
         sec.key.as_ref()?;
         Some(OutputCrypt { sec: sec.clone(), iv: IvSource::new() })
+    }
+
+    /// [`OutputCrypt::new`] for an encryption made by [`Security::create`]: the initialisation vectors are the output of `drbg` (the
+    /// generator the key came from).
+    pub fn with_drbg(sec: Security, drbg: Drbg) -> Option<OutputCrypt> {
+        sec.key.as_ref()?;
+        Some(OutputCrypt { sec, iv: IvSource::from_drbg(drbg) })
+    }
+
+    /// A new random file identifier for the second element of `/ID`, for an encryption made by [`Security::create`]: it comes from the
+    /// generator the vectors come from, so the file need not be read through again to make one (hashing a 100 MB body takes 0.2 s), and
+    /// it differs from every other file's as the vectors do. `None` for a file that keeps the encryption it was read with.
+    pub fn fresh_id(&self) -> Option<[u8; 16]> {
+        self.iv.generated()
     }
 
     /// The encryption dictionary to write into the new file: the same as the
@@ -1292,5 +1554,194 @@ mod tests {
         assert_eq!(crypt_filter_name(&d), Some(Name::from("Identity")));
         assert_eq!(crypt_filter_name(&dict("<< /Filter /FlateDecode >>")), None);
         assert_eq!(crypt_filter_name(&dict("<< >>")), None);
+    }
+
+    // --- a new encryption ---------------------------------------------------------------
+
+    fn protection(method: Method, user: &str, owner: &str, permissions: Permissions) -> Protection {
+        Protection { method, user_password: user.to_string(), owner_password: owner.to_string(), permissions, encrypt_metadata: true }
+    }
+
+    #[test]
+    fn the_flags_follow_table_22() {
+        assert_eq!(Permissions::all().to_flags(), 0xFFFF_FFFC);
+        let none = Permissions { print: false, print_high_quality: false, modify: false, copy: false, annotate: false, fill_forms: false, assemble: false, accessibility: false };
+        // Bits 1 and 2 are clear, 7, 8 and 13 to 32 are set whatever the permissions are.
+        assert_eq!(none.to_flags(), 0xFFFF_F0C0);
+        // The best quality of printing is a right of printing: without printing its bit stays clear.
+        assert_eq!(Permissions { print: false, print_high_quality: true, ..none }.to_flags(), 0xFFFF_F0C0);
+        assert_eq!(Permissions { print: true, print_high_quality: false, ..none }.to_flags(), 0xFFFF_F0C4);
+        // Every combination reads back as it was written (revision 3 and later).
+        for bits in 0u32..256 {
+            let on = |n: u32| bits & (1 << n) != 0;
+            let p = Permissions { print: on(0), print_high_quality: on(1), modify: on(2), copy: on(3), annotate: on(4), fill_forms: on(5), assemble: on(6), accessibility: on(7) };
+            let back = Permissions::from_flags(p.to_flags(), 3);
+            assert_eq!(back, Permissions { print_high_quality: p.print && p.print_high_quality, ..p }, "{bits:08b}");
+            assert_eq!(p.to_flags() & 0xFFFF_F0C3, 0xFFFF_F0C0, "reserved bits");
+            assert_eq!(Permissions::from_flags(p.to_flags(), 4), back);
+        }
+    }
+
+    #[test]
+    fn passwords_are_written_as_each_method_keeps_them() {
+        // AES-256: UTF-8 after the light SASLprep (a full-width letter is the ASCII one), at most 127 bytes.
+        assert_eq!(password_bytes(Method::AesV3, "密码").unwrap(), "密码".as_bytes());
+        assert_eq!(password_bytes(Method::AesV3, "ＡＢ").unwrap(), b"AB");
+        assert_eq!(password_bytes(Method::AesV3, "").unwrap(), Vec::<u8>::new());
+        assert!(password_bytes(Method::AesV3, &"a".repeat(127)).is_ok());
+        assert_eq!(password_bytes(Method::AesV3, &"a".repeat(128)), Err(PasswordProblem::TooLong { most: 127 }));
+        assert_eq!(password_bytes(Method::AesV3, &"密".repeat(43)), Err(PasswordProblem::TooLong { most: 127 }));
+        // AES-128: PDFDocEncoding, at most 32 bytes; Chinese cannot be written in it.
+        assert_eq!(password_bytes(Method::AesV2, "hôtel").unwrap(), vec![b'h', 0xF4, b't', b'e', b'l']);
+        assert_eq!(password_bytes(Method::AesV2, "密码"), Err(PasswordProblem::NotInPdfDocEncoding));
+        assert!(password_bytes(Method::AesV2, &"a".repeat(32)).is_ok());
+        assert_eq!(password_bytes(Method::AesV2, &"a".repeat(33)), Err(PasswordProblem::TooLong { most: 32 }));
+        // Text that is nothing once prepared is no password: written as it would be, the file would say it needs one and open with none. A
+        // space that is a character of its own (the ideographic one) is something.
+        for nothing in ["\u{200B}", "\u{200B}\u{00AD}\u{FEFF}\u{2060}"] {
+            assert_eq!(password_bytes(Method::AesV3, nothing), Err(PasswordProblem::NothingLeft), "{nothing:?}");
+        }
+        assert_eq!(password_bytes(Method::AesV3, "\u{3000}").unwrap(), b" ");
+        assert!(password_bytes(Method::AesV2, "\u{200B}").is_err());
+        // What is said about a password never contains it.
+        for p in [PasswordProblem::TooLong { most: 32 }, PasswordProblem::NotInPdfDocEncoding, PasswordProblem::NothingLeft] {
+            assert!(!p.to_string().is_empty());
+        }
+    }
+
+    /// The `/Encrypt` dictionary of `sec` read as a reader reads it (from the dictionary alone), and tried with `password`.
+    fn reopened(sec: &Security, id0: &[u8], password: &str) -> Option<Security> {
+        let mut again = Security::from_dict(sec.params.dict.clone(), id0.to_vec(), None).unwrap();
+        again.authenticate(password).then_some(again)
+    }
+
+    #[test]
+    fn a_new_encryption_opens_with_its_passwords_and_with_no_other() {
+        let id0 = b"0123456789abcdef";
+        let some = Permissions { print: true, print_high_quality: false, modify: false, copy: false, annotate: true, fill_forms: true, assemble: false, accessibility: true };
+        for method in [Method::AesV3, Method::AesV2] {
+            let mut drbg = Drbg::new(&[7u8; 32]);
+            // A user password and a different owner password, and some rights taken away.
+            let sec = Security::create(&protection(method, "open-me", "own-me", some), id0, &mut drbg).unwrap();
+            let user = reopened(&sec, id0, "open-me").unwrap();
+            assert_eq!(user.auth.map(|a| a.kind), Some(PasswordKind::User));
+            assert_eq!(user.permissions(), some, "{method:?}");
+            assert!(user.perms_valid());
+            assert_eq!(user.key, sec.key, "the file key that was made is the one the user password gives");
+            let owner = reopened(&sec, id0, "own-me").unwrap();
+            assert_eq!(owner.auth.map(|a| a.kind), Some(PasswordKind::Owner));
+            assert_eq!(owner.key, sec.key);
+            assert!(owner.is_owner_password("own-me") && !owner.is_owner_password("open-me"));
+            for wrong in ["open-m", "own-me ", "OPEN-ME", "", "own"] {
+                assert!(reopened(&sec, id0, wrong).is_none(), "{method:?} {wrong:?}");
+            }
+            let d = sec.describe();
+            assert_eq!((d.version, d.revision), if method == Method::AesV3 { (5, 6) } else { (4, 4) });
+            assert_eq!((d.stream_method, d.string_method, d.file_method), (method, method, method));
+            assert!(d.encrypt_metadata && d.needs_password());
+            // No user password: the file opens with the empty one, with the rights as they are; the owner password lifts them.
+            let open = Security::create(&protection(method, "", "own-me", some), id0, &mut drbg).unwrap();
+            let by_empty = reopened(&open, id0, "").unwrap();
+            assert_eq!(by_empty.permissions(), some);
+            assert!(!open.describe().needs_password());
+            assert!(reopened(&open, id0, "own-me").unwrap().is_owner_password("own-me"));
+            // Only a user password, nothing restricted: the owner password is the same one.
+            let both = Security::create(&protection(method, "same", "", Permissions::all()), id0, &mut drbg).unwrap();
+            assert!(reopened(&both, id0, "same").unwrap().is_owner_password("same"));
+            // AES-256 is new every time: another seed, another file key and other salts. The file key of AES-128 is what the standard makes of
+            // the passwords, /O, /P and the first part of /ID: with the same ones it is the same, and with another ID it is another.
+            let other = Security::create(&protection(method, "open-me", "own-me", some), id0, &mut Drbg::new(&[8u8; 32])).unwrap();
+            let elsewhere = Security::create(&protection(method, "open-me", "own-me", some), b"another id....", &mut Drbg::new(&[8u8; 32])).unwrap();
+            assert_ne!(elsewhere.key, sec.key);
+            if method == Method::AesV3 {
+                assert_ne!(other.key, sec.key);
+                assert_ne!(other.params.u, sec.params.u);
+            } else {
+                assert_eq!(other.key, sec.key);
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_aes_256_encryption_has_the_entries_of_revision_6() {
+        let mut drbg = Drbg::new(&[1u8; 32]);
+        let some = Permissions { copy: false, ..Permissions::all() };
+        let mut how = protection(Method::AesV3, "u", "o", some);
+        how.encrypt_metadata = false;
+        let sec = Security::create(&how, b"id", &mut drbg).unwrap();
+        let p = &sec.params;
+        assert_eq!((p.o.len(), p.u.len(), p.oe.len(), p.ue.len()), (48, 48, 32, 32));
+        assert_eq!(p.perms.as_ref().map(Vec::len), Some(16));
+        // /P as a signed number, and the check value /Perms says the same, with `F` for the clear metadata.
+        assert_eq!(p.p, some.to_flags());
+        assert_eq!(sec.params.dict.get("P"), Some(&Object::Integer(i64::from(some.to_flags() as i32))));
+        let block = cipher::aes256_decrypt_block(sec.key.as_deref().unwrap(), p.perms.as_deref().unwrap()).unwrap();
+        assert_eq!(&block[..4], some.to_flags().to_le_bytes());
+        assert_eq!(&block[4..8], [0xFF; 4]);
+        assert_eq!((block[8], &block[9..12]), (b'F', b"adb".as_slice()));
+        assert_eq!(sec.params.dict.get("EncryptMetadata"), Some(&Object::Bool(false)));
+        assert_eq!(sec.params.dict.get("Length"), Some(&Object::Integer(256)));
+        let reread = reopened(&sec, b"id", "o").unwrap();
+        assert!(!reread.encrypt_metadata());
+        // A file whose /P was edited afterwards no longer agrees with /Perms: the reader notices.
+        let mut edited = sec.params.dict.clone();
+        edited.set("P", Object::Integer(-4));
+        let mut tampered = Security::from_dict(edited, b"id".to_vec(), None).unwrap();
+        assert!(tampered.authenticate("u"));
+        assert!(!tampered.perms_valid());
+    }
+
+    #[test]
+    fn a_new_aes_128_encryption_has_the_entries_of_revision_4() {
+        let mut drbg = Drbg::new(&[2u8; 32]);
+        let sec = Security::create(&protection(Method::AesV2, "u", "o", Permissions::all()), b"some id", &mut drbg).unwrap();
+        let p = &sec.params;
+        assert_eq!((p.o.len(), p.u.len(), p.key_bytes), (32, 32, 16));
+        assert_eq!(p.u.get(16..), Some([0u8; 16].as_slice()), "/U is 16 bytes of the check and 16 of padding");
+        let dict = &sec.params.dict;
+        assert_eq!((dict.get("V"), dict.get("R"), dict.get("Length")), (Some(&Object::Integer(4)), Some(&Object::Integer(4)), Some(&Object::Integer(128))));
+        // The first part of /ID is part of the key: with another one the passwords open nothing.
+        assert!(reopened(&sec, b"some id", "u").is_some());
+        assert!(reopened(&sec, b"another", "u").is_none());
+    }
+
+    #[test]
+    fn what_cannot_be_protected_is_refused_with_a_reason_that_does_not_show_the_password() {
+        let mut drbg = Drbg::new(&[4u8; 32]);
+        let mut try_it = |how: Protection| Security::create(&how, b"id", &mut drbg).err().map(|e| e.to_string());
+        let locked = Permissions { copy: false, ..Permissions::all() };
+        // A right taken away needs an owner password; no password and no restriction protects nothing.
+        let e = try_it(protection(Method::AesV3, "secret-user", "", locked)).unwrap();
+        assert!(e.contains("owner password") && !e.contains("secret-user"), "{e}");
+        let e = try_it(protection(Method::AesV3, "", "", Permissions::all())).unwrap();
+        assert!(e.contains("nothing would be protected"), "{e}");
+        assert!(try_it(protection(Method::AesV3, "", "", locked)).is_some());
+        // A password the method cannot keep.
+        let e = try_it(protection(Method::AesV2, "密码一二三", "own", Permissions::all())).unwrap();
+        assert!(e.contains("user password") && e.contains("AES-256") && !e.contains("密码"), "{e}");
+        let e = try_it(protection(Method::AesV2, "", &"x".repeat(40), Permissions::all())).unwrap();
+        assert!(e.contains("owner password") && e.contains("32") && !e.contains("xxxx"), "{e}");
+        let e = try_it(protection(Method::AesV3, &"y".repeat(130), "", Permissions::all())).unwrap();
+        assert!(e.contains("127") && !e.contains("yyyy"), "{e}");
+        // A password that is nothing once prepared (a zero-width space): refused, whichever of the two it is.
+        let e = try_it(protection(Method::AesV3, "\u{200B}", "own", Permissions::all())).unwrap();
+        assert!(e.contains("user password") && e.contains("no password"), "{e}");
+        let e = try_it(protection(Method::AesV3, "u", "\u{200B}\u{200D}", Permissions::all())).unwrap();
+        assert!(e.contains("owner password") && e.contains("no password"), "{e}");
+        let e = try_it(protection(Method::AesV3, "\u{FEFF}", "", Permissions::all())).unwrap();
+        assert!(e.contains("user password") && e.contains("no password"), "{e}");
+        // The methods we do not write.
+        assert!(try_it(protection(Method::Rc4, "a", "b", Permissions::all())).is_some());
+        assert!(try_it(protection(Method::None, "a", "b", Permissions::all())).is_some());
+        // Debug output shows no password either.
+        let shown = format!("{:?}", protection(Method::AesV3, "very-secret", "also-secret", Permissions::all()));
+        assert!(!shown.contains("secret") && shown.contains("has_user_password: true"), "{shown}");
+    }
+
+    #[test]
+    fn a_password_that_is_wiped_is_empty() {
+        let mut text = String::from("hunter2");
+        wipe(&mut text);
+        assert!(text.is_empty());
     }
 }

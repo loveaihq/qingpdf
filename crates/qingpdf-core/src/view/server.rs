@@ -26,7 +26,7 @@ use super::forms;
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
-    BACKGROUND_PRIORITY, CharBoxes, Command, Event, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, RenderRequest,
+    BACKGROUND_PRIORITY, CharBoxes, Command, Event, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
     RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
 };
 use crate::view::geometry::line_rects;
@@ -273,6 +273,7 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
             thumb_cache_bytes: plan.thumb_cache_bytes,
             max_tile_pixels: plan.max_tile_pixels,
             rights,
+            protection: super::protection_of(&document, session.password()),
         }));
     }
     let Carry { queue, jobs, edits } = carry.unwrap_or(Carry { queue: Vec::new(), jobs: VecDeque::new(), edits: VecDeque::new() });
@@ -432,14 +433,15 @@ impl Server<'_> {
                 }
                 None
             }
-            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. }) => {
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. } | Command::Protect { .. }) => {
                 let doc = match &c {
                     Command::Edit { doc, .. }
                     | Command::Undo { doc, .. }
                     | Command::Redo { doc, .. }
                     | Command::Save { doc, .. }
                     | Command::Export { doc, .. }
-                    | Command::Extract { doc, .. } => *doc,
+                    | Command::Extract { doc, .. }
+                    | Command::Protect { doc, .. } => *doc,
                     _ => 0,
                 };
                 if doc == self.doc_id {
@@ -964,6 +966,29 @@ impl Server<'_> {
                         Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
                     },
                     Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0),
+                }
+                None
+            }
+            Command::Protect { doc, id, path, job } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, bytes: u64| this.tell(Event::Protected { doc, id, status, message, bytes });
+                if printing {
+                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0);
+                    return None;
+                }
+                let ProtectJob { change, mut seed } = *job;
+                // The document as it is, with the edits not saved: written afresh under the new encryption (or none).
+                let result = match &change {
+                    ProtectChange::Set(how) => ops::protect(self.document, self.session.password(), how, &seed),
+                    ProtectChange::Remove => ops::decrypt(self.document, self.session.password()),
+                };
+                seed.fill(0);
+                std::hint::black_box(&seed);
+                match result {
+                    Ok(out) => match write_atomic(&path, &out.data) {
+                        Ok(()) => reply(self, SaveStatus::Done, String::new(), out.data.len() as u64),
+                        Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0),
+                    },
+                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0),
                 }
                 None
             }

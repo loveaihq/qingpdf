@@ -117,7 +117,7 @@ pub(super) struct EditState {
     /// The Word export (5b): the box that asks where to write it is open, and the request that is writing it.
     /// A name was asked for an export: to Excel (true) or to Word (false).
     export_asked: Option<bool>,
-    exporting: Option<u64>,
+    pub(super) exporting: Option<u64>,
     /// The export going is to Excel.
     export_excel: bool,
     after: Option<After>,
@@ -737,6 +737,9 @@ impl App {
     }
 
     pub(super) fn save_picked(&mut self, path: Option<PathBuf>) -> Vec<Action> {
+        if let Some(actions) = self.protect_picked(path.clone()) {
+            return actions;
+        }
         if let Some(actions) = self.extract_picked(path.clone()) {
             return actions;
         }

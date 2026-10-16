@@ -7,12 +7,12 @@
 //! `md-5`. `aes` finds the CPU's AES instructions at run time, which the
 //! engine could not do itself without `unsafe`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 
 use aes::cipher::array::Array;
-use aes::cipher::consts::U16;
+use aes::cipher::consts::{U16, U32};
 use aes::cipher::{
     BlockCipherDecrypt, BlockCipherEncBackend, BlockCipherEncClosure, BlockCipherEncrypt, BlockSizeUser, KeyInit,
 };
@@ -117,6 +117,22 @@ fn cbc_encrypt_in_place<C: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>>(
         *dst = *src;
     }
     cipher.encrypt_with_backend(CbcEncrypt { iv: first, data });
+}
+
+/// CBC encryption of whole blocks in place, chained from `iv`, one call of the cipher for each block. The data of a file is encrypted
+/// with AES-256 this way: it is the cheaper way in code (the closure of [`cbc_encrypt_in_place`] is compiled again for each of the
+/// cipher's backends, and revision 6's hash needs that for AES-128 only), and the few nanoseconds a call costs are nothing beside
+/// rewriting the file.
+fn cbc_encrypt_blocks<C: BlockCipherEncrypt + BlockSizeUser<BlockSize = U16>>(cipher: &C, iv: [u8; 16], data: &mut [u8]) {
+    let mut previous = iv;
+    let (chunks, _) = data.as_chunks_mut::<16>();
+    for chunk in chunks {
+        xor16(chunk, &previous);
+        let mut block: Array<u8, U16> = Array::from(*chunk);
+        cipher.encrypt_block(&mut block);
+        chunk.copy_from_slice(block.as_slice());
+        previous = *chunk;
+    }
 }
 
 /// How much of a stream is decrypted at a time: small enough to stay in the
@@ -253,7 +269,7 @@ pub fn aes_encrypt_into(key: &[u8], iv: [u8; 16], data: &[u8], out: &mut Vec<u8>
     if key.len() == 16 {
         cbc_encrypt_in_place(&Aes128::new_from_slice(key).map_err(|_| CipherError::Key)?, &iv, body);
     } else {
-        cbc_encrypt_in_place(&Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?, &iv, body);
+        cbc_encrypt_blocks(&Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?, iv, body);
     }
     Ok(())
 }
@@ -270,6 +286,28 @@ pub fn aes256_decrypt_no_padding(key: &[u8], data: &[u8]) -> Result<Vec<u8>, Cip
     let mut with_iv = vec![0u8; 16];
     with_iv.extend_from_slice(data);
     cbc_decrypt_vec(&cipher, with_iv)
+}
+
+/// AES-256-CBC without padding and with a zero vector, encrypting: how the file key is put into `/UE` and
+/// `/OE` (the other way of [`aes256_decrypt_no_padding`]). `data` must be whole blocks.
+pub fn aes256_encrypt_no_padding(key: &[u8], data: &[u8]) -> Result<Vec<u8>, CipherError> {
+    if !data.len().is_multiple_of(16) {
+        return Err(CipherError::Length);
+    }
+    let cipher = Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?;
+    let mut out = data.to_vec();
+    cbc_encrypt_blocks(&cipher, [0u8; 16], &mut out);
+    Ok(out)
+}
+
+/// One block encrypted with AES-256 in ECB mode, as `/Perms` is stored (the other way of [`aes256_decrypt_block`]).
+pub fn aes256_encrypt_block(key: &[u8], block: [u8; 16]) -> Result<[u8; 16], CipherError> {
+    let cipher = Aes256::new_from_slice(key).map_err(|_| CipherError::Key)?;
+    let mut array: Array<u8, U16> = Array::from(block);
+    cipher.encrypt_block(&mut array);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(array.as_slice());
+    Ok(out)
 }
 
 /// The hash of revision 6 (ISO 32000-2 Algorithm 2.B, as pdf.js `PDF20` and
@@ -322,17 +360,62 @@ pub fn password_hash(revision: i64, password: &[u8], salt: &[u8], udata: &[u8]) 
     k
 }
 
-/// Initialisation vectors for the AES data we write. The vector of CBC mode
-/// has to be unpredictable, not secret; the engine has no random number
-/// generator and no dependency for one, so each vector is the first 16 bytes
-/// of SHA-256 over a seed and a counter. The seed hashes what the standard
-/// library's `RandomState` offers (keys the operating system drew at random
-/// for this process) together with the clock, the process number and an
-/// address (which moves with address space randomisation). The counter makes
-/// every vector different from the last.
+/// A generator of random bytes for a file that is written with an encryption of its own: AES-256 in counter mode, keyed with
+/// a seed that the caller drew from the system's cryptographic generator (`BCryptGenRandom` on Windows). The engine has no
+/// source of randomness and does not look for one: the file key, the salts, the file identifier and every initialisation vector
+/// come from here, and a seed that is guessable would make all of them guessable, so the caller must draw a new seed from the
+/// system for every file it writes and not use one twice. The output of AES under a secret key is as good as random for the
+/// 2^64 blocks a counter can count, which is more than a file needs.
+pub struct Drbg {
+    cipher: Aes256,
+    counter: u128,
+}
+
+impl Drbg {
+    /// `seed` is 32 bytes from the system's generator (see above).
+    pub fn new(seed: &[u8; 32]) -> Drbg {
+        let key: Array<u8, U32> = Array::from(*seed);
+        Drbg { cipher: Aes256::new(&key), counter: 0 }
+    }
+
+    /// The next 16 random bytes.
+    pub fn block(&mut self) -> [u8; 16] {
+        let mut block: Array<u8, U16> = Array::from(self.counter.to_be_bytes());
+        self.counter = self.counter.wrapping_add(1);
+        self.cipher.encrypt_block(&mut block);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(block.as_slice());
+        out
+    }
+
+    /// Fill `out` with random bytes.
+    pub fn fill(&mut self, out: &mut [u8]) {
+        for chunk in out.chunks_mut(16) {
+            let block = self.block();
+            for (dst, src) in chunk.iter_mut().zip(block) {
+                *dst = src;
+            }
+        }
+    }
+
+    /// `N` random bytes.
+    pub fn bytes<const N: usize>(&mut self) -> [u8; N] {
+        let mut out = [0u8; N];
+        self.fill(&mut out);
+        out
+    }
+}
+
+/// Where the initialisation vectors of the AES data we write come from. Either a [`Drbg`] (a file with an encryption of its own,
+/// whose caller drew a seed from the system), or, for a file that keeps the encryption it was read with, a hash chain: the vector
+/// of CBC mode has to be unpredictable, not secret, and the first 16 bytes of SHA-256 over a seed and a counter are that. The seed
+/// hashes what the standard library's `RandomState` offers (keys the operating system drew at random for this process) together
+/// with the clock, the process number and an address (which moves with address space randomisation). The counter makes every
+/// vector different from the last.
 pub struct IvSource {
     seed: [u8; 32],
     counter: Cell<u64>,
+    drbg: Option<RefCell<Drbg>>,
 }
 
 impl Default for IvSource {
@@ -354,10 +437,23 @@ impl IvSource {
         material.extend_from_slice(&std::process::id().to_le_bytes());
         let local = 0u8;
         material.extend_from_slice(&(std::ptr::from_ref(&local) as usize).to_le_bytes());
-        IvSource { seed: sha256(&material), counter: Cell::new(0) }
+        IvSource { seed: sha256(&material), counter: Cell::new(0), drbg: None }
+    }
+
+    /// The vectors are the output of `drbg`.
+    pub fn from_drbg(drbg: Drbg) -> Self {
+        IvSource { seed: [0u8; 32], counter: Cell::new(0), drbg: Some(RefCell::new(drbg)) }
+    }
+
+    /// The next 16 bytes of the generator, if the vectors come from one (a file with an encryption of its own).
+    pub fn generated(&self) -> Option<[u8; 16]> {
+        self.drbg.as_ref().map(|drbg| drbg.borrow_mut().block())
     }
 
     pub fn next_iv(&self) -> [u8; 16] {
+        if let Some(block) = self.generated() {
+            return block;
+        }
         let n = self.counter.get();
         self.counter.set(n.wrapping_add(1));
         let mut input = [0u8; 40];
@@ -539,5 +635,53 @@ mod tests {
         let b = source.next_iv();
         assert_ne!(a, b);
         assert_ne!(IvSource::new().next_iv(), a);
+    }
+
+    #[test]
+    fn one_block_of_ecb_is_encrypted_and_the_file_key_wrapping_round_trips() {
+        // FIPS 197 appendix C.3: AES-256.
+        let key: Vec<u8> = (0u8..32).collect();
+        let plain: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
+        assert_eq!(aes256_encrypt_block(&key, plain).unwrap().to_vec(), hex("8ea2b7ca516745bfeafc49904b496089"));
+        assert_eq!(aes256_encrypt_block(&key[..16], plain), Err(CipherError::Key));
+        // The file key in /UE and /OE: two blocks, a zero vector, no padding; the reader's unwrapping gives it back.
+        let file_key = [0x5Au8; 32];
+        let wrapped = aes256_encrypt_no_padding(&key, &file_key).unwrap();
+        assert_eq!(wrapped.len(), 32);
+        assert_ne!(wrapped, file_key);
+        assert_eq!(aes256_decrypt_no_padding(&key, &wrapped).unwrap(), file_key);
+        assert_eq!(aes256_encrypt_no_padding(&key, &file_key[..20]), Err(CipherError::Length));
+    }
+
+    #[test]
+    fn the_generator_is_aes_in_counter_mode_under_the_seed() {
+        let seed: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+        let mut a = Drbg::new(&seed);
+        // The blocks are the encryptions of 0, 1, 2 (big-endian, 128 bits) under the seed as the key.
+        for counter in 0u128..3 {
+            assert_eq!(a.block(), aes256_encrypt_block(&seed, counter.to_be_bytes()).unwrap(), "block {counter}");
+        }
+        // The same seed gives the same bytes, another seed other bytes; `fill` is the blocks one after the other.
+        let (mut b, mut c) = (Drbg::new(&seed), Drbg::new(&[9u8; 32]));
+        let mut forty = [0u8; 40];
+        b.fill(&mut forty);
+        let mut again = Drbg::new(&seed);
+        assert_eq!(forty[..16], again.block());
+        assert_eq!(forty[16..32], again.block());
+        assert_eq!(forty[32..], again.block()[..8]);
+        assert_ne!(c.block(), forty[..16]);
+        // Nothing repeats over a long run.
+        let mut seen = std::collections::HashSet::new();
+        let mut d = Drbg::new(&seed);
+        assert!((0..5000).all(|_| seen.insert(d.block())));
+    }
+
+    #[test]
+    fn initialisation_vectors_from_a_generator_are_its_blocks() {
+        let seed = [3u8; 32];
+        let source = IvSource::from_drbg(Drbg::new(&seed));
+        let mut same = Drbg::new(&seed);
+        assert_eq!(source.next_iv(), same.block());
+        assert_eq!(source.next_iv(), same.block());
     }
 }

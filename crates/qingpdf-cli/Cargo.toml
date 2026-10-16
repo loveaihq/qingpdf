@@ -17,7 +17,9 @@ qingpdf-core = { path = "../qingpdf-core" }
 png = "0.18.1"
 
 [lints.rust]
-unsafe_code = "forbid"
+# `unsafe` is allowed in one module only, `random.rs` (it asks Windows for random bytes for an encryption). `forbid` cannot be
+# lifted for a module, so the rule is `deny` here and `#[allow(unsafe_code)]` on that module alone.
+unsafe_code = "deny"
 
 [lints.clippy]
 # Same rules as the engine: nothing from a file or the command line may panic.
@@ -25,3 +27,5 @@ unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
 indexing_slicing = "deny"
+# Every `unsafe` block says why it is sound.
+undocumented_unsafe_blocks = "deny"

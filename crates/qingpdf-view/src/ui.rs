@@ -183,6 +183,8 @@ pub enum FormKind {
     Group,
     /// A line of text that starts as `text`.
     Edit,
+    /// A line of text typed as dots, empty to start with: a password. The value is wiped from the window's memory once it is handed over.
+    Secret,
     /// A line of text that starts as `text`, with a list of `choices` to pick one from (what is picked replaces the line).
     Combo,
     /// A list of `choices` to pick one from.

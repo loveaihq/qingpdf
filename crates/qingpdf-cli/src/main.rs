@@ -2,6 +2,7 @@
 
 mod args;
 mod help;
+mod random;
 
 use std::borrow::Cow;
 use std::fs;
@@ -12,11 +13,11 @@ use std::process::ExitCode;
 use qingpdf_core::edit::{self, ContentOp};
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
-use qingpdf_core::security::{Method, PasswordKind};
+use qingpdf_core::security::{Method, PasswordKind, Permissions, Protection};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
 use qingpdf_core::{Document, Error, Warning, docx, render, text, xlsx};
 
-use args::{Parsed, Request, UsageError};
+use args::{Parsed, PrintLevel, Protect, Request, UsageError};
 
 /// An error message for the user; the exit code is 1.
 type Failure = String;
@@ -114,6 +115,7 @@ fn run(request: Request) -> Result<(), Failure> {
             let out = ops::decrypt(&doc, &password).map_err(|e| op_error(&input, &e))?;
             finish(&output, &out)
         }
+        Request::Encrypt { input, output, force, password, how } => encrypt_command(&input, &output, force, &password, &how),
         Request::Text { input, pages, output, force, password } => {
             text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
         }
@@ -176,6 +178,86 @@ fn run(request: Request) -> Result<(), Failure> {
             add_command(&doc, &password, &input, &output, &ContentOp::Text { page: page - 1, at, size, text: text.replace("\\n", "\n"), color: [0, 0, 0] })
         }
     }
+}
+
+/// The passwords of `--password-file`: line 1 the user password, line 2 the owner password (a missing line, or an empty one, is no
+/// password). A byte order mark and the line ends are not part of them.
+fn read_password_file(path: &Path) -> Result<(String, String), Failure> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.len() > 4096 {
+        return Err(format!("{} is too big for a password file (line 1 the user password, line 2 the owner password)", path.display()));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", path.display()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    // A line ends with CRLF, LF or a lone CR, and that one end is no part of the password.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = text.split('\n');
+    let (user, owner) = (lines.next().unwrap_or_default().to_string(), lines.next().unwrap_or_default().to_string());
+    if lines.any(|l| !l.is_empty()) {
+        return Err(format!("{} has more than two lines (line 1 is the user password, line 2 the owner password)", path.display()));
+    }
+    // What is left is the password as it is, so a space (or a tab) at either end is not something the line end left behind by accident:
+    // `echo secret > pw.txt` in cmd writes "secret " and then the line end. Refused rather than guessed at; a control character likewise.
+    for (which, password) in [("user", &user), ("owner", &owner)] {
+        let spaced = password.chars().next().is_some_and(char::is_whitespace) || password.chars().next_back().is_some_and(char::is_whitespace);
+        if spaced || password.chars().any(char::is_control) {
+            return Err(format!(
+                "the {which} password in {} starts or ends with a space, or has a control character (cmd's `echo word > file` leaves a space before the line end); write it without",
+                path.display()
+            ));
+        }
+    }
+    Ok((user, owner))
+}
+
+/// What the options of `encrypt` ask for.
+fn protection_of(how: &Protect) -> Result<Protection, Failure> {
+    let (user, owner) = match &how.password_file {
+        Some(path) => read_password_file(path)?,
+        None => (how.user_password.clone().unwrap_or_default(), how.owner_password.clone().unwrap_or_default()),
+    };
+    let permissions = Permissions {
+        print: how.print != PrintLevel::None,
+        print_high_quality: how.print == PrintLevel::High,
+        modify: !how.no_modify,
+        copy: !how.no_copy,
+        annotate: !how.no_annotate,
+        fill_forms: !how.no_forms,
+        assemble: !how.no_assemble,
+        accessibility: !how.no_accessibility,
+    };
+    if !permissions.allows_everything() && owner.is_empty() {
+        return Err("a permission is turned off, so an owner password is needed (--owner-password, or line 2 of --password-file): it is what keeps anyone from turning the permission on again".to_string());
+    }
+    if user.is_empty() && owner.is_empty() {
+        return Err("nothing would be protected: give --user-password or --owner-password (or --password-file), or turn a permission off with --print, --no-copy and the like".to_string());
+    }
+    Ok(Protection {
+        method: if how.aes128 { Method::AesV2 } else { Method::AesV3 },
+        user_password: user,
+        owner_password: owner,
+        permissions,
+        encrypt_metadata: !how.cleartext_metadata,
+    })
+}
+
+/// Write a copy of the input under a new encryption (AES-256, or AES-128 with --aes128).
+fn encrypt_command(input: &Path, output: &Path, force: bool, password: &str, how: &Protect) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let protection = protection_of(how)?;
+    // The engine takes the random bytes from here and has no source of its own.
+    let seed = random::seed()?;
+    let out = ops::protect(&doc, password, &protection, &seed).map_err(|e| op_error(input, &e))?;
+    finish(output, &out)?;
+    let denied: Vec<&str> = protection.permissions.list().iter().filter(|(_, allowed)| !allowed).map(|(what, _)| *what).collect();
+    say(&format!(
+        "  {}; {}; {}\n",
+        if how.aes128 { "AES-128" } else { "AES-256" },
+        if protection.user_password.is_empty() { "opens without a password" } else { "a password is needed to open it" },
+        if denied.is_empty() { "nothing is restricted".to_string() } else { format!("not allowed: {}", denied.join(", ")) }
+    ));
+    Ok(())
 }
 
 /// Make a Word file of the pages.
@@ -394,7 +476,8 @@ fn write_replacing(target: &Path, data: &[u8]) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
-        let written = file.write_all(data).and_then(|()| file.flush());
+        // (On the disk before the rename: a crash must not leave the new name on a file that is not all there.)
+        let written = file.write_all(data).and_then(|()| file.flush()).and_then(|()| file.sync_all());
         drop(file);
         let done = written.and_then(|()| fs::rename(&temp, target));
         if done.is_err() {

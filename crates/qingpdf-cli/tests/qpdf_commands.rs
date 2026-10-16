@@ -258,6 +258,12 @@ fn qpdf_accepts_the_output_of_every_command_on_encrypted_files() {
         // The owner takes the encryption off.
         let plain = out("decrypt");
         let (code, err) = qingpdf(&args(&["decrypt", "@", "-o", "@", "--password", &row.owner], &[input, &plain]));
+        if label.contains("sig.") {
+            // A signed file is not written again by `decrypt`: it would no longer verify.
+            assert!(code == 1 && err.contains("signed") && !plain.exists(), "{label}: decrypt: {code} {err}");
+            outputs += 1;
+            continue;
+        }
         assert_eq!(code, 0, "{label}: decrypt: {err}");
         common::qpdf_accepts(&qpdf, &plain, "", &[(input, &row.user)], &format!("{label}: decrypt"));
         assert!(common::qpdf_encryption(&qpdf, &plain, "").is_none(), "{label}: qpdf still sees encryption in the decrypted copy");

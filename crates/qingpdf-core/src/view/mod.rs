@@ -163,6 +163,41 @@ pub struct Rights {
     pub assemble: bool,
 }
 
+/// How the open file is encrypted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cipher {
+    Rc4,
+    Aes128,
+    Aes256,
+    /// Only the embedded files are encrypted, or some mixture: the box says "other".
+    Other,
+}
+
+/// How the open file is protected: what File > Passwords and permissions shows, and whether it can be changed there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Protected {
+    /// How the file is encrypted; `None` for a file that is not.
+    pub cipher: Option<Cipher>,
+    /// A password is needed to open it (the empty one does not).
+    pub needs_password: bool,
+    /// What the file's flags allow (everything for a file that is not encrypted). Not what whoever opened it may do: the owner
+    /// password lifts every restriction ([`Rights`]).
+    pub permissions: crate::security::Permissions,
+    /// Whoever opened it may change its protection: the file is not encrypted, or the owner password opened it, or it allows
+    /// everything anyway (the rule of `decrypt`).
+    pub may_change: bool,
+    /// The file is signed or certified: writing it again would break the signature, so its protection is not changed.
+    pub signed: bool,
+}
+
+/// What a protection request does with the file ([`Engine::protect`]).
+pub enum ProtectChange {
+    /// Encrypt it as this says, replacing any encryption it has.
+    Set(Box<crate::security::Protection>),
+    /// Take the encryption off.
+    Remove,
+}
+
 /// The most dots per inch a page is printed at when the file allows only low-quality printing (Table 22, bit 12).
 pub const LOW_QUALITY_PRINT_DPI: f64 = 150.0;
 
@@ -179,6 +214,7 @@ pub struct Opened {
     /// The most pixels one request should ask for (a bigger page is asked for in pieces).
     pub max_tile_pixels: u32,
     pub rights: Rights,
+    pub protection: Protected,
 }
 
 /// Whether text could be had.
@@ -315,6 +351,8 @@ pub enum Event {
     /// from the top, no padding) showing the whole page as it is shown, at `dpi` dots to the inch. `status` is [`RenderStatus::Failed`]
     /// (nothing drawn, `message` says why) or [`RenderStatus::Incomplete`] (the page stopped part-way, `message` says) or complete.
     OcrImage { doc: u64, id: u64, page: u32, status: RenderStatus, message: String, width: u32, height: u32, dpi: f64, gray: Vec<u8> },
+    /// The answer to [`Engine::protect`]: the file at the path was written (`Done`, `bytes` long), or not (`Failed`, `message` says why).
+    Protected { doc: u64, id: u64, status: SaveStatus, message: String, bytes: u64 },
     /// The answer to [`Engine::export_docx`] and [`Engine::export_xlsx`]: `Done` (`message` is what the conversion warned of, if
     /// anything; `pages` how many pages were converted; `tables` how many tables are in the file: a Word table or an Excel sheet, and 0
     /// for an Excel file made of the text of the pages) or `Failed` (`message` says why; no file was written).
@@ -347,12 +385,19 @@ pub(crate) enum Command {
     Save { doc: u64, id: u64, path: String, whole: bool },
     Export { doc: u64, id: u64, path: String, excel: bool },
     Extract { doc: u64, id: u64, pages: Vec<u32>, path: String },
+    Protect { doc: u64, id: u64, path: String, job: Box<ProtectJob> },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
     Cancel(u64),
     Close,
     Quit,
+}
+
+/// What [`Engine::protect`] asks for, and the seed of the random bytes it needs.
+pub(crate) struct ProtectJob {
+    change: ProtectChange,
+    seed: [u8; 32],
 }
 
 pub(crate) enum Source {
@@ -627,6 +672,17 @@ impl Engine {
         let _ = self.commands.send(Command::Extract { doc, id, pages, path: path.to_string() });
     }
 
+    /// Write the document, with the edits not saved yet, as a file of its own at `path` (into a file of its own that replaces `path` only
+    /// when it is whole; `path` may be the open file) under the encryption `change` says: a new one (passwords, permissions, AES-256 or
+    /// AES-128; see `ops::protect` for the rules) or none. The open file is not touched. `seed` is 32 bytes from the system's cryptographic
+    /// random generator, new for this call (the engine draws no random numbers of its own); it is overwritten when used. Answered by
+    /// [`Event::Protected`]; a file that is signed, or that is encrypted and was not opened with the owner password and does not
+    /// allow everything ([`Protected::may_change`]), answers `Failed`. Done in the order of the edits.
+    pub fn protect(&self, doc: u64, id: u64, path: &str, change: ProtectChange, seed: [u8; 32]) {
+        let job = Box::new(ProtectJob { change, seed });
+        let _ = self.commands.send(Command::Protect { doc, id, path: path.to_string(), job });
+    }
+
     /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by
     /// [`Event::Edited`].
     pub fn delete_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
@@ -761,6 +817,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Save { .. }
             | Command::Export { .. }
             | Command::Extract { .. }
+            | Command::Protect { .. }
             | Command::Swap
             | Command::PrintNext(_)
             | Command::Cancel(_)
@@ -835,6 +892,27 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
     document.set_object_stream_cache_limit(usize::try_from(plan.object_streams).unwrap_or(usize::MAX));
     let rights = rights_of(&document, password);
     Ok(OpenDoc { doc_id, document, plan, rights })
+}
+
+/// How the file is protected, and whether whoever opened it with `password` may change that (see [`Protected`]).
+fn protection_of(document: &Document, password: &str) -> Protected {
+    let Some(encryption) = document.encryption() else {
+        return Protected { cipher: None, needs_password: false, permissions: crate::security::Permissions::all(), may_change: true, signed: crate::edit::signature::look(document).any() };
+    };
+    use crate::security::Method;
+    let cipher = match (encryption.stream_method, encryption.string_method) {
+        (Method::AesV3, Method::AesV3) => Cipher::Aes256,
+        (Method::AesV2, Method::AesV2) => Cipher::Aes128,
+        (Method::Rc4, Method::Rc4) => Cipher::Rc4,
+        _ => Cipher::Other,
+    };
+    Protected {
+        cipher: Some(cipher),
+        needs_password: encryption.needs_password(),
+        permissions: encryption.permissions,
+        may_change: has_owner_rights(document, &encryption, password) || encryption.permissions.allows_everything(),
+        signed: crate::edit::signature::look(document).any(),
+    }
 }
 
 /// What the file allows, for whoever opened it with `password` (see [`Rights`]).

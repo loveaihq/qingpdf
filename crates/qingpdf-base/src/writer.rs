@@ -394,6 +394,9 @@ pub struct Builder<'a> {
     root_metadata_out: Option<u32>,
     /// Set by [`Builder::collecting`]: the objects are handed back, not written.
     collect: Option<Collect>,
+    /// Look at every object written for a signature dictionary ([`Builder::watch_signatures`]), and whether one was met.
+    watch_signatures: bool,
+    signature_seen: bool,
 }
 
 /// What a builder that makes no file gives back: its objects by number, and the warnings.
@@ -434,6 +437,8 @@ impl<'a> Builder<'a> {
             root_metadata: None,
             root_metadata_out: None,
             collect: None,
+            watch_signatures: false,
+            signature_seen: false,
         }
     }
 
@@ -473,6 +478,26 @@ impl<'a> Builder<'a> {
             self.crypt = crypt;
             self.crypt_source = Some(source);
         }
+    }
+
+    /// Write the file under a new encryption (see `Security::create`), whatever the sources were: every string and stream is
+    /// encrypted under the number it gets in the new file, and the `/Crypt` filters the sources' streams named are taken out (the
+    /// new file has none of those names).
+    pub fn encrypt_with(&mut self, crypt: OutputCrypt) {
+        self.crypt = Some(crypt);
+        self.crypt_source = None;
+    }
+
+    /// From now on, note whether any object that is written has a signature dictionary in it ([`Builder::saw_signature`]): for a file that is
+    /// written again as a whole, which breaks every signature it had, wherever the dictionary hangs (the form's fields, an annotation's `/V`,
+    /// `/Perms`). Costs a walk of each object as it is written, no more than the writer itself makes.
+    pub fn watch_signatures(&mut self) {
+        self.watch_signatures = true;
+    }
+
+    /// Has an object with a signature dictionary been written since [`Builder::watch_signatures`]?
+    pub fn saw_signature(&self) -> bool {
+        self.signature_seen
     }
 
     /// Say that object `num` of `source` is the catalog's metadata stream,
@@ -590,6 +615,9 @@ impl<'a> Builder<'a> {
         }
         if self.buf.is_empty() {
             self.write_header();
+        }
+        if self.watch_signatures && !self.signature_seen {
+            self.signature_seen = has_signature(obj, 0);
         }
         let slot = usize::try_from(r.num)
             .ok()
@@ -959,7 +987,10 @@ impl<'a> Builder<'a> {
         // 14.4: the file identifier, two equal strings for a new file. An
         // encrypted file keeps the first one: the key of revisions 2 to 4
         // depends on it (7.6.3.3 step e).
-        let id = file_id(&self.buf);
+        let id = match self.crypt.as_ref().and_then(OutputCrypt::fresh_id) {
+            Some(fresh) => fresh,
+            None => file_id(&self.buf),
+        };
         table.extend_from_slice(b" /ID [");
         match &self.crypt {
             Some(c) => write_hex_string(&mut table, c.id0()),
@@ -971,6 +1002,19 @@ impl<'a> Builder<'a> {
         table.extend_from_slice(format!(" >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
         self.buf.extend_from_slice(&table);
         Ok((self.buf, warning.into_iter().collect()))
+    }
+}
+
+/// Is there a signature dictionary in `obj` (or is it one)? To the depth the writer goes to.
+fn has_signature(obj: &Object, depth: usize) -> bool {
+    if depth > MAX_WRITE_DEPTH {
+        return false;
+    }
+    match obj {
+        Object::Dict(d) => crate::security::is_signature_dict(d) || d.iter().any(|(_, v)| has_signature(v, depth + 1)),
+        Object::Array(items) => items.iter().any(|v| has_signature(v, depth + 1)),
+        Object::Stream(s) => crate::security::is_signature_dict(&s.dict) || s.dict.iter().any(|(_, v)| has_signature(v, depth + 1)),
+        _ => false,
     }
 }
 

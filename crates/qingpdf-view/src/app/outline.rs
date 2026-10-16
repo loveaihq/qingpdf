@@ -189,6 +189,7 @@ impl App {
             }
             ev @ (EngineEvent::OcrPages { .. } | EngineEvent::OcrImage { .. }) => self.on_ocr_event(ev),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
+            EngineEvent::Protected { doc, id, status, message, .. } if doc == self.doc_id => self.on_protected(id, status, &message).unwrap_or_default(),
             EngineEvent::Exported { doc, id, status, message, pages, tables, .. } if doc == self.doc_id => match self.on_extracted(id, status, &message, pages) {
                 Some(actions) => actions,
                 None => self.on_exported(id, status, &message, tables),

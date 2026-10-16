@@ -1717,3 +1717,87 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - 命令行的 `{date}` 是 UTC（和电脑上的日期最多差一天，北京时间零点到八点之间会是前一天）；阅读器用本地日期。
 - 取字现在会跳过所有 `/Type /Pagination` 的 `/Artifact`，包括别的软件写的页眉页脚（见上，是有意的）。
 - **复用 `put_on_page` 时发现一个 5c 里就有的问题，已修（第二轮）：** 识别文字（`ocr::layer`）给每页做一个各自的 Form，但共用同一个 `Shared`；两页共用同一个 `/Resources` 对象（或继承同一份、或共用同一个独立的 `/XObject` 字典）时，缓存里记的是第一次放进去的名字，第二页画的是第一页那份 Form，第二页的文字层成了第一页的字。扫描件各页常常各有各的资源，所以平时看不到（旧测试各页文字相同，也看不出来）。修法：两份缓存（`Shared.resources`、`Shared.dicts`）的键里加上标记对象的号，所以每个不同的标记各有一份资源副本；水印和页码每个操作只有一个标记（一个对象），键等价，输出的字节和以前一样（所有 4c 的测试都过，没改断言）。测试：`ocr.rs` 的 `pages_that_share_their_resources_each_get_the_text_layer_of_their_own`（六页：共用 `/Resources` 对象的两页、继承的两页、共用 `/XObject` 字典的两页，各给一个不同的词，打开的和存盘重开的都是各页自己的词；去掉修改后它在第二页读出第一页的词而失败），和 PDFium 对照 `tests/tools/ocr_shared_check.py`（六页各读出自己的词）。
+
+## 加密码和权限（2026-10-16）
+
+功能清单第②项（`PLAN.md` 已定 #7，用户 2026-10-16 定细节）：给文件设打开密码和权限密码、选哪些权限关掉、改已有的密码和权限、去掉密码。引擎只写 AES-256（V 5、修订版 6，默认）和 AES-128（V 4、修订版 4，`/CF /StdCF`，“兼容旧软件”），**不写 RC4**。规范：ISO 32000-1 7.6（算法 1、2、3、5，表 21、22）；AES-256 的算法 2.B、8、9、10 规范原文拿不到，照 qpdf 的做法写（`libqpdf/QPDF_encryption.cc`：`hash_V5`、`compute_encryption_key_V5`、`/Perms`），注释里写明，并用 qpdf 和 PDFium 逐项核对。代码：`qingpdf-base/src/security.rs`（`Protection`、`Security::create`、`password_bytes`、`Permissions::to_flags`）、`cipher.rs`（`Drbg`、AES-256 加密）、`writer.rs`（`Builder::encrypt_with`），`qingpdf-core/src/ops.rs`（`protect`、`ensure_unsigned`）、`view/`（`Engine::protect`、`Opened.protection`），`qingpdf-cli`（`encrypt`、`random.rs`），`qingpdf-view/src/app/protect.rs`、`win32.rs`（`random_bytes`、`FormKind::Secret`）。接口说明在 `docs/view-api.md`。没有新依赖。
+
+### 随机数：引擎不自己找
+
+- **引擎（`qingpdf-base`、`qingpdf-core`，都是 `forbid(unsafe_code)`）从调用者那里拿 32 字节种子，别的随机数都从种子来。** `cipher::Drbg`：AES-256 的计数器模式，密钥就是种子，计数从 0 起，每块 16 字节是第 n 块计数的加密（用已有的 `aes` 库，没有新代码依赖）。文件密钥、盐、`/Perms` 里的四个任意字节、没有 `/ID` 时新做的 `/ID` 第一项、**每个字符串和每个流的初始向量**、写完以后 `/ID` 的第二项（新加密的文件不再对整个输出做一遍哈希来算它：100 MB 的文件光这一遍就要 0.2 秒；输出里的向量本来就保证它和别的文件不同），都按用的先后从这一个发生器里取，所以同一个种子、同一个文件、同样的设置得到逐字节相同的输出（测试靠这个复现）。没有时间、进程号、地址这类弱来源，也没有退路：`ops::protect` 收到全零种子（调用者忘了填）直接拒绝。
+- **调用者怎么取：** 命令行 `qingpdf-cli/src/random.rs`（整个 crate 里唯一允许 `unsafe` 的模块，`Cargo.toml` 改成 `deny`，模块上 `#[allow(unsafe_code)]`，另加 `undocumented_unsafe_blocks = "deny"`）自己声明 `BCryptGenRandom`（bcrypt.dll），传 `BCRYPT_USE_SYSTEM_PREFERRED_RNG`，算法句柄为空，每个 `unsafe` 块写了为什么安全；阅读器在 `win32.rs` 里同样一个函数 `random_bytes`，`App::set_random` 交给界面层（和日期 `set_clock` 一个办法）。系统不给随机数：不加密、报错，不退到别的来源（命令行说 `Windows gave no random bytes ... nothing was encrypted`，阅读器一个消息框）。每次操作取一个新种子，用完改写成零。非 Windows 的编译没有来源，`encrypt` 会明说。
+- 原来“保持原加密”那条路（合并、拆分、删页……）的初始向量仍用 1.5 层的办法（`IvSource::new`，标准库的随机钥匙加时钟做一次哈希）：CBC 的向量只要不可预测，不要保密，那条路里的文件密钥是原文件的，不是新做的。新加密的文件不走它。
+
+### 算法
+
+- **AES-256（R6）：** 文件密钥 32 字节随机；用户盐、用户密钥盐、所有者盐、所有者密钥盐各 8 字节随机。`/U` = 哈希(密码 ‖ 用户校验盐) ‖ 校验盐 ‖ 密钥盐（48 字节），`/UE` = AES-256-CBC（零向量、不填充）加密文件密钥，密钥是哈希(密码 ‖ 用户密钥盐)；`/O`、`/OE` 同样，只是哈希的输入末尾多了整个 48 字节的 `/U`（算法 9）。哈希是 `cipher::password_hash(6, ...)`（2.B，读取端早就有）。`/Perms` = AES-256-ECB（文件密钥）加密 `P`（低位在前 4 字节）‖ `FF FF FF FF` ‖ `T`或`F`（`/EncryptMetadata`）‖ `adb` ‖ 4 个随机字节。加密字典：`/Filter /Standard /V 5 /R 6 /Length 256 /P /O /U /OE /UE /Perms /CF << /StdCF << /CFM /AESV3 /AuthEvent /DocOpen /Length 32 >> >> /StmF /StdCF /StrF /StdCF`，`/EncryptMetadata false` 只在关了的时候写。
+- **AES-128（R4）：** `/O` 是算法 3（所有者密码做 50 次 MD5，取前 16 字节当 RC4 密钥，对补齐的用户密码加密 20 次），文件密钥是算法 2（补齐的用户密码 ‖ `/O` ‖ `/P` ‖ `/ID` 第一项，关了元数据加密再加 `FFFFFFFF`，MD5 加 50 次，取 16 字节），`/U` 是算法 5（MD5(补齐串 ‖ `/ID` 第一项) 做 RC4 加 19 轮，后面补 16 个零字节）。**AES-128 的文件密钥不是随机的**：标准规定它由密码、`/O`、`/P` 和 `/ID` 第一项算出来；同一个文件用同样的密码和权限加密两次，文件密钥相同（每个字符串和流的初始向量照样是新的随机数；CBC 加随机向量，同一把密钥用多次不是问题）。我们照 qpdf 的办法留着文件原来的 `/ID` 第一项（文件的永久编号），没有 `/ID` 才新做一个（16 个随机字节），第二项照旧用输出内容算。每个对象的密钥是算法 1（文件密钥加对象号低 3 字节、代号低 2 字节、`sAlT`，MD5）。
+- **做出来先过读取端这一关：** `Security::create` 做完加密字典后，把字典当作一个刚读到的文件，用读取端的 `from_dict` 和 `authenticate` 试用户密码和所有者密码，都要打得开、而且得到的文件密钥就是刚做的那个，不然报内部错误，不写文件（`Security::create` 的单元测试靠它和 qpdf 双重核对）。
+- **输出一律整个重写，从不追加：** 沿用 `ops::build`（和 `copy`、`split`、`decrypt` 同一条路，所以书签、表单、命名目的地等照旧）：经典交叉引用表，不用对象流和交叉引用流，对象重新编号。所以**没有对象流的容器和交叉引用流要加密**：来源里有的（`gongwen-2024-nicheng-work-report.pdf`、`lunwen-arxiv-2401.01717-word.pdf`、`bug_757705.pdf`）被读出来，里面的对象和别的对象一样，各自加密，输出里没有交叉引用流、也没有对象流。每个字符串（含字符串在字典、数组、流字典里）一律写成十六进制的 AES 密文，每个流按它在新文件里的对象号加密、`/Length` 是密文长度；加密字典是单独一个不加密的对象；签名字典的 `/Contents` 不加密（但有签名的文件整个被拒绝，见下，所以只有“有 `/ByteRange` 但没签”的字典会碰到这条）。来源里流自己的 `/Crypt` 过滤器去掉（新文件里没有那个名字）；`/EncryptMetadata false` 时只有目录里 `/Metadata` 指的那个流不加密（和读取端同一条）。
+- 写文件还是先写同目录的临时文件、再改名（命令行 `write_replacing`，阅读器 `write_atomic`）。
+
+### 密码
+
+- **AES-256：** UTF-8，先做轻量的 SASLprep（`prepare_password`：全角 ASCII 换半角、各种空格换普通空格、去掉零宽字符和软连字符，和读取端一样，不做 Unicode 规范化表），最多 127 字节，**超过的拒绝**（不像 qpdf 悄悄截断：截断了，打前 127 字节就能开，用户却以为整个密码都起作用）。读取端先试原样再试轻量处理的，所以用户打全角的密码照样打得开；qpdf 和 PDFium 不做 SASLprep，要用处理后的写法（测试 `fullwidth-256`）。**这个取舍：** 密码里有会被轻量处理改掉的字符（全角字母数字、不换行空格这些）时，写进文件的是处理后的字节，只认原始字节的程序（qpdf、PDFium）要输处理后的写法；汉字、拉丁字母、数字、常见符号两种写法一样，不受影响。
+- **AES-128：** PDFDocEncoding（附录 D，同 `security::pdf_doc_bytes`），最多 32 字节，**超过的拒绝**；汉字写不进 PDFDocEncoding，**拒绝并说明**：`the user password has characters AES-128 cannot keep (PDFDocEncoding has no Chinese, for one); use AES-256 for it`。
+- **两个密码：** 打开密码（用户密码）可空，空是不用密码就能打开（带着权限限制）。所有者密码：**关了任何一项权限就必须有**（`a permission is turned off, so an owner password is needed`）；没关任何权限时没给就等于用户密码；既没有任何密码、又没关任何权限，什么也保护不了，拒绝（`nothing would be protected`）。错误消息从不带密码；`Protection` 的 `Debug` 不显示密码，`Drop` 时把密码字节改写成零（`security::wipe`，和阅读器原来给密码框用的办法一样）。
+
+### 权限
+
+- 八项：打印（不允许 / 低质量 / 高质量）、复制文字和图片、修改内容、批注、填表、组装页面、为辅助功能提取。`Permissions::to_flags`：第 1、2 位清零，第 7、8 位和第 13 到 32 位置 1（保留），第 3、4、5、6、9、10、11、12 位按各项（表 22）；**第 12 位（高质量打印）只跟着打印走**，不许打印时它清零；全都允许时是 `0xFFFFFFFC`（`/P -4`，qpdf 的默认）。写进字典的 `/P` 是带符号的整数（读取端取低 32 位）。读回来逐项一致（256 种组合的单元测试，用 `from_flags(…, 3)`）。
+- **“限制了”的定义：** 八项里有一项不允许（`!allows_everything()`）。
+
+### 谁能改
+
+- 要改的文件已经加密：要有所有者的权利，**和 `decrypt` 同一条规矩**（用所有者密码打开的、给的密码或空密码是所有者密码、或者八项权限全部允许；`ops::require_owner`，`decrypt` 也改用它，消息原样不变）。用用户密码打开又有限制的，拒绝并说：`the protection is not changed: the file was opened with the user password and its author did not allow: ... Give the owner password with --password to change it`。`/Perms` 对不上的用户密码打开，同 `decrypt` 算什么都不允许。
+- **有签名的文件（任何签名、任何级别的认证）一律拒绝：** 整个重写会让签名失效。`ops::ensure_unsigned`（用 4a 的 `signature::look`）。`decrypt`（命令行和阅读器的“去掉密码”）同样先过这一关（见下面“评审后的修补”）。
+
+### 命令行
+
+- `qingpdf encrypt a.pdf -o out.pdf [--user-password PW] [--owner-password PW] [--password-file FILE] [--aes128] [--print none|low|high] [--no-copy] [--no-modify] [--no-annotate] [--no-forms] [--no-assemble] [--no-accessibility] [--cleartext-metadata] [--password 输入文件的密码] [--force]`。`--password-file`：第一行用户密码，第二行所有者密码（BOM 和行尾的回车不算，最多两行，最大 4 KB，必须是 UTF-8，和 `--user-password` 不能一起用）。输出不能是输入，已有的输出要 `--force`；写完说一行（`AES-256; a password is needed to open it; not allowed: ...`），**从不打印密码**；用法错误只显示选项名（和别的命令一样）；`Request`/`Protect` 的 `Debug` 不显示密码。去掉密码就是原有的 `decrypt`。输入已加密：要 `--password` 并有所有者的权利。
+
+### 阅读器
+
+- **菜单：** 文件 → 密码和权限…（Pass&words 的 `&M`；没打开文件时灰）。**一个窗口**（`Action::AskForm`，通用的表单窗口，新增 `FormKind::Secret`：带遮挡、值用完擦掉、关窗口时清掉控件里的字）：最上面写现在的状态（加密方式 `AES-256` / `AES-128` / `RC4`、打开要不要密码、不允许哪些项，或“没有设密码，也没有限制”；有签名、不是所有者时多一句说明），中间两个密码各一个输入框加一个确认框（留空是没有），加密方式（AES-256 推荐 / AES-128 兼容旧软件）和打印的列表，六个“允许”的勾（复制、修改、批注、填表、组装、辅助功能；开始时是文件现在的样子，所以改密码不会悄悄把原来的限制放开），左下角“去掉密码”按钮（文件加密了才有），右边“保存…”和“取消”。**状态由引擎在打开文件时一起告诉**（`Opened.protection`）。
+- **流程：** 点“保存…”→ 检查（两次密码一样；关了权限必须有权限密码；有密码或有限制；密码对方式合格；不合格用消息框说明，**窗口带着刚才的选择（不含密码）再弹出来**）→ 问存到哪里（Windows 的保存框，起始就是这个文件的完整路径，所以默认是覆盖它，覆盖前 Windows 会问；`OFN_OVERWRITEPROMPT`）→ 取 32 字节种子 → `Engine::protect`（整个文档连没保存的改动重写，先写临时文件再改名）→ 成功后**用新密码重新打开写出的文件**。**没保存的改动：** 一起存进结果文件，不先问要不要存（使用说明里写明了），选了另一个文件名时原文件不动，改动在新文件里；重新打开后撤销历史没有了。**重新打开用权限密码**（没设权限密码就用打开密码），所以刚设完保护的人接着有全部权利，别人以后用打开密码打开才受限制。不是所有者（`Protected.may_change` 假）或有签名的文件：窗口只显示状态和原因，点“保存…”什么也不写。
+- **中文密码：** 带遮挡的框，Windows 常常不让中文输入法工作（对文件打开时问密码的框也一样，是原来就有的）；可以从别处复制粘贴。没有去改 IME 设置（要多一段 `unsafe`，而且这里没法不用键盘去试）。
+
+### 体积
+
+- **`qingpdf-view.exe` 3,474,944 → 3,499,520 字节，+24,576（限 +25,000；总上限 3,600,000）；`qingpdf.exe` 3,158,016 → 3,181,056（+23,040）。** `bcrypt` 的链接和 `Secret` 控件几乎不占（`random_bytes` 71 字节）。
+- **第一版（做完功能）是 +29,184，超了 4,184，所以先瘦身。** 用链接器的 `/MAP`（新旧各编一份，逐个符号比大小）看到的大头：`ops::protect`（里面内联了 `Security::create`）11.9 KB；AES-256 的软实现加密（`aes` 库的 `fixslice::aes256_encrypt`，没有 AES 指令的 CPU 用，库里固定带着）3.1 KB，躲不开；对话框的构造 2.9 KB、`App::event` 里内联进去的各个处理 3.6 KB；`Server::run` 里的 `protect` 2.3 KB；`i18n` 的表和字。拿掉的：①AES-256 的 CBC 加密不再用 `encrypt_with_backend` 的闭包（它按后端各编一份，每份 0.4 到 0.7 KB，再加 `cbc_encrypt_in_place::<Aes256>` 0.7 KB），改成逐块调用 `encrypt_block`（`cbc_encrypt_blocks`；AES-128 仍用原来给修订版 6 的哈希用的闭包，没有新增代码）：约 −1.5 KB，100 MB 的 AES-256 加密多 0.1 到 0.2 秒（见下）；②加密字典不再一条条 `dict.set` 拼，写成一行文字让已有的解析器读，只有和密码有关的几项再 `set`；`OutputCrypt::with_drbg` 收下 `Security` 不再克隆；做完的自检用读取端的 `from_dict` 加 `authenticate`，不另写一套：约 −1 KB；③成功时不再把警告拼成一句话交给界面；④少了 6 条消息（`PtNow`、`PtNoPwNeeded`、`PtNoLimit`、`PtHint`、`PtDirty`、`PtPrintBest`：“打开不需要密码”和“没有限制”靠没有那一行表示；没保存的改动一起存进去这件事只写在使用说明里；只许低质量打印由打印列表的当前项表示）、一些消息缩短、RC4 不显示位数、对话框去掉“现在”的框：约 −1 KB。留了 424 字节的余地；文件按 512 字节对齐，所以小改动有时一点也不变。
+- **试过没留的：** 没有。（把 `Security::create` 挪进 opt-level `z` 的 `qingpdf-core`、为了中文输入法在密码框里工作加 `unsafe`，都没有做。）
+
+### 测试和数字（本机，release，2026-10-16）
+
+- **`cargo clippy --workspace --all-targets --release -- -D warnings` 干净；`cargo test --release --no-fail-fast` 1258 通过、0 失败、3 个 ignored（原来 1226，多 32 个）：**
+  - `qingpdf-base` 单元测试 10 个：`cipher.rs` 3 个（AES-256 一块 ECB 加密（FIPS 197 的数）和 `/UE`、`/OE` 的包装来回；发生器就是以种子为钥匙的计数器模式 AES，同种子同字节、换种子换字节、5000 块不重复；向量等于发生器的块）；`security.rs` 7 个（表 22 的位：全允许是 `0xFFFFFFFC`，256 种组合写出再读回一致，第 12 位只跟着打印；两种方式的密码字节：全角变半角、127 和 32 字节的界、汉字写不进 AES-128、`hôtel` 是 `68 F4 74 65 6C`；AES-256 和 AES-128 的新加密用各自的两个密码从字典读回来打得开、别的密码打不开，AES-256 每次文件密钥和盐都新，AES-128 同 `/ID` 同密钥、换 `/ID` 换密钥；`/Perms` 解出来是 `/P`、四个 `FF`、`T` 或 `F`、`adb`，字典里 `/P` 被改后读取端发现；`/U` 后 16 字节是零；不能保护的各种情况，消息里没有密码，`Debug` 里没有密码；擦密码）。
+  - `crates/qingpdf-core/tests/protect.rs` 13 个：①17 种组合（AES-256 和 AES-128 × 只有用户密码、两个密码、只有所有者密码、两个相同；各项权限逐项关掉；不许打印、只许低质量）在 `gongwen-2025-service-mfg-plan.pdf`（经典交叉引用表、9 页）上，每个都用我们自己的读取端和 qpdf：两个密码都打得开、当作用户和所有者认出来、错的、空的、`密码错误` 都不行；修订版、`/P`、方法名、`/Length`；文字、每页内容流、文档信息逐字和来源一致；qpdf `--check` 通过；`--show-encryption` 说修订版 6 或 4、`P` 是我们设的、三个方法都是 AESv3 或 AESv2；qpdf 解密（QDF）后每页内容流和文档信息和来源一致；两边算出同一个文件密钥；②中文密码（AES-256：用户和所有者都是中文、42 个汉字的长密码、全角字母数字被处理成半角写法；AES-128：汉字被拒绝，消息说用 AES-256 而且不带密码；超过 127 和 32 字节被拒绝；`hôtel`、`âge` 按 PDFDocEncoding 写）；③三个有对象流和交叉引用流的来源（`gongwen-2024-nicheng-work-report.pdf` 32 页、`lunwen-arxiv-2401.01717-word.pdf`、`bug_757705.pdf`）× 两种方式：输出是经典的，其余检查同上；④已加密的来源：生成的 31 个加密文件里不带签名的 29 个，用所有者（或用户）密码读出、换成另一种方式和新密码写出（原来 AES-256 的写成 AES-128，其余写成 AES-256），qpdf 和我们都对得上，旧密码打不开；⑤谁能改（用户密码打开又有限制的三个文件被拒绝，消息说 `the protection is not changed` 和 owner password，用所有者密码或把所有者密码交给 `protect` 就行；所有者密码为空的文件、空密码的文件被拒绝；锁住的文件 `PasswordRequired`）；⑥有签名的文件被拒绝；⑦种子全零被拒绝，同种子同字节，换种子换字节；⑧`CONTENTMARKER`、`TITLEMARKER`、`AUTHORMARKER`、`METADATAMARKER` 四个标记在加密后的字节里找不到，两个密码也不在文件里，解密后都在；`/EncryptMetadata false` 时只有元数据的标记还在、qpdf 解出来都在（AES-256 和 AES-128）；⑨没有 `/ID` 的文件得到 16 字节的 `/ID`，有 `/ID` 的第一项不变；⑩`decrypt` 是回头路（用户密码拒绝，所有者密码还原出每一页）；⑪经引擎：`Opened.protection`（普通文件、八种加密文件加不同密码、签名文件）；带一步没保存的“转页”的文档整个写成新文件（改动在里面，原文件字节不变，写回打开的那个文件，对没加密的文档“去掉加密”答 `Failed`，没有留下 `.tmp`）；引擎对该拒绝的拒绝且什么也没写。
+  - 命令行 `tests/encrypt.rs` 7 个（帮助、用法错误退出 2、AES-256 默认并用 qpdf 验证、`--aes128`、密码文件含中文、各种拒绝且不写文件、已加密输入、有签名）加 `args.rs` 1 个；输出里找不到密码。
+  - 阅读器 `app/protect.rs` 1 个（走整个流程：状态、检查、保存框、`random` 失败、写出、重新打开、去掉密码、只有用户密码时只说明）；`i18n.rs`、`menus.rs` 原有的测试管着新条目（两种语言都有字、菜单项在、没文件时灰）。
+- **PDFium 和 qpdf 对照（`tests/tools/protect_check.py`，pypdfium2；十六种文件，每个都用密码文件传密码，不打印密码）：** AES-256 用户和所有者、只有用户、只有所有者，AES-128 同样三种，中文密码两种、`hôtel`/`âge`（PDFium 用 `FPDF_LoadDocument` 传 Latin-1 字节，因为 pypdfium2 只会传 UTF-8），有对象流和交叉引用流的来源（32 页的公文两种方式、论文一种）、四个已加密的来源换方式（AES-128 到 AES-256、AES-256 到 AES-128、RC4 到 AES-256、中文密码的修订版 6）：PDFium 用用户密码和所有者密码都打得开，错的和空的打不开，`FPDF_GetSecurityHandlerRevision` 是 6 或 4，`FPDF_GetDocUserPermissions` 逐位等于我们设的 `/P`，所有者密码打开时 `FPDF_GetDocPermissions` 是 `0xFFFFFFFC`（全部）；每一页用 PDFium 画出来的位图和来源的逐字节相同，文字相同；qpdf `--check` 通过、`--show-encryption` 的 R、P、方法对。十六种全过。拒绝的三种（AES-128 配汉字、有签名、用户密码改限制了的文件）退出 1，消息对。
+- **速度（命令行，整个进程，含读写文件，3 次）：** 512 页的纯文字文件（`ebook-wikisource-minfadian.pdf` 并 4 份，9.7 MB）0.63 到 0.66 秒（限 1 秒）；**100 MB 的文件**，扫描件那样的（300 页，每页一幅 340 KB 的图，102 MB）：AES-256 1.26 到 1.30 秒、AES-128 1.11 到 1.13 秒，原样重写（`split --pages 1-`）是 1.02 到 1.11 秒；结构最重的（英文论文并 26 份，624 页，102 MB，字体和资源重复很多）：1.92、2.00、2.12 秒，原样重写本身是 1.78 到 1.88 秒（限 2 秒，所以这一个差一点：重写占了 1.8 秒，加密只多 0.1 到 0.2 秒）。**第一版这一个是 2.02 到 2.34 秒**，查出来 `/ID` 第二项对整个输出做哈希就要 0.21 秒（进程里测）：新加密的文件改成从发生器取 16 字节，加上输出缓冲一次放够（`protect` 里 `size_hint`），加密部分从多出 0.3 秒降到 0.1 秒。
+- **截图（`scratchpad\ui\7-encrypt.png`，中文，新的设置文件夹，只用窗口消息发了菜单命令和 `PrintWindow`，密码框是空的，没有往任何窗口输入密码）：** 没加密的文件的窗口（状态“没有设密码，也没有限制。”、四个密码框、AES-256 推荐、打印“允许，高质量”、六个勾、保存和取消）；`7-encrypt-state.png` 是用空密码打开的 AES-256 文件（`bookmarks.r6-aes256-empty-print-none.pdf`，不许打印）：状态“加密方式：AES-256。 不允许：打印。 要改这里，请用所有者密码重新打开文件。”、打印列表是“不允许”、“去掉密码”按钮在左下角。第一次截图拍得太早（控件还没画完），等了 2.5 秒重拍。
+
+### 评审后的修补（2026-10-16，五处）
+
+评审认为算法对，另提出五处小毛病，都改了：
+
+1. **密码文件和“看不见的密码”。** `--password-file` 一行的结尾可以是 CRLF、LF 或单独一个 CR（各去掉一个，不是密码的一部分；最后一行可以没有结尾）；读出来的密码如果以空白（空格、制表符、全角空格……）开头或结尾，或含控制字符，**拒绝**并说明（`... starts or ends with a space, or has a control character (cmd's `echo word > file` leaves a space before the line end); write it without`，消息里没有密码）：cmd 里 `echo secret > pw.txt` 写出来的是 `secret ` 加 CRLF，原来会把那个空格当成密码的一部分，之后用 `secret` 打不开。只检查密码文件，命令行选项里的密码照旧原样用。另外 `password_bytes` 对**不是空、但处理之后什么也不剩**的密码（只有零宽空格、软连字符、字节顺序标记之类）答新的 `PasswordProblem::NothingLeft`，`Security::create` 和阅读器的检查因此都拒绝它（原来写出的文件会说“要密码”，却用空密码就打得开）；阅读器多一条消息 `PtBlank`。
+2. **`decrypt` 也拒绝有签名的文件。** `ops::decrypt` 在 `require_owner` 之后调 `ensure_unsigned`（和 `encrypt`、阅读器一样）：整个重写会让签名失效。阅读器的“去掉密码”不再自己先调一次。原来 `encryption.rs` 里对 31 个生成文件逐个 `decrypt` 的测试，两个带签名的（`sig.r4…`、`sig.r6…`）改成断言被拒绝。
+3. **阅读器 `Protect::reset` 要清掉正在写的请求。** 原来 `running`（请求号、文件、重新打开用的密码）在打开另一个文件时留着：密码还在内存里，而且后面的“密码和权限…”一直答“忙”。现在 `reset` 取出并擦掉密码；引擎的答复是给已经关掉的文档的，窗口本来就丢掉（引擎仍会把文件写完）。
+4. **命令行 `write_replacing` 在改名之前 `sync_all()`**（和阅读器的 `write_atomic` 一样），所有写文件的命令都受益。100 MB 的文件多一次落盘，数见下。
+5. **只挂在表单字段之外的签名字典。** `ensure_unsigned` 只看 `/AcroForm` 的字段和 `/Perms /DocMDP`，一个只从批注的 `/V`（间接或直接）挂着的签名字典它看不见，整个重写后签名悄悄失效。现在整个重写（`protect`、`decrypt`；`copy`、`split`、`merge` 不查，它们原来就不拒绝有签名的文件）时，`Builder::watch_signatures` 让写出每个对象前走一遍它的内容（深度和写出器一样限在 512，对象一个一个来，记在原来的预算里，没有另外一遍读文件），遇到 `/Type /Sig`、`/DocTimeStamp` 或有 `/ByteRange` 键的字典就记下，写完（`finish` 之前）答 `the file is signed: writing it again would break the signature`，不写文件。表单里那一眼（`ensure_unsigned`）留着，它便宜，而且在做事之前就拒绝。代价：要多做一遍对象的遍历，量见下。
+
+测试：`security.rs`（`NothingLeft`、`create` 拒绝零宽的用户或所有者密码）；`protect.rs`：`a_password_of_invisible_characters_is_refused…`、`decrypt_refuses_a_signed_file_as_protect_does`、`a_signature_that_no_form_lists_is_met_while_the_file_is_written…`（间接和直接两种；`protect` 拒绝，qpdf 加密的同样文件 `decrypt` 拒绝；`ensure_unsigned` 本身看不出来，写进了断言）；引擎的拒绝测试里多了去掉有签名文件的加密；命令行 `encrypt.rs`：`a_password_file_is_read_as_it_is_written_and_a_slip_is_refused`（六种行尾写法都对，七种失误都被拒绝且消息里没有密码，中间有空格的密码可以）、`decrypt` 拒绝有签名的文件；阅读器 `opening_another_file_while_one_is_being_written_forgets_that_request_and_its_password`。
+
+数字（本机，release）：`qingpdf-view.exe` 3,474,944 → 3,500,544（+25,600，这一步放宽到 +27,000 以内；修补用了 1,024 字节：多一条消息、`NothingLeft`、写出器里的遍历）；`qingpdf.exe` 3,183,616。clippy 干净；`cargo test --release --no-fail-fast` 1263 通过、0 失败、3 个 ignored（修补前 1258，多 5 个；`qpdf_commands.rs` 里对 31 个生成文件逐个 `decrypt` 的那一步，对两个带签名的改成断言拒绝）。速度（`protect_check.py`，这一遍电脑上没有别的编译在跑，所以比上一遍快）：512 页文字文件 0.27 到 0.28 秒，100 MB 的 624 页文件 0.89 到 0.95 秒，已含 `sync_all`；`protect_check.py` 的十六种文件仍全过。
+
+### 没做和疑点
+
+- **RC4 不写**；证书（公钥）加密不做；`/Perms` 对不上的文件不修。
+- **AES-128 的文件密钥不是随机的**（见上，标准如此）；文件有 `/ID` 时第一项不换。
+- **轻量 SASLprep 的取舍**见上；没做完整的 Unicode 规范化。
+- **输出不用对象流和交叉引用流**（和所有整份重写一样）：来源用了对象流压缩的文件，加密后会变大一些（`gongwen-2024-nicheng-work-report.pdf` 938,293 → 944,341（AES-256；原样重写是 939,396） 字节）。线性化（快速网页浏览）信息不保留（别的整份重写也是）。
+- **阅读器重新打开会丢掉撤销历史**（和“另存为”后一样）；写回同一个文件时，阅读器按它记着的位置回到刚才看的页和缩放，写到别的文件名则从第一页看起。
+- **没做的选项：** 阅读器里没有“不加密元数据”的开关（命令行 `--cleartext-metadata` 有）；没有“改成只对某些页加密”这类东西；不能在不重写文件的情况下改密码（加密本身要求整个重写）。

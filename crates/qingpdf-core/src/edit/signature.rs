@@ -40,6 +40,11 @@ pub(crate) struct Signatures {
 }
 
 impl Signatures {
+    /// Is there a signature or a certification at all?
+    pub(crate) fn any(&self) -> bool {
+        self.signed || self.certification.is_some()
+    }
+
     /// What an edit of this class may do to the file.
     pub(crate) fn policy(&self, class: EditClass) -> Policy {
         match (self.certification, class) {

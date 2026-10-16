@@ -719,7 +719,7 @@ impl Document {
 
     /// The first element of the trailer's `/ID` (14.4), which the key depends
     /// on for revisions 2 to 4; empty if there is none.
-    fn first_file_id(&self) -> Vec<u8> {
+    pub fn first_file_id(&self) -> Vec<u8> {
         let id = self.trailer.get("ID").and_then(|o| self.resolve(o).ok());
         match id {
             Some(Object::Array(items)) => match items.first() {
