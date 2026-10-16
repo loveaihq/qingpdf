@@ -190,6 +190,18 @@
 
 `Opened` 多一项 `protection: Protected { cipher, needs_password, permissions, may_change, signed }`：`cipher` 是 `None`（没加密）、`Aes256`、`Aes128`、`Rc4`（不分位数）或 `Other`；`needs_password` 是空密码打不开；`permissions` 是文件里写的权限（不是打开的人有的权利：用所有者密码打开的，`Rights` 全开，这里仍照实写）；`may_change` 是没加密、或用所有者密码打开的、或文件允许一切（`protect` 和 `decrypt` 同一条规矩）；`signed` 是有签名或认证。界面用它画对话框的"现在的保护"，并在 `may_change` 为假或 `signed` 为真时只说明原因、不去问文件名。
 
+## 压缩的请求和结果（2026-10-16）
+
+给 文件 → 压缩… 用。引擎做的是 `qingpdf_core::compress::compress`（命令行 `qingpdf compress` 是同一个函数）。
+
+| 调用 | 作用 |
+|---|---|
+| `compress(doc, id, 路径, CompressHow { preset, lossless_only })` | 把文档（连没保存的改动一起）整个重写成一个更小的文件写到路径（路径可以就是打开的那个文件），先写同目录的临时文件、再改名替换，出错原文件不动。`preset` 是 `compress::Preset::{High, Balanced, Small}`（200 dpi 质量 85 / 150 dpi 质量 75 / 100 dpi 质量 60），`lossless_only` 为真时图片不动。做的时候隔一会儿发 `CompressProgress { doc, id, percent }`（0 到 100，只升不降，同一个数不重复发），做完答 `Compressed { doc, id, status, message, before, after, kept }`：`Done` 时 `before` 是原文件字节数、`after` 是新文件字节数、`kept` 为假；**压完不比原来小时 `Done`、`kept` 为真、`after == before`，没写任何文件**；`Failed` 时 `message` 说原因（`Done` 时 `message` 是做的提醒，没有就是空）。**不碰打开的文件，也不换掉引擎里的文档**：界面做完后自己决定要不要用 `open_file` 打开新文件。 |
+
+规矩（不合规矩答 `Failed`，文件没写）：缩小图片要 `Rights.modify`（权限位 4，所有者密码能解除，和加水印、加页码同一条），`CompressHow.lossless_only` 不要（那是普通的整份重写，和转页、删页一样），所以界面菜单不灰，没有修改权的文件只给无损那一档；有签名的文件（任何签名、任何级别的认证）拒绝，整个重写会弄坏签名；文件超过 `view::MAX_COMPRESS_FILE`（30 MB）拒绝，消息里让用命令行；再按 `MemoryPlan::compress_room` 算：原文件、新文件、新图片（各最多一个文件那么大）、没保存的改动、窗口留着的（位图、缩略图、对象流、表单字段表）加 12 MiB 余量加起来不能超过 `TOTAL_BYTES`，超过就拒绝（大窗口里文件不小时会这样），不超过的话借给图片的是引擎画一页用的那部分（解码器、离屏层、蒙版）和剩下的两者中小的；开始前画页的缓存（字体、图片、表单、文字）先放掉，之后翻页时再填；打印在跑时答 `Failed`。加密的文件保持原来的加密（同一把文件密钥、同样的密码和权限，不需要所有者的权利，和转页、删页的整份重写一样）。按改动的顺序做；`cancel(id)`（窗口里按 Esc）在下一步停下，不答，临时文件删掉；一个在 `cancel` 之前已经做完的请求仍可能答一次，界面忽略。
+
+引擎线程做压缩的时候不画页（和导出 Word 一样）；做图片的几根线程（最多 8 根）借用画页的内存：`decoders + image_slot + layers + masks`，再减去 3 倍文件大小的余地，不少于 16 MiB（`Options.picture_memory`）；一幅需要的内存比这还多的图不动。数字和理由见 `docs/decisions.md` 的"压缩 PDF（2026-10-16）"。
+
 ## 对接别的语言
 
 接口里只有整数、浮点、字符串、字节数组和没有数据的枚举，没有 Rust 特有的东西（借用、闭包、泛型）。包成 C 接口：每个调用一个函数（`add_markup`、`add_ink`、`add_note`、`delete_annotation` 各是一个函数，不是一个带数据的 `Edit` 枚举），事件取出来摊平成一个结构（`kind` 加上各字段）、位图用"指针加长度"交出去并配一个释放函数，`notify` 换成"函数指针加一个 `void*`"。鸿蒙的 NAPI 同理：`poll` 的结果转成 JS 对象，`notify` 用线程安全函数回到主线程。**这两个包装 3d-1、3d-2、4a 都没有写。**

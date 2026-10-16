@@ -6,6 +6,10 @@
 /// bitmaps the window keeps. (200 MB, counted in millions of bytes.)
 pub const TOTAL_BYTES: u64 = 200_000_000;
 
+/// What compressing a file keeps free besides the file's copies, its edits, the window's share and the memory lent to the pictures: the
+/// merge tables, the page lists, the output's buffers.
+const COMPRESS_MARGIN: u64 = 12 << 20;
+
 /// A file up to this size gets the plan below as it is; a bigger one leaves less for the rest, and the parts shrink
 /// in proportion.
 const FULL_PLAN_FILE: u64 = 40_000_000;
@@ -110,6 +114,27 @@ impl MemoryPlan {
         self.thumb_cache_bytes = THUMB_CACHE_BYTES;
     }
 
+    /// What stays held while a file is compressed: the window's bitmaps and thumbnails, the decoded object streams, the lists of form
+    /// fields. (The drawing's caches, the text of the pages and the page being drawn are let go of for it.)
+    pub fn resident_bytes(&self) -> u64 {
+        self.bitmap_cache_bytes.saturating_add(self.thumb_cache_bytes).saturating_add(self.object_streams).saturating_add(self.form_bytes)
+    }
+
+    /// What the drawing uses at a moment and does not while a file is compressed: the memory the pictures may be lent.
+    pub fn lendable_bytes(&self) -> u64 {
+        self.decoders.saturating_add(self.layers).saturating_add(self.masks)
+    }
+
+    /// How much memory compressing a file may lend its pictures (`Options::picture_memory`): what the drawing can spare
+    /// ([`lendable_bytes`](Self::lendable_bytes)), as far as the total allows once what stays ([`resident_bytes`](Self::resident_bytes)),
+    /// the file, its edits not saved (`overlay`), its new self and its new pictures (as big as the file at the most) and a margin are
+    /// taken off. `Some(0)`: the pictures are left as they are, the rest is done. `None`: not even that fits the total (a window big
+    /// enough to keep most of it for its bitmaps, and a file that is not small).
+    pub fn compress_room(&self, overlay: u64) -> Option<u64> {
+        let held = self.file_bytes.saturating_mul(3).saturating_add(overlay).saturating_add(self.resident_bytes()).saturating_add(COMPRESS_MARGIN);
+        (held <= TOTAL_BYTES).then(|| self.lendable_bytes().min(TOTAL_BYTES - held))
+    }
+
     /// The most the engine can have at once: its caches, the work memory of a page, and the page (4 bytes a pixel).
     pub fn engine_bytes(&self) -> u64 {
         self.object_streams
@@ -199,6 +224,29 @@ mod tests {
                 assert!(p.bitmap_cache_bytes >= u64::from(p.max_tile_pixels) * 4, "{file} {view}: {p:?}");
             }
         }
+    }
+
+    #[test]
+    fn compressing_never_holds_more_than_the_total_and_a_small_window_leaves_room_for_the_pictures() {
+        let overlay = 16 << 20;
+        for file in [0, 5_000_000, 15_000_000, 30_000_000] {
+            for view in [0, HD, UHD, HUGE] {
+                let p = plan(TOTAL_BYTES, file, view).expect("a plan");
+                let held = 3 * file + overlay + p.resident_bytes() + COMPRESS_MARGIN;
+                match p.compress_room(overlay) {
+                    Some(room) => assert!(held + room <= TOTAL_BYTES && room <= p.lendable_bytes(), "{file} {view}: held {held} + room {room}"),
+                    None => assert!(held > TOTAL_BYTES, "{file} {view}: refused with {held} held"),
+                }
+            }
+        }
+        // A file of 5 MB in a window of 1080p: the pictures are lent a good part of what the drawing uses.
+        assert!(plan(TOTAL_BYTES, 5_000_000, HD).expect("a plan").compress_room(0).is_some_and(|room| room > 32 << 20));
+        // A file of 30 MB (the most) in a window of 1080p still fits, with the pictures lent less; in a 4K one it does not.
+        assert!(plan(TOTAL_BYTES, 30_000_000, HD).expect("a plan").compress_room(overlay).is_some_and(|room| room > 0));
+        assert_eq!(plan(TOTAL_BYTES, 30_000_000, UHD).expect("a plan").compress_room(overlay), None);
+        // Edits that are not saved are held too: with enough of them nothing is lent, and then not even the rest fits.
+        let p = plan(TOTAL_BYTES, 30_000_000, HD).expect("a plan");
+        assert_eq!(p.compress_room(100 << 20), None);
     }
 
     #[test]

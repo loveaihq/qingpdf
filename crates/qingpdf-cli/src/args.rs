@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use qingpdf_core::compress::Preset;
 use qingpdf_core::image::PageMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub enum Command {
     Rotate,
     Decrypt,
     Encrypt,
+    Compress,
     Text,
     Render,
     Img2pdf,
@@ -28,7 +30,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 17] = [
+    pub const ALL: [Command; 18] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -36,6 +38,7 @@ impl Command {
         Command::Rotate,
         Command::Decrypt,
         Command::Encrypt,
+        Command::Compress,
         Command::Text,
         Command::Render,
         Command::Img2pdf,
@@ -57,6 +60,7 @@ impl Command {
             Command::Rotate => "rotate",
             Command::Decrypt => "decrypt",
             Command::Encrypt => "encrypt",
+            Command::Compress => "compress",
             Command::Text => "text",
             Command::Render => "render",
             Command::Img2pdf => "img2pdf",
@@ -87,6 +91,8 @@ pub enum Request {
     Decrypt { input: PathBuf, output: PathBuf, force: bool, password: String },
     /// Write a copy under a new encryption; `password` opens the input.
     Encrypt { input: PathBuf, output: PathBuf, force: bool, password: String, how: Box<Protect> },
+    /// Write a smaller copy; `lossless` leaves the pictures as they are.
+    Compress { input: PathBuf, output: PathBuf, force: bool, password: String, preset: Preset, lossless: bool },
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
     Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
@@ -211,6 +217,8 @@ struct Allowed {
     pagenum: bool,
     /// The options of `encrypt`: the passwords, `--aes128`, `--print` and the `--no-...` switches.
     protect: bool,
+    /// The options of `compress`: `--preset` and `--lossless`.
+    compress: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
@@ -227,6 +235,7 @@ fn allowed(c: Command) -> Allowed {
         mark: false,
         pagenum: false,
         protect: false,
+        compress: false,
     };
     match c {
         Command::Info => Allowed { password: true, ..none },
@@ -236,6 +245,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Rotate => Allowed { output: true, force: true, pages: true, angle: true, password: true, ..none },
         Command::Decrypt => Allowed { output: true, force: true, password: true, ..none },
         Command::Encrypt => Allowed { output: true, force: true, password: true, protect: true, ..none },
+        Command::Compress => Allowed { output: true, force: true, password: true, compress: true, ..none },
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
@@ -283,6 +293,9 @@ struct Collected {
     password_file: Option<PathBuf>,
     print: Option<String>,
     switches: Switches,
+    /// `compress`: the preset, and `--lossless`.
+    preset: Option<String>,
+    lossless: bool,
 }
 
 /// The switches of `encrypt` that take no value.
@@ -390,6 +403,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 continue;
             }
             "--user-password" | "--owner-password" | "--password-file" | "--print" if ok.protect => {}
+            "--preset" if ok.compress => {}
+            "--lossless" if ok.compress => {
+                if inline.is_some() {
+                    return Err(usage(c, "--lossless does not take a value"));
+                }
+                got.lossless = true;
+                continue;
+            }
             "--tile" | "--under" if ok.mark && mark_option(command, &name) => {
                 if inline.is_some() {
                     return Err(usage(c, format!("{name} does not take a value")));
@@ -465,6 +486,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 };
                 if slot.replace(text(value, &name, command)?).is_some() {
                     return Err(slot_taken(&name));
+                }
+            }
+            "--preset" => {
+                if got.preset.replace(text(value, "--preset", command)?).is_some() {
+                    return Err(slot_taken("--preset"));
                 }
             }
             "--password-file" => {
@@ -575,7 +601,7 @@ fn hex_color(v: &str) -> Option<[u8; 3]> {
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -662,6 +688,17 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 cleartext_metadata,
             };
             Ok(Request::Encrypt { input, output, force, password, how: Box::new(how) })
+        }
+        Command::Compress => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let preset = match preset.as_deref() {
+                None | Some("balanced") => Preset::Balanced,
+                Some("high") => Preset::High,
+                Some("small") => Preset::Small,
+                Some(_) => return Err(usage(c, "--preset must be high, balanced or small")),
+            };
+            Ok(Request::Compress { input, output, force, password, preset, lossless })
         }
         Command::Text => {
             let input = one_input(&mut inputs)?;
@@ -1086,5 +1123,28 @@ mod tests {
         assert!(!fails(&["encrypt", "a.pdf", "-o", "o.pdf", "--usr-password=secret-value"]).contains("secret-value"));
         let request = run(&["encrypt", "a.pdf", "-o", "o.pdf", "--user-password", "very-secret", "--owner-password", "also-secret"]);
         assert!(!format!("{request:?}").contains("secret"));
+    }
+    #[test]
+    fn compress_takes_a_preset_and_lossless_and_the_usual_options() {
+        let Request::Compress { input, output, force, password, preset, lossless } = run(&["compress", "a.pdf", "-o", "out.pdf"]) else { panic!("not compress") };
+        assert_eq!((input, output, force, password.as_str(), preset, lossless), ("a.pdf".into(), "out.pdf".into(), false, "", Preset::Balanced, false));
+        let Request::Compress { preset, lossless, force, password, .. } = run(&["compress", "a.pdf", "-o", "o.pdf", "--preset", "small", "--lossless", "--force", "--password", "pw"]) else { panic!("not compress") };
+        assert_eq!((preset, lossless, force, password.as_str()), (Preset::Small, true, true, "pw"));
+        for (word, want) in [("high", Preset::High), ("balanced", Preset::Balanced), ("small", Preset::Small)] {
+            let Request::Compress { preset, .. } = run(&["compress", "a.pdf", "-o", "o.pdf", &format!("--preset={word}")]) else { panic!("not compress") };
+            assert_eq!(preset, want);
+        }
+        for (args, word) in [
+            (vec!["compress", "a.pdf"], "-o"),
+            (vec!["compress", "-o", "o.pdf"], "no input file"),
+            (vec!["compress", "a.pdf", "-o", "o.pdf", "--preset", "tiny"], "--preset must be high, balanced or small"),
+            (vec!["compress", "a.pdf", "-o", "o.pdf", "--preset"], "--preset needs a value"),
+            (vec!["compress", "a.pdf", "-o", "o.pdf", "--lossless=1"], "does not take a value"),
+            (vec!["compress", "a.pdf", "-o", "o.pdf", "--preset", "high", "--preset", "small"], "--preset given more than once"),
+            (vec!["compress", "a.pdf", "-o", "o.pdf", "--pages", "1"], "unknown option '--pages'"),
+            (vec!["info", "a.pdf", "--lossless"], "unknown option '--lossless'"),
+        ] {
+            assert!(fails(&args).contains(word), "{args:?}");
+        }
     }
 }

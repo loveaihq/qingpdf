@@ -52,6 +52,11 @@ impl Protect {
 
     /// The open file has gone: nothing is waiting for it, and the request that was writing it (its answer is not wanted: it is for a document
     /// that is not open any more) takes its password with it.
+    /// A request to change the protection is being made or waits for a file name.
+    pub(super) fn is_busy(&self) -> bool {
+        self.running.is_some() || self.waiting.is_some()
+    }
+
     pub(super) fn reset(&mut self) {
         self.info = None;
         self.last = None;

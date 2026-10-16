@@ -499,6 +499,33 @@ fn jpeg(env: &Env<'_>, data: &[u8], declared: u64) -> Result<Samples> {
     Ok(Samples { w: jw, h: jh, bpc: 8, ncomp, stride: jw * ncomp, data: pixels, alpha: None })
 }
 
+/// A JPEG as 8-bit samples for compressing a file: `comps` (1 or 3) colour components, the width and the height it says, the samples
+/// interleaved. `Err(Unsupported)` for a JPEG of other components (CMYK, YCCK) or other than `comps` of them. Not for drawing: no work
+/// meter, no budget; the caller holds the size.
+pub fn jpeg_samples(data: &[u8], comps: usize, most_pixels: usize) -> Result<(usize, usize, Vec<u8>)> {
+    let bad = |e: &dyn std::fmt::Debug| Error::syntax(None, format!("JPEG: {e:?}"));
+    let options = DecoderOptions::default().set_max_width(65_535).set_max_height(65_535);
+    let mut probe = JpegDecoder::new_with_options(ZCursor::new(data), options);
+    probe.decode_headers().map_err(|e| bad(&e))?;
+    let (out, found) = match probe.input_colorspace().unwrap_or(JpegSpace::RGB) {
+        JpegSpace::Luma => (JpegSpace::Luma, 1),
+        JpegSpace::RGB | JpegSpace::YCbCr => (JpegSpace::RGB, 3),
+        _ => (JpegSpace::RGB, 0),
+    };
+    if found != comps {
+        return Err(Error::Unsupported("a JPEG that has other components than its colour space".to_string()));
+    }
+    let mut d = JpegDecoder::new_with_options(ZCursor::new(data), options.jpeg_set_out_colorspace(out));
+    d.decode_headers().map_err(|e| bad(&e))?;
+    let (w, h) = d.dimensions().ok_or_else(|| Error::syntax(None, "JPEG without a frame header"))?;
+    if w.saturating_mul(h) > most_pixels {
+        return Err(Error::Unsupported("a JPEG with more pixels than the picture says".to_string()));
+    }
+    let mut data = vec![0u8; d.output_buffer_size().ok_or_else(|| Error::syntax(None, "JPEG without a frame header"))?];
+    d.decode_into(&mut data).map_err(|e| bad(&e))?;
+    Ok((w, h, data))
+}
+
 /// One row of raw sample values, one byte each (16-bit samples: the high byte).
 fn unpack_row<'a>(s: &'a Samples, y: usize, buf: &'a mut Vec<u8>) -> &'a [u8] {
     let n = s.w * s.ncomp;

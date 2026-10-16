@@ -104,7 +104,7 @@ pub fn parse_page_ranges(spec: &str, page_count: usize) -> Result<Vec<usize>> {
 // --- rewriting a document -----------------------------------------------------------
 
 /// How the output of [`build`] is encrypted.
-enum Encrypt {
+pub(crate) enum Encrypt {
     /// As the first document is, if it is encrypted.
     Keep,
     /// Not at all.
@@ -113,26 +113,36 @@ enum Encrypt {
     New(Box<OutputCrypt>),
 }
 
+/// What compressing asks of [`build`]: the objects that are the same as others (a number -> the number it is merged into), the objects whose
+/// content is made elsewhere (smaller pictures), and what is done to every stream on its way into the file.
+pub(crate) struct Tune<'t> {
+    pub merged: std::collections::HashMap<u32, u32>,
+    pub replaced: std::collections::HashMap<u32, Object>,
+    pub tidy: crate::writer::Tidy<'t>,
+    /// Pack the objects into object streams and write a cross-reference stream (PDF 1.5); not for a file that says it is PDF/A-1.
+    pub pack: bool,
+}
+
 /// One page of the output: page `page` of document `doc`, turned a further
 /// `rotate_by` degrees.
-struct Pick {
-    doc: usize,
-    page: usize,
-    rotate_by: i64,
+pub(crate) struct Pick {
+    pub doc: usize,
+    pub page: usize,
+    pub rotate_by: i64,
 }
 
 /// The pages of a document and their object numbers, read once.
-struct Loaded<'a> {
-    doc: &'a Document,
-    pages: Vec<Page>,
-    page_nums: HashSet<u32>,
+pub(crate) struct Loaded<'a> {
+    pub doc: &'a Document,
+    pub pages: Vec<Page>,
+    pub page_nums: HashSet<u32>,
     /// What the document-level structures say about the pages; read the first
     /// time a subset of the pages is cut out, then reused (splitting into many
     /// files cuts the same structures again and again).
     index: OnceCell<prune::Index>,
     /// The size of the file last written from this document: the next one is
     /// about as big (the pieces of a split), so the buffer is made that big.
-    size_hint: Cell<usize>,
+    pub size_hint: Cell<usize>,
     /// The name to use in messages (for a merge).
     label: Option<&'a str>,
 }
@@ -147,7 +157,7 @@ impl Loaded<'_> {
     }
 }
 
-fn load(doc: &Document) -> Result<Loaded<'_>> {
+pub(crate) fn load(doc: &Document) -> Result<Loaded<'_>> {
     if doc.is_locked() {
         return Err(Error::PasswordRequired);
     }
@@ -170,9 +180,13 @@ const THREADS: (&str, &str) = ("Threads", "article threads");
 /// other documents bring only their pages: their named destinations are made
 /// explicit and their structure tree links are dropped, because the things
 /// they point into are not copied.
-fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt) -> Result<Output> {
+pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune: Option<Tune<'_>>) -> Result<Output> {
     let base = docs.first().ok_or_else(|| internal("no documents"))?;
-    let version = docs.iter().map(|d| d.doc.version()).max().unwrap_or((1, 4));
+    let mut version = docs.iter().map(|d| d.doc.version()).max().unwrap_or((1, 4));
+    // A file made small has object streams and a cross-reference stream (PDF 1.5).
+    if tune.as_ref().is_some_and(|t| t.pack) {
+        version = version.max((1, 5));
+    }
     // The pages of the first document that stay, by object number.
     let kept: HashSet<u32> =
         picks.iter().filter(|p| p.doc == 0).filter_map(|p| base.pages.get(p.page)).map(|p| p.obj_ref.num).collect();
@@ -180,12 +194,23 @@ fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt) -> Result<Output
 
     let mut b = Builder::with_capacity(version, base.size_hint.get());
     // A file that is written afresh under another encryption (or none) loses every signature it had.
-    let rewriting = matches!(encrypt, Encrypt::New(_) | Encrypt::Clear);
+    let rewriting = matches!(encrypt, Encrypt::New(_) | Encrypt::Clear) || tune.is_some();
     if rewriting {
         b.watch_signatures();
     }
     let sources: Vec<usize> = docs.iter().map(|d| b.add_source(d.doc, &d.page_nums)).collect();
     let source_of = |i: usize| sources.get(i).copied().ok_or_else(|| internal("unknown document"));
+    if let Some(Tune { merged, replaced, tidy, pack }) = tune {
+        if pack {
+            b.pack_objects();
+        }
+        b.drop_junk();
+        b.merge_objects(source_of(0)?, merged);
+        for (num, object) in replaced {
+            b.replace(source_of(0)?, num, object);
+        }
+        b.tidy_streams(tidy);
+    }
     match encrypt {
         Encrypt::Keep => b.keep_encryption_of(source_of(0)?),
         Encrypt::Clear => {}
@@ -381,7 +406,7 @@ fn copy_inherited(page: &Page, dict: &mut Dict, key: &str) {
     }
 }
 
-fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
+pub(crate) fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
     (0..count).map(move |page| Pick { doc, page, rotate_by: 0 })
 }
 
@@ -391,7 +416,7 @@ fn all_picks(doc: usize, count: usize) -> impl Iterator<Item = Pick> {
 pub fn copy_all(doc: &Document) -> Result<Output> {
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks, Encrypt::Keep)
+    build(&[d], &picks, Encrypt::Keep, None)
 }
 
 /// A new file with just the pages `pages` (0-based indices, as returned by
@@ -402,7 +427,7 @@ pub fn extract_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     }
     let d = load(doc)?;
     let picks: Vec<Pick> = pages.iter().map(|&page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-    build(&[d], &picks, Encrypt::Keep)
+    build(&[d], &picks, Encrypt::Keep, None)
 }
 
 /// A new file without the pages `pages` (0-based indices).
@@ -413,7 +438,7 @@ pub fn delete_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     if picks.is_empty() {
         return Err(Error::Invalid("that would delete every page".to_string()));
     }
-    build(&[d], &picks, Encrypt::Keep)
+    build(&[d], &picks, Encrypt::Keep, None)
 }
 
 /// A new file in which the pages `pages` (0-based indices) are turned by
@@ -432,7 +457,7 @@ pub fn rotate_pages(doc: &Document, pages: &[usize], angle: i64) -> Result<Outpu
             p
         })
         .collect();
-    build(&[d], &picks, Encrypt::Keep)
+    build(&[d], &picks, Encrypt::Keep, None)
 }
 
 /// How much of a document `split_every` keeps parsed while it works.
@@ -482,7 +507,7 @@ pub fn split_every(
     for (i, start) in (0..count).step_by(every).enumerate() {
         let end = start.saturating_add(every).min(count);
         let picks: Vec<Pick> = (start..end).map(|page| Pick { doc: 0, page, rotate_by: 0 }).collect();
-        let out = build(&loaded, &picks, Encrypt::Keep)?;
+        let out = build(&loaded, &picks, Encrypt::Keep, None)?;
         for w in &out.warnings {
             if !warnings.contains(w) {
                 warnings.push(w.clone());
@@ -594,7 +619,7 @@ pub fn merge(inputs: &[Input<'_>]) -> Result<Output> {
     for (i, d) in docs.iter().enumerate() {
         picks.extend(all_picks(i, d.pages.len()));
     }
-    let mut out = build(&docs, &picks, Encrypt::Keep)?;
+    let mut out = build(&docs, &picks, Encrypt::Keep, None)?;
     // The first file's encryption is the output's (qpdf does the same). If it
     // has none, the output has none, and the encrypted files that came after
     // it lose theirs.
@@ -675,7 +700,7 @@ pub fn decrypt(doc: &Document, password: &str) -> Result<Output> {
     ensure_unsigned(doc)?;
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks, Encrypt::Clear)
+    build(&[d], &picks, Encrypt::Clear, None)
 }
 
 /// Does whoever opened the file have the right to change its protection: the owner password opened it (or the one given, or the
@@ -745,7 +770,7 @@ pub fn protect(doc: &Document, password: &str, how: &Protection, seed: &[u8; 32]
     // The output is about as big as the input: the buffer is made that big at once, not grown (and copied) over and over.
     d.size_hint.set(doc.data().len());
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
-    build(&[d], &picks, Encrypt::New(Box::new(crypt)))
+    build(&[d], &picks, Encrypt::New(Box::new(crypt)), None)
 }
 
 // --- images to PDF ---------------------------------------------------------------------
@@ -1826,8 +1851,8 @@ mod tests {
         }
         // And the writer keeps made-up objects out of the file's own namespace:
         // asking for a reference to an object of the file above the limit gives nothing.
-        let mut builder = Builder::new((1, 4));
         let pages = HashSet::new();
+        let mut builder = Builder::new((1, 4));
         let source = builder.add_source(&src, &pages);
         let made = builder.define_object(source, Object::Integer(7)).unwrap();
         assert!(made.num > crate::object::MAX_OBJECT_NUMBER);

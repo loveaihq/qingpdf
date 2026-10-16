@@ -144,6 +144,12 @@ pub fn decode_with_limit(
     Ok(current.unwrap_or_default())
 }
 
+/// The data of a stream that is Flate-coded alone, inflated and nothing else (no predictor is undone): what compressing a file takes
+/// to code it again. At most `limit` bytes.
+pub fn inflate(data: &[u8], limit: usize) -> Result<Vec<u8>> {
+    inflate_zlib(data, limit, 0, &DecodeBudget::default())
+}
+
 /// Run one of the simple decoders of [`codecs`]: its output may not outgrow the
 /// cap `limit` nor what is left of the budget, and what it produced is charged
 /// to the budget also when it fails.

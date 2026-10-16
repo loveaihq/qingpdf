@@ -7,6 +7,7 @@
 //! thumbnails: the list is drawn and handled there).
 
 mod chrome;
+mod compress;
 mod editing;
 mod forms;
 mod menus;
@@ -68,6 +69,8 @@ pub const CMD_FIND_PREV: u32 = 20;
 pub const CMD_COPY: u32 = 21;
 /// File > Passwords and permissions.
 pub const CMD_PROTECT: u32 = 22;
+/// File > Compress.
+pub const CMD_COMPRESS: u32 = 23;
 /// Tools > Recognize text: in every scanned page, on this page.
 pub const CMD_OCR_ALL: u32 = 26;
 pub const CMD_OCR_PAGE: u32 = 27;
@@ -140,6 +143,9 @@ const TAG_WATERMARK: u32 = 7;
 const TAG_SRC_PASSWORD: u32 = 8;
 const TAG_PAGENUM: u32 = 9;
 const TAG_PROTECT: u32 = 10;
+const TAG_COMPRESS: u32 = 11;
+const TAG_COMPRESS_SAVE: u32 = 12;
+const TAG_COMPRESS_OPEN: u32 = 13;
 
 // Timers.
 /// The view has stopped moving.
@@ -337,6 +343,7 @@ pub struct App {
     // --- passwords and permissions (2026-10-16) ---
     /// How the open file is protected, and the box that changes it.
     pt: protect::Protect,
+    cz: compress::Squeeze,
 }
 
 impl App {
@@ -426,6 +433,7 @@ impl App {
             pg: PageWork::new(),
             pn: pagenum::Pagenum::new(),
             pt: protect::Protect::new(),
+            cz: compress::Squeeze::new(),
         }
     }
 
@@ -505,6 +513,9 @@ impl App {
         }
         self.edit.reset();
         self.pt.reset();
+        if let Some(id) = self.cz.reset() {
+            self.engine.cancel(id);
+        }
         let had_outline = !self.outline.is_empty();
         self.doc = None;
         self.cache.clear();
@@ -999,6 +1010,7 @@ impl App {
             CMD_INS_WM => self.ask_watermark(),
             CMD_INS_PAGENUM => self.ask_pagenum(),
             CMD_PROTECT => self.ask_protect(),
+            CMD_COMPRESS => self.ask_compress(),
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
@@ -1320,6 +1332,7 @@ impl Handler for App {
             Event::Text { .. } => Vec::new(),
             Event::Form { tag: TAG_PAGENUM, answer } => self.pagenum_answered(answer),
             Event::Form { tag: TAG_PROTECT, answer } => self.protect_answered(answer),
+            Event::Form { tag: TAG_COMPRESS, answer } => self.compress_answered(answer),
             Event::Form { .. } => Vec::new(),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
             Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),
@@ -1341,6 +1354,8 @@ impl Handler for App {
             Event::OutlineClick(i) => self.outline_click(i),
             Event::FindText(text) => self.find_text_changed(text),
             Event::Confirmed { tag: TAG_LINK, yes } => self.link_confirmed(yes),
+            Event::Confirmed { tag: TAG_COMPRESS_SAVE, yes } => self.compress_save_answered(yes),
+            Event::Confirmed { tag: TAG_COMPRESS_OPEN, yes } => self.compress_open_answered(yes),
             Event::Confirmed { .. } => Vec::new(),
             Event::Printer(setup) => self.printer_chosen(setup),
             Event::PrintStepDone => self.print_step_done(),

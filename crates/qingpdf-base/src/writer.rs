@@ -7,7 +7,9 @@
 //! renumbering ([`Builder::import`]); only what is reachable from what the
 //! caller imports ends up in the file.
 //!
-//! The output uses a classic cross-reference table and no object streams.
+//! The output uses a classic cross-reference table and no object streams, unless the caller asks for the smaller form
+//! ([`Builder::pack_objects`]: the objects that may be are packed into object streams and the table is a cross-reference stream,
+//! 7.5.7 and 7.5.8; PDF 1.5).
 //!
 //! A file that was encrypted can be written encrypted again ([`Builder::keep_encryption_of`]):
 //! the same encryption dictionary and key, every string and stream encrypted
@@ -51,6 +53,14 @@ const MAX_UNREADABLE_LISTED: usize = 5;
 
 /// Flate compression level for new streams: a good size for little time.
 const FLATE_LEVEL: u8 = 6;
+
+/// The level for what is written to be as small as it can be (object streams and the cross-reference stream of
+/// [`Builder::pack_objects`]; `squeeze` uses it too).
+pub const BEST_FLATE_LEVEL: u8 = 9;
+
+/// An object stream holds at most this many objects, and about this many bytes of them (7.5.7 does not say; qpdf and Acrobat keep to 100).
+const PACK_MEMBERS: usize = 100;
+const PACK_BYTES: usize = 1 << 16;
 
 /// Flate compression (zlib, RFC 1950) of data that arrives in pieces: the
 /// compressed bytes are kept, the input is not, so a stream can be made of
@@ -365,6 +375,9 @@ struct Source<'a> {
     defined: HashMap<u32, Object>,
     /// The next number for one of them.
     next_defined: u32,
+    /// Objects that are the same as another one (same content, same references once those are looked at the same way): a
+    /// reference to the first is a reference to the second ([`Builder::merge_objects`]).
+    alias: HashMap<u32, u32>,
 }
 
 /// An imported object waiting for its references to be translated.
@@ -397,6 +410,25 @@ pub struct Builder<'a> {
     /// Look at every object written for a signature dictionary ([`Builder::watch_signatures`]), and whether one was met.
     watch_signatures: bool,
     signature_seen: bool,
+    /// Objects waiting to be written into an object stream, when the file is made small ([`Builder::pack_objects`]), and where the
+    /// ones that were written are: object number -> (number of the object stream, place in it).
+    pack: Option<Packing>,
+    packed: HashMap<u32, (u32, u32)>,
+    /// Take out what changes nothing visible (a page's thumbnail, private data of the program that made it) from the objects imported
+    /// ([`Builder::drop_junk`]).
+    drop_junk: bool,
+    /// What is done to the dictionary and the data of every stream imported, if the caller wants something done ([`Builder::tidy_streams`]).
+    tidy: Option<Tidy<'a>>,
+}
+
+/// What [`Builder::tidy_streams`] is given: the stream's dictionary, which it may change, and its data. An error ends the writing.
+pub type Tidy<'a> = Box<dyn FnMut(&mut Dict, &mut Vec<u8>) -> Result<()> + 'a>;
+
+/// The objects of an object stream that is being filled: the text of each, one after the other, and where each starts.
+#[derive(Default)]
+struct Packing {
+    members: Vec<(u32, usize)>,
+    body: Vec<u8>,
 }
 
 /// What a builder that makes no file gives back: its objects by number, and the warnings.
@@ -439,6 +471,10 @@ impl<'a> Builder<'a> {
             collect: None,
             watch_signatures: false,
             signature_seen: false,
+            pack: None,
+            packed: HashMap::new(),
+            drop_junk: false,
+            tidy: None,
         }
     }
 
@@ -500,6 +536,38 @@ impl<'a> Builder<'a> {
         self.signature_seen
     }
 
+    /// Write the smaller form of a file (PDF 1.5, 7.5.7 and 7.5.8): the objects that may be in an object stream (all that are not
+    /// streams) are packed into them, Flate-compressed together at the best level, and the table of objects is a compressed
+    /// cross-reference stream. Call it before anything is written. An encrypted file gets its object streams encrypted as streams
+    /// (the objects in them are not encrypted one by one) and its cross-reference stream is not encrypted (7.5.8.2).
+    pub fn pack_objects(&mut self) {
+        if self.collect.is_none() && self.buf.is_empty() {
+            self.version = self.version.max((1, 5));
+            self.pack = Some(Packing::default());
+        }
+    }
+
+    /// From now on a reference to object `from` of `source` is a reference to object `to` of it: the caller has found them to be
+    /// the same (equal objects, or equal streams with equal dictionaries), and only `to` is imported.
+    pub fn merge_objects(&mut self, source: usize, merged: HashMap<u32, u32>) {
+        if let Some(s) = self.source_mut(source) {
+            s.alias = merged;
+        }
+    }
+
+    /// Take out of every object imported what changes nothing that is seen: a page's thumbnail (`/Thumb`), the private data some
+    /// programs keep in pages, forms, pictures and the catalog (`/PieceInfo`), and the metadata of pages, forms and pictures
+    /// (`/Metadata`; the catalog's, the document's, stays).
+    pub fn drop_junk(&mut self) {
+        self.drop_junk = true;
+    }
+
+    /// Have `tidy` look at the dictionary and the data of each stream imported before it is written; it may change both (and so make
+    /// the data smaller). Its error ends the writing.
+    pub fn tidy_streams(&mut self, tidy: impl FnMut(&mut Dict, &mut Vec<u8>) -> Result<()> + 'a) {
+        self.tidy = Some(Box::new(tidy));
+    }
+
     /// Say that object `num` of `source` is the catalog's metadata stream,
     /// which an encryption that leaves metadata in the clear does not encrypt.
     pub fn mark_root_metadata(&mut self, source: usize, num: u32) {
@@ -523,6 +591,7 @@ impl<'a> Builder<'a> {
             shared: HashMap::new(),
             defined: HashMap::new(),
             next_defined: u32::MAX,
+            alias: HashMap::new(),
         });
         self.sources.len() - 1
     }
@@ -627,9 +696,66 @@ impl<'a> Builder<'a> {
         if slot.is_some() {
             return Err(Error::Invalid(format!("object {} written twice", r.num)));
         }
+        // An object that is not a stream waits for the others in an object stream (7.5.7); its strings are not encrypted one by one,
+        // the object stream is encrypted as a whole.
+        if let Some(pack) = self.pack.as_mut()
+            && !matches!(obj, Object::Stream(_))
+            && r.generation == 0
+        {
+            *slot = Some(0);
+            pack.members.push((r.num, pack.body.len()));
+            write_depth(&mut pack.body, obj, 0, None)?;
+            pack.body.push(b'\n');
+            if pack.members.len() >= PACK_MEMBERS || pack.body.len() >= PACK_BYTES {
+                self.flush_pack()?;
+            }
+            return Ok(());
+        }
         *slot = Some(u64::try_from(self.buf.len()).unwrap_or(u64::MAX));
         let enc = self.crypt.as_ref().map(|c| c.object(r.num, self.root_metadata_out == Some(r.num)));
         write_indirect(&mut self.buf, r.num, obj, enc.as_ref())
+    }
+
+    /// The number (in its source) of the document's metadata stream, if it was named.
+    fn keep_metadata(&self) -> Option<u32> {
+        self.root_metadata.map(|(_, num)| num)
+    }
+
+    /// Write the objects waiting (see [`Builder::pack_objects`]) as an object stream of their own (7.5.7, Table 16): `/N`, `/First`,
+    /// and in the data the pairs of object number and offset, then the objects.
+    fn flush_pack(&mut self) -> Result<()> {
+        let Some(pack) = self.pack.as_mut() else { return Ok(()) };
+        if pack.members.is_empty() {
+            return Ok(());
+        }
+        let members = std::mem::take(&mut pack.members);
+        let body = std::mem::take(&mut pack.body);
+        let mut data = Vec::with_capacity(body.len() + members.len() * 16);
+        for (num, start) in &members {
+            push_number(&mut data, u64::from(*num));
+            data.push(b' ');
+            push_number(&mut data, u64::try_from(*start).unwrap_or(0));
+            data.push(b'\n');
+        }
+        let first = data.len();
+        data.extend_from_slice(&body);
+        let mut dict = Dict::new();
+        dict.set("Type", Object::from("ObjStm"));
+        dict.set("N", Object::Integer(i64::try_from(members.len()).unwrap_or(i64::MAX)));
+        dict.set("First", Object::Integer(i64::try_from(first).unwrap_or(i64::MAX)));
+        dict.set("Filter", Object::from("FlateDecode"));
+        let stream = self.reserve()?;
+        let packed = Object::Stream(Stream { dict, data: compress_to_vec_zlib(&data, BEST_FLATE_LEVEL) });
+        let at = u64::try_from(self.buf.len()).unwrap_or(u64::MAX);
+        if let Some(slot) = usize::try_from(stream.num).ok().and_then(|n| n.checked_sub(1)).and_then(|i| self.offsets.get_mut(i)) {
+            *slot = Some(at);
+        }
+        let enc = self.crypt.as_ref().map(|c| c.object(stream.num, false));
+        write_indirect(&mut self.buf, stream.num, &packed, enc.as_ref())?;
+        for (index, (num, _)) in members.iter().enumerate() {
+            self.packed.insert(*num, (stream.num, u32::try_from(index).unwrap_or(0)));
+        }
+        Ok(())
     }
 
     /// [`Builder::put`] for an object the builder may keep: not copied by a builder that collects.
@@ -754,16 +880,27 @@ impl<'a> Builder<'a> {
                 }
                 Object::Array(items)
             }
-            Object::Dict(d) => match self.rewrite_dict(source, d)? {
-                Some(d) => Object::Dict(self.translate_dict(source, d)?),
-                None => Object::Null,
-            },
-            Object::Stream(Stream { mut dict, data }) => {
+            Object::Dict(mut d) => {
+                if self.drop_junk {
+                    take_out_junk(&mut d, false, self.keep_metadata());
+                }
+                match self.rewrite_dict(source, d)? {
+                    Some(d) => Object::Dict(self.translate_dict(source, d)?),
+                    None => Object::Null,
+                }
+            }
+            Object::Stream(Stream { mut dict, mut data }) => {
                 dict.remove("Length");
                 // Its data was decrypted when it was read. Only the source whose
                 // encryption is kept uses the crypt filters of that encryption.
                 if self.crypt_source != Some(source) {
                     strip_crypt_filter(&mut dict);
+                }
+                if self.drop_junk {
+                    take_out_junk(&mut dict, true, self.keep_metadata());
+                }
+                if let Some(tidy) = self.tidy.as_mut() {
+                    tidy(&mut dict, &mut data)?;
                 }
                 match self.rewrite_dict(source, dict)? {
                     Some(dict) => Object::Stream(Stream { dict: self.translate_dict(source, dict)?, data }),
@@ -850,6 +987,11 @@ impl<'a> Builder<'a> {
     /// The output object for source object `r`, importing it if this is the
     /// first time it is met.
     fn map_ref(&mut self, source: usize, r: ObjRef) -> Result<Option<ObjRef>> {
+        // (An object that is the same as another is that other.)
+        let r = match self.sources.get(source).and_then(|s| s.alias.get(&r.num)) {
+            Some(&to) => ObjRef::new(to, 0),
+            None => r,
+        };
         let (doc, is_page, replaced) = {
             let s = self.sources.get_mut(source).ok_or_else(|| Error::Invalid("unknown import source".to_string()))?;
             if let Some(known) = s.map.get(&r.num) {
@@ -950,7 +1092,8 @@ impl<'a> Builder<'a> {
                 self.put(ObjRef::new(num, 0), &Object::Null)?;
             }
         }
-        // The encryption dictionary is an object of its own, and never encrypted.
+        self.flush_pack()?;
+        // The encryption dictionary is an object of its own, and never encrypted (nor packed: 7.5.7 keeps it out of object streams).
         let encrypt_ref = match self.crypt.as_ref().map(|c| c.encrypt_dict().clone()) {
             Some(dict) => {
                 let r = self.reserve()?;
@@ -963,6 +1106,9 @@ impl<'a> Builder<'a> {
             }
             None => None,
         };
+        if self.pack.is_some() {
+            return self.finish_with_stream(root, info, encrypt_ref, warning);
+        }
         let xref_at = u64::try_from(self.buf.len()).unwrap_or(u64::MAX);
         let size = self.offsets.len() + 1;
         // 7.5.4: one 20-byte entry per object, the free-list head first.
@@ -1002,6 +1148,89 @@ impl<'a> Builder<'a> {
         table.extend_from_slice(format!(" >>\nstartxref\n{xref_at}\n%%EOF\n").as_bytes());
         self.buf.extend_from_slice(&table);
         Ok((self.buf, warning.into_iter().collect()))
+    }
+
+    /// The end of a file made with [`Builder::pack_objects`]: the table of objects as a cross-reference stream (7.5.8: one row of
+    /// type, offset (or object stream) and generation (or place in it) for each object, Flate-compressed with the "up" predictor,
+    /// which makes the columns that hardly change nearly free), and the entries of the trailer in its dictionary.
+    fn finish_with_stream(mut self, root: ObjRef, info: Option<ObjRef>, encrypt_ref: Option<ObjRef>, warning: Option<Warning>) -> Result<(Vec<u8>, Vec<Warning>)> {
+        let table = self.reserve()?;
+        let xref_at = u64::try_from(self.buf.len()).unwrap_or(u64::MAX);
+        let size = self.offsets.len() + 1;
+        // Field 2 holds an offset or an object stream's number: as many bytes as the biggest needs.
+        let biggest = self.packed.values().map(|(s, _)| u64::from(*s)).fold(xref_at, u64::max);
+        let width = (1..8usize).find(|&w| biggest >> (8 * w) == 0).unwrap_or(8);
+        let columns = 1 + width + 2;
+        let mut rows: Vec<u8> = Vec::with_capacity(size.saturating_mul(columns));
+        let mut row = |kind: u8, field: u64, last: u16| {
+            rows.push(kind);
+            rows.extend_from_slice(field.to_be_bytes().get(8 - width..).unwrap_or(&[]));
+            rows.extend_from_slice(&last.to_be_bytes());
+        };
+        row(0, 0, u16::MAX);
+        for (i, offset) in self.offsets.iter().enumerate() {
+            let num = u32::try_from(i + 1).unwrap_or(u32::MAX);
+            match self.packed.get(&num) {
+                _ if num == table.num => row(1, xref_at, 0),
+                Some((stream, index)) => row(2, u64::from(*stream), u16::try_from(*index).unwrap_or(0)),
+                None => row(1, offset.unwrap_or(0), 0),
+            }
+        }
+        // PNG "up" (predictor 12, 7.4.4.4): each row after the difference from the row above it.
+        let mut filtered = Vec::with_capacity(rows.len() + size);
+        let mut above = vec![0u8; columns];
+        for current in rows.chunks_exact(columns) {
+            filtered.push(2);
+            filtered.extend(current.iter().zip(&above).map(|(c, a)| c.wrapping_sub(*a)));
+            above.copy_from_slice(current);
+        }
+        let id = match self.crypt.as_ref().and_then(OutputCrypt::fresh_id) {
+            Some(fresh) => fresh,
+            None => file_id(&self.buf),
+        };
+        let id0 = match &self.crypt {
+            Some(c) => c.id0().to_vec(),
+            None => id.to_vec(),
+        };
+        let mut dict = Dict::new();
+        dict.set("Type", Object::from("XRef"));
+        dict.set("Size", Object::Integer(i64::try_from(size).unwrap_or(i64::MAX)));
+        dict.set("W", Object::Array([1, i64::try_from(width).unwrap_or(8), 2].map(Object::Integer).to_vec()));
+        dict.set("Root", Object::Ref(root));
+        if let Some(info) = info {
+            dict.set("Info", Object::Ref(info));
+        }
+        if let Some(r) = encrypt_ref {
+            dict.set("Encrypt", Object::Ref(r));
+        }
+        dict.set("ID", Object::Array(vec![Object::String(PdfString::hex(id0)), Object::String(PdfString::hex(id.to_vec()))]));
+        dict.set("Filter", Object::from("FlateDecode"));
+        let mut parms = Dict::new();
+        parms.set("Columns", Object::Integer(i64::try_from(columns).unwrap_or(1)));
+        parms.set("Predictor", Object::Integer(12));
+        dict.set("DecodeParms", Object::Dict(parms));
+        let stream = Object::Stream(Stream { dict, data: compress_to_vec_zlib(&filtered, BEST_FLATE_LEVEL) });
+        // (Never encrypted, 7.5.8.2.)
+        write_indirect(&mut self.buf, table.num, &stream, None)?;
+        self.buf.extend_from_slice(format!("startxref\n{xref_at}\n%%EOF\n").as_bytes());
+        Ok((self.buf, warning.into_iter().collect()))
+    }
+}
+
+/// Take out of the dictionary of a page, a form, a picture or the catalog what [`Builder::drop_junk`] says. `keep_metadata` is the
+/// reference of the document's metadata stream, which stays wherever it is named.
+fn take_out_junk(d: &mut Dict, is_stream: bool, keep_metadata: Option<u32>) {
+    let kind = if is_stream { d.get_name("Subtype") } else { d.get_name("Type") }.map(Name::as_bytes);
+    // (A page, the catalog, a form or a picture.)
+    let (page, catalog) = (kind == Some(b"Page"), kind == Some(b"Catalog"));
+    if !(page || catalog || (is_stream && matches!(kind, Some(b"Form" | b"Image")))) {
+        return;
+    }
+    let keeps = matches!(d.get("Metadata"), Some(Object::Ref(r)) if Some(r.num) == keep_metadata);
+    for key in ["Thumb", "PieceInfo", "Metadata"] {
+        if !(key == "Thumb" && !page) && !(key == "Metadata" && (catalog || keeps)) {
+            d.remove(key);
+        }
     }
 }
 
@@ -1415,6 +1644,95 @@ mod tests {
         // Numbers past what a file can have are refused.
         let mut b = Builder::collecting(MAX_OBJECT_NUMBER, 1 << 20, "x");
         assert!(b.reserve().is_ok() && b.reserve().is_err());
+    }
+
+    #[test]
+    fn packed_objects_go_into_object_streams_and_a_cross_reference_stream_and_read_back() {
+        let mut b = Builder::new((1, 4));
+        b.pack_objects();
+        let catalog = b.reserve().unwrap();
+        let mut refs = Vec::new();
+        // 250 small objects (three object streams), a stream between them, and strings that must come out as they went in.
+        for i in 0..250i64 {
+            let obj = Object::Dict(Dict::from_iter([
+                (Name::from("N"), Object::Integer(i)),
+                (Name::from("S"), Object::String(PdfString::literal(format!("text ({i})")))),
+                (Name::from("A"), Object::Array(vec![Object::Real(0.5), Object::from("Name"), Object::Null])),
+            ]));
+            refs.push(b.add(&obj).unwrap());
+            if i == 100 {
+                let s = b.add_flate_stream(Dict::new(), &b"stream data ".repeat(100)).unwrap();
+                refs.push(s);
+            }
+        }
+        let info = b.add(&Object::Dict(Dict::from_iter([(Name::from("Title"), Object::String(PdfString::literal("packed")))]))).unwrap();
+        b.put(catalog, &Object::Dict(Dict::from_iter([(Name::from("Type"), Object::from("Catalog")), (Name::from("K"), Object::Ref(refs[7]))]))).unwrap();
+        let (bytes, _) = b.finish(catalog, Some(info)).unwrap();
+        assert!(bytes.starts_with(b"%PDF-1.5\n"), "the version is raised to 1.5");
+        assert!(!bytes.windows(7).any(|w| w == b"trailer") && !bytes.windows(6).any(|w| w == b"\nxref\n"), "no classic table");
+        let doc = Document::from_bytes(bytes).unwrap();
+        assert!(!doc.was_repaired() && doc.uses_xref_streams() && doc.uses_object_streams());
+        assert_eq!(doc.version(), (1, 5));
+        for (i, r) in refs.iter().enumerate() {
+            let got = doc.get(*r).unwrap();
+            if let Object::Stream(s) = &got {
+                assert_eq!(doc.decode_stream(s).unwrap(), b"stream data ".repeat(100));
+            } else {
+                let n = if i > 101 { i as i64 - 1 } else { i as i64 };
+                assert_eq!(got.as_dict().unwrap().get_int("N"), Some(n), "object {}", r.num);
+            }
+        }
+        assert_eq!(doc.info().unwrap().unwrap().get("Title"), Some(&Object::String(PdfString::literal("packed"))));
+        assert_eq!(doc.catalog().unwrap().get("K"), Some(&Object::Ref(refs[7])));
+        // Smaller than the same objects in the classic form.
+        let mut plain = Builder::new((1, 4));
+        let c2 = plain.reserve().unwrap();
+        for i in 0..250i64 {
+            plain.add(&Object::Dict(Dict::from_iter([(Name::from("N"), Object::Integer(i))]))).unwrap();
+        }
+        plain.put(c2, &Object::Dict(Dict::new())).unwrap();
+        assert!(plain.finish(c2, None).unwrap().0.len() > 4000);
+    }
+
+    #[test]
+    fn junk_is_taken_out_of_pages_and_forms_and_the_document_metadata_stays() {
+        use crate::testutil::PdfBuilder;
+        let mut pb = PdfBuilder::new();
+        pb.obj(1, "<< /Type /Catalog /Pages 2 0 R /Metadata 7 0 R /PieceInfo << /X 1 >> >>");
+        pb.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        pb.obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Thumb 5 0 R /PieceInfo << /Y 2 >> /Metadata 8 0 R /Resources << /XObject << /Thumb 6 0 R >> >> >>");
+        pb.stream_obj(5, "/Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", &[0]);
+        pb.stream_obj(6, "/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Metadata 8 0 R /PieceInfo << /Z 3 >>", b"q Q");
+        pb.stream_obj(7, "/Type /Metadata /Subtype /XML", b"<xmp/>");
+        pb.stream_obj(8, "/Type /Metadata /Subtype /XML", b"<other/>");
+        let source = Document::from_bytes(pb.finish_classic(9, "/Root 1 0 R")).unwrap();
+        let pages: HashSet<u32> = HashSet::from([3]);
+        let mut b = Builder::new((1, 4));
+        b.drop_junk();
+        let s = b.add_source(&source, &pages);
+        b.mark_root_metadata(s, 7);
+        let catalog = b.reserve().unwrap();
+        let page = b.reserve().unwrap();
+        b.register_page(s, ObjRef::new(3, 0), page);
+        let Object::Dict(mut p) = b.import(s, source.get(ObjRef::new(3, 0)).unwrap()).unwrap() else { panic!() };
+        p.remove("Parent");
+        b.put(page, &Object::Dict(p)).unwrap();
+        let Object::Dict(mut c) = b.import(s, source.get(ObjRef::new(1, 0)).unwrap()).unwrap() else { panic!() };
+        c.set("Pages", Object::Ref(page));
+        b.put(catalog, &Object::Dict(c)).unwrap();
+        let (bytes, _) = b.finish(catalog, None).unwrap();
+        let out = Document::from_bytes(bytes).unwrap();
+        let cat = out.catalog().unwrap();
+        assert!(cat.contains_key("Metadata") && !cat.contains_key("PieceInfo"));
+        let page = out.pages().unwrap().remove(0);
+        assert!(!page.dict.contains_key("Thumb") && !page.dict.contains_key("PieceInfo") && !page.dict.contains_key("Metadata"), "{:?}", page.dict);
+        // The form (reached through a resource name that happens to be "Thumb") lost its metadata and private data, and kept its place.
+        let Some(Object::Dict(res)) = page.dict.get("Resources") else { panic!("resources") };
+        let Some(Object::Dict(xo)) = res.get("XObject") else { panic!("xobjects") };
+        let Some(Object::Ref(form)) = xo.get("Thumb") else { panic!("the resource named Thumb") };
+        let form = out.get(*form).unwrap();
+        let d = form.as_dict().unwrap();
+        assert!(d.contains_key("BBox") && !d.contains_key("Metadata") && !d.contains_key("PieceInfo"));
     }
 
     #[test]

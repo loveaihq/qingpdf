@@ -27,7 +27,7 @@ use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
     BACKGROUND_PRIORITY, CharBoxes, Command, Event, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
-    RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
+    MemoryPlan, RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
 };
 use crate::view::geometry::line_rects;
 
@@ -236,6 +236,11 @@ struct Server<'a> {
     edits: VecDeque<Command>,
     /// Set when the document is to be replaced (the loop then ends with [`Command::Swap`]).
     swap: Option<Pending>,
+    /// The plan the memory was shared by (what compressing lends its pictures, `Engine::compress`, is worked out from it), and the limits
+    /// and the text budget the drawing's caches are made again with.
+    plan: MemoryPlan,
+    limits: MemoryLimits,
+    text_budget: u64,
 }
 
 /// Serve one open document until a command ends it; that command is returned for the caller to carry out. An edit replaces the
@@ -279,14 +284,15 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
     let Carry { queue, jobs, edits } = carry.unwrap_or(Carry { queue: Vec::new(), jobs: VecDeque::new(), edits: VecDeque::new() });
     let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
     let mut renderer = Renderer::new(&document, crate::forms::painter());
-    renderer.set_memory_limits(MemoryLimits {
+    let limits = MemoryLimits {
         caches: to_usize(plan.render_caches),
         layers: to_usize(plan.layers),
         masks: to_usize(plan.masks),
         decoders: to_usize(plan.decoders),
         image_slot: to_usize(plan.image_slot),
         canvas_pixels: u64::from(plan.max_tile_pixels),
-    });
+    };
+    renderer.set_memory_limits(limits);
     renderer.set_cancel(Some(shared.stop.clone()));
     let mut server = Server {
         doc_id,
@@ -307,6 +313,9 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
         session: &mut *session,
         edits,
         swap: None,
+        text_budget: plan.text_cache,
+        limits,
+        plan,
     };
     let end = server.run();
     let Some(pending) = server.swap.take() else { return Exit::Done(end) };
@@ -433,7 +442,7 @@ impl Server<'_> {
                 }
                 None
             }
-            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. } | Command::Protect { .. }) => {
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. } | Command::Protect { .. } | Command::Compress { .. }) => {
                 let doc = match &c {
                     Command::Edit { doc, .. }
                     | Command::Undo { doc, .. }
@@ -441,7 +450,8 @@ impl Server<'_> {
                     | Command::Save { doc, .. }
                     | Command::Export { doc, .. }
                     | Command::Extract { doc, .. }
-                    | Command::Protect { doc, .. } => *doc,
+                    | Command::Protect { doc, .. }
+                    | Command::Compress { doc, .. } => *doc,
                     _ => 0,
                 };
                 if doc == self.doc_id {
@@ -989,6 +999,79 @@ impl Server<'_> {
                         Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0),
                     },
                     Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0),
+                }
+                None
+            }
+            Command::Compress { doc, id, path, how } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, before: u64, after: u64, kept: bool| this.tell(Event::Compressed { doc, id, status, message, before, after, kept });
+                if printing {
+                    reply(self, SaveStatus::Failed, BUSY.to_string(), 0, 0, false);
+                    return None;
+                }
+                // (Only what changes the pictures needs the right to change the content: written again as it is, the file is a plain copy.)
+                if !how.lossless_only && !self.rights.modify {
+                    reply(self, SaveStatus::Failed, DENIED_MODIFY.to_string(), 0, 0, false);
+                    return None;
+                }
+                if self.document.data().len() as u64 > super::MAX_COMPRESS_FILE {
+                    reply(self, SaveStatus::Failed, format!("the file is bigger than {} MB, the most this reader compresses; use the command line: qingpdf compress", super::MAX_COMPRESS_FILE / 1_000_000), 0, 0, false);
+                    return None;
+                }
+                // What the window keeps, the file and its copies must fit the total (the pictures are lent what is left): in a window big
+                // enough to keep most of it for its bitmaps, a file that is not small is left to the command line.
+                let Some(room) = self.plan.compress_room(self.document.overlay_bytes() as u64) else {
+                    reply(self, SaveStatus::Failed, "the window and the file leave this reader too little memory to compress it; use the command line: qingpdf compress".to_string(), 0, 0, false);
+                    return None;
+                };
+                // The drawing's caches (fonts, pictures, forms, the text of the pages read) are let go of: the memory is for the
+                // compressing, and they fill up again as pages are drawn.
+                self.renderer = Renderer::new(self.document, crate::forms::painter());
+                self.renderer.set_memory_limits(self.limits);
+                self.renderer.set_cancel(Some(self.shared.stop.clone()));
+                self.text = TextExtractor::new(self.document);
+                self.chars = TextCache::new(self.text_budget);
+                // The document as it is, with the edits not saved. The stop flag stops it at its next step; a flag raised late for the
+                // request before this one stops it too, and then it is started again.
+                let result = loop {
+                    match self.begin(id) {
+                        Err(end) => return Some(end),
+                        Ok(false) => {
+                            self.shared.current.store(0, Ordering::SeqCst);
+                            return None;
+                        }
+                        Ok(true) => {}
+                    }
+                    let last = std::cell::Cell::new(u32::MAX);
+                    let progress = |percent: u32| {
+                        if last.replace(percent) != percent {
+                            self.tell(Event::CompressProgress { doc, id, percent });
+                        }
+                    };
+                    let control = crate::compress::Control { stop: Some(self.shared.stop.clone()), progress: &progress };
+                    let options = crate::compress::Options { preset: how.preset, lossless_only: how.lossless_only, picture_memory: room, threads: 0 };
+                    let result = crate::compress::compress(self.document, self.session.password(), &options, &control);
+                    self.shared.current.store(0, Ordering::SeqCst);
+                    if matches!(result, Err(Error::Cancelled)) {
+                        match self.really_cancelled(id) {
+                            Err(end) => return Some(end),
+                            Ok(true) => return None,
+                            Ok(false) => continue,
+                        }
+                    }
+                    break result;
+                };
+                match result {
+                    Ok(packed) => {
+                        let message = packed.warnings.iter().map(|w| w.0.as_str()).collect::<Vec<_>>().join("; ");
+                        match packed.data {
+                            Some(data) => match write_atomic(&path, &data) {
+                                Ok(()) => reply(self, SaveStatus::Done, message, packed.before, data.len() as u64, false),
+                                Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0, false),
+                            },
+                            None => reply(self, SaveStatus::Done, message, packed.before, packed.before, true),
+                        }
+                    }
+                    Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0, false),
                 }
                 None
             }

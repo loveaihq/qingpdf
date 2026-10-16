@@ -321,11 +321,29 @@ pub enum Msg {
     PtNoRandom,
     PtDone,
     PtFailed,
+    CzMenu,
+    CzTitle,
+    CzIntro,
+    CzPictures,
+    CzHigh,
+    CzBalanced,
+    CzSmall,
+    CzLossless,
+    CzNoModify,
+    CzOk,
+    CzSaveAsk,
+    CzPickTitle,
+    CzSuffix,
+    CzWorking,
+    CzCancelled,
+    CzDone,
+    CzKept,
+    CzFailed,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 268] = [
+pub const ALL: [Msg; 286] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -594,6 +612,24 @@ pub const ALL: [Msg; 268] = [
     Msg::PtNoRandom,
     Msg::PtDone,
     Msg::PtFailed,
+    Msg::CzMenu,
+    Msg::CzTitle,
+    Msg::CzIntro,
+    Msg::CzPictures,
+    Msg::CzHigh,
+    Msg::CzBalanced,
+    Msg::CzSmall,
+    Msg::CzLossless,
+    Msg::CzNoModify,
+    Msg::CzOk,
+    Msg::CzSaveAsk,
+    Msg::CzPickTitle,
+    Msg::CzSuffix,
+    Msg::CzWorking,
+    Msg::CzCancelled,
+    Msg::CzDone,
+    Msg::CzKept,
+    Msg::CzFailed,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -866,6 +902,24 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::PtNoRandom => ("Windows gave no random numbers; nothing was written.", "系统没有给出随机数，所以没有写任何文件。"),
         Msg::PtDone => ("Saved, and opened again.", "已保存，并重新打开。"),
         Msg::PtFailed => ("The protection could not be changed:", "没能改密码和权限："),
+        Msg::CzMenu => ("&Compress...", "压缩(&C)..."),
+        Msg::CzTitle => ("Compress the file", "压缩文件"),
+        Msg::CzIntro => ("Make the file smaller: what repeats is written once, the file is packed, and pictures shown at more dots per inch than needed are made smaller. The result is a new file; this one is not changed.", "把文件变小：重复的内容只存一份，文件重新打包，画得比需要更精细的图片会缩小。结果存成新文件，当前文件不会改动。"),
+        Msg::CzPictures => ("Pictures", "图片"),
+        Msg::CzHigh => ("High quality (200 dpi)", "高质量（200 dpi）"),
+        Msg::CzBalanced => ("Balanced (150 dpi, recommended)", "平衡（150 dpi，推荐）"),
+        Msg::CzSmall => ("Smallest (100 dpi)", "最小（100 dpi）"),
+        Msg::CzLossless => ("Lossless only: do not change the pictures", "只做无损压缩（不改图片）"),
+        Msg::CzNoModify => ("The author of this file did not allow changing its content, so the pictures cannot be made smaller: only the lossless compression is done.", "这个文件的作者不允许修改内容，所以不能缩小图片，只做无损压缩。"),
+        Msg::CzOk => ("Compress...", "压缩..."),
+        Msg::CzSaveAsk => ("There are changes that are not saved. Save them first, and then compress?", "有还没保存的改动。先保存，再压缩吗？"),
+        Msg::CzPickTitle => ("Save the compressed file as", "把压缩后的文件存为"),
+        Msg::CzSuffix => ("-compressed", "-压缩"),
+        Msg::CzWorking => ("Compressing... {n}% (Esc cancels)", "正在压缩…… {n}%（按 Esc 取消）"),
+        Msg::CzCancelled => ("Compression cancelled.", "已取消压缩。"),
+        Msg::CzDone => ("Compressed: {before} to {after}, {pct}% smaller.\nOpen the new file?", "压缩完成：{before} 变成 {after}，小了 {pct}%。\n要打开压缩后的文件吗？"),
+        Msg::CzKept => ("The file would not get smaller ({before}), so no new file was written.", "这个文件压缩后不会变小（{before}），所以没有生成新文件。"),
+        Msg::CzFailed => ("The file could not be compressed:", "没能压缩："),
     };
     match lang {
         Lang::En => en,
@@ -937,7 +991,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 268);
+        assert_eq!(ALL.len(), 286);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

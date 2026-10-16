@@ -231,7 +231,7 @@ impl Plane {
 
 /// What the PDF image dictionary says about how to use the picture.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Alpha {
+pub enum Alpha {
     /// The file's opacity channel, if it has one, is not wanted.
     Ignore,
     /// `/SMaskInData 1`: the opacity channel is the image's alpha.
@@ -240,7 +240,7 @@ pub(crate) enum Alpha {
     Premultiplied,
 }
 
-pub(crate) struct Options {
+pub struct Options {
     /// About how big the picture is on the device: it is decoded at the smallest size that is not smaller.
     pub want: (usize, usize),
     /// How many colour channels the image dictionary's `/ColorSpace` has (it overrides the file's colour space).
@@ -253,7 +253,7 @@ pub(crate) struct Options {
     pub threads: Option<usize>,
 }
 
-pub(crate) struct Decoded {
+pub struct Decoded {
     pub w: usize,
     pub h: usize,
     /// Colour channels in `data`: 1, 3 or 4, interleaved, 8 bits each.
@@ -757,7 +757,7 @@ impl<'a> Walk<'a> {
 
 /// Decode a JP2 file or codestream. `Err(Error::Limit)`: the page's work (or this image's memory cap) is used up.
 /// `Err(Error::Invalid)`: nothing could be decoded; the caller draws a placeholder.
-pub(crate) fn decode(data: &[u8], opts: &Options, work: &Work) -> Result<Decoded> {
+pub fn decode(data: &[u8], opts: &Options, work: &Work) -> Result<Decoded> {
     let ctx = Ctx::new(work, opts.threads);
     let jp2 = parse_jp2(&ctx, data)?;
     let mut hdr = codestream::parse(&ctx, jp2.codestream)?;

@@ -156,6 +156,20 @@ pub mod cost {
     pub const SEARCH_CHAR: f64 = 25.0;
     pub const SEARCH_STEP: f64 = 3.0;
 
+    // Compressing a file (`squeeze`, `qingpdf-core::compress`). First guesses; the measured values are in `docs/decisions.md`.
+    /// A sample of a picture decoded (a JPEG; the JPEG 2000 decoder charges for itself), a sample of it averaged down to a smaller
+    /// size, a pixel of the smaller picture coded as a JPEG, and a byte of data deflated at the best level (and inflated before).
+    pub const SQZ_DECODE_SAMPLE: f64 = 4.0;
+    pub const SQZ_AVERAGE_SAMPLE: f64 = 2.5;
+    pub const SQZ_ENCODE_PIXEL: f64 = 60.0;
+    pub const SQZ_FLATE_BYTE: f64 = 30.0;
+    /// An operator of a content stream looked at for the pictures it draws, and a byte of one decoded.
+    pub const SQZ_WALK_OP: f64 = 50.0;
+    pub const SQZ_WALK_BYTE: f64 = 3.0;
+    /// An object read and looked at for the objects it names, and a byte of a stream's data read to be compared with others.
+    pub const SQZ_OBJECT: f64 = 600.0;
+    pub const SQZ_HASH_BYTE: f64 = 1.0;
+
     /// An outline item read (its dictionary and the title, apart from what resolving its destination costs), and an entry of
     /// the named destinations read from the file.
     pub const OUTLINE_ITEM: f64 = 20_000.0;

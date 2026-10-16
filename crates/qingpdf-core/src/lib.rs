@@ -6,6 +6,7 @@
 //!
 //! Spec references in comments point to ISO 32000-1:2008 unless noted.
 
+pub mod compress;
 pub mod docx;
 pub mod edit;
 pub mod forms;
@@ -13,6 +14,7 @@ pub mod image;
 pub mod layout;
 pub mod ops;
 pub mod prune;
+pub mod squeeze;
 mod tables;
 pub mod view;
 pub mod xlsx;

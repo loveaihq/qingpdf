@@ -23,6 +23,7 @@ pub mod parser;
 pub mod render;
 pub mod repair;
 pub mod security;
+pub mod squeeze;
 pub mod text;
 pub mod writer;
 pub mod xref;

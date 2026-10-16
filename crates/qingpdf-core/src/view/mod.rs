@@ -56,6 +56,10 @@ pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
 pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind};
 pub use plan::{MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
+
+/// The biggest file the reader compresses: the file, the new file and the new pictures are held at once, with the pictures being
+/// worked on (`docs/decisions.md`, compressing); a bigger one is for `qingpdf compress`.
+pub const MAX_COMPRESS_FILE: u64 = 30_000_000;
 pub use search::MAX_QUERY_CHARS;
 pub use server::{MAX_COPY_CHARS, MAX_COPY_PAGES, MAX_HITS_PER_PAGE, MAX_PRINT_DPI, MAX_PRINT_PAGES, MAX_SEARCH_HITS};
 
@@ -357,6 +361,12 @@ pub enum Event {
     /// anything; `pages` how many pages were converted; `tables` how many tables are in the file: a Word table or an Excel sheet, and 0
     /// for an Excel file made of the text of the pages) or `Failed` (`message` says why; no file was written).
     Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, tables: u32, bytes: u64 },
+    /// How far [`Engine::compress`] is, 0 to 100 (told every now and then while it runs).
+    CompressProgress { doc: u64, id: u64, percent: u32 },
+    /// The answer to [`Engine::compress`]: `Done` with the size of the file before and after (`after` is `before` and `kept` is true
+    /// when the result would not have been smaller: no file was written), or `Failed` (`message` says why; no file was written).
+    /// `message` also holds what the work warned of.
+    Compressed { doc: u64, id: u64, status: SaveStatus, message: String, before: u64, after: u64, kept: bool },
 }
 
 /// What can be asked of the open document besides drawing.
@@ -386,12 +396,21 @@ pub(crate) enum Command {
     Export { doc: u64, id: u64, path: String, excel: bool },
     Extract { doc: u64, id: u64, pages: Vec<u32>, path: String },
     Protect { doc: u64, id: u64, path: String, job: Box<ProtectJob> },
+    Compress { doc: u64, id: u64, path: String, how: CompressHow },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
     Cancel(u64),
     Close,
     Quit,
+}
+
+/// What [`Engine::compress`] asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressHow {
+    pub preset: crate::compress::Preset,
+    /// Only what loses nothing: the pictures are not changed.
+    pub lossless_only: bool,
 }
 
 /// What [`Engine::protect`] asks for, and the seed of the random bytes it needs.
@@ -683,6 +702,17 @@ impl Engine {
         let _ = self.commands.send(Command::Protect { doc, id, path: path.to_string(), job });
     }
 
+    /// Write the document, with the edits not saved yet, as a smaller file of its own at `path` (into a file of its own that replaces
+    /// `path` only when it is whole; see [`crate::compress`]): objects that repeat merged, the file packed, the pictures made smaller as
+    /// `how` says. The open file is not touched. Told by [`Event::CompressProgress`] as it goes and answered by [`Event::Compressed`];
+    /// a file that is signed is refused, and so is one whose author did not allow changing its content and that was not opened with the
+    /// owner password, unless `how.lossless_only` (a plain rewrite). [`Engine::cancel`] stops it (it gets no answer then). Done at once, one at a time, before the drawing; the pictures are
+    /// worked on by several threads that borrow the memory the drawing uses. A file bigger than [`MAX_COMPRESS_FILE`] is refused; the pictures are lent what is left of the total once what the window
+    /// keeps and the file's own copies are taken off.
+    pub fn compress(&self, doc: u64, id: u64, path: &str, how: CompressHow) {
+        let _ = self.commands.send(Command::Compress { doc, id, path: path.to_string(), how });
+    }
+
     /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by
     /// [`Event::Edited`].
     pub fn delete_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
@@ -818,6 +848,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Export { .. }
             | Command::Extract { .. }
             | Command::Protect { .. }
+            | Command::Compress { .. }
             | Command::Swap
             | Command::PrintNext(_)
             | Command::Cancel(_)

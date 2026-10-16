@@ -16,6 +16,7 @@ Commands:
   rotate    Turn pages by a multiple of 90 degrees
   decrypt   Write a copy of an encrypted PDF without the encryption
   encrypt   Write a copy with passwords and permissions (AES-256, or AES-128)
+  compress  Write a smaller copy (merges what repeats, packs the file, shrinks pictures)
   text      Extract the text of a PDF, in reading order
   render    Draw pages as PNG images (graphics and images; letters as boxes for now)
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
@@ -204,6 +205,34 @@ Options:
   --password <password>  The password of the input, if it is encrypted
   -o, --output <file>    The file to write (required)
   --force                Overwrite the output file if it exists
+";
+
+const COMPRESS: &str = "Usage:
+  qingpdf compress <file.pdf> -o <output.pdf> [--preset high|balanced|small] [--lossless] [--password <password>] [--force]
+
+Write the document again as a smaller file and say how big both are. What every run does, and loses nothing by: leaves out
+the objects nobody uses, writes objects that are the same (a font, a picture or a colour profile repeated on every page) once, packs the
+objects into object streams and the table of them into a cross-reference stream (PDF 1.5; a file that says it is PDF/A-1 keeps
+a classic table, which that standard asks for), codes Flate data again at the best level, and takes out what changes nothing that is seen (page thumbnails, private data of the program that made the file,
+the metadata of pages and forms; the document's own metadata and information stay).
+
+Unless --lossless is given, the pictures are also made smaller: a picture drawn at more dots per inch than the preset keeps is
+averaged down to that and coded again as a JPEG, where that is smaller. Presets: high (200 dpi, JPEG quality 85), balanced
+(150 dpi, quality 75; the default), small (100 dpi, quality 60). Left as they are: pictures that are drawn in a pattern or a
+Type 3 glyph, stencils and black-and-white pictures (these are only coded again), pictures with a mask by colour, indexed and
+CMYK pictures, those with a /Decode array, and 16-bit ones. A picture's soft mask is made smaller with it.
+
+The output is never bigger than the input: when it would not be smaller, the output is a copy of the input and the command says so.
+An encrypted input keeps its protection (the same method and passwords; give --password to open it). Making the pictures
+smaller needs the owner's rights if the author did not allow changing the content (as for a watermark); --lossless does not.
+A signed file is refused: writing it again would break the signature.
+
+Options:
+  --preset <name>       high, balanced (default) or small
+  --lossless            Only what loses nothing: the pictures are not changed
+  --password <password> The password of an encrypted file
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
 ";
 
 const TEXT: &str = "\
@@ -486,6 +515,7 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Rotate) => format!("{ROTATE}{PAGE_LIST}"),
         Some(Command::Decrypt) => DECRYPT.to_string(),
         Some(Command::Encrypt) => ENCRYPT.to_string(),
+        Some(Command::Compress) => COMPRESS.to_string(),
         Some(Command::Text) => format!("{TEXT}{PAGE_LIST}"),
         Some(Command::Render) => format!("{RENDER}{PAGE_LIST}"),
         Some(Command::Img2pdf) => IMG2PDF.to_string(),

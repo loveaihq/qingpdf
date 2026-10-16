@@ -6,10 +6,11 @@ mod random;
 
 use std::borrow::Cow;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use qingpdf_core::compress::{self, Preset};
 use qingpdf_core::edit::{self, ContentOp};
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
@@ -116,6 +117,7 @@ fn run(request: Request) -> Result<(), Failure> {
             finish(&output, &out)
         }
         Request::Encrypt { input, output, force, password, how } => encrypt_command(&input, &output, force, &password, &how),
+        Request::Compress { input, output, force, password, preset, lossless } => compress_command(&input, &output, force, &password, preset, lossless),
         Request::Text { input, pages, output, force, password } => {
             text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
         }
@@ -257,6 +259,62 @@ fn encrypt_command(input: &Path, output: &Path, force: bool, password: &str, how
         if protection.user_password.is_empty() { "opens without a password" } else { "a password is needed to open it" },
         if denied.is_empty() { "nothing is restricted".to_string() } else { format!("not allowed: {}", denied.join(", ")) }
     ));
+    Ok(())
+}
+
+/// Digits with a comma between each three.
+fn grouped(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Write a smaller copy of the input; say how big both are. When it would not be smaller the output is a copy of the input.
+fn compress_command(input: &Path, output: &Path, force: bool, password: &str, preset: Preset, lossless: bool) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let how = compress::Options { preset, lossless_only: lossless, ..compress::Options::default() };
+    let shown = std::cell::Cell::new(101u32);
+    let progress = |percent: u32| {
+        if std::io::stderr().is_terminal() && percent / 5 != shown.get() / 5 {
+            shown.set(percent);
+            eprint!("\r{percent:>3}%");
+        }
+    };
+    let control = compress::Control { stop: None, progress: &progress };
+    let packed = compress::compress(&doc, password, &how, &control).map_err(|e| op_error(input, &e));
+    if shown.get() != 101 {
+        eprint!("\r    \r");
+    }
+    let packed = packed?;
+    print_warnings(&packed.warnings);
+    let (before, after) = (packed.before, packed.after);
+    match &packed.data {
+        Some(data) => {
+            write_file(output, data)?;
+            say(&format!(
+                "wrote {}: {} bytes -> {} bytes ({:.1}% smaller; {} picture{} made smaller, {} object{} merged)\n",
+                output.display(),
+                grouped(before),
+                grouped(after),
+                (before - after) as f64 * 100.0 / before.max(1) as f64,
+                packed.pictures,
+                plural(packed.pictures as usize),
+                packed.merged,
+                plural(packed.merged as usize)
+            ));
+        }
+        None => {
+            write_file(output, doc.data())?;
+            say(&format!("wrote {}: no smaller than the input ({} bytes), so it is a copy of the input\n", output.display(), grouped(before)));
+        }
+    }
     Ok(())
 }
 

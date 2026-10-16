@@ -46,6 +46,9 @@ impl App {
         if let Some(actions) = self.cancel_export() {
             return actions;
         }
+        if let Some(actions) = self.cancel_compress() {
+            return actions;
+        }
         if let Some(actions) = self.stop_ocr() {
             return actions;
         }

@@ -18,6 +18,7 @@ qingpdf rotate a.pdf --pages 1-3 --angle 90 -o out.pdf
 qingpdf img2pdf 1.jpg 2.png -o out.pdf              one image per page (JPEG kept as-is, EXIF orientation honoured)
 qingpdf decrypt a.pdf -o plain.pdf --password P     write an unencrypted copy (owner password, or a file that allows everything)
 qingpdf encrypt a.pdf -o out.pdf --user-password U --owner-password O [--aes128] [--print none|low|high] [--no-copy] [--no-modify] [--no-annotate] [--no-forms] [--no-assemble] [--no-accessibility] [--password-file F]   write a copy with passwords and permissions (AES-256, or AES-128 with --aes128; the whole file is written again; signed files are refused)
+qingpdf compress a.pdf -o out.pdf [--preset high|balanced|small] [--lossless] [--password P]   write a smaller copy (what repeats is written once, the file is packed into object streams, Flate data is deflated again, pictures drawn at more dots per inch than the preset keeps are averaged down and coded as JPEG; the output is never bigger than the input; signed files are refused; a file without the right to change its content can only be compressed with --lossless)
 qingpdf text a.pdf -o a.txt                         text in reading order (a scan gives nothing here; recognise it in the viewer: Tools > Recognize text)
 qingpdf render a.pdf --pages 1-3 --dpi 150 -o page_%d.png  draw pages to PNG
 qingpdf watermark a.pdf --text "机密" --opacity 0.3 --angle 45 --tile -o out.pdf   text or picture watermark (--under the content, --pages 1-3)

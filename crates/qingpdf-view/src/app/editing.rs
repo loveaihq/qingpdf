@@ -51,6 +51,8 @@ pub(super) enum Tool {
 pub(super) enum After {
     Quit,
     Open(PathBuf),
+    /// The box for compressing the file is shown (the changes were saved first).
+    Compress,
 }
 
 /// A stroke being drawn: the page and the points so far (points of the page as the engine tells them).
@@ -120,7 +122,7 @@ pub(super) struct EditState {
     pub(super) exporting: Option<u64>,
     /// The export going is to Excel.
     export_excel: bool,
-    after: Option<After>,
+    pub(super) after: Option<After>,
     /// The place where the pointer went down for a note, and where the note is to go while its text is asked for.
     note_press: Option<(u32, f32, f32, i64, i64)>,
     note_at: Option<(u32, f32, f32)>,
@@ -740,6 +742,9 @@ impl App {
         if let Some(actions) = self.protect_picked(path.clone()) {
             return actions;
         }
+        if let Some(actions) = self.compress_picked(path.clone()) {
+            return actions;
+        }
         if let Some(actions) = self.extract_picked(path.clone()) {
             return actions;
         }
@@ -784,6 +789,7 @@ impl App {
                 match self.edit.after.take() {
                     Some(After::Quit) => actions.extend(self.exit_now()),
                     Some(After::Open(p)) => actions.extend(self.open_path_now(&p, "")),
+                    Some(After::Compress) => actions.push(Action::AskForm(self.compress_form())),
                     None => actions.extend(self.say(t(lang, Msg::NoteSaved).to_string())),
                 }
                 actions
@@ -822,6 +828,7 @@ impl App {
                 match after {
                     After::Quit => self.exit_now(),
                     After::Open(p) => self.open_path_now(&p, ""),
+                    After::Compress => Vec::new(),
                 }
             }
             SaveChoice::Cancel => Vec::new(),
