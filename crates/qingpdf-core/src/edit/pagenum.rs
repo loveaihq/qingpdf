@@ -11,7 +11,7 @@
 //! The streams that draw them are listed under a private key of the page ([`TAG`]), which is how they are found again and taken out
 //! ([`unpaginate`]); the page's own content is not touched in either direction.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::fmt::Write;
 
 use super::appearance::num;
@@ -19,6 +19,7 @@ use super::boxes::{BOX_COST, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use super::content::{self, Placing, Resource, Shared};
 use super::fontsub::{self, Look};
 use super::Ctx;
+use crate::idmap::IdSet;
 use crate::document::Page;
 use crate::error::{Error, Result};
 use crate::layout::Face;
@@ -201,7 +202,7 @@ pub(super) fn paginate(ctx: &mut Ctx<'_>, pages: &[Page], spec: &Pagination) -> 
     let how = Placing { resource: Resource { category: "Font", wanted: &name, object: font_ref }, under: false, tag: Some(TAG) };
     let run = Run { templates: &templates, start: u64::from(spec.start), first, last, mirror: spec.mirror, skip_first: spec.skip_first, date: &date, file: &file };
     let mut shared = Shared::default();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     let mut written = 0usize;
     for (index, page) in chosen {
         // (A page named twice, or listed twice by the page tree, is done once.)
@@ -238,7 +239,7 @@ const MAX_READ: usize = 4 << 20;
 /// [`paginate`] writes (a page's key is the file's word, and may name a stream of the page's own text). A page whose list of streams is not
 /// what [`paginate`] made of it (it was changed since) is left as it is.
 pub(super) fn unpaginate(ctx: &mut Ctx<'_>, pages: &[Page]) -> Result<()> {
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     let mut taken = 0usize;
     for page in pages {
         if !seen.insert(page.obj_ref.num) {
@@ -249,7 +250,7 @@ pub(super) fn unpaginate(ctx: &mut Ctx<'_>, pages: &[Page]) -> Result<()> {
         let Some(Object::Array(ours)) = dict.get(TAG).cloned() else { continue };
         let Some(Object::Array(list)) = dict.get("Contents").cloned() else { continue };
         content::charge(ctx, CHAR_COST * (ours.len() + list.len()) as f64)?;
-        let ours: HashSet<u32> = ours.iter().filter_map(|o| o.as_obj_ref().map(|r| r.num)).collect();
+        let ours: IdSet<u32> = ours.iter().filter_map(|o| o.as_obj_ref().map(|r| r.num)).collect();
         // The listed streams that are ours (each is read once).
         let mut checked: Vec<(u32, bool)> = Vec::new();
         let mut kept: Vec<Object> = Vec::with_capacity(list.len());

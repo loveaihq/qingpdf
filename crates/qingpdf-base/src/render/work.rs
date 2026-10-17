@@ -8,7 +8,7 @@
 //! page gives one warning, and what is drawn so far is kept. The weights below were measured on the machine the
 //! tests run on (see `docs/decisions.md`, 3c); they need to be right to a factor of two, not exactly.
 
-use std::collections::HashMap;
+use crate::idmap::IdMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -230,7 +230,7 @@ struct Slot {
 
 #[derive(Default)]
 struct KeptObjects {
-    map: HashMap<ObjRef, Slot>,
+    map: IdMap<ObjRef, Slot>,
     bytes: usize,
 }
 

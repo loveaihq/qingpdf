@@ -7,9 +7,10 @@
 //! more pages than fit would otherwise throw out each page just before the next pass wanted it, and the cache would never
 //! be hit; this way the next pass finds the first pages that fitted.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use crate::idmap::IdMap;
 use crate::text::PageChars;
 
 /// What one box and a slot of the map take besides the text itself.
@@ -26,7 +27,7 @@ pub(super) struct TextCache {
     budget: usize,
     bytes: usize,
     tick: u64,
-    map: HashMap<u32, Slot>,
+    map: IdMap<u32, Slot>,
     /// Pages by when they were last used (smallest first).
     order: BTreeMap<u64, u32>,
 }
@@ -38,7 +39,7 @@ fn weight(chars: &PageChars) -> usize {
 
 impl TextCache {
     pub(super) fn new(budget: u64) -> TextCache {
-        TextCache { budget: usize::try_from(budget).unwrap_or(usize::MAX), bytes: 0, tick: 0, map: HashMap::new(), order: BTreeMap::new() }
+        TextCache { budget: usize::try_from(budget).unwrap_or(usize::MAX), bytes: 0, tick: 0, map: IdMap::new(), order: BTreeMap::new() }
     }
 
     /// The characters of `page` if they are kept; they count as used now.

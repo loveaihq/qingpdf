@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use crate::idmap::IdMap;
 use crate::text::data;
 use crate::text::interp::mul;
 use crate::text::fontprog::{self, Index, Res, u8_at, u16_at};
@@ -47,10 +48,10 @@ pub(crate) struct CffFont {
     encoding: usize,
     /// The `cmap` of the OpenType file the font came in, if any.
     pub cmap: Option<Cmap>,
-    by_sid: OnceLock<HashMap<u16, u32>>,
+    by_sid: OnceLock<IdMap<u16, u32>>,
     by_name: OnceLock<HashMap<String, u32>>,
-    by_unicode: OnceLock<HashMap<u32, u32>>,
-    by_cid: OnceLock<HashMap<u32, u32>>,
+    by_unicode: OnceLock<IdMap<u32, u32>>,
+    by_cid: OnceLock<IdMap<u32, u32>>,
     builtin: OnceLock<Vec<u32>>,
 }
 
@@ -160,11 +161,11 @@ impl CffFont {
 
     // --- looking glyphs up ---
 
-    fn sid_map(&self) -> &HashMap<u16, u32> {
+    fn sid_map(&self) -> &IdMap<u16, u32> {
         self.by_sid.get_or_init(|| {
-            let mut map = HashMap::new();
+            let mut map = IdMap::new();
             for (gid, &sid) in self.charset.iter().enumerate() {
-                map.entry(sid).or_insert(u32::try_from(gid).unwrap_or(0));
+                map.insert_first(sid, u32::try_from(gid).unwrap_or(0));
             }
             map
         })
@@ -177,9 +178,9 @@ impl CffFont {
         }
         self.by_cid
             .get_or_init(|| {
-                let mut map = HashMap::new();
+                let mut map = IdMap::new();
                 for (gid, &c) in self.charset.iter().enumerate() {
-                    map.entry(u32::from(c)).or_insert(u32::try_from(gid).unwrap_or(0));
+                    map.insert_first(u32::from(c), u32::try_from(gid).unwrap_or(0));
                 }
                 map
             })
@@ -215,15 +216,19 @@ impl CffFont {
     /// The glyph for a Unicode value, through the glyph names (and the `cmap` of an OpenType file).
     pub fn gid_of_unicode(&self, cp: u32) -> Option<u32> {
         let map = self.by_unicode.get_or_init(|| {
-            let mut map: HashMap<u32, u32> = HashMap::new();
+            let mut map: IdMap<u32, u32> = IdMap::new();
             for (name, &gid) in self.name_map() {
                 if name == ".notdef" {
                     continue;
                 }
                 if let [one] = data::glyph_name_to_unicode(name).as_slice() {
-                    let slot = map.entry(*one).or_insert(gid);
                     // Several glyphs for one character: the first in the font wins.
-                    *slot = (*slot).min(gid);
+                    match map.get_mut(one) {
+                        Some(slot) => *slot = (*slot).min(gid),
+                        None => {
+                            map.insert(*one, gid);
+                        }
+                    }
                 }
             }
             map

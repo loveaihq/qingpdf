@@ -2,12 +2,13 @@
 //! tree.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::error::{Error, Result};
 use crate::filter::{self, DecodeBudget, MAX_DECODED_SIZE, MAX_OBJSTM_DECODED};
+use crate::idmap::{IdMap, IdSet};
 use crate::lexer::find_bytes;
 use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::parser::{EndstreamIndex, Parser, StreamHelper};
@@ -109,7 +110,7 @@ pub struct Document {
     /// The object streams that have been read (decoded, and decrypted if need be)
     /// at least once: reading one again, because the cache let it go, is paid
     /// for out of `budget`.
-    objstms_read: RefCell<HashSet<u32>>,
+    objstms_read: RefCell<IdSet<u32>>,
     /// Strings that could not be decrypted and were kept as they are (object
     /// number -> how many); see [`Document::decryption_warning`].
     strings_kept: RefCell<BTreeMap<u32, u32>>,
@@ -348,7 +349,7 @@ fn copy_error(e: &Error) -> Error {
 /// is kept too (it weighs next to nothing), so a broken stream is not decoded
 /// again for every object that lives in it.
 struct ObjStmCache {
-    map: HashMap<u32, CachedObjStm>,
+    map: IdMap<u32, CachedObjStm>,
     /// Object stream numbers by when they were last used (a counter that goes
     /// up), the one used longest ago first.
     recency: BTreeMap<u64, u32>,
@@ -372,7 +373,7 @@ impl Default for ObjStmCache {
 
 impl ObjStmCache {
     fn with_capacity(capacity: usize) -> ObjStmCache {
-        ObjStmCache { map: HashMap::new(), recency: BTreeMap::new(), clock: 0, bytes: 0, capacity }
+        ObjStmCache { map: IdMap::new(), recency: BTreeMap::new(), clock: 0, bytes: 0, capacity }
     }
 
     /// The cached result, which counts as used now.
@@ -452,7 +453,7 @@ impl Drop for PageDecodeBudget<'_> {
 /// Parsed objects kept by object number, until `budget` bytes are used.
 #[derive(Default)]
 struct ObjectCache {
-    map: HashMap<u32, Object>,
+    map: IdMap<u32, Object>,
     bytes: usize,
     budget: usize,
 }
@@ -641,7 +642,7 @@ impl Document {
             uses_xref_streams: Cell::new(uses_xref_streams),
             nesting: Cell::new(0),
             unreadable: RefCell::new(Unopened::default()),
-            objstms_read: RefCell::new(HashSet::new()),
+            objstms_read: RefCell::new(IdSet::new()),
             strings_kept: RefCell::new(BTreeMap::new()),
             strings_kept_unlisted: Cell::new(0),
             security: None,
@@ -1530,9 +1531,9 @@ struct Node {
 /// What a page tree walk keeps track of.
 struct TreeWalk {
     limits: TreeLimits,
-    nodes: HashMap<ObjRef, Rc<Node>>,
+    nodes: IdMap<ObjRef, Rc<Node>>,
     /// The page tree nodes between the root and where the walk is.
-    on_path: HashSet<ObjRef>,
+    on_path: IdSet<ObjRef>,
     visits: usize,
     pages: usize,
     repeated_pages: usize,
@@ -1543,8 +1544,8 @@ impl TreeWalk {
     fn new(limits: TreeLimits) -> TreeWalk {
         TreeWalk {
             limits,
-            nodes: HashMap::new(),
-            on_path: HashSet::new(),
+            nodes: IdMap::new(),
+            on_path: IdSet::new(),
             visits: 0,
             pages: 0,
             repeated_pages: 0,

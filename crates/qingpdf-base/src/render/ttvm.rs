@@ -18,7 +18,7 @@
 //! start as `prep` left them (a glyph does not see what another glyph wrote); `GETINFO` says version 35,
 //! grayscale, not rotated, not stretched.
 
-use std::collections::HashMap;
+use crate::idmap::IdMap;
 
 pub(crate) type Res<T> = Result<T, &'static str>;
 
@@ -224,7 +224,7 @@ struct Defs {
     funcs: Vec<Option<Def>>,
     /// How many of them are defined.
     count: usize,
-    instrs: HashMap<u8, Def>,
+    instrs: IdMap<u8, Def>,
 }
 
 /// The state `fpgm` and `prep` leave: shared by the glyph programs of a font, which each work on a copy.

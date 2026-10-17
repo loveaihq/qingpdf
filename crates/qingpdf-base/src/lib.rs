@@ -10,12 +10,13 @@
 
 pub mod cipher;
 pub mod codecs;
-pub mod dests;
 pub mod document;
 pub mod error;
 pub mod filter;
+pub mod idmap;
 pub mod info;
 pub mod layout;
+pub mod keymap;
 pub mod lexer;
 pub mod object;
 pub mod order;
@@ -25,7 +26,6 @@ pub mod repair;
 pub mod security;
 pub mod squeeze;
 pub mod text;
-pub mod writer;
 pub mod xref;
 
 #[cfg(any(test, feature = "testutil"))]
@@ -34,4 +34,3 @@ pub mod testutil;
 pub use document::{Document, Page};
 pub use error::{Error, Result};
 pub use object::{Dict, Name, ObjRef, Object, PdfString, Stream};
-pub use writer::{Builder, Warning};

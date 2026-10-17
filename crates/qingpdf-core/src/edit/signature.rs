@@ -6,9 +6,9 @@
 //! changed after signing; a certified file says which changes it allows (`/P`: 1 none, 2 filling in forms and signing, 3 and
 //! annotations): with 2, a form may be filled in and nothing else is added.
 
-use std::collections::HashSet;
 
 use super::EditClass;
+use crate::idmap::IdSet;
 use crate::document::Document;
 use crate::object::{Dict, Object};
 
@@ -113,7 +113,7 @@ fn has_signed_field(doc: &Document, catalog: &Dict) -> bool {
     let Some(form) = dict_of(doc, catalog.get("AcroForm")) else { return false };
     let Some(fields) = form.get("Fields").and_then(|f| doc.resolve(f).ok()) else { return false };
     let Some(fields) = fields.as_array() else { return false };
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     let mut stack: Vec<(Object, usize, bool)> = fields.iter().map(|f| (f.clone(), 0, false)).collect();
     let mut looked_at = 0usize;
     while let Some((item, depth, inherited_sig)) = stack.pop() {

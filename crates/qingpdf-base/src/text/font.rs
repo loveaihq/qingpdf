@@ -9,11 +9,12 @@
 //! code itself.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::document::Document;
+use crate::idmap::IdMap;
+use crate::keymap::KeyMap;
 use crate::object::{Dict, ObjRef, Object};
 
 use super::cmap::{self, CMap, MAX_USECMAP_DEPTH, ToUni, Uni};
@@ -23,16 +24,26 @@ use super::fontprog::{self, Kind};
 /// Distinct warnings kept for one run; more are counted and dropped.
 const MAX_WARNINGS: usize = 50;
 
+/// The predefined CMap of this name (`None` when there is none: a miss is kept too), read once for the run.
+fn predefined_cached(cmaps: &mut KeyMap<String, Option<Arc<CMap>>>, name: &str) -> Option<Arc<CMap>> {
+    if let Some(found) = cmaps.get(name) {
+        return found.clone();
+    }
+    let found = cmap::predefined(name);
+    cmaps.insert(name.to_string(), found.clone());
+    found
+}
+
 #[derive(Default)]
 pub(crate) struct Warnings {
     pub list: Vec<String>,
-    seen: HashSet<String>,
+    seen: KeyMap<String, ()>,
 }
 
 impl Warnings {
     pub fn add(&mut self, message: impl Into<String>) {
         let message = message.into();
-        if self.list.len() < MAX_WARNINGS && self.seen.insert(message.clone()) {
+        if self.list.len() < MAX_WARNINGS && self.seen.insert(message.clone(), ()).is_none() {
             self.list.push(message);
         }
     }
@@ -139,7 +150,7 @@ struct Composite {
     w: Vec<(u32, u32, f64)>,
     dw2: (f64, f64),
     w2: Vec<(u32, u32, [f64; 3])>,
-    cache: RefCell<HashMap<u64, Rc<CachedChar>>>,
+    cache: RefCell<IdMap<u64, Rc<CachedChar>>>,
 }
 
 // --- small helpers for reading dictionaries ---------------------------------------------------------
@@ -242,7 +253,7 @@ fn stream_data(doc: &Document, obj: Option<&Object>, what: &str, warnings: &mut 
 // --- loading -----------------------------------------------------------------------------------------
 
 impl Font {
-    pub(crate) fn load(doc: &Document, dict: &Dict, cmaps: &mut HashMap<String, Option<Arc<CMap>>>, warnings: &mut Warnings) -> Font {
+    pub(crate) fn load(doc: &Document, dict: &Dict, cmaps: &mut KeyMap<String, Option<Arc<CMap>>>, warnings: &mut Warnings) -> Font {
         let subtype = dict.get_name("Subtype").map(|n| String::from_utf8_lossy(n.as_bytes()).into_owned()).unwrap_or_default();
         let base = dict
             .get_name("BaseFont")
@@ -443,7 +454,7 @@ impl Font {
         dict: &Dict,
         name: String,
         to_uni: Option<ToUni>,
-        cmaps: &mut HashMap<String, Option<Arc<CMap>>>,
+        cmaps: &mut KeyMap<String, Option<Arc<CMap>>>,
         warnings: &mut Warnings,
     ) -> Font {
         let descendant = match resolved(doc, dict.get("DescendantFonts")) {
@@ -465,7 +476,7 @@ impl Font {
         let cmap = match resolved(doc, dict.get("Encoding")) {
             Some(Object::Name(n)) => {
                 let cmap_name = String::from_utf8_lossy(n.as_bytes()).into_owned();
-                let found = cmaps.entry(cmap_name.clone()).or_insert_with(|| cmap::predefined(&cmap_name)).clone();
+                let found = predefined_cached(cmaps, &cmap_name);
                 found.unwrap_or_else(|| {
                     warnings.add(format!("font {name}: unknown predefined CMap {cmap_name}, read as Identity-H"));
                     Arc::new(CMap::identity(0))
@@ -518,7 +529,7 @@ impl Font {
                 w,
                 dw2,
                 w2,
-                cache: RefCell::new(HashMap::new()),
+                cache: RefCell::new(IdMap::new()),
             }),
         }
     }
@@ -603,7 +614,7 @@ fn load_to_unicode(doc: &Document, dict: &Dict, warnings: &mut Warnings) -> Opti
 fn embedded_cmap(
     doc: &Document,
     stream: &crate::object::Stream,
-    cmaps: &mut HashMap<String, Option<Arc<CMap>>>,
+    cmaps: &mut KeyMap<String, Option<Arc<CMap>>>,
     seen: &mut Vec<ObjRef>,
     depth: usize,
     warnings: &mut Warnings,
@@ -635,7 +646,7 @@ fn embedded_cmap(
         match stream.dict.get("UseCMap") {
             Some(Object::Name(n)) => {
                 let base_name = String::from_utf8_lossy(n.as_bytes()).into_owned();
-                base = cmaps.entry(base_name.clone()).or_insert_with(|| cmap::predefined(&base_name)).clone();
+                base = predefined_cached(cmaps, &base_name);
             }
             Some(obj) => {
                 let r = obj.as_obj_ref();
@@ -649,7 +660,7 @@ fn embedded_cmap(
             None => {
                 if let Some(n) = &parsed.use_name {
                     let base_name = String::from_utf8_lossy(n).into_owned();
-                    base = cmaps.entry(base_name.clone()).or_insert_with(|| cmap::predefined(&base_name)).clone();
+                    base = predefined_cached(cmaps, &base_name);
                 }
             }
         }

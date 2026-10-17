@@ -6,7 +6,6 @@
 //! only down to the size the page shows). What cannot be decoded comes back as [`Loaded::Placeholder`].
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use tiny_skia::Pixmap;
@@ -17,6 +16,7 @@ use zune_jpeg::zune_core::options::DecoderOptions;
 
 use crate::document::Document;
 use crate::error::{Error, Result};
+use crate::idmap::IdMap;
 use crate::object::{Dict, Name, Object, Stream};
 use crate::text::font::Warnings;
 
@@ -1068,7 +1068,7 @@ fn finish_row(plan: &Plan, acc: &[f32], ow: usize, nch: usize, dst: &mut [u8], t
 /// Colours already worked out for the pixels of a spot-colour image (DeviceN and the like, whose tint
 /// function is far slower than a table), by the whole sample values they came from.
 #[derive(Default)]
-struct TintCache(HashMap<u64, [u8; 3]>);
+struct TintCache(IdMap<u64, [u8; 3]>);
 
 /// Entries a [`TintCache`] holds before it starts over.
 const TINT_CACHE_ENTRIES: usize = 1 << 17;

@@ -10,9 +10,10 @@
 //! not work in proportion to the file: it grows with the size of the file.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::idmap::{IdMap, IdSet};
 use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::object::{Dict, Name, ObjRef, Object, PdfString};
@@ -62,12 +63,12 @@ pub struct Spend {
     /// The indirect objects that have been resolved, with their sizes: the first
     /// time one is paid for in full, as a distinct object; again only if it is
     /// bigger than [`FREE_COPY`].
-    seen: RefCell<HashMap<u32, usize>>,
+    seen: RefCell<IdMap<u32, usize>>,
 }
 
 impl Spend {
     pub fn new(total: usize) -> Spend {
-        Spend { left: Cell::new(total), total, seen: RefCell::new(HashMap::new()) }
+        Spend { left: Cell::new(total), total, seen: RefCell::new(IdMap::new()) }
     }
 
     /// Pay for `bytes` of copying; `Limit` when there is not enough left.
@@ -239,7 +240,7 @@ impl NamedDests {
 /// absurd sizes are cut, and what is copied is paid for by its bytes.
 fn read_tree(doc: &Document, root: &Object, spend: &Spend, charge: &dyn Fn(usize) -> bool) -> Result<Vec<(Vec<u8>, Object)>> {
     let mut out: Vec<(Vec<u8>, Object)> = Vec::new();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     let mut once = |obj: &Object| -> bool {
         match obj {
             Object::Ref(r) => seen.insert(r.num),
@@ -318,7 +319,7 @@ pub fn explicit(doc: &Document, value: &Object, spend: &Spend) -> Result<Option<
 
 /// The page (its object number) an explicit destination array points at, if
 /// it points at one of `pages`.
-pub fn array_page(array: &[Object], pages: &HashSet<u32>) -> Option<u32> {
+pub fn array_page(array: &[Object], pages: &IdSet<u32>) -> Option<u32> {
     match array.first()? {
         Object::Ref(r) if pages.contains(&r.num) => Some(r.num),
         _ => None,
@@ -365,7 +366,7 @@ pub fn item_page(
     doc: &Document,
     item: &Dict,
     names: &NamedDests,
-    pages: &HashSet<u32>,
+    pages: &IdSet<u32>,
 ) -> Result<Option<u32>> {
     Ok(item_array(doc, item, names)?.and_then(|a| array_page(&a, pages)))
 }
@@ -464,7 +465,7 @@ mod tests {
         let names = NamedDests::load(&doc).unwrap();
         assert_eq!(names.tree().len(), 4);
         assert_eq!(names.dict().len(), 2);
-        let pages: HashSet<u32> = [3, 4].into_iter().collect();
+        let pages: IdSet<u32> = [3, 4].into_iter().collect();
         let page_of = |key: &[u8], is_name: bool| {
             array_page(&names.lookup(&doc, key, is_name).unwrap().unwrap(), &pages)
         };
@@ -576,7 +577,7 @@ mod tests {
         let doc = open(many_small_destinations(n));
         let names = NamedDests::load(&doc).unwrap();
         assert_eq!(names.tree().len(), n as usize);
-        let pages: HashSet<u32> = [4].into_iter().collect();
+        let pages: IdSet<u32> = [4].into_iter().collect();
         // Every one of them can be resolved for the page it is on (as `Index::build` does).
         for (_, value) in names.tree() {
             let array = explicit(&doc, value, names.spend()).unwrap().unwrap();

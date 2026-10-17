@@ -1,10 +1,9 @@
 //! The codestream's markers (ISO/IEC 15444-1 Annex A): the main header, and the tile-parts found by their SOT markers
 //! with the parameters their headers add.
 
-use std::collections::HashMap;
-
 use super::{Ctx, Warnings, bad, be16, be32};
 use crate::error::{Error, Result};
+use crate::idmap::IdMap;
 use crate::render::work::cost;
 
 /// Most components (the standard allows 16384; a page's picture has 1 to 4).
@@ -119,11 +118,11 @@ pub(super) struct Poc {
 #[derive(Default)]
 pub(super) struct Coding {
     pub cod: Option<Cod>,
-    pub coc: HashMap<usize, Style>,
+    pub coc: IdMap<usize, Style>,
     pub qcd: Option<Quant>,
-    pub qcc: HashMap<usize, Quant>,
+    pub qcc: IdMap<usize, Quant>,
     /// Region of interest shift (RGN), by component.
-    pub rgn: HashMap<usize, u8>,
+    pub rgn: IdMap<usize, u8>,
     pub poc: Vec<Poc>,
 }
 
@@ -146,7 +145,7 @@ pub(super) struct Header {
     pub siz: Siz,
     pub main: Coding,
     pub ppm: Vec<u8>,
-    pub tiles: HashMap<u64, Tile>,
+    pub tiles: IdMap<u64, Tile>,
     pub warnings: Warnings,
 }
 
@@ -374,7 +373,7 @@ pub(super) fn parse(ctx: &Ctx, data: &[u8]) -> Result<Header> {
     }
     ctx.take_memory(ppm.len() as u64)?;
     let mut ppm_pos = 0usize;
-    let mut tiles: HashMap<u64, Tile> = HashMap::new();
+    let mut tiles: IdMap<u64, Tile> = IdMap::new();
     let ntiles = siz.tiles_across().saturating_mul(siz.tiles_down());
     let mut count = 0usize;
     // The tile-parts.
@@ -455,8 +454,9 @@ pub(super) fn parse(ctx: &Ctx, data: &[u8]) -> Result<Header> {
             };
             if !tiles.contains_key(&t) {
                 ctx.take_memory(std::mem::size_of::<Tile>() as u64 + 64)?;
+                tiles.insert(t, Tile::default());
             }
-            let tile = tiles.entry(t).or_default();
+            let Some(tile) = tiles.get_mut(&t) else { return Err(bad("the codestream has no tile data")) };
             merge(&mut tile.coding, tile_coding);
             if tile.coding.poc.len() > MAX_POC {
                 return Err(Error::Limit("JPX: too many progression order changes".to_string()));

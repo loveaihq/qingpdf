@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use super::{Ctx, TOO_BIG};
+use crate::idmap::IdSet;
 use crate::document::{self, Document, NodeKind, Page, classify};
 use crate::error::{Error, Result};
 use crate::object::{Dict, Name, ObjRef, Object};
@@ -581,7 +582,7 @@ fn insert(ctx: &mut Ctx<'_>, mut tree: Tree, pages: &[Page], at: usize, path: &s
     };
     let parent = tree.nodes.get(place.0).map(|n| n.obj).ok_or_else(|| odd("the page tree is not as it was read"))?;
 
-    let page_nums: HashSet<u32> = source_pages.iter().map(|p| p.obj_ref.num).collect();
+    let page_nums: IdSet<u32> = source_pages.iter().map(|p| p.obj_ref.num).collect();
     let mut b = Builder::collecting(ctx.next, ctx.room.saturating_sub(ctx.used), TOO_BIG);
     let s = b.add_source(&source, &page_nums);
     // The links that name a destination get the destination itself (the names of the other file are not here), and what points into
@@ -685,7 +686,7 @@ fn prepare_form(doc: &Document, source: &Document, b: &mut Builder<'_>, s: usize
     // A name the document has is changed to the first `name_n` that neither has: found once for a name (two fields of the other file that
     // had one name get the same new one: they were one field there).
     let mut renames: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     // The fields still to look at, each with: is it of the first level, does `/FT /Sig` come from above, is a signature above it.
     let mut todo: Vec<(ObjRef, bool, bool, bool)> = fields.iter().map(|r| (*r, true, false, false)).collect();
     while let Some((r, root, sig, signed)) = todo.pop() {

@@ -3,8 +3,8 @@
 //!
 //! Only addresses that are safe to hand to the system are kept: see [`safe_uri`].
 
-use std::collections::HashMap;
 
+use crate::idmap::IdMap;
 use crate::dests;
 use crate::document::{Document, Page};
 use crate::object::{Object, PdfString};
@@ -71,7 +71,7 @@ pub fn safe_uri(bytes: &[u8]) -> Option<String> {
 }
 
 /// The links of `page`. `truncated`: there were more than [`MAX_LINKS`], or too many annotations, or the work ran out.
-pub(super) fn read(doc: &Document, page: &Page, pages: &[Page], index: &HashMap<u32, u32>, names: &Names<'_>, work: &Work) -> (Vec<Link>, bool) {
+pub(super) fn read(doc: &Document, page: &Page, pages: &[Page], index: &IdMap<u32, u32>, names: &Names<'_>, work: &Work) -> (Vec<Link>, bool) {
     let mut links = Vec::new();
     let mut truncated = false;
     let Some(held) = page.dict.get("Annots").and_then(|a| work.read(doc, a)) else { return (links, false) };

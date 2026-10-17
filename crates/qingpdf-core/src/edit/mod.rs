@@ -21,11 +21,11 @@ mod pages;
 mod retext;
 pub(crate) mod signature;
 
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
 
+use crate::idmap::IdSet;
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, Stream};
@@ -658,7 +658,7 @@ fn is_locked(doc: &Document, d: &Dict) -> bool {
 
 /// If the popup of annotation `d` (number `owner`) says it belongs to it, put the popup's number in `gone`. A popup that names
 /// another annotation as its parent is not this one's to take out (12.5.6.14).
-fn add_own_popup(doc: &Document, d: &Dict, owner: u32, gone: &mut HashSet<u32>) {
+fn add_own_popup(doc: &Document, d: &Dict, owner: u32, gone: &mut IdSet<u32>) {
     let Some(Object::Ref(popup)) = d.get("Popup") else { return };
     let belongs = match doc.get(*popup) {
         Ok(Object::Dict(p)) => p.get("Parent").and_then(Object::as_obj_ref).is_some_and(|parent| parent.num == owner),
@@ -709,7 +709,7 @@ fn change_annots(ctx: &mut Ctx<'_>, pages: &[Page], page: &Page, change: AnnotsC
             if is_locked(ctx.doc, d) {
                 return Err(Error::Invalid("the annotation is locked: its author does not allow it to be taken out".to_string()));
             }
-            let mut gone: HashSet<u32> = HashSet::new();
+            let mut gone: IdSet<u32> = IdSet::new();
             if num != 0 {
                 gone.insert(num);
                 add_own_popup(ctx.doc, d, num, &mut gone);

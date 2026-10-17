@@ -4,8 +4,10 @@
     python tests/tools/make_icon.py            # writes crates/qingpdf-view-bin/qingpdf.ico
 
 No libraries are needed (zlib and struct from the standard library). Every size is drawn from the same shapes (so they match), each
-pixel is the average of a grid of points (smooth edges, no halo). The sizes are 16, 32 and 48 as plain 32-bit pictures (BMP, the
-form every Windows reads) and 256 as a PNG (what Windows Vista and later take for the biggest size, and a lot smaller than a BMP).
+pixel is the average of a grid of points (smooth edges, no halo). Every size (16, 32, 48 and 256) is a 32-bit PNG: Windows Vista and
+later read a PNG picture of any size in an icon, and a PNG of these flat colours is a tenth of the plain 32-bit picture (BMP) it
+replaces (13 KB of the 20 KB of the program's icon resource; the program's size is capped, 2026-10-16). Each PNG is coded with
+the filter that is smallest for it, zlib at its best level.
 `crates/qingpdf-view-bin/build.rs` reads the .ico and puts the pictures into the program as resources.
 """
 import math
@@ -86,31 +88,42 @@ def draw(size, grid):
     return rows
 
 
-def bmp_entry(rows):
-    """The picture of an icon of this size as an .ico holds it: a DIB header (the height doubled for the mask), the 32-bit pixels
-    from the bottom row up, and an all-zero mask (the opacity is in the pixels)."""
-    size = len(rows)
-    head = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
-    pixels = b"".join(struct.pack("<BBBB", b, g, r, a) for row in reversed(rows) for (r, g, b, a) in row)
-    mask = bytes(((size + 31) // 32 * 4) * size)
-    return head + pixels + mask
-
-
 def png_entry(rows):
+    """The picture as a 32-bit PNG (8 bits per channel with alpha): the smallest of four ways to filter the rows (none, sub, up, and
+    for each row the one whose bytes add up to the least, the PNG specification's suggestion), zlib at its best level."""
     size = len(rows)
 
     def chunk(kind, data):
         body = kind + data
         return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
 
-    raw = b"".join(b"\x00" + b"".join(bytes(p) for p in row) for row in rows)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+    lines = [b"".join(bytes(p) for p in row) for row in rows]
+
+    def filtered(kind, prev, line):
+        if kind == 0:
+            return line
+        return bytes((v - (line[i - 4] if kind == 1 and i >= 4 else (prev[i] if kind == 2 else 0))) & 255 for i, v in enumerate(line))
+
+    def cost(buf):
+        return sum(v if v < 128 else 256 - v for v in buf)
+
+    def coded(pick):
+        raw = b""
+        prev = bytes(len(lines[0]))
+        for line in lines:
+            kind = pick(prev, line)
+            raw += bytes([kind]) + filtered(kind, prev, line)
+            prev = line
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+    best = lambda prev, line: min((0, 1, 2), key=lambda k: cost(filtered(k, prev, line)))  # noqa: E731
+    return min((coded(lambda prev, line: 0), coded(lambda prev, line: 1), coded(lambda prev, line: 2), coded(best)), key=len)
 
 
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "..", "..", "crates", "qingpdf-view-bin", "qingpdf.ico")
-    images = [(16, bmp_entry(draw(16, 12))), (32, bmp_entry(draw(32, 8))), (48, bmp_entry(draw(48, 8))), (256, png_entry(draw(256, 4)))]
+    images = [(size, png_entry(draw(size, grid))) for size, grid in ((16, 12), (32, 8), (48, 8), (256, 4))]
     data = struct.pack("<HHH", 0, 1, len(images))
     offset = 6 + 16 * len(images)
     for size, blob in images:

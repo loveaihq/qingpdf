@@ -11,13 +11,14 @@
 //! Limits: [`MAX_GLYPHS`] glyphs in one subset (components included), [`MAX_FONT_BYTES`] for the font program before it is
 //! compressed, [`MAX_COMPONENT_VISITS`] components looked at; every glyph is charged to the work meter.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::sync::Arc;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
 
 use super::Ctx;
+use crate::idmap::IdMap;
 use crate::error::{Error, Result};
 use crate::object::{Dict, ObjRef, Object, PdfString, Stream};
 use crate::render::glyf::{TtFont, parse_component};
@@ -203,7 +204,7 @@ pub(crate) struct Embedded {
     pub program: Vec<u8>,
     /// `/BaseFont`: a six-letter subset tag, a plus sign and the font's PostScript name.
     pub name: String,
-    pub cid: HashMap<char, u16>,
+    pub cid: IdMap<char, u16>,
     /// By character code (= glyph number), in thousandths of an em.
     pub widths: Vec<u16>,
     flags: i64,
@@ -391,15 +392,15 @@ pub(crate) fn embed(font: &TtFont, chars: &BTreeSet<char>, work: &Work) -> Resul
 
     // The glyphs of the subset: 0 is `.notdef`, then one for each character, then the components they pull in.
     let mut slots: Vec<u32> = vec![0];
-    let mut cid: HashMap<char, u16> = HashMap::new();
+    let mut cid: IdMap<char, u16> = IdMap::new();
     for &c in chars {
         let g = cmap.unicode(c as u32).filter(|&g| g != 0).ok_or_else(|| Error::Invalid(format!("the font has no glyph for U+{:04X}", c as u32)))?;
         cid.insert(c, u16::try_from(slots.len()).map_err(|_| damaged())?);
         slots.push(g);
     }
-    let mut first: HashMap<u32, usize> = HashMap::new();
+    let mut first: IdMap<u32, usize> = IdMap::new();
     for (i, &g) in slots.iter().enumerate() {
-        first.entry(g).or_insert(i);
+        first.insert_first(g, i);
     }
     let mut records: Vec<Vec<u8>> = Vec::new();
     let mut visits = 0usize;
@@ -518,7 +519,7 @@ pub(crate) fn embed(font: &TtFont, chars: &BTreeSet<char>, work: &Work) -> Resul
 }
 
 /// The `/ToUnicode` CMap (9.10.3): every character used, by its character code.
-fn to_unicode(cid: &HashMap<char, u16>) -> String {
+fn to_unicode(cid: &IdMap<char, u16>) -> String {
     let mut entries: Vec<(u16, char)> = cid.iter().map(|(&c, &id)| (id, c)).collect();
     crate::order::sort_by_key(&mut entries, |e| u64::from(e.0) << 32 | u64::from(e.1));
     let mut s = String::from(
@@ -624,7 +625,7 @@ pub(super) fn add_type3(ctx: &mut Ctx<'_>, font: &TtFont, chars: &BTreeSet<char>
     let (inv, e) = ([m[3] / det, -m[1] / det, -m[2] / det, m[0] / det], font.em_matrix());
     let to_glyph = [e[0] * inv[0] + e[1] * inv[2], e[0] * inv[1] + e[1] * inv[3], e[2] * inv[0] + e[3] * inv[2], e[2] * inv[1] + e[3] * inv[3], 0.0, 0.0];
     let (mut procs, mut widths, mut codes, mut names) = (Dict::new(), Vec::new(), Vec::new(), Vec::new());
-    let mut cid: HashMap<char, u16> = HashMap::new();
+    let mut cid: IdMap<char, u16> = IdMap::new();
     let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
     for (i, &c) in chars.iter().enumerate() {
         if !ctx.work.charge(GLYPH_COST) {
@@ -721,7 +722,7 @@ mod tests {
         };
         for c in &chars {
             let gid = font.cmap.as_ref().unwrap().unicode(*c as u32).unwrap();
-            let cid = u32::from(emb.cid[c]);
+            let cid = u32::from(*emb.cid.get(c).unwrap());
             assert_eq!(shape(&font, gid), shape(&sub, cid), "the outline of {c}");
             let (original, copy) = (font.advance(gid).unwrap(), sub.advance(cid).unwrap());
             assert!((original - copy).abs() < 1e-6, "the width of {c}: {original} and {copy}");
@@ -749,7 +750,7 @@ mod tests {
 
     #[test]
     fn the_unicode_map_has_every_character_and_the_checksum_adds_up() {
-        let cid: HashMap<char, u16> = [('\u{4E2D}', 1), ('a', 2), ('\u{1F600}', 3)].into_iter().collect();
+        let cid: IdMap<char, u16> = [('\u{4E2D}', 1), ('a', 2), ('\u{1F600}', 3)].into_iter().collect();
         let map = to_unicode(&cid);
         assert!(map.contains("<0001> <4E2D>") && map.contains("<0002> <0061>") && map.contains("<0003> <D83DDE00>"), "{map}");
         assert!(map.contains("3 beginbfchar"));

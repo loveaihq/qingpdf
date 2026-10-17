@@ -16,13 +16,13 @@
 //! afresh under the number it gets in the new file (7.6.2).
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hasher;
 
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use miniz_oxide::deflate::core::{CompressorOxide, TDEFLFlush, TDEFLStatus, compress, create_comp_flags_from_zip_params};
 
+use crate::idmap::{IdMap, IdSet};
 use crate::dests::NamedDests;
 use crate::document::Document;
 use crate::error::{Error, Result};
@@ -343,17 +343,17 @@ pub fn write_indirect_gen(
 
 /// For an annotation object number, the pages that list it; and the pages that
 /// are kept.
-type Exclusion<'a> = (&'a HashMap<u32, Vec<u32>>, &'a HashSet<u32>);
+type Exclusion<'a> = (&'a IdMap<u32, Vec<u32>>, &'a IdSet<u32>);
 
 /// One document objects are imported from.
 struct Source<'a> {
     doc: &'a Document,
     /// Object numbers of all the pages of the document. A reference to one
     /// that was not registered with [`Builder::register_page`] becomes null.
-    pages: &'a HashSet<u32>,
+    pages: &'a IdSet<u32>,
     /// Source object number -> number in the output, or `None` when the
     /// reference becomes null (the target is not part of the output).
-    map: HashMap<u32, Option<u32>>,
+    map: IdMap<u32, Option<u32>>,
     /// Turn named destinations into explicit ones through this document's own
     /// name tree (see [`Builder::resolve_named_destinations`]).
     resolve_names: bool,
@@ -363,21 +363,21 @@ struct Source<'a> {
     /// Leave out the keys that point into a structure tree that is not copied.
     drop_structure_links: bool,
     /// Objects whose content is to be taken from here, not from the file.
-    replace: HashMap<u32, Object>,
+    replace: IdMap<u32, Object>,
     /// Annotations that no kept page lists are not imported: object number ->
     /// pages that list it, and the pages that are kept.
     exclude: Option<Exclusion<'a>>,
     /// Inherited values written once for all the pages that share them.
-    shared: HashMap<usize, ObjRef>,
+    shared: IdMap<usize, ObjRef>,
     /// Objects made up by the caller ([`Builder::define_object`]), by their
     /// numbers: a table of their own, in the range above what a file can
     /// have, which no reference read from a file can name.
-    defined: HashMap<u32, Object>,
+    defined: IdMap<u32, Object>,
     /// The next number for one of them.
     next_defined: u32,
     /// Objects that are the same as another one (same content, same references once those are looked at the same way): a
     /// reference to the first is a reference to the second ([`Builder::merge_objects`]).
-    alias: HashMap<u32, u32>,
+    alias: IdMap<u32, u32>,
 }
 
 /// An imported object waiting for its references to be translated.
@@ -413,7 +413,7 @@ pub struct Builder<'a> {
     /// Objects waiting to be written into an object stream, when the file is made small ([`Builder::pack_objects`]), and where the
     /// ones that were written are: object number -> (number of the object stream, place in it).
     pack: Option<Packing>,
-    packed: HashMap<u32, (u32, u32)>,
+    packed: IdMap<u32, (u32, u32)>,
     /// Take out what changes nothing visible (a page's thumbnail, private data of the program that made it) from the objects imported
     /// ([`Builder::drop_junk`]).
     drop_junk: bool,
@@ -472,7 +472,7 @@ impl<'a> Builder<'a> {
             watch_signatures: false,
             signature_seen: false,
             pack: None,
-            packed: HashMap::new(),
+            packed: IdMap::new(),
             drop_junk: false,
             tidy: None,
         }
@@ -549,7 +549,7 @@ impl<'a> Builder<'a> {
 
     /// From now on a reference to object `from` of `source` is a reference to object `to` of it: the caller has found them to be
     /// the same (equal objects, or equal streams with equal dictionaries), and only `to` is imported.
-    pub fn merge_objects(&mut self, source: usize, merged: HashMap<u32, u32>) {
+    pub fn merge_objects(&mut self, source: usize, merged: IdMap<u32, u32>) {
         if let Some(s) = self.source_mut(source) {
             s.alias = merged;
         }
@@ -578,20 +578,20 @@ impl<'a> Builder<'a> {
     /// `pages`. Returns the index to pass to the import functions. The same
     /// document may be added again to get a separate copy of everything
     /// (merging a file with itself, say).
-    pub fn add_source(&mut self, doc: &'a Document, pages: &'a HashSet<u32>) -> usize {
+    pub fn add_source(&mut self, doc: &'a Document, pages: &'a IdSet<u32>) -> usize {
         self.sources.push(Source {
             doc,
             pages,
-            map: HashMap::new(),
+            map: IdMap::new(),
             resolve_names: false,
             names: OnceCell::new(),
             drop_structure_links: false,
-            replace: HashMap::new(),
+            replace: IdMap::new(),
             exclude: None,
-            shared: HashMap::new(),
-            defined: HashMap::new(),
+            shared: IdMap::new(),
+            defined: IdMap::new(),
             next_defined: u32::MAX,
-            alias: HashMap::new(),
+            alias: IdMap::new(),
         });
         self.sources.len() - 1
     }
@@ -656,7 +656,7 @@ impl<'a> Builder<'a> {
     /// Do not import the annotations of `source` that are listed only by
     /// pages that are not in `kept`: `owners` says, for an annotation object
     /// number, which pages list it. References to them become null.
-    pub fn exclude_annotations(&mut self, source: usize, owners: &'a HashMap<u32, Vec<u32>>, kept: &'a HashSet<u32>) {
+    pub fn exclude_annotations(&mut self, source: usize, owners: &'a IdMap<u32, Vec<u32>>, kept: &'a IdSet<u32>) {
         if let Some(s) = self.source_mut(source) {
             s.exclude = Some((owners, kept));
         }
@@ -812,7 +812,7 @@ impl<'a> Builder<'a> {
     /// Pages never registered become null.
     pub fn register_page(&mut self, source: usize, old: ObjRef, new: ObjRef) {
         if let Some(s) = self.sources.get_mut(source) {
-            s.map.entry(old.num).or_insert(Some(new.num));
+            s.map.insert_first(old.num, Some(new.num));
         }
     }
 
@@ -1618,7 +1618,7 @@ mod tests {
         pb.obj(5, "<< /Font << /F1 6 0 R >> >>");
         pb.obj(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
         let source = Document::from_bytes(pb.finish_classic(7, "/Root 1 0 R")).unwrap();
-        let pages: HashSet<u32> = HashSet::from([3]);
+        let pages: IdSet<u32> = [3].into_iter().collect();
         // Numbers start at 100; the page the caller reserved is 100, what it leads to is numbered after it, nothing is encrypted or written.
         let mut b = Builder::collecting(100, 1 << 20, "too big");
         let s = b.add_source(&source, &pages);
@@ -1706,7 +1706,7 @@ mod tests {
         pb.stream_obj(7, "/Type /Metadata /Subtype /XML", b"<xmp/>");
         pb.stream_obj(8, "/Type /Metadata /Subtype /XML", b"<other/>");
         let source = Document::from_bytes(pb.finish_classic(9, "/Root 1 0 R")).unwrap();
-        let pages: HashSet<u32> = HashSet::from([3]);
+        let pages: IdSet<u32> = [3].into_iter().collect();
         let mut b = Builder::new((1, 4));
         b.drop_junk();
         let s = b.add_source(&source, &pages);

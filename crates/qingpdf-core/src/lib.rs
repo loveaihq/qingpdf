@@ -7,6 +7,7 @@
 //! Spec references in comments point to ISO 32000-1:2008 unless noted.
 
 pub mod compress;
+pub mod dests;
 pub mod docx;
 pub mod edit;
 pub mod forms;
@@ -17,12 +18,14 @@ pub mod prune;
 pub mod squeeze;
 mod tables;
 pub mod view;
+pub mod writer;
 pub mod xlsx;
 mod xml;
 mod zip;
 
-pub use qingpdf_base::{dests, document, error, filter, info, lexer, object, order, parser, render, repair, security, text, writer, xref};
+pub use qingpdf_base::{document, error, filter, idmap, info, lexer, object, order, parser, render, repair, security, text, xref};
 #[cfg(test)]
 use qingpdf_base::testutil;
 
-pub use qingpdf_base::{Builder, Dict, Document, Error, Name, ObjRef, Object, Page, PdfString, Result, Stream, Warning};
+pub use qingpdf_base::{Dict, Document, Error, Name, ObjRef, Object, Page, PdfString, Result, Stream};
+pub use writer::{Builder, Warning};

@@ -2,11 +2,11 @@
 //! stitching (3) and PostScript calculator (4). Used for the tint transforms of
 //! Separation and DeviceN colour spaces.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::document::Document;
+use crate::idmap::IdMap;
 use crate::object::{Dict, ObjRef, Object};
 
 /// Most nesting of stitching functions followed.
@@ -92,7 +92,7 @@ fn clamp(v: f64, (lo, hi): (f64, f64)) -> f64 {
 /// tree of exponential size), and the number of function objects and their size are bounded.
 struct Loader<'a> {
     doc: &'a Document,
-    memo: HashMap<ObjRef, Option<Arc<Function>>>,
+    memo: IdMap<ObjRef, Option<Arc<Function>>>,
     nodes_left: usize,
     weight_left: usize,
 }
@@ -206,7 +206,7 @@ impl Loader<'_> {
 impl Function {
     /// Read a function object. `None` when it is not a function we can run.
     pub fn load(doc: &Document, obj: &Object) -> Option<Arc<Function>> {
-        let mut loader = Loader { doc, memo: HashMap::new(), nodes_left: MAX_NODES, weight_left: MAX_WEIGHT };
+        let mut loader = Loader { doc, memo: IdMap::new(), nodes_left: MAX_NODES, weight_left: MAX_WEIGHT };
         loader.load_at(obj, 0)
     }
 
@@ -216,7 +216,7 @@ impl Function {
         if objs.is_empty() || objs.len() > MAX_ARITY {
             return None;
         }
-        let mut loader = Loader { doc, memo: HashMap::new(), nodes_left: MAX_NODES, weight_left: MAX_WEIGHT };
+        let mut loader = Loader { doc, memo: IdMap::new(), nodes_left: MAX_NODES, weight_left: MAX_WEIGHT };
         objs.iter().map(|o| loader.load_at(o, 0)).collect()
     }
 

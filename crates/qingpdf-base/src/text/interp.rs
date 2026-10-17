@@ -5,12 +5,14 @@
 //! becomes a [`Glyph`] with its position, writing direction and advance.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::document::Document;
 use crate::error::{Error, Result};
+use crate::idmap::{IdMap, IdSet};
+use crate::keymap::KeyMap;
 use crate::object::{Dict, ObjRef, Object};
 use crate::render::work::{Work, cost};
 
@@ -64,7 +66,7 @@ impl std::hash::Hasher for Fx {
 }
 
 pub(crate) type FxMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
-pub(crate) type FxSet<K> = HashSet<K, std::hash::BuildHasherDefault<Fx>>;
+pub(crate) type FxKeyMap<K, V> = KeyMap<K, V, std::hash::BuildHasherDefault<Fx>>;
 
 // Operators as numbers (their bytes and length), so that `operator` is a jump and not a
 // chain of comparisons: it runs for every operator of every page.
@@ -159,15 +161,15 @@ pub struct Glyph {
 /// (a page may have hundreds of fonts, and every `Tf` looks one up), and the fonts
 /// already loaded for them.
 pub(crate) struct Scope {
-    fonts: FxMap<Vec<u8>, Object>,
-    xobjects: FxMap<Vec<u8>, Object>,
-    loaded: RefCell<FxMap<Vec<u8>, Option<Rc<Font>>>>,
+    fonts: FxKeyMap<Vec<u8>, Object>,
+    xobjects: FxKeyMap<Vec<u8>, Object>,
+    loaded: RefCell<FxKeyMap<Vec<u8>, Option<Rc<Font>>>>,
 }
 
 impl Scope {
     pub fn new(doc: &Document, resources: Option<&Object>) -> Scope {
         let res = resources.and_then(|r| doc.resolve(r).ok());
-        let sub = |key: &str| -> FxMap<Vec<u8>, Object> {
+        let sub = |key: &str| -> FxKeyMap<Vec<u8>, Object> {
             let dict = res
                 .as_ref()
                 .and_then(Object::as_dict)
@@ -181,7 +183,7 @@ impl Scope {
             // `Dict` keeps the last of a repeated key (decisions.md), so the pairs are distinct.
             dict.into_pairs().into_iter().map(|(k, v)| (k.0, v)).collect()
         };
-        Scope { fonts: sub("Font"), xobjects: sub("XObject"), loaded: RefCell::new(FxMap::default()) }
+        Scope { fonts: sub("Font"), xobjects: sub("XObject"), loaded: RefCell::new(FxKeyMap::default()) }
     }
 }
 
@@ -197,13 +199,13 @@ pub(crate) struct Form {
 /// What lives as long as one text extraction: caches shared by all pages.
 #[derive(Default)]
 pub(crate) struct Shared {
-    pub fonts: FxMap<ObjRef, Option<Rc<Font>>>,
-    pub forms: FxMap<ObjRef, Rc<Form>>,
+    pub fonts: IdMap<ObjRef, Option<Rc<Font>>>,
+    pub forms: IdMap<ObjRef, Rc<Form>>,
     pub form_bytes: usize,
-    pub not_forms: FxSet<ObjRef>,
+    pub not_forms: IdSet<ObjRef>,
     /// The ones of `not_forms` that are images (`page.rs` places them on the page).
-    pub image_refs: FxSet<ObjRef>,
-    pub cmaps: HashMap<String, Option<Arc<CMap>>>,
+    pub image_refs: IdSet<ObjRef>,
+    pub cmaps: KeyMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
 }
 
@@ -288,7 +290,7 @@ pub(crate) struct Interp<'a> {
     tlm: Matrix,
     basis: Option<Basis>,
     /// Characters shown that have no Unicode value, per font name.
-    pub unmapped: HashMap<String, usize>,
+    pub unmapped: KeyMap<String, usize>,
     /// The marked-content sequences open (14.6): true for one that is a watermark or pagination artifact (14.8.2.2), whose text is
     /// not content; how many of those are open; and how many sequences were opened past `MAX_MARKED_DEPTH` (only counted).
     marks: Vec<bool>,
@@ -319,7 +321,7 @@ impl<'a> Interp<'a> {
             tm: IDENTITY,
             tlm: IDENTITY,
             basis: None,
-            unmapped: HashMap::new(),
+            unmapped: KeyMap::new(),
             marks: Vec::new(),
             hidden: 0,
             marks_past: 0,

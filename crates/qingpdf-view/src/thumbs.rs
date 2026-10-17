@@ -6,10 +6,10 @@
 //! The list is virtual: a row costs a few numbers, a picture only exists for the rows in view and a few next to them, held to a
 //! number of bytes (`view::THUMB_CACHE_BYTES`, part of the memory plan). A thousand-page file asks for a dozen pictures, not a thousand.
 
-use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::sched;
+use qingpdf_core::idmap::{IdMap, IdSet};
 
 /// The two tabs of the sidebar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -223,14 +223,14 @@ impl Thumb {
 
 /// The pictures held, to a number of bytes: when a new one does not fit, the ones on the rows farthest from the rows in view go first.
 pub struct ThumbCache {
-    map: HashMap<u32, Thumb>,
+    map: IdMap<u32, Thumb>,
     bytes: u64,
     cap: u64,
 }
 
 impl ThumbCache {
     pub fn new(cap: u64) -> ThumbCache {
-        ThumbCache { map: HashMap::new(), bytes: 0, cap }
+        ThumbCache { map: IdMap::new(), bytes: 0, cap }
     }
 
     pub fn cap(&self) -> u64 {
@@ -346,7 +346,7 @@ pub struct Plan {
 
 /// Compare what is wanted with what is asked for (request, page) and what is there already (`done`). A request for a page that is not
 /// wanted any more is taken back; new ones are made while fewer than `room` are out.
-pub fn plan(wanted: &[Want], asked: &HashMap<u64, u32>, done: impl Fn(u32) -> bool, room: usize) -> Plan {
+pub fn plan(wanted: &[Want], asked: &IdMap<u64, u32>, done: impl Fn(u32) -> bool, room: usize) -> Plan {
     let mut cancel: Vec<u64> = asked.iter().filter(|(_, page)| !wanted.iter().any(|w| w.page == **page)).map(|(id, _)| *id).collect();
     cancel.sort_unstable();
     let out = asked.len() - cancel.len();
@@ -360,10 +360,10 @@ pub struct Thumbs {
     pub scroll: i64,
     pub cache: ThumbCache,
     /// The requests out: request, page.
-    pub asked: HashMap<u64, u32>,
+    pub asked: IdMap<u64, u32>,
     /// The pages the engine could not draw (twice), and the ones it could not draw once (they are asked for again).
-    pub failed: HashSet<u32>,
-    retried: HashSet<u32>,
+    pub failed: IdSet<u32>,
+    retried: IdSet<u32>,
     /// What the rows were made for.
     built: Option<Built>,
     /// The page the list was last moved to show.
@@ -382,7 +382,7 @@ pub struct Built {
 
 impl Thumbs {
     pub fn new() -> Thumbs {
-        Thumbs { strip: Strip::default(), scroll: 0, cache: ThumbCache::new(0), asked: HashMap::new(), failed: HashSet::new(), retried: HashSet::new(), built: None, synced: None, keep_place: false }
+        Thumbs { strip: Strip::default(), scroll: 0, cache: ThumbCache::new(0), asked: IdMap::new(), failed: IdSet::new(), retried: IdSet::new(), built: None, synced: None, keep_place: false }
     }
 
     /// Forget everything (another file, or none), with room for `cap` bytes of pictures.
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn requests_for_rows_that_are_no_longer_wanted_are_taken_back_and_few_are_made_at_a_time() {
         let want: Vec<Want> = (3..9).map(|p| Want { page: p, priority: P_VISIBLE + p }).collect();
-        let none = HashMap::new();
+        let none = IdMap::new();
         // Nothing asked: the first two are asked for (the room), in order.
         let p = plan(&want, &none, |_| false, MAX_IN_FLIGHT);
         assert_eq!((p.cancel.len(), p.issue.iter().map(|w| w.page).collect::<Vec<_>>()), (0, vec![3, 4]));
@@ -832,7 +832,7 @@ mod tests {
         let p = plan(&want, &none, |p| p == 3, MAX_IN_FLIGHT);
         assert_eq!(p.issue.iter().map(|w| w.page).collect::<Vec<_>>(), vec![4, 5]);
         // 4 is asked for, and 1 (scrolled away) too: 1 is taken back, 4 is not asked again, and one more is asked for to fill the room.
-        let asked: HashMap<u64, u32> = [(7, 4), (8, 1)].into_iter().collect();
+        let asked: IdMap<u64, u32> = [(7, 4), (8, 1)].into_iter().collect();
         let p = plan(&want, &asked, |p| p == 3, MAX_IN_FLIGHT);
         assert_eq!(p.cancel, vec![8]);
         assert_eq!(p.issue.iter().map(|w| w.page).collect::<Vec<_>>(), vec![5]);

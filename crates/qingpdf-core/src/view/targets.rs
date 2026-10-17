@@ -2,8 +2,8 @@
 //! and a place down it, with the named destinations of the file read once and only when something asks.
 
 use std::cell::OnceCell;
-use std::collections::HashMap;
 
+use crate::idmap::IdMap;
 use crate::dests::NamedDests;
 use crate::document::{Document, Page};
 use crate::object::Object;
@@ -50,7 +50,7 @@ pub(super) struct Target {
 /// The target of an explicit destination array. `index` maps the object number of a page to its place in the document. A
 /// destination that does not name one of the pages, or whose page is given as a number (a destination in another file),
 /// leads nowhere.
-pub(super) fn target(array: &[Object], pages: &[Page], index: &HashMap<u32, u32>) -> Option<Target> {
+pub(super) fn target(array: &[Object], pages: &[Page], index: &IdMap<u32, u32>) -> Option<Target> {
     let Some(Object::Ref(r)) = array.first() else { return None };
     let at = *index.get(&r.num)?;
     let page = pages.get(at as usize)?;
@@ -70,10 +70,10 @@ pub(super) fn target(array: &[Object], pages: &[Page], index: &HashMap<u32, u32>
 }
 
 /// Object number of each page to its place.
-pub(super) fn page_index(pages: &[Page]) -> HashMap<u32, u32> {
-    let mut index = HashMap::with_capacity(pages.len());
+pub(super) fn page_index(pages: &[Page]) -> IdMap<u32, u32> {
+    let mut index = IdMap::with_capacity(pages.len());
     for (i, p) in pages.iter().enumerate() {
-        index.entry(p.obj_ref.num).or_insert(u32::try_from(i).unwrap_or(u32::MAX));
+        index.insert_first(p.obj_ref.num, u32::try_from(i).unwrap_or(u32::MAX));
     }
     index
 }

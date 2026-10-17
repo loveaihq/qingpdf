@@ -10,12 +10,12 @@
 //! The history is bounded ([`MAX_UNDO_STEPS`] steps, and with the objects in front of the file together within the memory the
 //! plan sets aside for edits): the oldest step that does not fit any more becomes part of the document for good.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
 
 use super::wipe;
+use crate::idmap::IdMap;
 use crate::document::Document;
 use crate::edit::signature::{self, Policy, Signatures};
 use crate::edit::EditClass;
@@ -131,7 +131,7 @@ pub(crate) struct Session {
     work_used: f64,
     /// Recognised text (5c) of a file that may not be written to (it is signed, or its author did not allow changes): kept here, for
     /// the reader's search, selection and copy only, never saved; by page, and how many characters it holds in all.
-    memory_text: HashMap<u32, Rc<PageChars>>,
+    memory_text: IdMap<u32, Rc<PageChars>>,
     memory_chars: usize,
 }
 
@@ -155,7 +155,7 @@ impl Session {
             signatures: None,
             warned: false,
             work_used: 0.0,
-            memory_text: HashMap::new(),
+            memory_text: IdMap::new(),
             memory_chars: 0,
         }
     }

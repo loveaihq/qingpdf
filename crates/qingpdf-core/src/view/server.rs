@@ -6,12 +6,13 @@
 //! copy, a band of a print). Every step of those is one page, charged to a work meter of its own that is cancelled by the
 //! same flag as the drawing, so a hostile page cannot hold the thread for long.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use crate::idmap::IdMap;
 use crate::document::{Document, Page};
 use crate::edit::{self, EditClass, signature::Policy};
 use crate::error::Error;
@@ -217,7 +218,7 @@ struct Server<'a> {
     document: &'a Document,
     /// The pages; the dictionary of a page that an edit changed is read again.
     pages: Vec<Page>,
-    index: HashMap<u32, u32>,
+    index: IdMap<u32, u32>,
     max_tile_pixels: u32,
     rights: Rights,
     renderer: Renderer<'a>,

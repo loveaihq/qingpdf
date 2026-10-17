@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use qingpdf_core::idmap::IdMap;
 use qingpdf_core::view::{Engine, Event as EngineEvent, Link, OpenFailure, Opened, OutlineItem, RenderRequest, RenderStatus, Rendered, Rights, TOTAL_BYTES};
 
 use crate::bench::Bench;
@@ -233,10 +234,10 @@ pub struct App {
     cache: BitmapCache,
     /// The requests the engine has: by the piece, and by the request.
     in_flight: HashMap<Key, u64>,
-    asked: HashMap<u64, Want>,
+    asked: IdMap<u64, Want>,
     /// Pieces the engine could not draw: not asked for again.
     failed: HashSet<Key>,
-    notices: HashMap<u32, Notice>,
+    notices: IdMap<u32, Notice>,
     next_id: u64,
     wrong_password: bool,
     /// What the scroll bars show now, so that they are set only when it changes.
@@ -259,11 +260,11 @@ pub struct App {
     outline: Vec<OutlineItem>,
     show_sidebar: bool,
     /// The links of the pages near the window, and the engine's requests for them (request, page).
-    links: HashMap<u32, Vec<Link>>,
-    links_asked: HashMap<u64, u32>,
+    links: IdMap<u32, Vec<Link>>,
+    links_asked: IdMap<u64, u32>,
     /// The boxes of the characters of the pages the pointer has been on, and the requests for them.
-    boxes: HashMap<u32, PageBoxes>,
-    boxes_asked: HashMap<u64, u32>,
+    boxes: IdMap<u32, PageBoxes>,
+    boxes_asked: IdMap<u64, u32>,
     /// The left button is down: where, and on what.
     press: Option<Press>,
     /// Where the pointer was last, in the client area.
@@ -373,9 +374,9 @@ impl App {
             moving: false,
             cache: BitmapCache::new(0),
             in_flight: HashMap::new(),
-            asked: HashMap::new(),
+            asked: IdMap::new(),
             failed: HashSet::new(),
-            notices: HashMap::new(),
+            notices: IdMap::new(),
             next_id: 1,
             wrong_password: false,
             bars: (None, None),
@@ -389,10 +390,10 @@ impl App {
             rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true },
             outline: Vec::new(),
             show_sidebar: true,
-            links: HashMap::new(),
-            links_asked: HashMap::new(),
-            boxes: HashMap::new(),
-            boxes_asked: HashMap::new(),
+            links: IdMap::new(),
+            links_asked: IdMap::new(),
+            boxes: IdMap::new(),
+            boxes_asked: IdMap::new(),
             press: None,
             mouse: (0, 0),
             selection: None,

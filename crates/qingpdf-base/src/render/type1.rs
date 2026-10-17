@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use crate::idmap::IdMap;
 use crate::text::data;
 use crate::text::fontprog::{self, Lexer, Res, Tok};
 
@@ -35,7 +36,7 @@ pub(crate) struct T1Font {
     matrix: [f64; 6],
     /// The font's own encoding: names by code, `None` for StandardEncoding.
     encoding: Option<Vec<Option<Vec<u8>>>>,
-    by_unicode: OnceLock<HashMap<u32, usize>>,
+    by_unicode: OnceLock<IdMap<u32, usize>>,
 }
 
 fn decrypt(data: &[u8], key: u16, skip: usize) -> Vec<u8> {
@@ -239,14 +240,18 @@ impl T1Font {
 
     pub fn gid_of_unicode(&self, cp: u32) -> Option<u32> {
         let map = self.by_unicode.get_or_init(|| {
-            let mut map: HashMap<u32, usize> = HashMap::new();
+            let mut map: IdMap<u32, usize> = IdMap::new();
             for (name, &gid) in &self.by_name {
                 if name == ".notdef" {
                     continue;
                 }
                 if let [one] = data::glyph_name_to_unicode(name).as_slice() {
-                    let slot = map.entry(*one).or_insert(gid);
-                    *slot = (*slot).min(gid);
+                    match map.get_mut(one) {
+                        Some(slot) => *slot = (*slot).min(gid),
+                        None => {
+                            map.insert(*one, gid);
+                        }
+                    }
                 }
             }
             map

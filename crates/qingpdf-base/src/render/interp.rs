@@ -15,10 +15,12 @@ use tiny_skia::{
 
 use crate::document::Document;
 use crate::error::{Error, Result};
+use crate::idmap::IdMap;
+use crate::keymap::KeyMap;
 use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::text::cmap::{CMap, Uni};
 use crate::text::font::{Font, Warnings};
-use crate::text::interp::{FxMap, IDENTITY, Matrix, finite, mul, numbers};
+use crate::text::interp::{FxKeyMap, FxMap, IDENTITY, Matrix, finite, mul, numbers};
 use crate::text::scan::{Item, Operand, Scanner};
 
 use super::color::ColorSpace;
@@ -125,14 +127,14 @@ pub(crate) struct Resources {
     /// Tells this dictionary from every other one made (names the fonts written into it).
     id: u32,
     dict: Dict,
-    fonts: OnceCell<FxMap<Vec<u8>, Object>>,
-    xobjects: OnceCell<FxMap<Vec<u8>, Object>>,
-    ext_g_states: OnceCell<FxMap<Vec<u8>, Object>>,
-    color_spaces: OnceCell<FxMap<Vec<u8>, Object>>,
-    patterns: OnceCell<FxMap<Vec<u8>, Object>>,
-    shadings: OnceCell<FxMap<Vec<u8>, Object>>,
-    properties: OnceCell<FxMap<Vec<u8>, Object>>,
-    loaded_spaces: RefCell<FxMap<Vec<u8>, Option<Arc<ColorSpace>>>>,
+    fonts: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    xobjects: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    ext_g_states: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    color_spaces: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    patterns: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    shadings: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    properties: OnceCell<FxKeyMap<Vec<u8>, Object>>,
+    loaded_spaces: RefCell<FxKeyMap<Vec<u8>, Option<Arc<ColorSpace>>>>,
     /// Does some graphics state dictionary here ask for a blend mode other than Normal?
     has_blend: OnceCell<bool>,
 }
@@ -153,12 +155,12 @@ impl Resources {
             patterns: OnceCell::new(),
             shadings: OnceCell::new(),
             properties: OnceCell::new(),
-            loaded_spaces: RefCell::new(FxMap::default()),
+            loaded_spaces: RefCell::new(FxKeyMap::default()),
             has_blend: OnceCell::new(),
         })
     }
 
-    fn table(&self, doc: &Document, cat: Cat) -> &FxMap<Vec<u8>, Object> {
+    fn table(&self, doc: &Document, cat: Cat) -> &FxKeyMap<Vec<u8>, Object> {
         let (cell, key) = match cat {
             Cat::Font => (&self.fonts, "Font"),
             Cat::XObject => (&self.xobjects, "XObject"),
@@ -172,7 +174,7 @@ impl Resources {
             let sub = self.dict.get(key).and_then(|o| doc.resolve(o).ok());
             match sub {
                 Some(Object::Dict(d)) => d.into_pairs().into_iter().map(|(k, v)| (k.0, v)).collect(),
-                _ => FxMap::default(),
+                _ => FxKeyMap::default(),
             }
         })
     }
@@ -228,9 +230,9 @@ struct Type3 {
     matrix: Matrix,
     /// Code to glyph name.
     names: Vec<Option<Vec<u8>>>,
-    procs: FxMap<Vec<u8>, Object>,
+    procs: FxKeyMap<Vec<u8>, Object>,
     resources: Option<Rc<Resources>>,
-    cache: RefCell<FxMap<u8, Option<Rc<Vec<u8>>>>>,
+    cache: RefCell<IdMap<u8, Option<Rc<Vec<u8>>>>>,
 }
 
 struct FontEntry {
@@ -350,11 +352,11 @@ pub(crate) struct Shared {
     /// Set from another thread to stop the page being drawn at its next operator ([`Error::Cancelled`]).
     pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     fonts: FxMap<FontKey, Option<Rc<FontEntry>>>,
-    pub cmaps: HashMap<String, Option<Arc<CMap>>>,
+    pub cmaps: KeyMap<String, Option<Arc<CMap>>>,
     pub warnings: Warnings,
-    forms: FxMap<ObjRef, Option<Rc<Form>>>,
+    forms: IdMap<ObjRef, Option<Rc<Form>>>,
     /// Resource dictionaries that are objects of their own, each made once however many forms share it.
-    resources: FxMap<ObjRef, Rc<Resources>>,
+    resources: IdMap<ObjRef, Rc<Resources>>,
     cache_bytes: usize,
     images: HashMap<ImageKey, Rc<Prepared>>,
     image_bytes: usize,
@@ -375,14 +377,14 @@ pub(crate) struct Shared {
     #[cfg(test)]
     bitmap_peak: usize,
     /// Shadings and patterns read, by object (each is read once however many times it is used); they count in `cache_bytes`.
-    shadings: FxMap<ObjRef, Option<Rc<Shading>>>,
-    patterns: FxMap<ObjRef, Option<Rc<PatternDef>>>,
+    shadings: IdMap<ObjRef, Option<Rc<Shading>>>,
+    patterns: IdMap<ObjRef, Option<Rc<PatternDef>>>,
     /// The work the last page drawn used (tests look at it).
     #[cfg(test)]
     pub last_work: f64,
     /// The optional content configuration of the document, and whether the content of an XObject is shown.
     oc: Option<Rc<OcConfig>>,
-    xobject_shown: FxMap<ObjRef, bool>,
+    xobject_shown: IdMap<ObjRef, bool>,
     /// What draws the form fields that have no appearance (4b); given when the renderer is made.
     widgets: Option<Box<dyn super::WidgetPainter>>,
 }
@@ -1694,7 +1696,7 @@ impl<'a> Interp<'a> {
             _ => return None,
         };
         let resources = d.get("Resources").map(|r| self.resources_of(r));
-        Some(Type3 { matrix, names, procs, resources, cache: RefCell::new(FxMap::default()) })
+        Some(Type3 { matrix, names, procs, resources, cache: RefCell::new(IdMap::default()) })
     }
 
     /// One pixel wide outline of an upright box, written straight into the page; false when the

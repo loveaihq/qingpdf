@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use qingpdf_base::text::font::{STYLE_BOLD, STYLE_CJK_SHIFT, STYLE_FAMILY_SHIFT, STYLE_ITALIC};
 
+use crate::idmap::IdMap;
 use crate::xml::esc;
 use super::flow::{Align, Block, Cell, Mark, NumFmt, PageOut, Para, Pic, Run, Table, continues, round_size};
 
@@ -207,24 +208,24 @@ struct Look {
 }
 
 fn look(pages: &[PageOut]) -> Look {
-    let mut sizes: HashMap<u32, u64> = HashMap::new();
-    let mut styles: HashMap<u8, u64> = HashMap::new();
-    let mut pitches: HashMap<u32, u64> = HashMap::new();
+    let mut sizes: IdMap<u32, u64> = IdMap::new();
+    let mut styles: IdMap<u8, u64> = IdMap::new();
+    let mut pitches: IdMap<u32, u64> = IdMap::new();
     for page in pages {
         each_para(&page.blocks, &mut |p, _| {
             for r in &p.runs {
                 let n = r.text.chars().count() as u64;
                 if (MIN_SIZE..=MAX_SIZE).contains(&r.size) {
-                    *sizes.entry((r.size * 2.0) as u32).or_insert(0) += n;
+                    sizes.update((r.size * 2.0) as u32, 0, |v| *v += n);
                 }
-                *styles.entry(r.style & !(STYLE_BOLD | STYLE_ITALIC)).or_insert(0) += n;
+                styles.update(r.style & !(STYLE_BOLD | STYLE_ITALIC), 0, |v| *v += n);
             }
             if p.lines > 1 && (MIN_SIZE..=2.0 * MAX_SIZE).contains(&p.pitch) {
-                *pitches.entry((p.pitch * 2.0) as u32).or_insert(0) += u64::from(p.chars);
+                pitches.update((p.pitch * 2.0) as u32, 0, |v| *v += u64::from(p.chars));
             }
         });
     }
-    let top = |m: &HashMap<u32, u64>| m.iter().max_by_key(|&(k, n)| (*n, *k)).map(|(k, _)| *k as f32 / 2.0);
+    let top = |m: &IdMap<u32, u64>| m.iter().max_by_key(|&(k, n)| (*n, *k)).map(|(k, _)| *k as f32 / 2.0);
     let body = top(&sizes).filter(|b| (MIN_SIZE..=MAX_SIZE).contains(b)).unwrap_or(DEFAULT_SIZE);
     let style = styles.iter().max_by_key(|&(k, n)| (*n, *k)).map_or(0, |(k, _)| *k);
     Look { body, style, pitch: top(&pitches).unwrap_or(body * 1.25), heads: Vec::new() }

@@ -18,8 +18,8 @@
 //! splitting a book into one file per page does not read its outline again
 //! for every file.
 
-use std::collections::{HashMap, HashSet};
 
+use crate::idmap::{IdMap, IdSet};
 use crate::dests::{self, NamedDests};
 use crate::document::{Document, Page};
 use crate::error::Result;
@@ -66,7 +66,7 @@ struct Form {
 /// What a document's structures say about its pages, read once.
 pub(crate) struct Index {
     /// Annotation object number -> the pages that list it in `/Annots`.
-    pub(crate) annot_pages: HashMap<u32, Vec<u32>>,
+    pub(crate) annot_pages: IdMap<u32, Vec<u32>>,
     names: NamedDests,
     tree_pages: Vec<Option<u32>>,
     dict_pages: Vec<Option<u32>>,
@@ -77,7 +77,7 @@ pub(crate) struct Index {
 impl Index {
     /// Read the structures; `Limit` if the named destinations ask for more
     /// than they may.
-    pub(crate) fn build(doc: &Document, pages: &[Page], page_nums: &HashSet<u32>) -> Result<Index> {
+    pub(crate) fn build(doc: &Document, pages: &[Page], page_nums: &IdSet<u32>) -> Result<Index> {
         let names = NamedDests::load(doc)?;
         let page_of = |entries: &[(Vec<u8>, Object)]| -> Result<Vec<Option<u32>>> {
             entries
@@ -107,7 +107,7 @@ impl Index {
     pub(crate) fn apply(
         &self,
         doc: &Document,
-        kept: &HashSet<u32>,
+        kept: &IdSet<u32>,
         b: &mut Builder<'_>,
         source: usize,
         catalog: &mut Dict,
@@ -140,7 +140,7 @@ impl Index {
     fn cut_destinations(
         &self,
         doc: &Document,
-        kept: &HashSet<u32>,
+        kept: &IdSet<u32>,
         b: &mut Builder<'_>,
         source: usize,
         catalog: &mut Dict,
@@ -177,7 +177,7 @@ impl Index {
     }
 
     /// Bookmarks that lead to a page that is gone.
-    fn cut_outlines(&self, doc: &Document, kept: &HashSet<u32>, b: &mut Builder<'_>, source: usize, catalog: &mut Dict) {
+    fn cut_outlines(&self, doc: &Document, kept: &IdSet<u32>, b: &mut Builder<'_>, source: usize, catalog: &mut Dict) {
         let Some(outlines) = &self.outlines else {
             return;
         };
@@ -222,7 +222,7 @@ impl Index {
 
         // The links between the items that stay: each group of siblings
         // (the first level, or the children of one item) is a new list.
-        let mut prev_next: HashMap<usize, (Option<ObjRef>, Option<ObjRef>)> = HashMap::new();
+        let mut prev_next: IdMap<usize, (Option<ObjRef>, Option<ObjRef>)> = IdMap::new();
         let mut link_group = |group: &[usize]| {
             for (k, &i) in group.iter().enumerate() {
                 let prev = k.checked_sub(1).and_then(|p| group.get(p)).and_then(|&p| items.get(p)).map(|it| it.r);
@@ -269,7 +269,7 @@ impl Index {
     fn cut_form(
         &self,
         doc: &Document,
-        kept: &HashSet<u32>,
+        kept: &IdSet<u32>,
         b: &mut Builder<'_>,
         source: usize,
         catalog: &mut Dict,
@@ -311,9 +311,9 @@ impl Index {
 }
 
 /// Which page lists which annotation: for an annotation object number, the object numbers of the pages whose `/Annots` has it.
-fn annotation_owners(doc: &Document, pages: &[Page]) -> HashMap<u32, Vec<u32>> {
-    let mut annot_pages: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut seen_pages: HashSet<u32> = HashSet::new();
+fn annotation_owners(doc: &Document, pages: &[Page]) -> IdMap<u32, Vec<u32>> {
+    let mut annot_pages: IdMap<u32, Vec<u32>> = IdMap::new();
+    let mut seen_pages: IdSet<u32> = IdSet::new();
     for page in pages {
         if !seen_pages.insert(page.obj_ref.num) {
             continue;
@@ -324,10 +324,11 @@ fn annotation_owners(doc: &Document, pages: &[Page]) -> HashMap<u32, Vec<u32>> {
         for annot in &annots {
             if let Object::Ref(r) = annot {
                 // (A page is done with before the next one starts, so a page that lists an annotation twice is the last owner.)
-                let owners = annot_pages.entry(r.num).or_default();
-                if owners.last() != Some(&page.obj_ref.num) {
-                    owners.push(page.obj_ref.num);
-                }
+                annot_pages.update(r.num, Vec::new(), |owners| {
+                    if owners.last() != Some(&page.obj_ref.num) {
+                        owners.push(page.obj_ref.num);
+                    }
+                });
             }
         }
     }
@@ -351,7 +352,7 @@ impl Form {
     /// Which fields live when only the pages `kept` stay: a widget is dead if only removed pages list it (or, unlisted, if its `/P` is
     /// a removed page); a field is dead if it has no living widget or sub-field. A field with nothing to show anywhere (a calculation
     /// field) lives. `None` when none dies.
-    fn cut(&self, doc: &Document, acro: &Dict, annot_pages: &HashMap<u32, Vec<u32>>, kept: &HashSet<u32>) -> Option<FormCut> {
+    fn cut(&self, doc: &Document, acro: &Dict, annot_pages: &IdMap<u32, Vec<u32>>, kept: &IdSet<u32>) -> Option<FormCut> {
         let fields = &self.fields;
         let widget_dead = |f: &Field| match annot_pages.get(&f.r.num) {
             Some(owners) => !owners.iter().any(|p| kept.contains(p)),
@@ -387,7 +388,7 @@ impl Form {
         // The calculation order names fields; the dead ones go.
         let order = match acro.get("CO").and_then(|c| doc.resolve(c).ok()) {
             Some(Object::Array(order)) => {
-                let gone: HashSet<u32> = dead.iter().copied().collect();
+                let gone: IdSet<u32> = dead.iter().copied().collect();
                 Some(order.into_iter().filter(|o| !matches!(o, Object::Ref(r) if gone.contains(&r.num))).collect())
             }
             _ => None,
@@ -401,10 +402,10 @@ impl Form {
 pub fn form_after_removal(doc: &Document, pages: &[Page], removed: &[u32]) -> Result<Option<FormCut>> {
     let catalog = doc.catalog()?;
     let Some(entry) = catalog.get("AcroForm") else { return Ok(None) };
-    let page_nums: HashSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
+    let page_nums: IdSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
     let (Some(form), Ok(Object::Dict(acro))) = (read_form(doc, entry, &page_nums), doc.resolve(entry)) else { return Ok(None) };
-    let removed: HashSet<u32> = removed.iter().copied().collect();
-    let kept: HashSet<u32> = page_nums.iter().copied().filter(|n| !removed.contains(n)).collect();
+    let removed: IdSet<u32> = removed.iter().copied().collect();
+    let kept: IdSet<u32> = pages.iter().map(|p| p.obj_ref.num).filter(|n| !removed.contains(n)).collect();
     Ok(form.cut(doc, &acro, &annotation_owners(doc, pages), &kept))
 }
 
@@ -447,7 +448,7 @@ fn read_outlines(
     doc: &Document,
     entry: &Object,
     names: &NamedDests,
-    pages: &HashSet<u32>,
+    pages: &IdSet<u32>,
 ) -> Result<Option<Outlines>> {
     let Some(Object::Dict(root)) = doc.resolve(entry).ok() else {
         return Ok(None);
@@ -457,7 +458,7 @@ fn read_outlines(
     };
     let mut items: Vec<Item> = Vec::new();
     let mut top: Vec<usize> = Vec::new();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     let mut cycles = false;
     // The root is not an item: a link that leads back to it is a cycle.
     if let Object::Ref(r) = entry {
@@ -504,7 +505,7 @@ fn read_outlines(
 }
 
 /// The field tree under the catalog's `/AcroForm` `/Fields` (12.7.3).
-fn read_form(doc: &Document, entry: &Object, pages: &HashSet<u32>) -> Option<Form> {
+fn read_form(doc: &Document, entry: &Object, pages: &IdSet<u32>) -> Option<Form> {
     let Object::Dict(acro) = doc.resolve(entry).ok()? else {
         return None;
     };
@@ -513,7 +514,7 @@ fn read_form(doc: &Document, entry: &Object, pages: &HashSet<u32>) -> Option<For
     };
     let mut fields: Vec<Field> = Vec::new();
     let mut top: Vec<usize> = Vec::new();
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     // Pushed in reverse so that they come out in the order of the file.
     let mut stack: Vec<(ObjRef, Option<usize>)> = Vec::new();
     for root in roots.iter().rev() {
@@ -749,7 +750,7 @@ mod tests {
         let doc = open(out.data);
         let root_ref = doc.catalog().unwrap().get("Outlines").and_then(Object::as_obj_ref).unwrap();
         // Walk the way a reader (qpdf) does: no item may be met twice, and none may lead to the root.
-        let mut seen: HashSet<u32> = HashSet::new();
+        let mut seen: IdSet<u32> = IdSet::new();
         seen.insert(root_ref.num);
         let mut titles: Vec<String> = Vec::new();
         let mut stack: Vec<ObjRef> = vec![dict_of(&doc, &Object::Ref(root_ref)).get("First").and_then(Object::as_obj_ref).unwrap()];
@@ -917,7 +918,7 @@ mod tests {
         let expected = (0..130).filter(|i| i % 3 != 1).count();
         assert_eq!(names.tree().len(), expected);
         let pages = doc.pages().unwrap();
-        let page_nums: HashSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
+        let page_nums: IdSet<u32> = pages.iter().map(|p| p.obj_ref.num).collect();
         for (key, _) in names.tree() {
             let array = names.lookup(&doc, key, false).unwrap().unwrap();
             assert!(dests::array_page(&array, &page_nums).is_some(), "{}", String::from_utf8_lossy(key));

@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use crate::idmap::{IdMap, IdSet};
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::object::{Dict, ObjRef, Object, Stream};
@@ -172,13 +173,13 @@ struct Form {
 /// What looking at every object of the file found.
 struct Survey {
     /// Object number -> the number of the object it is the same as (the first of them met).
-    merged: HashMap<u32, u32>,
+    merged: IdMap<u32, u32>,
     /// The picture streams (numbers of the objects that stay), the forms, a picture's soft mask, and how many pictures name a mask.
     images: Vec<u32>,
-    image_set: HashSet<u32>,
-    forms: HashMap<u32, Form>,
-    masks: HashMap<u32, u32>,
-    mask_users: HashMap<u32, u32>,
+    image_set: IdSet<u32>,
+    forms: IdMap<u32, Form>,
+    masks: IdMap<u32, u32>,
+    mask_users: IdMap<u32, u32>,
 }
 
 impl Survey {
@@ -358,11 +359,11 @@ fn really_same(doc: &Document, rep: u32, frame: &Frame, class: &dyn Fn(u32) -> u
 /// Look at every object that can be reached from the catalog and the information dictionary, children before the objects that name
 /// them, and find the ones that are the same as others.
 fn survey(doc: &Document, work: &Work, ctl: &Control<'_>) -> Result<Survey> {
-    let mut out = Survey { merged: HashMap::new(), images: Vec::new(), image_set: HashSet::new(), forms: HashMap::new(), masks: HashMap::new(), mask_users: HashMap::new() };
+    let mut out = Survey { merged: IdMap::new(), images: Vec::new(), image_set: IdSet::new(), forms: IdMap::new(), masks: IdMap::new(), mask_users: IdMap::new() };
     let (mut done, mut open) = (Bits::default(), Bits::default());
     let mut table: HashMap<u128, u32> = HashMap::new();
     // Objects that something reached through them leads back to.
-    let mut cyclic: HashSet<u32> = HashSet::new();
+    let mut cyclic: IdSet<u32> = IdSet::new();
     let total = f64::from(doc.next_free_number().max(1));
     let mut looked = 0u32;
     let roots: Vec<ObjRef> = ["Root", "Info"].iter().filter_map(|k| doc.trailer().get(k).and_then(Object::as_obj_ref)).collect();
@@ -423,7 +424,7 @@ fn survey(doc: &Document, work: &Work, ctl: &Control<'_>) -> Result<Survey> {
                         if let Some(Object::Ref(m)) = s.dict.get("SMask") {
                             let m = class(m.num);
                             out.masks.insert(rep, m);
-                            *out.mask_users.entry(m).or_insert(0) += 1;
+                            out.mask_users.update(m, 0, |n| *n += 1);
                         }
                     }
                     Some(n) if n == "Form" => {
@@ -458,12 +459,12 @@ struct Walk<'a> {
     doc: &'a Document,
     survey: &'a Survey,
     work: &'a Work,
-    uses: HashMap<u32, Use>,
+    uses: IdMap<u32, Use>,
     /// The forms walked at a size already, and the ones whose resources were looked at for what draws pictures where nothing can measure.
     seen: HashSet<(u32, [i64; 4])>,
-    scanned: HashSet<u32>,
-    names: HashMap<u32, Names>,
-    contents: HashMap<u32, Rc<Vec<u8>>>,
+    scanned: IdSet<u32>,
+    names: IdMap<u32, Names>,
+    contents: IdMap<u32, Rc<Vec<u8>>>,
     content_bytes: usize,
     /// The operators a page may run (forms included); every page starts again, the work meter bounds the whole.
     ops_limit: usize,
@@ -472,7 +473,7 @@ struct Walk<'a> {
 
 impl<'a> Walk<'a> {
     fn new(doc: &'a Document, survey: &'a Survey, work: &'a Work) -> Walk<'a> {
-        Walk { doc, survey, work, uses: HashMap::new(), seen: HashSet::new(), scanned: HashSet::new(), names: HashMap::new(), contents: HashMap::new(), content_bytes: 0, ops_limit: MAX_WALK_OPS, ops_left: MAX_WALK_OPS }
+        Walk { doc, survey, work, uses: IdMap::new(), seen: HashSet::new(), scanned: IdSet::new(), names: IdMap::new(), contents: IdMap::new(), content_bytes: 0, ops_limit: MAX_WALK_OPS, ops_left: MAX_WALK_OPS }
     }
 
     /// The `/XObject` names of `resources`.
@@ -500,13 +501,14 @@ impl<'a> Walk<'a> {
     }
 
     fn note(&mut self, picture: u32, ctm: &Matrix, pinned: bool) {
-        let u = self.uses.entry(picture).or_default();
-        if pinned {
-            u.pinned = true;
-        } else {
-            u.w = u.w.max(ctm[0].hypot(ctm[1]));
-            u.h = u.h.max(ctm[2].hypot(ctm[3]));
-        }
+        self.uses.update(picture, Use::default(), |u| {
+            if pinned {
+                u.pinned = true;
+            } else {
+                u.w = u.w.max(ctm[0].hypot(ctm[1]));
+                u.h = u.h.max(ctm[2].hypot(ctm[3]));
+            }
+        });
     }
 
     /// The decoded content of the form `num`, kept for the next time while there is room.
@@ -831,7 +833,7 @@ fn colour_transform_is_off(dict: &Dict) -> bool {
 }
 
 /// The job for the picture `num`, if it can be made smaller exactly as far as the preset says: what it is, what it is drawn at.
-fn picture_job(doc: &Document, survey: &Survey, uses: &HashMap<u32, Use>, num: u32, how: &Options) -> Option<Job> {
+fn picture_job(doc: &Document, survey: &Survey, uses: &IdMap<u32, Use>, num: u32, how: &Options) -> Option<Job> {
     let u = uses.get(&num).filter(|u| !u.pinned && u.w > 0.0 && u.h > 0.0)?;
     // (A picture that is the soft mask of another is changed with that one, or not at all.)
     if survey.mask_users.contains_key(&num) {
@@ -932,12 +934,12 @@ fn run_batch(jobs: Vec<(u32, Job)>, threads: usize, work: &Work) -> Vec<(u32, Re
 fn shrink_pictures(
     doc: &Document,
     survey: &Survey,
-    uses: &HashMap<u32, Use>,
+    uses: &IdMap<u32, Use>,
     how: &Options,
     work: &Work,
     ctl: &Control<'_>,
     warnings: &mut Vec<Warning>,
-) -> Result<(HashMap<u32, Object>, u32)> {
+) -> Result<(IdMap<u32, Object>, u32)> {
     let threads = thread_count(how);
     let total = survey.images.len().max(1);
     let (mut batch, mut held) = (Vec::new(), 0u64);
@@ -964,7 +966,7 @@ fn shrink_pictures(
     if work.was_cancelled() {
         return Err(Error::Cancelled);
     }
-    let mut replaced = HashMap::new();
+    let mut replaced = IdMap::new();
     let mut count = 0u32;
     let mut limit = false;
     for (num, result) in results {
@@ -1024,7 +1026,7 @@ pub fn compress(doc: &Document, password: &str, how: &Options, ctl: &Control<'_>
     (ctl.progress)(0);
     let found = survey(doc, &work, ctl)?;
     let mut warnings = Vec::new();
-    let mut replaced = HashMap::new();
+    let mut replaced = IdMap::new();
     let mut pictures = 0;
     if !how.lossless_only && !found.images.is_empty() {
         (ctl.progress)(23);

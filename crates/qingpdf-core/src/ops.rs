@@ -15,8 +15,8 @@
 //! Only [`decrypt`] writes a file without it, and [`protect`] writes one under a new encryption.
 
 use std::cell::{Cell, OnceCell};
-use std::collections::HashSet;
 
+use crate::idmap::{IdMap, IdSet};
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
 use crate::image::{self, Format, PageMode};
@@ -116,8 +116,8 @@ pub(crate) enum Encrypt {
 /// What compressing asks of [`build`]: the objects that are the same as others (a number -> the number it is merged into), the objects whose
 /// content is made elsewhere (smaller pictures), and what is done to every stream on its way into the file.
 pub(crate) struct Tune<'t> {
-    pub merged: std::collections::HashMap<u32, u32>,
-    pub replaced: std::collections::HashMap<u32, Object>,
+    pub merged: IdMap<u32, u32>,
+    pub replaced: IdMap<u32, Object>,
     pub tidy: crate::writer::Tidy<'t>,
     /// Pack the objects into object streams and write a cross-reference stream (PDF 1.5); not for a file that says it is PDF/A-1.
     pub pack: bool,
@@ -135,7 +135,7 @@ pub(crate) struct Pick {
 pub(crate) struct Loaded<'a> {
     pub doc: &'a Document,
     pub pages: Vec<Page>,
-    pub page_nums: HashSet<u32>,
+    pub page_nums: IdSet<u32>,
     /// What the document-level structures say about the pages; read the first
     /// time a subset of the pages is cut out, then reused (splitting into many
     /// files cuts the same structures again and again).
@@ -188,7 +188,7 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
         version = version.max((1, 5));
     }
     // The pages of the first document that stay, by object number.
-    let kept: HashSet<u32> =
+    let kept: IdSet<u32> =
         picks.iter().filter(|p| p.doc == 0).filter_map(|p| base.pages.get(p.page)).map(|p| p.obj_ref.num).collect();
     let subset = kept.len() < base.page_nums.len();
 
@@ -433,7 +433,7 @@ pub fn extract_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
 /// A new file without the pages `pages` (0-based indices).
 pub fn delete_pages(doc: &Document, pages: &[usize]) -> Result<Output> {
     let d = load(doc)?;
-    let gone: HashSet<usize> = pages.iter().copied().collect();
+    let gone: IdSet<usize> = pages.iter().copied().collect();
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).filter(|p| !gone.contains(&p.page)).collect();
     if picks.is_empty() {
         return Err(Error::Invalid("that would delete every page".to_string()));
@@ -448,7 +448,7 @@ pub fn rotate_pages(doc: &Document, pages: &[usize], angle: i64) -> Result<Outpu
         return Err(Error::Invalid(format!("the angle must be a multiple of 90, not {angle}")));
     }
     let d = load(doc)?;
-    let turn: HashSet<usize> = pages.iter().copied().collect();
+    let turn: IdSet<usize> = pages.iter().copied().collect();
     let picks: Vec<Pick> = all_picks(0, d.pages.len())
         .map(|mut p| {
             if turn.contains(&p.page) {
@@ -1851,7 +1851,7 @@ mod tests {
         }
         // And the writer keeps made-up objects out of the file's own namespace:
         // asking for a reference to an object of the file above the limit gives nothing.
-        let pages = HashSet::new();
+        let pages = IdSet::new();
         let mut builder = Builder::new((1, 4));
         let source = builder.add_source(&src, &pages);
         let made = builder.define_object(source, Object::Integer(7)).unwrap();

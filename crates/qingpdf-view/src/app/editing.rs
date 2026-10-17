@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use qingpdf_core::idmap::IdMap;
 use qingpdf_core::view::{ALL_PAGES, AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, line_rects};
 
 use super::forms::FormState;
@@ -104,11 +105,11 @@ pub(super) struct EditState {
     pub author: String,
     pub(super) ink: Option<InkDraft>,
     /// The annotations of the pages near the window, and the engine's requests for them (request, page).
-    pub(super) annots: HashMap<u32, Vec<AnnotInfo>>,
-    annots_asked: HashMap<u64, u32>,
+    pub(super) annots: IdMap<u32, Vec<AnnotInfo>>,
+    annots_asked: IdMap<u64, u32>,
     /// The annotation picked: its page and its place in that page's list.
     pub(super) picked: Option<(u32, usize)>,
-    pub(super) asked: HashMap<u64, Asked>,
+    pub(super) asked: IdMap<u64, Asked>,
     pub can_undo: bool,
     pub can_redo: bool,
     pub dirty: bool,
@@ -138,10 +139,10 @@ impl EditState {
             width: DEFAULT_WIDTH,
             author,
             ink: None,
-            annots: HashMap::new(),
-            annots_asked: HashMap::new(),
+            annots: IdMap::new(),
+            annots_asked: IdMap::new(),
             picked: None,
-            asked: HashMap::new(),
+            asked: IdMap::new(),
             can_undo: false,
             can_redo: false,
             dirty: false,

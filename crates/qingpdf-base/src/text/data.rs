@@ -5,10 +5,11 @@
 //! Sources: Adobe's cmap-resources and agl-aglfn (BSD-3-Clause, see
 //! `third_party/`); the simple-font encodings are ISO 32000-1 Annex D.
 
-use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use miniz_oxide::inflate::decompress_to_vec_zlib_with_limit;
+
+use crate::idmap::IdMap;
 
 use super::cmap::{CMap, CidRange, CodeSpace, Kind};
 
@@ -46,7 +47,7 @@ static CJK_NORM_BLOB: &[u8] = include_bytes!("../../data/text/cjknorm.bin");
 static CJK_NORM: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
 
 static CID_TO_UNI: [OnceLock<Vec<u32>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
-static UNI_TO_CID: [OnceLock<HashMap<u32, u32>>; 4] =
+static UNI_TO_CID: [OnceLock<IdMap<u32, u32>>; 4] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 static CMAP_SETS: [OnceLock<Vec<Arc<CMap>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 static AGL: OnceLock<Agl> = OnceLock::new();
@@ -94,17 +95,17 @@ impl Ordering {
     pub fn unicode_to_cid(self, cp: u32) -> Option<u32> {
         let i = self.index();
         let map = UNI_TO_CID.get(i)?.get_or_init(|| {
-            let mut map = HashMap::new();
+            let mut map = IdMap::new();
             for (cid, &cp) in self.cid_table().iter().enumerate() {
                 if cp != 0 {
-                    map.entry(cp).or_insert(u32::try_from(cid).unwrap_or(0));
+                    map.insert_first(cp, u32::try_from(cid).unwrap_or(0));
                 }
             }
             // The table gives some characters as the Kangxi radical they are also written as (the CID of 子 and 香 is of the
             // radical's code point): the ideograph itself finds that CID too.
             for (cid, &cp) in self.cid_table().iter().enumerate() {
                 if cp != 0 {
-                    map.entry(normalize_cjk(cp)).or_insert(u32::try_from(cid).unwrap_or(0));
+                    map.insert_first(normalize_cjk(cp), u32::try_from(cid).unwrap_or(0));
                 }
             }
             map

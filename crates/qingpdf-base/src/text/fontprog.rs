@@ -17,7 +17,7 @@
 //! size of the data or by a fixed limit, and a program that does not fit is an
 //! error: the caller carries on with the encoding it would have used anyway.
 
-use std::collections::HashMap;
+use crate::idmap::IdMap;
 
 use super::cmap::Uni;
 use super::data;
@@ -776,13 +776,17 @@ fn truetype(d: &[u8]) -> Res<Table> {
         return Ok(table);
     }
     // The Unicode value of a glyph: the reversed Unicode cmap (lowest code wins), else its name.
-    let mut reverse: HashMap<u16, u32> = HashMap::new();
+    let mut reverse: IdMap<u16, u32> = IdMap::new();
     let unicode_sub = find_sub(3, 10).or_else(|| find_sub(3, 1)).or_else(|| subs.iter().find(|s| s.platform == 0));
     if let Some(s) = unicode_sub {
         let mut left = MAX_CMAP_VISITS;
         cmap_enumerate(cmap, s.off, &mut left, &mut |code, gid| {
-            let entry = reverse.entry(gid).or_insert(code);
-            *entry = (*entry).min(code);
+            match reverse.get_mut(&gid) {
+                Some(entry) => *entry = (*entry).min(code),
+                None => {
+                    reverse.insert(gid, code);
+                }
+            }
         });
     }
     let post = sfnt_table(d, b"post").and_then(Post::parse);

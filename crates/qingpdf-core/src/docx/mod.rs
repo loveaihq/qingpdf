@@ -17,7 +17,6 @@
 mod flow;
 mod write;
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,6 +26,7 @@ use qingpdf_base::render::export::{decode_image, png};
 use qingpdf_base::render::work::{PAGE_WORK, Work};
 use qingpdf_base::text::{self, ImagePlace, TextExtractor};
 
+use crate::idmap::IdMap;
 use crate::object::{Dict, Object, Stream};
 use crate::{Document, Error, ObjRef, Result};
 
@@ -148,7 +148,7 @@ pub fn export_to_path(doc: &Document, password: &str, pages: Option<&[usize]>, p
 #[derive(Default)]
 struct Images {
     /// By the image's object: the number of its file in the package and its extension (`None`: not usable, not tried again).
-    seen: HashMap<ObjRef, Option<(usize, &'static str)>>,
+    seen: IdMap<ObjRef, Option<(usize, &'static str)>>,
     /// The numbers and extensions of the files, for the relationships.
     files: Vec<&'static str>,
 }

@@ -14,11 +14,11 @@
 //! that left the drawing to the reader (`NeedAppearances`, or just no `/AP`).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Write;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+use crate::idmap::IdMap;
 use crate::layout::{self, Da, Face, Spec, Style, reals};
 use crate::document::Document;
 use crate::object::{Dict, Object, Stream};
@@ -103,8 +103,8 @@ pub struct AcroForm {
 /// and the fields of a form that inherit from one parent, share them instead of reading and parsing them again each.
 #[derive(Default)]
 struct Cache {
-    das: HashMap<u32, Rc<Da>>,
-    opts: HashMap<u32, Rc<Options>>,
+    das: IdMap<u32, Rc<Da>>,
+    opts: IdMap<u32, Rc<Options>>,
     bytes: usize,
 }
 

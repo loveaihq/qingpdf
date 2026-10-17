@@ -17,7 +17,6 @@
 //! 994,816 bytes it was before the text tables. Memory (target 200 MB) is
 //! measured from outside: `python measure.py -- qingpdf.exe text <file> -o <out>`.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -521,7 +520,7 @@ fn encrypted() -> Result<bool, String> {
     ] {
         let source = Document::open(dir.join(file)).map_err(|e| e.to_string())?;
         let build = |encrypt: bool| -> Result<(Vec<u8>, ObjRef), String> {
-            let pages = HashSet::new();
+            let pages = qingpdf_core::idmap::IdSet::new();
             let mut b = Builder::new((1, 7));
             let src = b.add_source(&source, &pages);
             if encrypt {
@@ -644,7 +643,10 @@ fn main() -> Result<(), String> {
     println!("  merged file: {merged_pages} pages, {:.1} MB", std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) as f64 / 1e6);
 
     // size of the program: 3,207,680 bytes before the second slimming (2026-10-15; over the 3 MB, as the slimming before it left it),
-    // 3,130,368 after it (docs/decisions.md, "瘦身第二次"). The reader, qingpdf-view.exe, has a limit of 3.6 MB of its own (3,447,296 after).
+    // 3,130,368 after it (docs/decisions.md, "瘦身第二次"), 3,282,944 with the compression of 2026-10-16 in it and 3,169,792 after
+    // the third slimming ("瘦身第三次"; the line below was over before it as well, and is still 24,064 over).
+    // The reader, qingpdf-view.exe, has a limit of 3.6 MB of its own: 3,447,296 after the second slimming, 3,594,752 with the
+    // compression, 3,458,560 after the third.
     let bytes = std::fs::metadata(&program).map_err(|e| e.to_string())?.len();
     let size_ok = bytes <= 3 * 1024 * 1024;
     println!("qingpdf.exe size:           {bytes} bytes = {:.2} MB  (target <= 3 MB)  {}", bytes as f64 / 1_048_576.0, verdict(size_ok));

@@ -6,11 +6,11 @@
 //! OCMD (an OCMD that names itself, say) simply counts for nothing.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 
 use crate::document::Document;
+use crate::idmap::{IdMap, IdSet};
 use crate::object::{Dict, ObjRef, Object};
-use crate::text::interp::FxMap;
+use crate::text::interp::FxKeyMap;
 
 use super::work::{Work, cost};
 
@@ -43,14 +43,14 @@ pub(crate) struct OcConfig {
     /// The document has `/OCProperties`; without them everything is shown.
     present: bool,
     base_on: bool,
-    on: HashSet<ObjRef>,
-    off: HashSet<ObjRef>,
+    on: IdSet<ObjRef>,
+    off: IdSet<ObjRef>,
     /// Groups an automatic state (`/AS` with the event `View`) sets, and to what.
-    auto_view: HashMap<ObjRef, bool>,
+    auto_view: IdMap<ObjRef, bool>,
     /// Whether a group or a membership dictionary is shown, by object: (it is a group, it is shown).
-    states: RefCell<FxMap<ObjRef, (bool, bool)>>,
+    states: RefCell<IdMap<ObjRef, (bool, bool)>>,
     /// The same for the membership dictionaries that are written in place (see [`direct_key`]), for the page being drawn.
-    direct: RefCell<FxMap<Vec<u8>, bool>>,
+    direct: RefCell<FxKeyMap<Vec<u8>, bool>>,
 }
 
 fn refs_of(doc: &Document, obj: Option<&Object>) -> Vec<ObjRef> {
@@ -67,11 +67,11 @@ impl OcConfig {
         let mut config = OcConfig {
             present: false,
             base_on: true,
-            on: HashSet::new(),
-            off: HashSet::new(),
-            auto_view: HashMap::new(),
-            states: RefCell::new(FxMap::default()),
-            direct: RefCell::new(FxMap::default()),
+            on: IdSet::new(),
+            off: IdSet::new(),
+            auto_view: IdMap::new(),
+            states: RefCell::new(IdMap::new()),
+            direct: RefCell::new(FxKeyMap::default()),
         };
         let Ok(catalog) = doc.catalog() else { return config };
         let Some(Ok(Object::Dict(props))) = catalog.get("OCProperties").map(|o| doc.resolve(o)) else { return config };
@@ -80,8 +80,12 @@ impl OcConfig {
         if let Some(Ok(Object::Name(n))) = d.get("BaseState").map(|o| doc.resolve(o)) {
             config.base_on = n.as_bytes() != b"OFF";
         }
-        config.on = refs_of(doc, d.get("ON")).into_iter().collect();
-        config.off = refs_of(doc, d.get("OFF")).into_iter().collect();
+        for r in refs_of(doc, d.get("ON")) {
+            config.on.insert(r);
+        }
+        for r in refs_of(doc, d.get("OFF")) {
+            config.off.insert(r);
+        }
         // 8.11.4.4: an automatic state says that, for the event `View`, the groups of the listed categories follow
         // the `ViewState` of their usage dictionaries.
         if let Some(Ok(Object::Array(auto))) = d.get("AS").map(|o| doc.resolve(o)) {

@@ -35,7 +35,6 @@ mod tests_hostile;
 mod tests_text;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use bitmap::{Bitmap, Op};
@@ -44,6 +43,7 @@ use huffman::Table;
 use super::mq::Mq;
 use super::work::{Work, cost};
 use crate::error::{Error, Result};
+use crate::idmap::IdMap;
 use crate::object::ObjRef;
 
 /// A fault of this image (not of the page's budget).
@@ -259,7 +259,7 @@ struct PageState {
 /// The segments of a `/JBIG2Globals` stream, decoded: the images of a page that name the same stream share them
 /// (they would otherwise decode it again each, and a page of many crops of one scan would use its work up on that).
 pub(crate) struct Globals {
-    segments: HashMap<u32, Stored>,
+    segments: IdMap<u32, Stored>,
     /// Segments, to count them against the limit of the image.
     count: usize,
     warnings: Vec<String>,
@@ -270,7 +270,7 @@ pub(crate) struct Globals {
 /// The globals a page has decoded, by the object that is their stream. Bounded by the bytes they hold.
 #[derive(Default)]
 pub(crate) struct GlobalsCache {
-    entries: RefCell<HashMap<ObjRef, Rc<Globals>>>,
+    entries: RefCell<IdMap<ObjRef, Rc<Globals>>>,
     bytes: Cell<u64>,
 }
 
@@ -307,7 +307,7 @@ pub(crate) struct GlobalsSource<'a> {
 
 struct Decoder<'a> {
     ctx: &'a Ctx<'a>,
-    segments: HashMap<u32, Stored>,
+    segments: IdMap<u32, Stored>,
     /// The decoded globals, if the image has any that were kept; their segments are looked up after its own.
     globals: Option<Rc<Globals>>,
     page: Option<PageState>,
@@ -666,7 +666,7 @@ pub(crate) fn decode(data: &[u8], globals: Option<&[u8]>, want: (usize, usize), 
 
 fn run<'a>(ctx: &'a Ctx<'a>, data: &[u8], globals: Option<GlobalsSource<'_>>, want: (usize, usize)) -> Result<Page> {
     let work = ctx.work;
-    let mut d = Decoder { ctx, segments: HashMap::new(), globals: None, page: None, want, stripe_end: None, count: 0, warnings: Vec::new(), done: false };
+    let mut d = Decoder { ctx, segments: IdMap::new(), globals: None, page: None, want, stripe_end: None, count: 0, warnings: Vec::new(), done: false };
     if let Some(source) = &globals {
         d.use_globals(source)?;
     }

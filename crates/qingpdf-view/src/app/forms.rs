@@ -3,9 +3,9 @@
 //! system's edit box, so that the input method of Chinese works as everywhere), the list a choice is made from, Tab from field to
 //! field, the frame of a picture that is being placed and the box that is being dragged out for a text box.
 
-use std::collections::HashMap;
 use std::path::Path;
 
+use qingpdf_core::idmap::IdMap;
 use qingpdf_core::view::{FieldInfo, FieldKind, FillValue, LineView, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_TEXT_CHARS, TextStatus, Watermark};
 
 use super::editing::{Asked, Tool};
@@ -66,8 +66,8 @@ enum Grab {
 
 pub(super) struct FormState {
     /// The fields of the pages near the window, and the engine's requests for them (request, page).
-    fields: HashMap<u32, Vec<FieldInfo>>,
-    asked: HashMap<u64, u32>,
+    fields: IdMap<u32, Vec<FieldInfo>>,
+    asked: IdMap<u64, u32>,
     editing: Option<Editing>,
     /// The choice list is open (or about to open) for this field.
     choosing: Option<Choosing>,
@@ -103,7 +103,7 @@ pub(super) const WM_ANGLE: [i32; 3] = [0, 45, 90];
 impl FormState {
     pub(super) fn new() -> FormState {
         let wm = Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false };
-        FormState { fields: HashMap::new(), asked: HashMap::new(), editing: None, choosing: None, dragging: None, stamp: None, line_ask: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE, content: false, wm }
+        FormState { fields: IdMap::new(), asked: IdMap::new(), editing: None, choosing: None, dragging: None, stamp: None, line_ask: None, grab: None, picking: false, text_size: DEFAULT_TEXT_SIZE, content: false, wm }
     }
 
     pub(super) fn drop_page(&mut self, page: u32) {
@@ -751,7 +751,7 @@ mod tests {
     }
 
     fn centre(app: &App, index: usize) -> (i32, i32) {
-        let f = &app.edit.forms.fields[&0][index];
+        let f = &app.edit.forms.fields.get(&0).unwrap()[index];
         let r = app.window_rect(0, f.rect).expect("the field is on the window");
         (r.x + r.w / 2, r.y + r.h / 2)
     }
@@ -788,7 +788,7 @@ mod tests {
         app.open_path(&file, "");
         pump(&mut app, "the file to open", |a| a.has_document());
         pump(&mut app, "the fields", |a| a.edit.forms.fields.contains_key(&0));
-        assert_eq!(app.edit.forms.fields[&0].len(), 4);
+        assert_eq!(app.edit.forms.fields.get(&0).unwrap().len(), 4);
 
         // A click on the first field opens the box for one line, empty; Tab keeps what was typed and opens the next field's box, with
         // what that has in it.

@@ -2,7 +2,6 @@
 //! pages; and hostile ones (truncated tables, offsets out of range, composite glyphs that include themselves, subroutine loops,
 //! charstrings that never end, garbage where the encrypted part should be) that must be errors or nothing, quickly.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1162,7 +1161,7 @@ fn gbk_pairs_apply_only_to_fonts_with_no_program_at_all() {
     let dict = "/Subtype /TrueType /BaseFont /#CB#CE#CC#E5 /FirstChar 65 /LastChar 65 /Widths [500]";
     let gbk_pairs = |doc: &super::Document| {
         let Object::Dict(d) = doc.get(ObjRef::new(5, 0)).unwrap() else { panic!("no font dictionary") };
-        let font = Font::load(doc, &d, &mut HashMap::new(), &mut Warnings::default());
+        let font = Font::load(doc, &d, &mut crate::keymap::KeyMap::new(), &mut Warnings::default());
         GlyphSource::new(doc, &d, &font).gbk_pairs
     };
     let font = format!("<< /Type /Font {dict} /FontDescriptor 6 0 R >>");

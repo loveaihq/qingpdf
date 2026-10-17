@@ -6,11 +6,12 @@ use std::rc::Rc;
 
 use crate::document::{Document, Page};
 use crate::error::{Error, Result};
+use crate::idmap::IdSet;
 use crate::object::{Dict, ObjRef, Object};
 use crate::render::work::{Work, cost};
 
 use super::font::Font;
-use super::interp::{FxMap, FxSet, Glyph, Interp, Scope, Shared, spent};
+use super::interp::{FxMap, Glyph, Interp, Scope, Shared, spent};
 use super::layout::{self, Mark};
 
 /// Most content streams (the page's own and forms) one page may be read with, and fonts it may switch between.
@@ -285,7 +286,7 @@ impl<'a> EditScanner<'a> {
             return Err(spent(work));
         }
         let content = Rc::new(content);
-        let (mut seen, mut twice): (FxSet<ObjRef>, FxSet<ObjRef>) = (FxSet::default(), FxSet::default());
+        let (mut seen, mut twice): (IdSet<ObjRef>, IdSet<ObjRef>) = (IdSet::default(), IdSet::default());
         for r in streams.iter().filter_map(|s| s.2) {
             if !seen.insert(r) {
                 twice.insert(r);

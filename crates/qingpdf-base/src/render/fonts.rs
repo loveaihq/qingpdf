@@ -17,7 +17,7 @@ use crate::object::{Dict, ObjRef, Object};
 use crate::text::data::{self, Ordering};
 use crate::text::font::{Font, Shown, Warnings};
 use crate::text::fontprog;
-use crate::text::interp::FxMap;
+use crate::idmap::IdMap;
 
 use super::cff::CffFont;
 use super::glyf::{Cmap, TtFont};
@@ -91,7 +91,7 @@ pub(crate) struct Budget {
     work: Rc<Cell<usize>>,
     read: Rc<Cell<usize>>,
     /// The programs alive, by the stream they were read from: fonts that share a FontFile share its parse.
-    held: Rc<RefCell<FxMap<ObjRef, Weak<Held>>>>,
+    held: Rc<RefCell<IdMap<ObjRef, Weak<Held>>>>,
 }
 
 impl Budget {
@@ -335,7 +335,7 @@ pub(crate) struct Loaded {
     pub substituted: bool,
     name: String,
     serial: u32,
-    cache: RefCell<FxMap<u64, Lookup>>,
+    cache: RefCell<IdMap<u64, Lookup>>,
     cache_bytes: Cell<usize>,
     error: Cell<Option<&'static str>>,
     /// The font is a "tricky" TrueType font: its glyphs are made with their instructions run (3b2).
@@ -394,7 +394,7 @@ impl Loaded {
             substituted,
             name: plan.name.clone(),
             serial: SERIAL.fetch_add(1, AtomicOrdering::Relaxed),
-            cache: RefCell::new(FxMap::default()),
+            cache: RefCell::new(IdMap::default()),
             cache_bytes: Cell::new(0),
             error: Cell::new(None),
             hinted,

@@ -3,10 +3,10 @@
 //! (7.5.6), hybrid files (7.5.8.4) and object streams (7.5.7).
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
 use crate::filter::{self, DecodeBudget, MAX_DECODED_SIZE};
+use crate::idmap::{IdMap, IdSet};
 use crate::lexer::{Lexer, Token, offset_u64, rfind_bytes};
 use crate::object::{Dict, Object};
 use crate::parser::{Parser, PlainHelper, StreamHelper};
@@ -306,7 +306,7 @@ pub fn read_xref_budgeted(data: &[u8], budget: &DecodeBudget) -> Result<XrefData
     let mut rows = RowBudget(MAX_OBJECTS);
     let mut trailer: Option<Dict> = None;
     let mut uses_xref_streams = false;
-    let mut seen: HashSet<usize> = HashSet::new();
+    let mut seen: IdSet<usize> = IdSet::new();
     // (offset, is this a cross-reference stream named by /XRefStm)
     let mut pending: Vec<(usize, bool)> = vec![(start, false)];
 
@@ -596,7 +596,7 @@ pub struct ObjStm {
     /// (object number, absolute offset into `data`), in stream order.
     pairs: Vec<(u32, usize)>,
     /// First position in `pairs` of each object number.
-    by_num: OnceCell<HashMap<u32, usize>>,
+    by_num: OnceCell<IdMap<u32, usize>>,
 }
 
 impl ObjStm {
@@ -666,11 +666,13 @@ impl ObjStm {
 
     /// Where each object number first appears in `pairs`, made the first time
     /// an index hint is wrong (usually it is right, and this is never made).
-    fn by_number(&self) -> &HashMap<u32, usize> {
+    fn by_number(&self) -> &IdMap<u32, usize> {
         self.by_num.get_or_init(|| {
-            let mut map: HashMap<u32, usize> = HashMap::with_capacity(self.pairs.len());
+            let mut map: IdMap<u32, usize> = IdMap::new();
             for (i, &(num, _)) in self.pairs.iter().enumerate() {
-                map.entry(num).or_insert(i);
+                if !map.contains_key(&num) {
+                    map.insert(num, i);
+                }
             }
             map
         })

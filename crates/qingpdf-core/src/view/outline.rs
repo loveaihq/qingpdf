@@ -4,8 +4,8 @@
 //! The file is not trusted: the number of items and their depth are capped, a chain that comes back to an item it has been
 //! at ends there, the titles are cut, and every item is charged to the work meter by what reading it cost.
 
-use std::collections::{HashMap, HashSet};
 
+use crate::idmap::{IdMap, IdSet};
 use crate::dests;
 use crate::document::{Document, Page};
 use crate::info::decode_text_string;
@@ -46,7 +46,7 @@ pub(super) struct Outline {
 }
 
 /// The bookmarks of `doc`. Stops early (with what was read) when `work` is spent or cancelled.
-pub(super) fn read(doc: &Document, pages: &[Page], index: &HashMap<u32, u32>, names: &Names<'_>, work: &Work) -> Outline {
+pub(super) fn read(doc: &Document, pages: &[Page], index: &IdMap<u32, u32>, names: &Names<'_>, work: &Work) -> Outline {
     let mut out = Outline { items: Vec::new(), truncated: false };
     let Ok(catalog) = doc.catalog() else { return out };
     let Some(root) = catalog.get("Outlines").and_then(|o| doc.resolve(o).ok()) else { return out };
@@ -54,7 +54,7 @@ pub(super) fn read(doc: &Document, pages: &[Page], index: &HashMap<u32, u32>, na
     let Some(Object::Ref(first)) = root.get("First") else { return out };
     // The object numbers of the items read: an item met twice (a chain that loops, a child that is also a sibling) is not
     // followed again.
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut seen: IdSet<u32> = IdSet::new();
     if let Some(Object::Ref(r)) = catalog.get("Outlines") {
         seen.insert(r.num);
     }
