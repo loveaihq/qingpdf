@@ -281,6 +281,11 @@ impl Object {
         }
     }
 
+    /// The flags (`/F` of an annotation) the way the renderer reads them: an integer, or a real with its fraction cut off; none if it is not a number.
+    pub fn as_flags(&self) -> i64 {
+        self.as_f64().map_or(0, |v| v as i64)
+    }
+
     /// Integers and reals both count as numbers (7.3.3).
     pub fn as_f64(&self) -> Option<f64> {
         match self {

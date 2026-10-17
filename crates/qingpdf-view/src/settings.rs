@@ -1,7 +1,7 @@
 //! What the reader keeps between runs, in one small UTF-8 text file, `%APPDATA%\qingpdf\author.txt` (the name it has had since the
 //! name put on the annotations, 4a, was kept there). The first line is that name, as it always was, so that an older build still reads
 //! it; the lines after it are `key=value` settings: `lang` (`system`, `zh` or `en`), `toolbar` (`1` or `0`), `sidebar` (the width of
-//! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks` or `pages`: the tab of the sidebar last used) and `window` (`x,y,w,h,maximized`, see [`Placement`]). Nothing is sent anywhere. The file is
+//! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks`, `pages` or `annots`: the tab of the sidebar last used) and `window` (`x,y,w,h,maximized`, see [`Placement`]). Nothing is sent anywhere. The file is
 //! not trusted (another program may have written it): a name that is too long or has control characters in it is not used, a setting
 //! that is not understood or is out of range is ignored.
 

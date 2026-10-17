@@ -153,7 +153,7 @@ impl Interp<'_> {
         if subtype.as_deref() == Some(b"Popup") {
             return Ok(());
         }
-        let flags = d.get("F").and_then(|o| self.work.read(doc, o)).and_then(|o| o.as_f64()).map_or(0, |v| v as i64);
+        let flags = d.get("F").and_then(|o| self.work.read(doc, o)).map_or(0, |o| o.as_flags());
         if flags & (FLAG_HIDDEN | FLAG_NO_VIEW) != 0 {
             return Ok(());
         }

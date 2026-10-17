@@ -123,7 +123,8 @@ pub enum Event {
     /// The left button went down, moved (with it down) or came up, at this place in the client area.
     /// `clicks` says which click in a row this is (1, 2 or 3: a double click selects a word, a triple click a line).
     MouseDown { x: i32, y: i32, ctrl: bool, shift: bool, clicks: u8 },
-    MouseMove { x: i32, y: i32 },
+    /// (`shift`: Shift is held, which keeps a shape being dragged out square, round or at a multiple of 45 degrees.)
+    MouseMove { x: i32, y: i32, shift: bool },
     MouseUp { x: i32, y: i32 },
     /// The window lost the mouse while the button was down (another window took it).
     MouseLost,
@@ -324,6 +325,10 @@ pub enum Cursor {
     Text,
     /// Over the edge of the bookmarks, which can be dragged to make them wider or narrower.
     SizeWE,
+    /// Over an annotation that is picked (it is moved by dragging), and over its corners (it is resized by dragging them).
+    Move,
+    SizeNWSE,
+    SizeNESW,
 }
 
 /// What the reader asks the window to do (after it has finished with an event).
@@ -344,8 +349,9 @@ pub enum Action {
     /// person says otherwise).
     AskSave { tag: u32, title: String, text: String },
     /// Ask for a line of text in a box of its own; the answer comes as [`Event::Text`] with the same `tag`. A
-    /// `secret` is shown as dots, and what is typed is wiped from the window's memory once it has been handed over.
-    AskText { tag: u32, title: String, prompt: String, secret: bool, ok: String, cancel: String },
+    /// `secret` is shown as dots, and what is typed is wiped from the window's memory once it has been handed over. The line starts as `initial`
+    /// (selected, so that typing replaces it).
+    AskText { tag: u32, title: String, prompt: String, secret: bool, initial: String, ok: String, cancel: String },
     /// Ask for several things in a box of its own; the answer comes as [`Event::Form`] with the same tag.
     AskForm(FormSpec),
     Message { title: String, text: String },

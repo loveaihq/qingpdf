@@ -11,6 +11,7 @@ use crate::object::{Object, PdfString};
 use crate::render::work::{Work, cost};
 use crate::text::Shown;
 
+use super::annots;
 use super::targets::{Names, target};
 
 /// Most links one page has in the list; the rest are left out.
@@ -88,7 +89,7 @@ pub(super) fn read(doc: &Document, page: &Page, pages: &[Page], index: &IdMap<u3
             continue;
         }
         // Hidden (bit 2) and not-to-be-viewed (bit 6) annotations are not there for the reader.
-        if d.get_int("F").is_some_and(|f| f & (2 | 32) != 0) {
+        if annots::flags_in(doc, d, work) & (2 | 32) != 0 {
             continue;
         }
         let Some([x0, y0, x1, y1]) = work.rectangle(doc, d.get("Rect")) else { continue };

@@ -594,6 +594,7 @@ const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_CAPTURECHANGED: u32 = 0x0215;
 const WS_CLIPCHILDREN: u32 = 0x0200_0000;
+const MK_SHIFT: usize = 0x0004;
 const MK_LBUTTON: usize = 1;
 const HTCLIENT: u32 = 1;
 const IDC_HAND: usize = 32649;
@@ -691,6 +692,9 @@ const ICON_ID: usize = 1;
 const COLOR_BTNFACE: i32 = 15;
 const SW_SHOWMAXIMIZED: i32 = 3;
 const IDC_SIZEWE: usize = 32644;
+const IDC_SIZEALL: usize = 32646;
+const IDC_SIZENWSE: usize = 32642;
+const IDC_SIZENESW: usize = 32643;
 const TPM_RIGHTBUTTON: u32 = 0x2;
 const CCS_NORESIZE: u32 = 0x4;
 const CCS_NOPARENTALIGN: u32 = 0x8;
@@ -1031,8 +1035,8 @@ fn execute(state: &WindowState, actions: Vec<Action>) {
                 };
                 queue.extend(deliver(state, Event::SaveChoice { tag, choice }));
             }
-            Action::AskText { tag, title, prompt, secret, ok, cancel } => {
-                let text = input_dialog(hwnd, state.dpi.get(), state.font.get(), &title, &prompt, secret, &ok, &cancel);
+            Action::AskText { tag, title, prompt, secret, initial, ok, cancel } => {
+                let text = input_dialog(hwnd, state.dpi.get(), state.font.get(), &title, &prompt, secret, &initial, &ok, &cancel);
                 queue.extend(deliver(state, Event::Text { tag, text }));
             }
             Action::AskForm(spec) => {
@@ -1310,7 +1314,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         WM_MOUSEMOVE => {
             if wparam & MK_LBUTTON != 0 {
                 let (x, y) = mouse_place(lparam);
-                dispatch(state, Event::MouseMove { x, y: y - content_top(state) });
+                dispatch(state, Event::MouseMove { x, y: y - content_top(state), shift: wparam & MK_SHIFT != 0 });
             }
             return 0;
         }
@@ -1343,6 +1347,9 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                 };
                 let id = match shape {
                     Cursor::SizeWE => IDC_SIZEWE,
+                    Cursor::Move => IDC_SIZEALL,
+                    Cursor::SizeNWSE => IDC_SIZENWSE,
+                    Cursor::SizeNESW => IDC_SIZENESW,
                     Cursor::Hand => IDC_HAND,
                     Cursor::Cross => IDC_CROSS,
                     Cursor::Text => IDC_IBEAM,
@@ -2161,12 +2168,12 @@ fn end_modal(owner: isize, dialog: isize) {
 
 /// A box with a line of text to fill in. Modal: it handles messages itself until it is closed.
 #[allow(clippy::too_many_arguments)]
-fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, secret: bool, ok: &str, cancel: &str) -> Option<String> {
+fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, secret: bool, initial: &str, ok: &str, cancel: &str) -> Option<String> {
     let state = DialogState { done: Cell::new(false), accepted: Cell::new(false), pressed: Cell::new(0), sketch: RefCell::new(None) };
     let (dialog, instance) = make_dialog(owner, dpi, title, (380, 138), &state)?;
     let child = |class: &str, text: &str, style: u32, ex: u32, at: (i32, i32, i32, i32), id: usize| dialog_child(dialog, instance, dpi, font, class, text, style, ex, at, id);
     child("STATIC", prompt, 0, 0, (16, 14, 348, 20), 100);
-    let edit = child("EDIT", "", WS_TABSTOP | ES_AUTOHSCROLL | if secret { ES_PASSWORD } else { 0 }, WS_EX_CLIENTEDGE, (16, 38, 348, 24), 101);
+    let edit = child("EDIT", initial, WS_TABSTOP | ES_AUTOHSCROLL | if secret { ES_PASSWORD } else { 0 }, WS_EX_CLIENTEDGE, (16, 38, 348, 24), 101);
     child("BUTTON", ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (176, 88, 90, 28), IDOK);
     child("BUTTON", cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (274, 88, 90, 28), IDCANCEL);
     modal_loop(owner, dialog, &state, edit);

@@ -35,6 +35,8 @@ enum Editing {
     TextBox { page: u32, rect: [f32; 4] },
     /// A line of the page's own text (5a): where it was clicked, what it said and where it is.
     Line { page: u32, at: [f32; 2], old: String, rect: [f32; 4] },
+    /// The text of a text box that is on the page (2026-10-17): its page, its place in the page's list and its number, where it is and what it said.
+    AnnotText { page: u32, index: u32, num: u32, rect: [f32; 4], old: String },
 }
 
 /// A combo box or list that is being chosen from. Its options are not in the list of fields: they are asked for when it is clicked
@@ -277,7 +279,7 @@ impl App {
     // --- the box things are typed in -------------------------------------------------------------------------------
 
     /// A rectangle of the page (points) as a rectangle of the window (pixels).
-    fn window_rect(&self, page: u32, r: [f32; 4]) -> Option<Rect> {
+    pub(super) fn window_rect(&self, page: u32, r: [f32; 4]) -> Option<Rect> {
         let l = &self.doc.as_ref()?.layout;
         let map = l.page_map(page as usize)?;
         let (x0, y0, x1, y1) = map.rect_to_px(r);
@@ -298,12 +300,20 @@ impl App {
         vec![Action::FieldEdit(Some(FieldBox { rect, text: f.value.clone(), multiline: f.multiline, max_len: f.max_len }))]
     }
 
+    /// A double click on a text box that is on the page: its text is typed over in a box over it.
+    pub(super) fn open_annotation_box(&mut self, page: u32, rect: [f32; 4], text: String, index: u32, num: u32) -> Vec<Action> {
+        let Some(window) = self.window_rect(page, rect) else { return Vec::new() };
+        self.edit.forms.editing = Some(Editing::AnnotText { page, index, num, rect, old: text.clone() });
+        vec![Action::FieldEdit(Some(FieldBox { rect: window, text, multiline: true, max_len: MAX_FREETEXT_CHARS as u32 }))]
+    }
+
     /// The page moved under the box (a scroll, a zoom): the box goes with it.
     pub(super) fn reposition_editor(&self) -> Vec<Action> {
         let rect = match self.edit.forms.editing.as_ref() {
             Some(Editing::Field { page, index }) => self.edit.forms.fields.get(page).and_then(|l| l.get(*index)).and_then(|f| self.window_rect(*page, f.rect)),
             Some(Editing::TextBox { page, rect }) => self.window_rect(*page, *rect),
             Some(Editing::Line { page, rect, .. }) => self.window_rect(*page, *rect).map(|r| self.line_box(r)),
+            Some(Editing::AnnotText { page, rect, .. }) => self.window_rect(*page, *rect),
             None => None,
         };
         rect.map(|r| vec![Action::FieldMove(r)]).unwrap_or_default()
@@ -335,6 +345,12 @@ impl App {
                     let text: String = text.chars().take(MAX_TEXT_CHARS).collect();
                     self.engine.replace_line(self.doc_id, id, page, at, &old, &text);
                     self.edit.asked.insert(id, Asked::Line);
+                }
+            }
+            Editing::AnnotText { page, index, num, old, .. } => {
+                if exit != FieldExit::Cancel && !text.trim().is_empty() && text != old {
+                    let text: String = text.chars().take(MAX_FREETEXT_CHARS).collect();
+                    actions.extend(self.send_text(page, index, num, &text));
                 }
             }
             Editing::TextBox { page, rect } => {
@@ -582,6 +598,7 @@ impl App {
             title: t(self.lang, Msg::InsertWatermark).replace('&', ""),
             prompt: t(self.lang, Msg::WatermarkPrompt).to_string(),
             secret: false,
+            initial: String::new(),
             ok: t(self.lang, Msg::Ok).to_string(),
             cancel: t(self.lang, Msg::Cancel).to_string(),
         }]
@@ -823,7 +840,7 @@ mod tests {
         app.event(Event::Command(CMD_TOOL_TEXTBOX));
         let r = app.window_rect(0, [150.0, 30.0, 150.0, 30.0]).unwrap();
         app.event(Event::MouseDown { x: r.x, y: r.y, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: r.x + 60, y: r.y + 30 });
+        app.event(Event::MouseMove { x: r.x + 60, y: r.y + 30, shift: false });
         let boxed = app.event(Event::MouseUp { x: r.x + 120, y: r.y + 60 });
         assert!(boxed.iter().any(|a| matches!(a, Action::FieldEdit(Some(b)) if b.multiline && b.rect.w >= 100)), "{boxed:?}");
         app.event(Event::FieldDone { text: "审批意见：同意".to_string(), exit: FieldExit::Blur });
@@ -842,13 +859,13 @@ mod tests {
         assert!(((before[2] - before[0]) / (before[3] - before[1]) - 2.0).abs() < 0.01, "the frame has the shape of the picture: {before:?}");
         let inside = app.window_rect(page, before).map(|r| (r.x + r.w / 2, r.y + r.h / 2)).unwrap();
         app.event(Event::MouseDown { x: inside.0, y: inside.1, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: inside.0 + 40, y: inside.1 + 30 });
+        app.event(Event::MouseMove { x: inside.0 + 40, y: inside.1 + 30, shift: false });
         app.event(Event::MouseUp { x: inside.0 + 40, y: inside.1 + 30 });
         let moved = app.edit.forms.stamp.as_ref().unwrap().rect;
         assert!(moved[0] > before[0] && moved[1] > before[1] && ((moved[2] - moved[0]) - (before[2] - before[0])).abs() < 0.01, "{before:?} -> {moved:?}");
         let corner = app.window_rect(page, moved).map(|r| (r.x + r.w, r.y + r.h)).unwrap();
         app.event(Event::MouseDown { x: corner.0, y: corner.1, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: corner.0 - 30, y: corner.1 - 5 });
+        app.event(Event::MouseMove { x: corner.0 - 30, y: corner.1 - 5, shift: false });
         app.event(Event::MouseUp { x: corner.0 - 30, y: corner.1 - 5 });
         let smaller = app.edit.forms.stamp.as_ref().unwrap().rect;
         let (w, h) = (smaller[2] - smaller[0], smaller[3] - smaller[1]);

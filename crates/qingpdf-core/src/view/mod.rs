@@ -42,7 +42,7 @@ use crate::error::Error;
 use crate::ops::has_owner_rights;
 use crate::text;
 
-pub use annots::{AnnotInfo, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_PARTS};
+pub use annots::{AnnotInfo, ListedAnnot, MAX_ANNOT_INFOS, MAX_CONTENTS_CHARS, MAX_FULL_TEXT_CHARS, MAX_LISTED_ANNOTS, MAX_LISTED_CHARS, MAX_PARTS};
 pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
 pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
@@ -54,7 +54,7 @@ pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
-pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind};
+pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind, ShapeKind, keep_on_page};
 pub use plan::{MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
 
 /// The biggest file the reader compresses: the file, the new file and the new pictures are held at once, with the pictures being
@@ -334,6 +334,11 @@ pub enum Event {
     PrintDone { doc: u64, id: u64, status: PrintStatus, pages_done: u32, message: String },
     /// The annotations of a page that can be picked (the answer to [`Engine::annotations`]), in the order of the page's list.
     Annotations { doc: u64, id: u64, page: u32, items: Vec<AnnotInfo>, truncated: bool },
+    /// Every annotation of the document that can be picked, page by page in the order of each page's list (the answer to [`Engine::annot_list`]);
+    /// `truncated`: some are left out (more than [`MAX_LISTED_ANNOTS`] in all, or more than [`MAX_ANNOT_INFOS`] on a page).
+    AnnotList { doc: u64, id: u64, items: Vec<ListedAnnot>, truncated: bool },
+    /// The whole text of an annotation (the answer to [`Engine::annotation_text`]); `found` is false when it is not there any more.
+    AnnotText { doc: u64, id: u64, page: u32, index: u32, num: u32, found: bool, text: String },
     /// The form fields of a page (the answer to [`Engine::fields`]), in the order of the page's list (the order Tab goes in).
     Fields { doc: u64, id: u64, page: u32, items: Vec<FieldInfo>, truncated: bool },
     /// The line of text at a place (the answer to [`Engine::text_line`]): `line` is `None` when there is no text near it; `status`
@@ -378,6 +383,8 @@ pub(crate) enum Request {
     Copy { from: (u32, u32), to: (u32, u32) },
     Print(Vec<PrintPage>),
     Annotations(u32),
+    AnnotList,
+    AnnotText { page: u32, index: u32, num: u32 },
     Fields(u32),
     Options { page: u32, index: u32, num: u32 },
     TextLine { page: u32, at: [f32; 2] },
@@ -539,6 +546,17 @@ impl Engine {
     /// answered by [`Event::Annotations`].
     pub fn annotations(&self, doc: u64, id: u64, page: u32) {
         self.request(doc, id, Request::Annotations(page));
+    }
+
+    /// Ask for every annotation of the document that can be picked (not links, form fields, popups or hidden ones), page after page, at most
+    /// [`MAX_LISTED_ANNOTS`]: answered by one [`Event::AnnotList`], worked out a page at a time between the other work.
+    pub fn annot_list(&self, doc: u64, id: u64) {
+        self.request(doc, id, Request::AnnotList);
+    }
+
+    /// Ask for the whole text (`/Contents`, at most [`MAX_FULL_TEXT_CHARS`] characters) of an annotation, to edit it: answered by [`Event::AnnotText`].
+    pub fn annotation_text(&self, doc: u64, id: u64, page: u32, index: u32, num: u32) {
+        self.request(doc, id, Request::AnnotText { page, index, num });
     }
 
     /// Mark text: one `[left, top, right, bottom]` for each line, in the points of [`CharBoxes`] (the rectangles of
@@ -711,6 +729,40 @@ impl Engine {
     /// keeps and the file's own copies are taken off.
     pub fn compress(&self, doc: u64, id: u64, path: &str, how: CompressHow) {
         let _ = self.commands.send(Command::Compress { doc, id, path: path.to_string(), how });
+    }
+
+    /// Draw a shape: a rectangle, an ellipse, a line or an arrow, with its line `width` points wide (between [`MIN_INK_WIDTH`] and [`MAX_INK_WIDTH`]) in
+    /// `color`; `fill` fills a rectangle or an ellipse with the colour lightened. `from` and `to` are the points of [`CharBoxes`] the person dragged
+    /// from and to (opposite corners, or the ends of the line). Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_shape(&self, doc: u64, id: u64, page: u32, kind: ShapeKind, from: [f32; 2], to: [f32; 2], color: [u8; 3], width: f32, fill: bool, author: &str) {
+        let edit = crate::edit::Edit::Shape { page, kind, from, to, color, width, fill, author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
+    /// Move an annotation (the one [`Event::Annotations`] told as `index` and `num` of the page, any kind but links, form fields and popups; not a
+    /// locked one) by `delta` points of the page as shown. Answered by [`Event::Edited`].
+    pub fn move_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32, delta: [f32; 2]) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Move { page, index, num, delta } });
+    }
+
+    /// Put an annotation in `rect` (`[left, top, right, bottom]` of the page as shown): squares, circles, lines, drawings, text boxes, pictures and
+    /// polygons can be resized, notes and text markup cannot. Answered by [`Event::Edited`].
+    pub fn resize_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32, rect: [f32; 4]) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Resize { page, index, num, rect } });
+    }
+
+    /// Draw an annotation again in `color`, with its line `width` points wide, filled or not (`None`: as it is): text markup, drawings, shapes, notes
+    /// and text boxes; other kinds are refused. Answered by [`Event::Edited`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn restyle_annotation(&self, doc: u64, id: u64, page: u32, index: u32, num: u32, color: Option<[u8; 3]>, width: Option<f32>, fill: Option<bool>) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Restyle { page, index, num, color, width, fill } });
+    }
+
+    /// Give an annotation another text (at most [`MAX_FULL_TEXT_CHARS`] characters; a text box is drawn again with it, a blank one is refused).
+    /// Answered by [`Event::Edited`].
+    pub fn set_annotation_text(&self, doc: u64, id: u64, page: u32, index: u32, num: u32, text: &str) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::SetText { page, index, num, text: text.to_string() } });
     }
 
     /// Take an annotation out: the one that [`Event::Annotations`] told as `index` and `num` of the page. Answered by

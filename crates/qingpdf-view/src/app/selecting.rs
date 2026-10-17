@@ -50,6 +50,13 @@ pub(super) struct Press {
 
 impl App {
     pub(super) fn mouse_down(&mut self, x: i64, y: i64, ctrl: bool, shift: bool, clicks: u8) -> Vec<Action> {
+        // What the arrow keys moved so far is sent before the pointer does anything else.
+        let mut actions = self.flush_nudge();
+        actions.extend(self.mouse_down_now(x, y, ctrl, shift, clicks));
+        actions
+    }
+
+    fn mouse_down_now(&mut self, x: i64, y: i64, ctrl: bool, shift: bool, clicks: u8) -> Vec<Action> {
         self.mouse = (x, y);
         self.press = None;
         // The edge of the bookmarks is taken hold of.
@@ -62,8 +69,9 @@ impl App {
             return actions;
         }
         self.thumb_focus = false;
-        // A drawing or a note takes the pointer for itself.
-        if let Some(actions) = self.edit_mouse_down(x, y) {
+        self.annots_focus = false;
+        // A drawing, a shape, a note or an annotation picked takes the pointer for itself.
+        if let Some(actions) = self.edit_mouse_down(x, y, clicks) {
             return actions;
         }
         let mut actions = Vec::new();
@@ -83,7 +91,7 @@ impl App {
         actions
     }
 
-    pub(super) fn mouse_move(&mut self, x: i64, y: i64) -> Vec<Action> {
+    pub(super) fn mouse_move(&mut self, x: i64, y: i64, shift: bool) -> Vec<Action> {
         self.mouse = (x, y);
         if self.split_drag.is_some() {
             return self.split_drag_to(x);
@@ -91,10 +99,13 @@ impl App {
         if self.thumb_drag {
             return self.thumb_drag_to(y);
         }
+        if self.annots_dragging() {
+            return self.annots_drag_to(y);
+        }
         if let Some(actions) = self.thumb_drag_move(x, y) {
             return actions;
         }
-        if let Some(actions) = self.edit_mouse_move(x, y) {
+        if let Some(actions) = self.edit_mouse_move(x, y, shift) {
             return actions;
         }
         let threshold = self.px(DRAG_THRESHOLD);
@@ -117,6 +128,9 @@ impl App {
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
         if self.thumb_drag {
             actions.extend(self.thumb_drag_end());
+            return actions;
+        }
+        if self.annots_drag_end() {
             return actions;
         }
         if self.split_drag.is_some() {
@@ -152,6 +166,7 @@ impl App {
         self.edit.give_up_stroke();
         let mut actions = vec![Action::KillTimer(TIMER_DRAG)];
         actions.extend(self.cancel_thumb_drag().unwrap_or_default());
+        self.annots_drag_end();
         actions.extend(self.thumb_drag_end());
         actions.extend(self.split_drag_end());
         actions

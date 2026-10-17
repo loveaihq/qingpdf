@@ -202,6 +202,24 @@
 
 引擎线程做压缩的时候不画页（和导出 Word 一样）；做图片的几根线程（最多 8 根）借用画页的内存：`decoders + image_slot + layers + masks`，再减去 3 倍文件大小的余地，不少于 16 MiB（`Options.picture_memory`）；一幅需要的内存比这还多的图不动。数字和理由见 `docs/decisions.md` 的"压缩 PDF（2026-10-16）"。
 
+## 批注加强的请求和结果（2026-10-17）
+
+形状、改已经在页面上的批注（我们加的和别的软件加的）、全部批注的清单。位置同样是"页面显示后的点"。这些都是 `EditClass::Annotate`：权限看 `Rights.annotate`（位 6），有所有者密码都放开，认证的文件（`/Perms /DocMDP`）`/P` 为 3 才许、为 1 或 2 答 `Failed`（消息里写着 DocMDP），和 4a 的批注一样；撤销、重做、增量保存（一次保存一段）都和 4a 共用，一次编辑一步。
+
+| 调用 | 作用 |
+|---|---|
+| `add_shape(doc, id, page, kind, from, to, color, width, fill, author)` | 形状：`kind` 是 `ShapeKind::{Rectangle, Ellipse, Line, Arrow}`；矩形、椭圆的 `from`、`to` 是对角，直线、箭头是两端（箭头头在 `to`，`/LE [/None /OpenArrow]`、`/IT /LineArrow`）。`width` 夹在 `MIN_INK_WIDTH`..`MAX_INK_WIDTH`（0.25 到 36 点，不是数当 1 点）；`fill` 只对矩形、椭圆：`/IC` 是描边颜色向白色靠 70%，外观里用 `/BM /Multiply` 画，下面的字透得出来。位置夹进页内；边长（直线是长度）不到 2 点答 `Failed`。外观 `/BBox` 等于 `/Rect`、矩阵是单位阵；矩形、椭圆的路径在 `/Rect` 里缩进半个线宽，`/RD` 照实写（12.5.6.8），所以 `/Rect` 是形状向外长半个线宽；`/BS /W`、`/Contents ()`、`/Subj`、作者、`/M`、`/CreationDate` 和别的批注一样。答 `Edited`。 |
+| `move_annotation(doc, id, page, index, num, delta)` | 把批注（`annotations` 给的 `index`、`num`）移动 `delta`（页面显示后的点）：改 `/Rect` 和类型的点（`/QuadPoints`、`/InkList`、`/L`、`/Vertices`、`/CL`，它的弹出框的 `/Rect`），外观原样留着（算法 8.1 把外观的框放到新的 `/Rect` 上，所以它跟着走）。移动的距离用 `view::keep_on_page` 夹：至少留 8 点（或整个，不到 8 点时）在页内。不转向的批注（`/F` 位 5，便签）照样按用户空间左上角移。答 `Edited`。 |
+| `resize_annotation(doc, id, page, index, num, rect)` | 把批注放进 `rect`（`[左, 上, 右, 下]`，最小 8 点、夹进页内）。矩形、椭圆、直线、手写、文字框是我们会画的：外观**重画**（线宽、字号不跟着变；直线、手写的点按旧框到新框的比例放，框是重画后外观的框），别的（图片、多边形、折线）外观不动，由 `/Rect` 的变化把它拉伸（算法 8.1），点也按比例变。便签的图标、文字标记不能缩放。答 `Edited`。 |
+| `restyle_annotation(doc, id, page, index, num, color, width, fill)` | 重画：新颜色、新线宽、填充与否（`None` 是不变）。只做我们会画的：文字标记（四种）、手写、矩形、椭圆、直线、便签、文字框；别的类型答 `Failed`。文字标记的四边形不论文件里什么顺序都先按页面上看到的重排（每行取四个角的外接框）。文字框的颜色是 `/DA` 里的文字颜色（`/C` 是背景，不动），字号和文字不变，`/RC` 去掉。线宽太粗放不进框的形状答 `Failed`。答 `Edited`。 |
+| `set_annotation_text(doc, id, page, index, num, text)` | 给批注新的文字（`/Contents`，去掉 `/RC`）；文字框按新文字重画（框向下长，最多 `MAX_FREETEXT_CHARS` 字，全空答 `Failed`）。答 `Edited`。 |
+| `annotation_text(doc, id, page, index, num)` | 取批注的全部文字（最多 `MAX_FULL_TEXT_CHARS`=4000 字，换行保留成换行符），答 `AnnotText { doc, id, page, index, num, found, text }`；`found` 为假是批注已经不在那个位置了，或者它的字超过 4000 字（给前 4000 字、存回去会丢后面的，所以不给；`set_annotation_text` 对这样的也答 `Failed`，消息里有 "too long"）。 |
+| `annot_list(doc, id)` | 全文档的批注清单，答 `AnnotList { doc, id, items: [ListedAnnot { page, info: AnnotInfo }], truncated }`：按页、再按页里的顺序；不列链接、表单控件、弹出框和隐藏的；每页最多 `MAX_ANNOT_INFOS`（2000）个，总共最多 `MAX_LISTED_ANNOTS`（20000）个，超了 `truncated`；所有页合计看过的 `/Annots` 条目也有上限（`MAX_LIST_VISITS`=1,500,000，一万页共用一个大数组不会读两亿次），超了同样 `truncated`。一页一步，夹在画页之间，每页有自己的计量器。`info.contents` 只有第一行（最多 `MAX_LISTED_CHARS`=120 字），`parts` 是空的。 |
+
+`AnnotInfo` 多了：`line`（直线的两端，用来点中直线本身而不是它的框）、`modified`（`/M`，写成 `2026-10-17 14:30`，不是日期就原样截短）、`flags`（`/F`），和几个问类型的方法：`locked()`（Locked 位 8 或 ReadOnly 位 7：不能移动、缩放、重画、删除）、`text_locked()`（ReadOnly 位 7 或 LockedContents 位 10：不能改字；Locked 不管内容）、`restylable()`、`has_width()`、`fillable()`、`resizable()`、`typed()`。
+
+**被拒绝的：** 锁住的（位 8）批注，移动、缩放、重画、删除答 `Failed`（消息里有 "locked"），改字可以；只读的（位 7）都拒绝；文字锁住的（位 10）只拒绝改字。重画会丢东西的（虚线、没有边框的矩形和椭圆、云边、引线、说明文字、别的线头、手写的 `/Path`、别的名字的便签、有 `/RC`、边框、底色、`/CL`、`/Q`、`/CA` 的文字框，见 `docs/decisions.md`）重画、缩放答 `Failed`（"cannot draw again"），移动可以；移动时回复它的批注、回复的弹出框一起走，回复里有锁住的，整个移动答 `Failed`（"locked"）。文字框改字时：Locked 的框不变，排不下答 `Failed`（"does not fit"）；框挂在页外的答 `Failed`（"edge of the page"）。旧框有一边不到 1 点的不缩放，点超出 ±3.4×10^38 的不移动也不缩放（"too far"，"too small"）。链接、表单控件、弹出框答 `Failed`（"part of the page"）。直接写在页的 `/Annots` 数组里的批注（没有对象号）不能改（删除可以）。`index`、`num` 和页面现在的列表对不上（列表过期）答 `Failed`（"not there any more"）。每个点、每笔手写的数都设了上限（一个批注最多 10 万个数）并计入工作计量器；一次编辑最多一页的工作量，和 4a 一样。
+
 ## 对接别的语言
 
 接口里只有整数、浮点、字符串、字节数组和没有数据的枚举，没有 Rust 特有的东西（借用、闭包、泛型）。包成 C 接口：每个调用一个函数（`add_markup`、`add_ink`、`add_note`、`delete_annotation` 各是一个函数，不是一个带数据的 `Edit` 枚举），事件取出来摊平成一个结构（`kind` 加上各字段）、位图用"指针加长度"交出去并配一个释放函数，`notify` 换成"函数指针加一个 `void*`"。鸿蒙的 NAPI 同理：`poll` 的结果转成 JS 对象，`notify` 用线程安全函数回到主线程。**这两个包装 3d-1、3d-2、4a 都没有写。**

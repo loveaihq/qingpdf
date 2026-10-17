@@ -201,6 +201,7 @@ impl App {
             title: t(lang, Msg::PasswordTitle).to_string(),
             prompt: t(lang, if wrong { Msg::PasswordWrongPrompt } else { Msg::PasswordPrompt }).to_string(),
             secret: true,
+            initial: String::new(),
             ok: t(lang, Msg::Ok).to_string(),
             cancel: t(lang, Msg::Cancel).to_string(),
         }]
@@ -406,6 +407,8 @@ impl App {
         self.ctx_at = None;
         self.thumbs.pages_changed();
         self.thumb_target = None;
+        // The annotations are listed by page number: the list is made again.
+        self.forget_listed_selection();
         // The bookmarks lead to pages by their number: the engine says where they lead now.
         if !self.outline.is_empty() && self.bench.is_none() {
             actions.extend(self.ask_for_outline());
@@ -645,11 +648,11 @@ mod tests {
         click_row(&mut app, 0, false, false);
         // A press and a tiny move is not a drag.
         app.event(Event::MouseDown { x: 60, y: row_y(&app, 0), ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: 61, y: row_y(&app, 0) + 1 });
+        app.event(Event::MouseMove { x: 61, y: row_y(&app, 0) + 1, shift: false });
         assert!(app.pg.drag.as_ref().is_some_and(|d| !d.moved));
         // Moved to the lower half of row 4: the drop goes in front of row 5, and a line is drawn there.
         let y = row_y(&app, 4) + app.thumbs.strip.row(4).map_or(0, |r| r.height / 2) as i32 - 3;
-        let actions = app.event(Event::MouseMove { x: 60, y });
+        let actions = app.event(Event::MouseMove { x: 60, y, shift: false });
         assert!(actions.iter().any(|a| matches!(a, Action::SetTimer { id: TIMER_THUMB_DRAG, .. })));
         assert_eq!(app.pg.drag.as_ref().map(|d| (d.moved, d.gap)), Some((true, Some(5))));
         let mut rec = Rec::default();
@@ -677,7 +680,7 @@ mod tests {
         click_row(&mut app, 3, true, false);
         let drag_to = |app: &mut App, from: i32, to: i32, x: i32| {
             app.event(Event::MouseDown { x: 60, y: from, ctrl: false, shift: false, clicks: 1 });
-            app.event(Event::MouseMove { x, y: to });
+            app.event(Event::MouseMove { x, y: to, shift: false });
         };
         // In front of itself.
         let (a, b, far) = (row_y(&app, 2), row_y(&app, 3), row_y(&app, 6));
@@ -713,7 +716,7 @@ mod tests {
         click_row(&mut app, 0, false, false);
         let bottom = app.view_h as i32 - 3;
         app.event(Event::MouseDown { x: 60, y: row_y(&app, 0), ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: 60, y: bottom });
+        app.event(Event::MouseMove { x: 60, y: bottom, shift: false });
         let (before, gap) = (app.thumbs.scroll, app.pg.drag.as_ref().and_then(|d| d.gap).expect("over the list"));
         for _ in 0..5 {
             app.event(Event::Timer(TIMER_THUMB_DRAG));
@@ -722,12 +725,12 @@ mod tests {
         assert!(app.pg.drag.as_ref().and_then(|d| d.gap).is_some_and(|g| g > gap), "the place the drop goes to follows the list");
         // The middle of the list does not scroll it.
         let middle = app.view_h as i32 / 2;
-        app.event(Event::MouseMove { x: 60, y: middle });
+        app.event(Event::MouseMove { x: 60, y: middle, shift: false });
         let held = app.thumbs.scroll;
         app.event(Event::Timer(TIMER_THUMB_DRAG));
         assert_eq!(app.thumbs.scroll, held);
         // At the top it scrolls up.
-        app.event(Event::MouseMove { x: 60, y: app.px(TAB_H) as i32 + 2 });
+        app.event(Event::MouseMove { x: 60, y: app.px(TAB_H) as i32 + 2, shift: false });
         app.event(Event::Timer(TIMER_THUMB_DRAG));
         assert!(app.thumbs.scroll < held);
         // The timer stops when the drag is over.
@@ -961,7 +964,7 @@ mod tests {
         assert!(app.note.as_deref().is_some_and(|n| n.contains("does not allow inserting")) && app.edit.asked.is_empty() && !app.edit.dirty);
         // Dragging does not even start.
         app.event(Event::MouseDown { x: 60, y: row_y(&app, 0), ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: 60, y: row_y(&app, 1) });
+        app.event(Event::MouseMove { x: 60, y: row_y(&app, 1), shift: false });
         assert!(app.pg.drag.as_ref().is_some_and(|d| !d.moved));
         app.event(Event::MouseUp { x: 60, y: row_y(&app, 1) });
         assert!(app.edit.asked.is_empty());

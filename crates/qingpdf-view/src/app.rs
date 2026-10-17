@@ -6,6 +6,10 @@
 //! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans), `sidebar` (the tabs, and the
 //! thumbnails: the list is drawn and handled there).
 
+#[cfg(test)]
+mod annot_tests;
+mod annotedit;
+mod annotlist;
 mod chrome;
 mod compress;
 mod editing;
@@ -41,7 +45,7 @@ use crate::select::Selection;
 use crate::thumbs::{self, Tab};
 use crate::tiles;
 use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
-use qingpdf_core::view::MarkupKind;
+use qingpdf_core::view::{MarkupKind, ShapeKind};
 use crate::zoom::{self, ZoomMode};
 
 pub use printjob::PrintTest;
@@ -108,6 +112,12 @@ pub const CMD_TOOL_INK: u32 = 45;
 pub const CMD_TOOL_NOTE: u32 = 46;
 pub const CMD_TOOL_TEXTBOX: u32 = 47;
 pub const CMD_TOOL_EDITTEXT: u32 = 48;
+/// The shapes of the Comment menu (2026-10-17) and its fill switch.
+pub const CMD_TOOL_RECT: u32 = 130;
+pub const CMD_TOOL_ELLIPSE: u32 = 131;
+pub const CMD_TOOL_LINE: u32 = 132;
+pub const CMD_TOOL_ARROW: u32 = 133;
+pub const CMD_FILL: u32 = 134;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
@@ -147,6 +157,7 @@ const TAG_PROTECT: u32 = 10;
 const TAG_COMPRESS: u32 = 11;
 const TAG_COMPRESS_SAVE: u32 = 12;
 const TAG_COMPRESS_OPEN: u32 = 13;
+const TAG_NOTE_EDIT: u32 = 14;
 
 // Timers.
 /// The view has stopped moving.
@@ -163,6 +174,8 @@ const TIMER_DRAG: u32 = 4;
 const DRAG_MS: u32 = 50;
 /// The pointer is dragging thumbnails: scroll the list if it is held at an edge.
 const TIMER_THUMB_DRAG: u32 = 5;
+/// The arrow keys have been left alone for a moment: the nudges are sent as one move.
+const TIMER_NUDGE: u32 = 6;
 
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
@@ -328,6 +341,9 @@ pub struct App {
     thumbs: thumbs::Thumbs,
     /// The keys belong to the list of thumbnails (it was clicked last), and its bar is being dragged.
     thumb_focus: bool,
+    /// ... or to the list of annotations (the third tab).
+    annots_focus: bool,
+    al: annotlist::AnnotList,
     thumb_drag: bool,
     /// The page the list of thumbnails moved to (it is the page shown as current while it is in view), and whether that move is going on.
     thumb_target: Option<usize>,
@@ -427,6 +443,8 @@ impl App {
             thumbs_alone: false,
             thumbs: thumbs::Thumbs::new(),
             thumb_focus: false,
+            annots_focus: false,
+            al: annotlist::AnnotList::new(),
             thumb_drag: false,
             thumb_target: None,
             thumb_nav: false,
@@ -504,6 +522,8 @@ impl App {
         self.thumbs.reset(0);
         self.pg.reset();
         self.thumb_focus = false;
+        self.annots_focus = false;
+        self.reset_annot_list();
         self.thumb_drag = false;
         self.thumb_target = None;
         if let Some(s) = self.search.take() {
@@ -596,6 +616,7 @@ impl App {
         if self.bench.is_none() {
             actions.extend(self.ask_for_outline());
         }
+        self.ask_for_annot_list();
         actions.extend(self.start_print_test());
         actions
     }
@@ -617,6 +638,7 @@ impl App {
                     title: t(lang, Msg::PasswordTitle).to_string(),
                     prompt: prompt.to_string(),
                     secret: true,
+                    initial: String::new(),
                     ok: t(lang, Msg::Ok).to_string(),
                     cancel: t(lang, Msg::Cancel).to_string(),
                 });
@@ -1022,6 +1044,11 @@ impl App {
             CMD_TOOL_INK => self.toggle_tool(Tool::Ink),
             CMD_TOOL_NOTE => self.toggle_tool(Tool::Note),
             CMD_TOOL_EDITTEXT => self.set_tool(Tool::EditText),
+            CMD_TOOL_RECT => self.toggle_tool(Tool::Shape(ShapeKind::Rectangle)),
+            CMD_TOOL_ELLIPSE => self.toggle_tool(Tool::Shape(ShapeKind::Ellipse)),
+            CMD_TOOL_LINE => self.toggle_tool(Tool::Shape(ShapeKind::Line)),
+            CMD_TOOL_ARROW => self.toggle_tool(Tool::Shape(ShapeKind::Arrow)),
+            CMD_FILL => self.toggle_fill(),
             c if (CMD_COLOR_BASE..CMD_COLOR_BASE + 6).contains(&c) => self.set_color((c - CMD_COLOR_BASE) as usize),
             c if (CMD_WIDTH_BASE..CMD_WIDTH_BASE + 4).contains(&c) => self.set_width((c - CMD_WIDTH_BASE) as usize),
             CMD_PRINT => self.print_command(),
@@ -1053,7 +1080,7 @@ impl App {
                 let title = t(self.lang, Msg::GoToTitle).to_string();
                 let prompt = format!("{} (1-{})", t(self.lang, Msg::GoToTitle), self.page_count());
                 let (ok, cancel) = (t(self.lang, Msg::Ok).to_string(), t(self.lang, Msg::Cancel).to_string());
-                vec![Action::AskText { tag: TAG_GOTO, title, prompt, secret: false, ok, cancel }]
+                vec![Action::AskText { tag: TAG_GOTO, title, prompt, secret: false, initial: String::new(), ok, cancel }]
             }
             CMD_FIND => self.open_find(),
             CMD_FIND_NEXT => self.find_step(true),
@@ -1064,9 +1091,23 @@ impl App {
     }
 
     fn key(&mut self, key: u32, ctrl: bool, shift: bool) -> Vec<Action> {
+        // The arrow keys nudge the annotation that is picked; anything else ends the nudging, which is sent as one move first.
+        if !ctrl && matches!(key, vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN) && let Some(actions) = self.nudge_key(key, shift) {
+            return actions;
+        }
+        let mut actions = self.flush_nudge();
+        actions.extend(self.key_now(key, ctrl, shift));
+        actions
+    }
+
+    fn key_now(&mut self, key: u32, ctrl: bool, shift: bool) -> Vec<Action> {
         // The list of thumbnails has the keyboard: the arrow keys move from page to page.
         if !ctrl && self.thumb_focus && self.thumbs_shown() && let Some(list_key) = sidebar::list_key(key) {
             return self.thumb_key(list_key);
+        }
+        // ... and so has the list of annotations.
+        if !ctrl && self.annots_focus && self.annots_shown() && let Some(list_key) = sidebar::list_key(key) {
+            return self.annots_key(list_key);
         }
         let page_step = (self.view_h * 9 / 10).max(1);
         let line = self.px(LINE_STEP);
@@ -1113,6 +1154,7 @@ impl App {
             vk::F4 => self.command(CMD_BOOKMARKS),
             // In the list of thumbnails Delete takes pages out; over the pages it takes the annotation picked out.
             vk::DELETE if self.thumb_focus && self.thumbs_shown() => self.command(CMD_PG_DELETE),
+            vk::DELETE if self.annots_focus && self.annots_shown() => self.annots_delete(),
             vk::DELETE => self.command(CMD_REMOVE),
             vk::NEXT => self.scroll_by(0, page_step, false),
             vk::PRIOR => self.scroll_by(0, -page_step, false),
@@ -1236,6 +1278,7 @@ impl Handler for App {
                 self.view_h = i64::from(h).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
+                self.clamp_annots_scroll();
                 let mut actions = self.after_view_change(false);
                 actions.extend(self.chrome());
                 if let Some(path) = self.pending_open.take() {
@@ -1259,6 +1302,8 @@ impl Handler for App {
             Event::Wheel { delta, ctrl, shift, x, y } => {
                 if !ctrl && !shift && self.over_thumbs(i64::from(x), i64::from(y)) {
                     self.thumb_wheel(delta)
+                } else if !ctrl && !shift && self.over_annots(i64::from(x), i64::from(y)) {
+                    self.annots_wheel(delta)
                 } else if ctrl {
                     let z = zoom::wheel(self.zoom, f64::from(delta) / 120.0);
                     self.set_zoom(ZoomMode::Custom, z, Some((i64::from(x) - self.view_x, i64::from(y))))
@@ -1274,7 +1319,9 @@ impl Handler for App {
                 if cmd != CMD_BOOKMARKS && !pages::is_page_command(cmd) {
                     self.thumb_focus = false;
                 }
-                self.command(cmd)
+                let mut actions = self.flush_nudge();
+                actions.extend(self.command(cmd));
+                actions
             }
             Event::Drop(files) => match files.first() {
                 Some(f) => self.open_path(f, ""),
@@ -1293,6 +1340,7 @@ impl Handler for App {
             }
             Event::Timer(TIMER_DRAG) => self.drag_timer(),
             Event::Timer(TIMER_THUMB_DRAG) => self.thumb_drag_tick(),
+            Event::Timer(TIMER_NUDGE) => self.flush_nudge(),
             Event::Timer(_) => Vec::new(),
             Event::FilePicked(path) if self.pg.insert_pending() => self.insert_picked(path).unwrap_or_default(),
             Event::FilePicked(Some(path)) => {
@@ -1324,6 +1372,7 @@ impl Handler for App {
             },
             Event::Text { tag: TAG_SRC_PASSWORD, text } => self.source_password_answered(text),
             Event::Text { tag: TAG_NOTE, text } => self.note_answered(text),
+            Event::Text { tag: TAG_NOTE_EDIT, text } => self.note_edit_answered(text),
             Event::Text { tag: TAG_AUTHOR, text } => self.author_answered(text),
             Event::Text { tag: TAG_WATERMARK, text } => self.watermark_answered(text),
             Event::Text { tag: TAG_GOTO, text } => match text.and_then(|s| s.trim().parse::<usize>().ok()) {
@@ -1342,7 +1391,7 @@ impl Handler for App {
                 Some(page) => self.go_to_page(page),
                 None => Vec::new(),
             },
-            Event::MouseMove { x, y } => self.mouse_move(i64::from(x), i64::from(y)),
+            Event::MouseMove { x, y, shift } => self.mouse_move(i64::from(x), i64::from(y), shift),
             Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
             Event::MouseLost => self.mouse_lost(),
             Event::CloseRequested => match self.ask_unsaved(After::Quit) {

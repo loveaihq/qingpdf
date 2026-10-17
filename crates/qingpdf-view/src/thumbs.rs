@@ -11,12 +11,13 @@ use std::ops::Range;
 use crate::sched;
 use qingpdf_core::idmap::{IdMap, IdSet};
 
-/// The two tabs of the sidebar.
+/// The three tabs of the sidebar: the bookmarks, the thumbnails of the pages, the list of the annotations.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Tab {
     #[default]
     Bookmarks,
     Pages,
+    Annots,
 }
 
 impl Tab {
@@ -25,6 +26,7 @@ impl Tab {
         match self {
             Tab::Bookmarks => "bookmarks",
             Tab::Pages => "pages",
+            Tab::Annots => "annots",
         }
     }
 
@@ -32,14 +34,21 @@ impl Tab {
         match s.trim().to_ascii_lowercase().as_str() {
             "bookmarks" => Some(Tab::Bookmarks),
             "pages" => Some(Tab::Pages),
+            "annots" => Some(Tab::Annots),
             _ => None,
         }
     }
 }
 
-/// The tab at this place across a header of `width` pixels: the left half is the bookmarks, the right half the pages.
+/// The tab at this place across a header of `width` pixels: the left third is the bookmarks, the middle third the pages, the right third the annotations.
 pub fn tab_at(x: i64, width: i64) -> Tab {
-    if x * 2 < width { Tab::Bookmarks } else { Tab::Pages }
+    if x * 3 < width {
+        Tab::Bookmarks
+    } else if x * 3 < width * 2 {
+        Tab::Pages
+    } else {
+        Tab::Annots
+    }
 }
 
 /// The most pixels of a picture the engine is asked for (a bigger box is drawn from a smaller picture, stretched).
@@ -968,9 +977,9 @@ mod tests {
     }
 
     #[test]
-    fn the_tabs_are_the_halves_of_the_header_and_their_words_are_kept_in_the_settings() {
-        assert_eq!((tab_at(0, 260), tab_at(129, 260), tab_at(130, 260), tab_at(259, 260)), (Tab::Bookmarks, Tab::Bookmarks, Tab::Pages, Tab::Pages));
-        for t in [Tab::Bookmarks, Tab::Pages] {
+    fn the_tabs_are_the_thirds_of_the_header_and_their_words_are_kept_in_the_settings() {
+        assert_eq!((tab_at(0, 270), tab_at(89, 270), tab_at(90, 270), tab_at(179, 270), tab_at(180, 270), tab_at(269, 270)), (Tab::Bookmarks, Tab::Bookmarks, Tab::Pages, Tab::Pages, Tab::Annots, Tab::Annots));
+        for t in [Tab::Bookmarks, Tab::Pages, Tab::Annots] {
             assert_eq!(Tab::parse(t.as_str()), Some(t));
         }
         assert_eq!(Tab::parse(" Pages "), Some(Tab::Pages));

@@ -50,7 +50,8 @@ impl App {
         }
         if let Some(tab) = s.tab {
             self.tab = tab;
-            self.thumbs_alone = tab == Tab::Pages;
+            self.thumbs_alone = tab != Tab::Bookmarks;
+            self.annots_focus = false;
         }
         self.toolbar_dirty = true;
         self.menus_dirty = true;

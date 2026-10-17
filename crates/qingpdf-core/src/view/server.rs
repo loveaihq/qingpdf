@@ -27,7 +27,7 @@ use super::forms;
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
-    BACKGROUND_PRIORITY, CharBoxes, Command, Event, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
+    BACKGROUND_PRIORITY, CharBoxes, Command, Event, ListedAnnot, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
     MemoryPlan, RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
 };
 use crate::view::geometry::line_rects;
@@ -92,6 +92,17 @@ struct OcrImageJob {
     incomplete: String,
 }
 
+struct AnnotListJob {
+    id: u64,
+    /// The next page to read.
+    next: u32,
+    items: Vec<ListedAnnot>,
+    /// A page had more annotations than are listed, the list is full, or the pages together had too many entries to look at.
+    truncated: bool,
+    /// The entries of the pages' `/Annots` looked at so far.
+    visits: usize,
+}
+
 struct PrintJob {
     id: u64,
     pages: Vec<PrintPage>,
@@ -109,9 +120,11 @@ enum Job {
     Links { id: u64, page: u32 },
     CharBoxes { id: u64, page: u32 },
     Annotations { id: u64, page: u32 },
+    AnnotText { id: u64, page: u32, index: u32, num: u32 },
     Fields { id: u64, page: u32 },
     Options { id: u64, page: u32, index: u32, num: u32 },
     TextLine { id: u64, page: u32, at: [f32; 2] },
+    AnnotList(AnnotListJob),
     Search(SearchJob),
     Copy(CopyJob),
     Print(PrintJob),
@@ -122,7 +135,8 @@ enum Job {
 impl Job {
     fn id(&self) -> u64 {
         match self {
-            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } | Job::TextLine { id, .. } => *id,
+            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::AnnotText { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } | Job::TextLine { id, .. } => *id,
+            Job::AnnotList(a) => a.id,
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
             Job::Print(p) => p.id,
@@ -133,7 +147,7 @@ impl Job {
 
     /// A quick request that someone is waiting for.
     fn immediate(&self) -> bool {
-        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::Fields { .. } | Job::Options { .. } | Job::TextLine { .. })
+        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::AnnotText { .. } | Job::Fields { .. } | Job::Options { .. } | Job::TextLine { .. })
     }
 
     /// Has something to do now (a print job whose band is not used yet waits).
@@ -147,6 +161,8 @@ impl Job {
             Request::Links(page) => Job::Links { id, page },
             Request::CharBoxes(page) => Job::CharBoxes { id, page },
             Request::Annotations(page) => Job::Annotations { id, page },
+            Request::AnnotText { page, index, num } => Job::AnnotText { id, page, index, num },
+            Request::AnnotList => Job::AnnotList(AnnotListJob { id, next: 0, items: Vec::new(), truncated: false, visits: 0 }),
             Request::Fields(page) => Job::Fields { id, page },
             Request::Options { page, index, num } => Job::Options { id, page, index, num },
             Request::TextLine { page, at } => Job::TextLine { id, page, at },
@@ -562,6 +578,8 @@ impl Server<'_> {
             Job::Links { id, page } => self.links(*id, *page),
             Job::CharBoxes { id, page } => self.char_boxes(*id, *page),
             Job::Annotations { id, page } => self.annotations(*id, *page),
+            Job::AnnotText { id, page, index, num } => self.annot_text(*id, *page, *index, *num),
+            Job::AnnotList(a) => self.step_annot_list(a),
             Job::Fields { id, page } => self.fields(*id, *page),
             Job::Options { id, page, index, num } => self.options(*id, *page, *index, *num),
             Job::TextLine { id, page, at } => self.text_line(*id, *page, *at),
@@ -648,6 +666,40 @@ impl Server<'_> {
         }
         self.tell(Event::Annotations { doc: self.doc_id, id, page, items, truncated });
         Step::Done
+    }
+
+    fn annot_text(&mut self, id: u64, page: u32, index: u32, num: u32) -> Step {
+        let work = self.meter();
+        let text = self.pages.get(page as usize).and_then(|p| annots::text(self.document, p, index, num, &work));
+        if work.was_cancelled() {
+            return Step::Cancelled;
+        }
+        self.tell(Event::AnnotText { doc: self.doc_id, id, page, index, num, found: text.is_some(), text: text.unwrap_or_default() });
+        Step::Done
+    }
+
+    /// One page of the list of the document's annotations.
+    fn step_annot_list(&mut self, j: &mut AnnotListJob) -> Step {
+        let work = self.meter();
+        let page = self.pages.get(j.next as usize);
+        let looked = page.map_or(0, |p| annots::looked_at(self.document, p, &work));
+        let over = j.visits.saturating_add(looked) > annots::MAX_LIST_VISITS;
+        let Some(page) = page.filter(|_| !over && j.items.len() < annots::MAX_LISTED_ANNOTS) else {
+            j.truncated |= (over || j.items.len() >= annots::MAX_LISTED_ANNOTS) && (j.next as usize) < self.pages.len();
+            self.tell(Event::AnnotList { doc: self.doc_id, id: j.id, items: std::mem::take(&mut j.items), truncated: j.truncated });
+            return Step::Done;
+        };
+        j.visits += looked;
+        let (infos, cut) = annots::read(self.document, page, &work);
+        if work.was_cancelled() {
+            return Step::Cancelled;
+        }
+        j.truncated |= cut;
+        let room = annots::MAX_LISTED_ANNOTS.saturating_sub(j.items.len());
+        j.truncated |= infos.len() > room;
+        j.items.extend(infos.into_iter().take(room).map(|i| annots::listed(j.next, i)));
+        j.next += 1;
+        Step::More
     }
 
     fn fields(&mut self, id: u64, page: u32) -> Step {

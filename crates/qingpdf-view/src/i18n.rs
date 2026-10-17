@@ -128,6 +128,18 @@ pub enum Msg {
     ToolSquiggly,
     ToolInk,
     ToolNote,
+    ToolRect,
+    ToolEllipse,
+    ToolLine,
+    ToolArrow,
+    FillShapes,
+    TabAnnots,
+    NoteChanged,
+    NoteLocked,
+    NoteShapeHint,
+    NoteListCut,
+    AnnotsEmpty,
+    ListPage,
     ColorMenu,
     ColYellow,
     ColGreen,
@@ -343,7 +355,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 286] = [
+pub const ALL: [Msg; 298] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -419,6 +431,18 @@ pub const ALL: [Msg; 286] = [
     Msg::ToolSquiggly,
     Msg::ToolInk,
     Msg::ToolNote,
+    Msg::ToolRect,
+    Msg::ToolEllipse,
+    Msg::ToolLine,
+    Msg::ToolArrow,
+    Msg::FillShapes,
+    Msg::TabAnnots,
+    Msg::NoteChanged,
+    Msg::NoteLocked,
+    Msg::NoteShapeHint,
+    Msg::NoteListCut,
+    Msg::AnnotsEmpty,
+    Msg::ListPage,
     Msg::ColorMenu,
     Msg::ColYellow,
     Msg::ColGreen,
@@ -709,6 +733,18 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::ToolSquiggly => ("Squi&ggly", "波浪线(&G)"),
         Msg::ToolInk => ("&Draw", "手写(&D)"),
         Msg::ToolNote => ("&Note", "便签(&N)"),
+        Msg::ToolRect => ("&Rectangle", "矩形(&J)"),
+        Msg::ToolEllipse => ("&Ellipse", "椭圆(&E)"),
+        Msg::ToolLine => ("&Line", "直线(&L)"),
+        Msg::ToolArrow => ("A&rrow", "箭头(&F)"),
+        Msg::FillShapes => ("Fill &shapes", "填充(&P)"),
+        Msg::TabAnnots => ("Comments", "批注"),
+        Msg::NoteChanged => ("Annotation changed (Ctrl+Z undoes it).", "已修改批注（Ctrl+Z 撤销）。"),
+        Msg::NoteLocked => ("This annotation is locked: its author does not allow it to be changed or removed.", "这个批注已锁定：作者不允许改动或删除。"),
+        Msg::NoteShapeHint => ("Drag to draw (Shift keeps it square, round or at 45 degrees; Esc ends).", "按住鼠标拖动来画（按住 Shift 保持正方形、正圆或 45° 角；按 Esc 结束）。"),
+        Msg::NoteListCut => ("Only the first annotations are listed.", "只列出了前面的一部分批注。"),
+        Msg::AnnotsEmpty => ("There are no annotations in this file.", "这个文件里没有批注。"),
+        Msg::ListPage => ("Page {n}", "第 {n} 页"),
         Msg::ColorMenu => ("&Colour", "颜色(&C)"),
         Msg::ColYellow => ("Yellow", "黄色"),
         Msg::ColGreen => ("Green", "绿色"),
@@ -991,7 +1027,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 286);
+        assert_eq!(ALL.len(), 298);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

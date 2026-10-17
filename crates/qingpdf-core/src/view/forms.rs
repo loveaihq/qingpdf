@@ -6,6 +6,7 @@
 use crate::document::{Document, Page};
 use crate::edit::FieldInfo;
 use crate::forms;
+use super::annots;
 use crate::object::Object;
 use crate::render::work::{Work, cost};
 use crate::text::Shown;
@@ -42,7 +43,7 @@ pub(super) fn read(doc: &Document, page: &Page, work: &Work) -> (Vec<FieldInfo>,
         if !d.get("Subtype").and_then(|s| work.read(doc, s)).is_some_and(|s| matches!(&*s, Object::Name(n) if n == "Widget")) {
             continue;
         }
-        if d.get_int("F").is_some_and(|f| f & (2 | 32) != 0) {
+        if annots::flags_in(doc, d, work) & (2 | 32) != 0 {
             continue;
         }
         let Some([x0, y0, x1, y1]) = work.rectangle(doc, d.get("Rect")) else { continue };

@@ -15,10 +15,12 @@ pub(crate) mod content;
 mod fill;
 pub(crate) mod fontsub;
 pub(crate) mod incremental;
+pub(crate) mod modify;
 mod ocr;
 mod pagenum;
 mod pages;
 mod retext;
+mod shapes;
 pub(crate) mod signature;
 
 use std::rc::Rc;
@@ -40,6 +42,8 @@ pub use pages::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, PageOp
 pub(crate) use pages::unique as unique_pages;
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
 pub use pagenum::{MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, Pagination, SLOTS};
+pub use modify::keep_on_page;
+pub use shapes::ShapeKind;
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
 pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
 /// Most points one drawing has (all its strokes together); a longer one is thinned out, its ends kept.
@@ -93,9 +97,20 @@ pub enum Edit {
     Ink { page: u32, strokes: Vec<Vec<[f32; 2]>>, color: [u8; 3], width: f32, author: String },
     /// A note whose icon has its top left corner at `at`, with `text`.
     Note { page: u32, at: [f32; 2], text: String, color: [u8; 3], author: String },
+    /// A rectangle, an ellipse, a line or an arrow (12.5.6.7, 12.5.6.8): `from` and `to` are opposite corners, or the two ends of the line (points of
+    /// the page as shown); the line is `width` points wide, `fill` fills a rectangle or an ellipse with the colour lightened.
+    Shape { page: u32, kind: ShapeKind, from: [f32; 2], to: [f32; 2], color: [u8; 3], width: f32, fill: bool, author: String },
     /// Take an annotation out of the page: the `index`-th entry of its `/Annots`, which must be object number `num`
     /// (0 for an annotation written in the array itself). A popup that belongs to it goes with it.
     Delete { page: u32, index: u32, num: u32 },
+    /// Move the annotation (the `index`-th entry of the page's `/Annots`, object `num`) by `delta` points of the page as shown.
+    Move { page: u32, index: u32, num: u32, delta: [f32; 2] },
+    /// Put the annotation in `rect` (`[left, top, right, bottom]`, the page as shown).
+    Resize { page: u32, index: u32, num: u32, rect: [f32; 4] },
+    /// Draw the annotation again in another colour, with another line width, filled or not (`None`: as it is).
+    Restyle { page: u32, index: u32, num: u32, color: Option<[u8; 3]>, width: Option<f32>, fill: Option<bool> },
+    /// Give the annotation another text (its `/Contents`; a text box is drawn again).
+    SetText { page: u32, index: u32, num: u32, text: String },
     /// Fill in a form field (4b): its widget is the `index`-th entry of the page's `/Annots`, object number `num`.
     Fill { page: u32, index: u32, num: u32, value: FillValue },
     /// A text box (`FreeText`) in `rect` (`[left, top, right, bottom]` of the page as shown), the text `size` points high.
@@ -142,6 +157,11 @@ impl Edit {
             | Edit::Ink { page, .. }
             | Edit::Note { page, .. }
             | Edit::Delete { page, .. }
+            | Edit::Shape { page, .. }
+            | Edit::Move { page, .. }
+            | Edit::Resize { page, .. }
+            | Edit::Restyle { page, .. }
+            | Edit::SetText { page, .. }
             | Edit::Fill { page, .. }
             | Edit::FreeText { page, .. }
             | Edit::Stamp { page, .. }
@@ -266,24 +286,40 @@ impl Ctx<'_> {
     }
 
     fn form(&mut self, a: &Appearance) -> Result<ObjRef> {
+        self.form_with(a, None)
+    }
+
+    /// The form of an appearance; `ca` is the annotation's own opacity (`/CA`), which is set before anything is painted.
+    fn form_with(&mut self, a: &Appearance, ca: Option<f64>) -> Result<ObjRef> {
         let r = self.alloc()?;
         let mut dict = Dict::new();
         dict.set("Type", Object::from("XObject"));
         dict.set("Subtype", Object::from("Form"));
         dict.set("BBox", reals(&a.bbox));
         dict.set("Matrix", reals(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]));
-        let mut resources = Dict::new();
+        let mut states = Dict::new();
+        let mut content = String::new();
         if a.multiply {
             let mut state = Dict::new();
             state.set("Type", Object::from("ExtGState"));
             state.set("BM", Object::from("Multiply"));
-            let mut states = Dict::new();
             states.set("GS0", Object::Dict(state));
+        }
+        if let Some(ca) = ca {
+            let mut state = Dict::new();
+            state.set("CA", Object::Real(ca));
+            state.set("ca", Object::Real(ca));
+            states.set("GS1", Object::Dict(state));
+            content.push_str("/GS1 gs\n");
+        }
+        content.push_str(&a.content);
+        let mut resources = Dict::new();
+        if !states.is_empty() {
             resources.set("ExtGState", Object::Dict(states));
         }
         dict.set("Resources", Object::Dict(resources));
         dict.set("Filter", Object::from("FlateDecode"));
-        let data = compress_to_vec_zlib(a.content.as_bytes(), 6);
+        let data = compress_to_vec_zlib(content.as_bytes(), 6);
         self.objects.push((r.num, Object::Stream(Stream { dict, data })));
         Ok(r)
     }
@@ -338,6 +374,23 @@ pub(crate) fn apply_any(doc: &Document, pages: &[Page], edit: &Edit, now: &str, 
         pages::apply(&mut ctx, pages, op)?;
         return Ok((ctx.objects, ctx.notes));
     }
+    // Shapes and changes to the annotations that are there (2026-10-17) are the reader's alone, like the pages.
+    if let Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } = edit {
+        let page = pages.get(usize::try_from(edit.page()).unwrap_or(usize::MAX)).ok_or_else(|| Error::Invalid("there is no such page".to_string()))?;
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
+        match edit {
+            Edit::Shape { kind, from, to, color, width, fill, author, .. } => {
+                let made = shapes::shape(&mut ctx, &Shown::of(page), *kind, *from, *to, *color, *width, *fill, author, now)?;
+                change_annots(&mut ctx, pages, page, AnnotsChange::Add(made))?;
+            }
+            Edit::Move { index, num, delta, .. } => modify::move_by(&mut ctx, pages, page, *index, *num, *delta, now)?,
+            Edit::Resize { index, num, rect, .. } => modify::resize(&mut ctx, pages, page, *index, *num, *rect, now)?,
+            Edit::Restyle { index, num, color, width, fill, .. } => modify::restyle(&mut ctx, pages, page, *index, *num, *color, *width, *fill, now)?,
+            Edit::SetText { index, num, text, .. } => modify::set_text(&mut ctx, pages, page, *index, *num, text, now)?,
+            _ => {}
+        }
+        return Ok((ctx.objects, ctx.notes));
+    }
     apply_noted(doc, pages, edit, now, work, room)
 }
 
@@ -380,7 +433,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));
@@ -653,7 +706,7 @@ fn locate(doc: &Document, pages: &[Page], page: &Page, page_dict: &Dict) -> Resu
 }
 
 fn is_locked(doc: &Document, d: &Dict) -> bool {
-    d.get("F").and_then(|f| doc.resolve(f).ok()).and_then(|f| f.as_int()).is_some_and(|f| f & FLAG_LOCKED != 0)
+    modify::flags_of(doc, d) & FLAG_LOCKED != 0
 }
 
 /// If the popup of annotation `d` (number `owner`) says it belongs to it, put the popup's number in `gone`. A popup that names
@@ -667,6 +720,34 @@ fn add_own_popup(doc: &Document, d: &Dict, owner: u32, gone: &mut IdSet<u32>) {
     if belongs {
         gone.insert(popup.num);
     }
+}
+
+/// The annotation `d` (object `owner`) and what goes with it, by object number: its popup, the replies to it and to those (12.5.6.2, at most
+/// [`MAX_REPLY_DEPTH`] steps down) and their popups. A reply that is locked stops all of it, with `locked` as the reason.
+fn companions(doc: &Document, items: &[Object], owner: u32, d: &Dict, locked: &str) -> Result<IdSet<u32>> {
+    let mut gone: IdSet<u32> = IdSet::new();
+    gone.insert(owner);
+    add_own_popup(doc, d, owner, &mut gone);
+    for _ in 0..MAX_REPLY_DEPTH {
+        let mut grew = false;
+        for other in items {
+            let Some(r) = other.as_obj_ref().filter(|r| !gone.contains(&r.num)) else { continue };
+            let Ok(Object::Dict(reply)) = doc.get(r) else { continue };
+            if !reply.get("IRT").and_then(Object::as_obj_ref).is_some_and(|to| gone.contains(&to.num)) {
+                continue;
+            }
+            if is_locked(doc, &reply) {
+                return Err(Error::Invalid(locked.to_string()));
+            }
+            gone.insert(r.num);
+            add_own_popup(doc, &reply, r.num, &mut gone);
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    Ok(gone)
 }
 
 /// Write the page's annotation list again with `change` made: the page object when the list is in it (or there is none, or
@@ -709,30 +790,7 @@ fn change_annots(ctx: &mut Ctx<'_>, pages: &[Page], page: &Page, change: AnnotsC
             if is_locked(ctx.doc, d) {
                 return Err(Error::Invalid("the annotation is locked: its author does not allow it to be taken out".to_string()));
             }
-            let mut gone: IdSet<u32> = IdSet::new();
-            if num != 0 {
-                gone.insert(num);
-                add_own_popup(ctx.doc, d, num, &mut gone);
-                for _ in 0..MAX_REPLY_DEPTH {
-                    let mut grew = false;
-                    for other in &items {
-                        let Some(r) = other.as_obj_ref().filter(|r| !gone.contains(&r.num)) else { continue };
-                        let Ok(Object::Dict(reply)) = ctx.doc.get(r) else { continue };
-                        if !reply.get("IRT").and_then(Object::as_obj_ref).is_some_and(|to| gone.contains(&to.num)) {
-                            continue;
-                        }
-                        if is_locked(ctx.doc, &reply) {
-                            return Err(Error::Invalid("a reply to the annotation is locked: it is not taken out".to_string()));
-                        }
-                        gone.insert(r.num);
-                        add_own_popup(ctx.doc, &reply, r.num, &mut gone);
-                        grew = true;
-                    }
-                    if !grew {
-                        break;
-                    }
-                }
-            }
+            let gone = if num != 0 { companions(ctx.doc, &items, num, d, "a reply to the annotation is locked: it is not taken out")? } else { IdSet::new() };
             items = items
                 .into_iter()
                 .enumerate()
@@ -792,6 +850,8 @@ pub(crate) fn save_section(doc: &Document) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod forms_tests;
+#[cfg(test)]
+mod modify_tests;
 #[cfg(test)]
 mod pages_tests;
 #[cfg(test)]

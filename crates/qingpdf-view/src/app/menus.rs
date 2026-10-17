@@ -17,6 +17,13 @@ pub(super) struct MenuState {
     pub can_undo: bool,
     pub can_redo: bool,
     pub has_picked: bool,
+    /// With an annotation picked: its colour, the width of its line and its fill can be changed (the reader draws that kind and it is not locked).
+    /// With none, they are for the next ones, so they can.
+    pub color_ok: bool,
+    pub width_ok: bool,
+    pub fill_ok: bool,
+    /// The shapes are filled.
+    pub fill: bool,
     /// The command of the tool in use (`CMD_TOOL_*`), the colour chosen and the line width.
     pub tool: u32,
     pub color: usize,
@@ -43,6 +50,10 @@ impl MenuState {
             can_undo: false,
             can_redo: false,
             has_picked: false,
+            color_ok: true,
+            width_ok: true,
+            fill_ok: true,
+            fill: false,
             tool: CMD_TOOL_SELECT,
             color: 0,
             width: 1,
@@ -148,9 +159,9 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             title: t(lang, Msg::CommentMenu).to_string(),
             entries: {
                 let tool = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.tool == id, enabled: id == CMD_TOOL_SELECT && st.has_doc || st.can_edit };
-                let colors: Vec<MenuEntry> = COLORS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_COLOR_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.color == i, enabled: st.can_edit }).collect();
+                let colors: Vec<MenuEntry> = COLORS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_COLOR_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.color == i, enabled: st.can_edit && st.color_ok }).collect();
                 let sizes: Vec<MenuEntry> = TEXT_SIZES.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_SIZE_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.text_size == i, enabled: st.can_edit }).collect();
-                let widths: Vec<MenuEntry> = WIDTHS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_WIDTH_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.width == i, enabled: st.can_edit }).collect();
+                let widths: Vec<MenuEntry> = WIDTHS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_WIDTH_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.width == i, enabled: st.can_edit && st.width_ok }).collect();
                 vec![
                     tool(CMD_TOOL_SELECT, Msg::ToolSelect),
                     MenuEntry::Separator,
@@ -159,6 +170,11 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     tool(CMD_TOOL_STRIKE, Msg::ToolStrike),
                     tool(CMD_TOOL_SQUIGGLY, Msg::ToolSquiggly),
                     tool(CMD_TOOL_INK, Msg::ToolInk),
+                    tool(CMD_TOOL_RECT, Msg::ToolRect),
+                    tool(CMD_TOOL_ELLIPSE, Msg::ToolEllipse),
+                    tool(CMD_TOOL_LINE, Msg::ToolLine),
+                    tool(CMD_TOOL_ARROW, Msg::ToolArrow),
+                    MenuEntry::Item { id: CMD_FILL, label: t(lang, Msg::FillShapes).to_string(), checked: st.fill, enabled: st.can_edit && st.fill_ok },
                     tool(CMD_TOOL_NOTE, Msg::ToolNote),
                     tool(CMD_TOOL_TEXTBOX, Msg::ToolTextBox),
                     tool(CMD_STAMP, Msg::ToolStamp),
@@ -231,11 +247,16 @@ impl App {
             Tool::TextBox => CMD_TOOL_TEXTBOX,
             Tool::Stamp => CMD_STAMP,
             Tool::EditText => CMD_TOOL_EDITTEXT,
+            Tool::Shape(ShapeKind::Rectangle) => CMD_TOOL_RECT,
+            Tool::Shape(ShapeKind::Ellipse) => CMD_TOOL_ELLIPSE,
+            Tool::Shape(ShapeKind::Line) => CMD_TOOL_LINE,
+            Tool::Shape(ShapeKind::Arrow) => CMD_TOOL_ARROW,
         }
     }
 
     pub(super) fn menus(&self) -> Vec<Menu> {
         let tool = self.tool_command();
+        let picked = self.edit.picked_info();
         let st = MenuState {
             has_doc: self.doc.is_some(),
             show_sidebar: self.sidebar_width() > 0,
@@ -243,7 +264,11 @@ impl App {
             can_edit: self.doc.is_some() && self.rights.annotate,
             can_undo: self.edit.can_undo,
             can_redo: self.edit.can_redo,
-            has_picked: self.has_picked(),
+            has_picked: picked.is_some_and(|a| !a.locked()),
+            color_ok: picked.is_none_or(|a| a.restylable() && !a.locked()),
+            width_ok: picked.is_none_or(|a| a.has_width() && !a.locked()),
+            fill_ok: picked.is_none_or(|a| a.fillable() && !a.locked()),
+            fill: self.edit.ae.fill,
             tool,
             color: self.edit.current_color(),
             width: self.edit.width,

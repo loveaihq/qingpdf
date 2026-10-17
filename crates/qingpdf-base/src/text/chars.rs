@@ -55,6 +55,11 @@ impl Shown {
         }
     }
 
+    /// The page is turned by its own `/Rotate`.
+    pub fn is_turned(&self) -> bool {
+        self.rotate != 0
+    }
+
     /// The size of the page as it is shown, in points (width, height).
     pub fn size(&self) -> (f64, f64) {
         let (w, h) = (self.x1 - self.x0, self.y1 - self.y0);

@@ -33,7 +33,7 @@ pub(super) const PIXEL_COST: f64 = 12.0;
 pub(super) const BOX_COST: f64 = 300_000.0;
 
 /// The rectangle `[left, top, right, bottom]` of the page as shown, in order, at least [`MIN_SIDE`] a side and inside the page.
-fn normalized(shown: &Shown, rect: [f32; 4]) -> Result<[f64; 4]> {
+pub(super) fn normalized(shown: &Shown, rect: [f32; 4]) -> Result<[f64; 4]> {
     let [a, b, c, d] = [finite_place(rect[0])?, finite_place(rect[1])?, finite_place(rect[2])?, finite_place(rect[3])?];
     let (page_w, page_h) = shown.size();
     let (mut l, mut r) = (a.min(c), a.max(c));
@@ -78,19 +78,34 @@ fn add_form(ctx: &mut Ctx<'_>, w: f64, h: f64, matrix: [f64; 6], content: &str, 
     Ok(r)
 }
 
-/// A text box with `text` in it, `size` points high, in the rectangle `rect` (grown downwards when the text needs more room).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn freetext(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], text: &str, size: f32, color: [u8; 3], author: &str, now: &str) -> Result<Vec<ObjRef>> {
-    let size = f64::from(size);
-    if !size.is_finite() {
-        return Err(Error::Invalid("the size of the text is not a number".to_string()));
-    }
-    let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+/// The text of a text box as it is kept: line ends as `\n`, no other control characters, at most [`MAX_FREETEXT_CHARS`] characters.
+pub(super) fn clean_text(text: &str) -> String {
     let normalized_text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let clean: String = normalized_text.chars().filter(|&c| c == '\n' || !c.is_control()).take(MAX_FREETEXT_CHARS).collect();
-    if clean.trim().is_empty() {
-        return Err(Error::Invalid("the text box is empty".to_string()));
-    }
+    normalized_text.chars().filter(|&c| c == '\n' || !c.is_control()).take(MAX_FREETEXT_CHARS).collect()
+}
+
+/// The size a text box's text is drawn at, held to the sizes it may have.
+pub(super) fn clamp_size(size: f64) -> Result<f64> {
+    if size.is_finite() { Ok(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)) } else { Err(Error::Invalid("the size of the text is not a number".to_string())) }
+}
+
+/// The colour operator of a `/DA` for an RGB colour.
+pub(super) fn da_color(color: [u8; 3]) -> String {
+    let n = |c: u8| super::appearance::num(f64::from(c) / 255.0);
+    format!("{} {} {} rg", n(color[0]), n(color[1]), n(color[2]))
+}
+
+/// How a text box is fitted to its text: it grows downwards when the text needs more room, or it stays as it is and the text must fit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fit {
+    Grow,
+    Fixed,
+}
+
+/// The appearance of a text box: `clean` (see [`clean_text`]) laid out in the rectangle `at` (`[left, top, right, bottom]` of the page as shown,
+/// already held to the page when it may grow) `size` points high, in the colour `color` (an operator with its operands, `0 g`); the box grows
+/// downwards when the text needs more room, unless it is `Fixed`. Returns the form and the annotation's rectangle in user space.
+pub(super) fn freetext_ap(ctx: &mut Ctx<'_>, shown: &Shown, at: [f64; 4], clean: &str, size: f64, color: &str, fit: Fit) -> Result<(ObjRef, [f64; 4])> {
     if !ctx.work.charge(BOX_COST + 600.0 * clean.chars().count() as f64) {
         return Err(Error::Limit("the text box took too much work".to_string()));
     }
@@ -99,37 +114,59 @@ pub(super) fn freetext(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], text: &
     let embedded = fontsub::embed(&font, &chars, ctx.work)?;
     let font_ref = fontsub::add_objects(ctx, &embedded)?;
 
-    let [l, t, r, mut b] = normalized(shown, rect)?;
-    let (page_w, page_h) = shown.size();
+    let [l, t, r, mut b] = at;
+    let (_, page_h) = shown.size();
     // Room for all the lines: the box grows downwards, as far as the page goes.
     let (asc, desc) = embedded.ascent_descent();
-    let (lines, cut) = layout::wrap(&embedded, &clean, size, (r - l - 4.0).max(1.0), layout::MAX_LINES);
+    let (lines, cut) = layout::wrap(&embedded, clean, size, (r - l - 4.0).max(1.0), layout::MAX_LINES);
     if cut {
         return Err(Error::Limit(format!("the text takes more than {} lines", layout::MAX_LINES)));
     }
     let needed = lines.len() as f64 * (asc - desc) * size + 4.0;
-    if needed > b - t {
-        b = (t + needed).min(page_h.max(t + MIN_SIDE));
+    if fit == Fit::Fixed {
+        if needed > b - t + 0.01 {
+            return Err(Error::Invalid("the text does not fit in its box".to_string()));
+        }
+    } else {
+        if needed > b - t {
+            b = (t + needed).min(page_h.max(t + MIN_SIDE));
+        }
+        b = b.max(t + MIN_SIDE);
     }
-    let b = b.max(t + MIN_SIDE);
-    let _ = page_w;
     let (w, h) = (r - l, b - t);
     let (user_rect, matrix) = frame(shown, [l, t, r, b]);
 
-    let da = Da { font: b"F0".to_vec(), size, color: format!("{} {} {} rg", super::appearance::num(f64::from(color[0]) / 255.0), super::appearance::num(f64::from(color[1]) / 255.0), super::appearance::num(f64::from(color[2]) / 255.0)) };
-    let spec = Spec { text: &clean, multiline: true, q: 0, comb: None };
+    let da = Da { font: b"F0".to_vec(), size, color: color.to_string() };
+    let spec = Spec { text: clean, multiline: true, q: 0, comb: None };
     let content = layout::text_content(&embedded as &dyn Face, &spec, &da, w, h, 0.0, "F0").0;
     let mut fonts = Dict::new();
     fonts.set("F0", Object::Ref(font_ref));
     let mut resources = Dict::new();
     resources.set("Font", Object::Dict(fonts));
     let form = add_form(ctx, w, h, matrix, &content, resources)?;
+    Ok((form, user_rect))
+}
 
+/// The `/DA` of a text box.
+pub(super) fn da_string(size: f64, color: &str) -> Object {
+    Object::String(crate::object::PdfString::literal(format!("/Helv {} Tf {color}", super::appearance::num(size)).into_bytes()))
+}
+
+/// A text box with `text` in it, `size` points high, in the rectangle `rect` (grown downwards when the text needs more room).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn freetext(ctx: &mut Ctx<'_>, shown: &Shown, rect: [f32; 4], text: &str, size: f32, color: [u8; 3], author: &str, now: &str) -> Result<Vec<ObjRef>> {
+    let size = clamp_size(f64::from(size))?;
+    let clean = clean_text(text);
+    if clean.trim().is_empty() {
+        return Err(Error::Invalid("the text box is empty".to_string()));
+    }
+    let da = da_color(color);
+    let (form, user_rect) = freetext_ap(ctx, shown, normalized(shown, rect)?, &clean, size, &da, Fit::Grow)?;
     let annot_ref = ctx.alloc()?;
     let mut d = annotation("FreeText", user_rect, color, author, now);
     d.remove("C");
     d.set("Contents", text_string(&clean.replace('\n', "\r")));
-    d.set("DA", Object::String(crate::object::PdfString::literal(format!("/Helv {} Tf {}", super::appearance::num(size), da.color).into_bytes())));
+    d.set("DA", da_string(size, &da));
     d.set("Q", Object::Integer(0));
     d.set("IT", Object::from("FreeTextTypewriter"));
     d.set("Border", Object::Array(vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)]));

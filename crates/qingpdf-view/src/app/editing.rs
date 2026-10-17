@@ -5,8 +5,9 @@
 use std::path::PathBuf;
 
 use qingpdf_core::idmap::IdMap;
-use qingpdf_core::view::{ALL_PAGES, AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, line_rects};
+use qingpdf_core::view::{ALL_PAGES, AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, ShapeKind, line_rects};
 
+use super::annotedit::AnnotEdit;
 use super::forms::FormState;
 use super::*;
 use crate::ui::SaveChoice;
@@ -25,10 +26,6 @@ pub(super) const WIDTHS: [(Msg, f32); 4] = [(Msg::WidthThin, 1.0), (Msg::WidthMe
 const DEFAULT_WIDTH: usize = 1;
 /// Most points kept of one stroke while it is drawn (the engine thins a longer one).
 const MAX_DRAFT_POINTS: usize = 20_000;
-/// The colour of the frame round the annotation picked.
-const PICK_COLOR: u32 = 0x0066FF;
-/// How far (in points) from an annotation a click still picks it.
-const PICK_SLOP: f32 = 2.0;
 
 /// What the pointer does on the pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +42,8 @@ pub(super) enum Tool {
     Stamp,
     /// Click a line of the page's text and type what it is to read instead (5a).
     EditText,
+    /// Drag out a rectangle, an ellipse, a line or an arrow (2026-10-17).
+    Shape(ShapeKind),
 }
 
 /// What is to be done once the changes are saved (or given up).
@@ -82,6 +81,8 @@ pub(super) enum Asked {
     /// Page numbers, headers and footers were put on, or taken away.
     Pagenum,
     Unpagenum,
+    /// An annotation was moved, resized, drawn again or given a text (2026-10-17).
+    Change,
 }
 
 impl Asked {
@@ -129,6 +130,8 @@ pub(super) struct EditState {
     note_at: Option<(u32, f32, f32)>,
     /// Form fields, text boxes and pictures (4b).
     pub forms: FormState,
+    /// Shapes, and the annotation picked held, nudged, drawn again (2026-10-17).
+    pub(super) ae: AnnotEdit,
 }
 
 impl EditState {
@@ -155,21 +158,24 @@ impl EditState {
             note_press: None,
             note_at: None,
             forms: FormState::new(),
+            ae: AnnotEdit::new(),
         }
     }
 
     /// Forget everything about the document that is gone (the author and the tool stay).
     pub(super) fn reset(&mut self) {
-        let (author, color, width) = (std::mem::take(&mut self.author), self.color, self.width);
+        let (author, color, width, fill) = (std::mem::take(&mut self.author), self.color, self.width, self.ae.fill);
         *self = EditState::new(author);
         self.color = color;
         self.width = width;
+        self.ae.fill = fill;
     }
 
     /// The window lost the pointer while it was down: a stroke or a note that was begun is given up.
     pub(super) fn give_up_stroke(&mut self) {
         self.ink = None;
         self.note_press = None;
+        self.ae.give_up();
         self.forms.give_up_drag();
     }
 
@@ -179,6 +185,7 @@ impl EditState {
         self.annots.clear();
         self.picked = None;
         self.ink = None;
+        self.ae.forget_pages();
         let mut ids: Vec<u64> = self.annots_asked.drain().map(|(i, _)| i).collect();
         ids.extend(self.forms.forget_pages(actions));
         ids
@@ -225,6 +232,7 @@ impl App {
             return self.say(t(self.lang, if self.edit.forms.content { Msg::NoteModifyDenied } else { Msg::NoteAnnotDenied }).to_string());
         }
         self.edit.ink = None;
+        self.edit.ae.give_up();
         self.edit.picked = None;
         self.edit.forms.give_up();
         self.menus_dirty = true;
@@ -243,6 +251,7 @@ impl App {
             Tool::Note => Some(Msg::NoteNoteHint),
             Tool::TextBox => Some(Msg::NoteTextBoxHint),
             Tool::EditText => Some(Msg::NoteEditTextHint),
+            Tool::Shape(_) => Some(Msg::NoteShapeHint),
         };
         match hint {
             Some(m) => self.say(t(self.lang, m).to_string()),
@@ -251,6 +260,10 @@ impl App {
     }
 
     pub(super) fn set_color(&mut self, index: usize) -> Vec<Action> {
+        // With an annotation picked, the colour is its; with none, the next ones'.
+        if index < COLORS.len() && self.has_picked() && let Some(actions) = self.restyle_picked(Some(index), None, None) {
+            return actions;
+        }
         if index < COLORS.len() {
             self.edit.color = Some(index);
             self.menus_dirty = true;
@@ -259,6 +272,9 @@ impl App {
     }
 
     pub(super) fn set_width(&mut self, index: usize) -> Vec<Action> {
+        if index < WIDTHS.len() && self.has_picked() && let Some(actions) = self.restyle_picked(None, Some(index), None) {
+            return actions;
+        }
         if index < WIDTHS.len() {
             self.edit.width = index;
             self.menus_dirty = true;
@@ -272,6 +288,7 @@ impl App {
             title: t(self.lang, Msg::AuthorTitle).to_string(),
             prompt: format!("{} ({})", t(self.lang, Msg::AuthorPrompt), self.edit.author),
             secret: false,
+            initial: String::new(),
             ok: t(self.lang, Msg::Ok).to_string(),
             cancel: t(self.lang, Msg::Cancel).to_string(),
         }]
@@ -287,11 +304,12 @@ impl App {
 
     /// Esc: back to selecting, and no stroke or annotation picked.
     pub(super) fn escape_tool(&mut self) -> Option<Vec<Action>> {
-        if self.edit.tool == Tool::Select && self.edit.ink.is_none() && self.edit.picked.is_none() && !self.edit.forms.has_stamp() {
+        if self.edit.tool == Tool::Select && self.edit.ink.is_none() && self.edit.picked.is_none() && !self.edit.forms.has_stamp() && !self.edit.ae.holds() {
             return None;
         }
         self.edit.tool = Tool::Select;
         self.edit.ink = None;
+        self.edit.ae.give_up();
         self.edit.picked = None;
         self.edit.forms.give_up();
         self.menus_dirty = true;
@@ -302,11 +320,13 @@ impl App {
 
     /// The pointer went down with a tool that takes it: a stroke is started, or the place of a note noted. `None`: the tool leaves
     /// it to selecting.
-    pub(super) fn edit_mouse_down(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+    pub(super) fn edit_mouse_down(&mut self, x: i64, y: i64, clicks: u8) -> Option<Vec<Action>> {
         if let Some(actions) = self.forms_mouse_down(x, y) {
             return Some(actions);
         }
         match self.edit.tool {
+            Tool::Select => self.annot_mouse_down(x, y, clicks),
+            Tool::Shape(_) => self.shape_mouse_down(x, y),
             Tool::Ink => {
                 let (page, ..) = self.page_at_point(x, y)?;
                 let (xp, yp) = self.page_point(page as u32, x, y)?;
@@ -326,8 +346,11 @@ impl App {
     }
 
     /// The pointer moved with the button down: `true` if a stroke took it.
-    pub(super) fn edit_mouse_move(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
+    pub(super) fn edit_mouse_move(&mut self, x: i64, y: i64, shift: bool) -> Option<Vec<Action>> {
         if let Some(actions) = self.forms_mouse_move(x, y) {
+            return Some(actions);
+        }
+        if let Some(actions) = self.annot_mouse_move(x, y, shift) {
             return Some(actions);
         }
         let page = self.edit.ink.as_ref()?.page;
@@ -344,6 +367,9 @@ impl App {
     /// The button came up: a stroke is handed to the engine, or the text of a note asked for. `true` if a tool took it.
     pub(super) fn edit_mouse_up(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
         if let Some(actions) = self.forms_mouse_up(x, y) {
+            return Some(actions);
+        }
+        if let Some(actions) = self.annot_mouse_up(x, y) {
             return Some(actions);
         }
         if let Some(draft) = self.edit.ink.take() {
@@ -370,6 +396,7 @@ impl App {
             title: t(self.lang, Msg::NoteTitle).to_string(),
             prompt: t(self.lang, Msg::NotePrompt).to_string(),
             secret: false,
+            initial: String::new(),
             ok: t(self.lang, Msg::Ok).to_string(),
             cancel: t(self.lang, Msg::Cancel).to_string(),
         }])
@@ -405,6 +432,7 @@ impl App {
             title: t(self.lang, Msg::NoteTitle).to_string(),
             prompt: t(self.lang, Msg::NotePrompt).to_string(),
             secret: false,
+            initial: String::new(),
             ok: t(self.lang, Msg::Ok).to_string(),
             cancel: t(self.lang, Msg::Cancel).to_string(),
         }]
@@ -489,34 +517,17 @@ impl App {
     pub(super) fn on_annotations(&mut self, id: u64, page: u32, items: Vec<AnnotInfo>) -> Vec<Action> {
         if self.edit.annots_asked.remove(&id).is_some() {
             self.edit.annots.insert(page, items);
+            self.resolve_want_pick(page);
         }
-        Vec::new()
+        vec![Action::Invalidate]
     }
 
     /// Pick the annotation of `page` at the place (`x`, `y`) in points, if there is one (the last of them is on top).
     pub(super) fn pick_annotation(&mut self, page: u32, x: f64, y: f64) -> Vec<Action> {
-        let (x, y) = (x as f32, y as f32);
-        let hit = self.edit.annots.get(&page).and_then(|list| {
-            list.iter().enumerate().rev().find(|(_, a)| {
-                let rects: &[[f32; 4]] = if a.parts.is_empty() { std::slice::from_ref(&a.rect) } else { &a.parts };
-                rects.iter().any(|r| r[0] - PICK_SLOP <= x && x <= r[2] + PICK_SLOP && r[1] - PICK_SLOP <= y && y <= r[3] + PICK_SLOP)
-            })
-        });
+        let hit = self.annotation_at(page, x as f32, y as f32);
         let before = self.edit.picked;
-        self.edit.picked = hit.map(|(i, _)| (page, i));
-        let mut actions = Vec::new();
-        if let Some(a) = self.edit.picked_info() {
-            let mut text = a.subtype.clone();
-            if !a.author.is_empty() {
-                text.push_str(" - ");
-                text.push_str(&a.author);
-            }
-            if !a.contents.is_empty() {
-                text.push_str(": ");
-                text.push_str(&a.contents);
-            }
-            actions.extend(self.say(text));
-        }
+        self.edit.picked = hit.map(|i| (page, i));
+        let mut actions = self.describe_picked();
         if before != self.edit.picked {
             self.menus_dirty = true;
             actions.push(Action::Invalidate);
@@ -527,7 +538,7 @@ impl App {
     /// Is there an annotation under this place (so that the pointer can say so)?
     pub(super) fn annotation_cursor(&self) -> Option<Cursor> {
         match self.edit.tool {
-            Tool::Ink | Tool::Note | Tool::TextBox => Some(Cursor::Cross),
+            Tool::Ink | Tool::Note | Tool::TextBox | Tool::Shape(_) => Some(Cursor::Cross),
             Tool::Markup(_) | Tool::EditText => Some(Cursor::Text),
             Tool::Select | Tool::Stamp => None,
         }
@@ -542,6 +553,9 @@ impl App {
         let Some((page, _)) = self.edit.picked else { return Vec::new() };
         if !self.rights.annotate {
             return self.say(t(self.lang, Msg::NoteAnnotDenied).to_string());
+        }
+        if a.locked() {
+            return self.say(t(self.lang, Msg::NoteLocked).to_string());
         }
         if let Some(wait) = self.edit_wait() {
             return wait;
@@ -579,6 +593,10 @@ impl App {
         self.edit.can_undo = r.can_undo;
         self.edit.can_redo = r.can_redo;
         self.edit.dirty = r.dirty;
+        // A change that was not made leaves nothing to pick again.
+        if what == Asked::Change && r.status != EditStatus::Done {
+            self.edit.ae.want_pick = None;
+        }
         self.menus_dirty = true;
         let lang = self.lang;
         let mut actions = vec![Action::SetTitle(self.title()), Action::Invalidate];
@@ -614,6 +632,7 @@ impl App {
                 self.schedule();
                 self.ask_for_links();
                 self.ask_for_annots();
+                self.annots_stale();
                 // The engine tells once, with a message, that the file is signed and the signature will show it as changed.
                 let mut extra = String::new();
                 let note = if what == Asked::Line {
@@ -632,6 +651,7 @@ impl App {
                 } else {
                     match what {
                         Asked::Add => Some(Msg::NoteAdded),
+                        Asked::Change => Some(Msg::NoteChanged),
                         Asked::Fill => Some(Msg::NoteFilled),
                         Asked::Remove => Some(Msg::NoteRemoved),
                         Asked::Pagenum => Some(Msg::NotePagenum),
@@ -856,41 +876,10 @@ impl App {
             let side = (width_pt * doc.layout.scale()).round().max(1.0) as i64;
             let [r, g, b] = self.rgb();
             let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
-            let dot = |p: &mut dyn Painter, x: f64, y: f64| {
-                p.fill_rect(Rect { x: clamp32(left + x.round() as i64 - side / 2), y: clamp32(top + y.round() as i64 - side / 2), w: clamp32(side), h: clamp32(side) }, color);
-            };
-            let mut last: Option<(f64, f64)> = None;
-            for pt in &draft.points {
-                let (x, y) = map.to_px(f64::from(pt[0]), f64::from(pt[1]));
-                if let Some((lx, ly)) = last {
-                    // Dots along the segment, as many as keep it unbroken.
-                    let steps = ((x - lx).abs().max((y - ly).abs()) / (side as f64 / 2.0).max(1.0)).ceil().clamp(1.0, 4000.0) as i64;
-                    for i in 1..=steps {
-                        let t = i as f64 / steps as f64;
-                        dot(p, lx + (x - lx) * t, ly + (y - ly) * t);
-                    }
-                } else {
-                    dot(p, x, y);
-                }
-                last = Some((x, y));
-            }
+            let points: Vec<(f64, f64)> = draft.points.iter().map(|pt| map.to_px(f64::from(pt[0]), f64::from(pt[1]))).collect();
+            self.draw_dots(p, &points, left, top, side, color);
         }
-        if let Some((pp, _)) = self.edit.picked
-            && pp as usize == page
-            && let Some(a) = self.edit.picked_info()
-        {
-            let rects: Vec<[f32; 4]> = if a.parts.is_empty() { vec![a.rect] } else { a.parts.clone() };
-            for r in rects {
-                let (x0, y0, x1, y1) = map.rect_to_px(r);
-                let (x0, y0, x1, y1) = (left + x0.floor() as i64 - 1, top + y0.floor() as i64 - 1, left + x1.ceil() as i64 + 1, top + y1.ceil() as i64 + 1);
-                let t = self.px(2).max(1);
-                let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w.max(1)), h: clamp32(h.max(1)) };
-                p.fill_rect(rect(x0, y0, x1 - x0, t), PICK_COLOR);
-                p.fill_rect(rect(x0, y1 - t, x1 - x0, t), PICK_COLOR);
-                p.fill_rect(rect(x0, y0, t, y1 - y0), PICK_COLOR);
-                p.fill_rect(rect(x1 - t, y0, t, y1 - y0), PICK_COLOR);
-            }
-        }
+        self.draw_annot_marks(p, page, left, top);
     }
 }
 

@@ -126,6 +126,9 @@ impl App {
         if self.split_drag.is_some() || self.on_split(x, y) {
             return Cursor::SizeWE;
         }
+        if let Some(shape) = self.pick_cursor(x, y) {
+            return shape;
+        }
         if let Some(shape) = self.annotation_cursor()
             && self.page_at_point(x, y).is_some()
         {
@@ -178,6 +181,8 @@ impl App {
             }
             EngineEvent::CharBoxes(b) if b.doc == self.doc_id => self.on_boxes(b),
             EngineEvent::Annotations { doc, id, page, items, .. } if doc == self.doc_id => self.on_annotations(id, page, items),
+            EngineEvent::AnnotList { doc, id, items, truncated } if doc == self.doc_id => self.on_annot_list(id, items, truncated),
+            EngineEvent::AnnotText { doc, id, found, text, .. } if doc == self.doc_id => self.on_annot_text(id, found, text),
             EngineEvent::Fields { doc, id, page, items, .. } if doc == self.doc_id => self.on_fields(id, page, items),
             EngineEvent::Options { doc, id, items, .. } if doc == self.doc_id => self.on_options(id, items),
             EngineEvent::TextLine { doc, id, status, message, line, .. } if doc == self.doc_id => self.on_text_line(id, status, &message, line),

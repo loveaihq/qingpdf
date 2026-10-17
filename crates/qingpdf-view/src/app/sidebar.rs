@@ -1,5 +1,5 @@
-//! The sidebar beside the pages (2026-10-14): two tabs, the bookmarks (the window's tree control, put under the tabs) and the
-//! thumbnails (a list this file draws and handles, from the small pictures the engine makes). The rows, the cache, what to ask for and
+//! The sidebar beside the pages (2026-10-14): three tabs, the bookmarks (the window's tree control, put under the tabs), the
+//! thumbnails (a list this file draws and handles, from the small pictures the engine makes) and the annotations (`annotlist.rs`). The rows, the cache, what to ask for and
 //! the keys are plain logic in `thumbs.rs`; this is the part that knows about the engine, the window and the painter.
 //!
 //! The pictures are asked for at a priority after everything the pages need (`thumbs::P_VISIBLE`), only for the rows in view and a few next
@@ -25,22 +25,22 @@ const BAR_EDGE: i64 = 3;
 pub(super) const DEFAULT_WIDTH: i64 = THUMB_W + 2 * (THUMB_MARGIN + BAR_W + BAR_EDGE);
 
 // Colours.
-const LIST_BG: u32 = 0xEEEEEE;
-const HEADER_BG: u32 = 0xE0E0E0;
+pub(super) const LIST_BG: u32 = 0xEEEEEE;
+pub(super) const HEADER_BG: u32 = 0xE0E0E0;
 const TAB_ON_BG: u32 = 0xFAFAFA;
 const TAB_LINE: u32 = 0x2B7CFF;
 const HEADER_EDGE: u32 = 0xB4B4B4;
-const SELECTED_BORDER: u32 = 0x3390FF;
+pub(super) const SELECTED_BORDER: u32 = 0x3390FF;
 /// The page in view, when the chosen pages are others: a thin frame.
 const CURRENT_FRAME: u32 = 0x8FB8F0;
 pub(super) const SELECTED_BG: u32 = 0xD3E3FB;
 const THUMB_BORDER: u32 = 0x8C8C8C;
 const PLACEHOLDER: u32 = 0xF7F7F7;
 const DAMAGED: u32 = 0xCDCDCD;
-const NUMBER_FG: u32 = 0x404040;
-const SELECTED_FG: u32 = 0x0B4FB3;
-const DISABLED_FG: u32 = 0x9A9A9A;
-const BAR_COLOR: u32 = 0xB4B4B4;
+pub(super) const NUMBER_FG: u32 = 0x404040;
+pub(super) const SELECTED_FG: u32 = 0x0B4FB3;
+pub(super) const DISABLED_FG: u32 = 0x9A9A9A;
+pub(super) const BAR_COLOR: u32 = 0xB4B4B4;
 
 /// The key of the list a key of the keyboard is, if it is one.
 pub(super) fn list_key(key: u32) -> Option<ListKey> {
@@ -81,9 +81,9 @@ impl App {
         (self.view_h - self.px(TAB_H)).max(0)
     }
 
-    /// The tab that shows: the person's, but the thumbnails when there are no bookmarks.
+    /// The tab that shows: the person's, but the thumbnails when they chose the bookmarks and there are none.
     pub(super) fn active_tab(&self) -> Tab {
-        if self.outline.is_empty() { Tab::Pages } else { self.tab }
+        if self.outline.is_empty() && self.tab == Tab::Bookmarks { Tab::Pages } else { self.tab }
     }
 
     /// Are the thumbnails on the screen?
@@ -115,10 +115,12 @@ impl App {
             // The tab that shows may have changed (the bookmarks came).
             self.sync_thumbs();
             self.schedule_thumbs();
+            self.ask_for_annot_list();
             actions.push(Action::Invalidate);
         }
         actions.extend(self.chrome());
         self.menus_dirty = true;
+        self.ask_for_annot_list();
         actions
     }
 
@@ -146,11 +148,14 @@ impl App {
             return Vec::new();
         }
         self.tab = tab;
-        self.thumbs_alone = tab == Tab::Pages;
+        // (Without bookmarks the sidebar is there only for the tab that is not them.)
+        self.thumbs_alone = tab != Tab::Bookmarks;
         self.thumb_focus = tab == Tab::Pages;
+        self.annots_focus = tab == Tab::Annots;
         self.keep(|s| s.tab = Some(tab));
         self.sync_thumbs();
         self.schedule_thumbs();
+        self.ask_for_annot_list();
         let mut actions = self.chrome();
         actions.push(Action::Invalidate);
         actions
@@ -299,9 +304,13 @@ impl App {
         if y < tabs {
             return Some(self.choose_tab(tab_at(x, width)));
         }
+        if self.annots_shown() {
+            return Some(self.annots_press(x, y));
+        }
         if !self.thumbs_shown() {
             return Some(Vec::new());
         }
+        self.annots_focus = false;
         self.thumb_focus = true;
         if x >= width - self.px(THUMB_GUTTER) && self.thumbs.strip.total() > self.list_h() {
             self.thumb_drag = true;
@@ -349,6 +358,8 @@ impl App {
         let (width, tabs) = (self.list_w(), self.px(TAB_H));
         if self.thumbs_shown() {
             self.draw_thumbs(p, width, tabs);
+        } else if self.annots_shown() {
+            self.draw_annot_list(p, width, tabs);
         }
         // The tabs come last: a row scrolled up under them is hidden by them.
         self.draw_tabs(p, width, tabs);
@@ -357,8 +368,8 @@ impl App {
     fn draw_tabs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
         p.fill_rect(rect(0, 0, width, tabs), HEADER_BG);
         let active = self.active_tab();
-        let half = width / 2;
-        for (tab, x0, x1, msg) in [(Tab::Bookmarks, 0, half, Msg::TabBookmarks), (Tab::Pages, half, width, Msg::TabPages)] {
+        let (third, two_thirds) = (width / 3, width * 2 / 3);
+        for (tab, x0, x1, msg) in [(Tab::Bookmarks, 0, third, Msg::TabBookmarks), (Tab::Pages, third, two_thirds, Msg::TabPages), (Tab::Annots, two_thirds, width, Msg::TabAnnots)] {
             let on = tab == active;
             let enabled = tab != Tab::Bookmarks || !self.outline.is_empty();
             if on {
@@ -371,7 +382,8 @@ impl App {
             p.text(clamp32(x0 + (x1 - x0 - w) / 2), clamp32((tabs - i64::from(p.line_height())) / 2 - self.px(1)), s, color);
         }
         p.fill_rect(rect(0, tabs - self.px(1).max(1), width, self.px(1).max(1)), HEADER_EDGE);
-        p.fill_rect(rect(half, 0, self.px(1).max(1), tabs), HEADER_EDGE);
+        p.fill_rect(rect(third, 0, self.px(1).max(1), tabs), HEADER_EDGE);
+        p.fill_rect(rect(two_thirds, 0, self.px(1).max(1), tabs), HEADER_EDGE);
     }
 
     fn draw_thumbs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
@@ -689,9 +701,9 @@ pub(super) mod tests {
         let actions = app.chrome();
         let tabs = app.px(TAB_H);
         assert!(actions.iter().any(|a| matches!(a, Action::Sidebar(r) if i64::from(r.y) == tabs && r.w > 0 && i64::from(r.y + r.h) == app.view_h)));
-        // The right half of the header is the pages.
-        let right = (app.list_w() - 10) as i32;
-        tab_click(&mut app, right);
+        // The middle third of the header is the pages.
+        let middle = (app.list_w() / 2) as i32;
+        tab_click(&mut app, middle);
         assert_eq!(app.active_tab(), Tab::Pages);
         assert!(app.thumbs_shown() && app.thumb_focus);
         assert!(app.chrome().iter().any(|a| matches!(a, Action::Sidebar(r) if r.w == 0)), "the tree is hidden");
@@ -760,7 +772,7 @@ pub(super) mod tests {
         assert!(app.thumb_drag);
         let mid = app.thumbs.scroll;
         assert!(mid > app.thumbs.strip.total() / 4 && mid < app.thumbs.strip.total() * 3 / 4, "about the middle: {mid}");
-        app.event(Event::MouseMove { x, y: y_at(1.0) });
+        app.event(Event::MouseMove { x, y: y_at(1.0), shift: false });
         assert_eq!(app.thumbs.scroll, app.thumbs.strip.max_scroll(list_h));
         assert!(app.thumbs.asked.is_empty(), "nothing is asked for while the bar is dragged");
         app.event(Event::MouseUp { x, y: y_at(1.0) });
@@ -795,7 +807,7 @@ pub(super) mod tests {
         let (rows, bytes) = (app.thumbs.strip.clone(), app.thumbs.cache.bytes());
         let edge = (app.view_x - 2) as i32;
         app.event(Event::MouseDown { x: edge, y: 300, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: edge + 80, y: 300 });
+        app.event(Event::MouseMove { x: edge + 80, y: 300, shift: false });
         assert!(app.thumbs.asked.is_empty(), "nothing is asked for in the middle of the drag");
         app.event(Event::MouseUp { x: edge + 80, y: 300 });
         assert_eq!(app.list_w(), app.px(DEFAULT_WIDTH + 80));
@@ -806,7 +818,7 @@ pub(super) mod tests {
         // Made as narrow as it goes (120), it is too narrow for the margins: the thumbnails shrink to fit, and are asked for at the new size.
         let edge = (app.view_x - 2) as i32;
         app.event(Event::MouseDown { x: edge, y: 300, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseMove { x: edge - 400, y: 300 });
+        app.event(Event::MouseMove { x: edge - 400, y: 300, shift: false });
         app.event(Event::MouseUp { x: edge - 400, y: 300 });
         assert_eq!(app.sidebar_pref, 120);
         let narrow = app.thumbs.strip.row(0).copied().expect("a row");

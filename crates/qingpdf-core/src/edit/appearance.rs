@@ -22,11 +22,11 @@ pub(crate) struct Appearance {
 
 pub(crate) use crate::layout::num;
 
-fn point(out: &mut String, p: (f64, f64), op: &str) {
+pub(super) fn point(out: &mut String, p: (f64, f64), op: &str) {
     let _ = writeln!(out, "{} {} {op}", num(p.0), num(p.1));
 }
 
-fn color(out: &mut String, c: [f64; 3], op: &str) {
+pub(super) fn color(out: &mut String, c: [f64; 3], op: &str) {
     let _ = writeln!(out, "{} {} {} {op}", num(c[0]), num(c[1]), num(c[2]));
 }
 

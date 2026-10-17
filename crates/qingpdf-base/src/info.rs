@@ -138,6 +138,15 @@ pub fn pdf_doc_char(b: u8) -> char {
 /// dropped. Control characters become spaces, so a hostile file cannot send
 /// terminal escape codes through `info`.
 pub fn decode_text_string(bytes: &[u8]) -> String {
+    decode_text(bytes, false)
+}
+
+/// [`decode_text_string`] for a text that has lines (a note's, a text box's): the line ends (carriage return, line feed) stay as they are.
+pub fn decode_text_lines(bytes: &[u8]) -> String {
+    decode_text(bytes, true)
+}
+
+fn decode_text(bytes: &[u8], lines: bool) -> String {
     let decoded: String = if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         decode_utf16(rest, true)
     } else if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
@@ -149,7 +158,7 @@ pub fn decode_text_string(bytes: &[u8]) -> String {
     };
     strip_language_escapes(&decoded)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if c.is_control() && !(lines && matches!(c, '\r' | '\n')) { ' ' } else { c })
         .collect()
 }
 
