@@ -23,6 +23,11 @@ impl Squeeze {
         Squeeze { waiting: None, running: None, made: None }
     }
 
+    /// A compression is waiting for the name of the file or is going on.
+    pub(super) fn busy(&self) -> bool {
+        self.running.is_some() || self.waiting.is_some()
+    }
+
     /// The open file has gone: what was going on for it is given up (the engine is told).
     pub(super) fn reset(&mut self) -> Option<u64> {
         self.waiting = None;
@@ -296,7 +301,8 @@ mod tests {
         app.open_path(&file, "");
         pump_for(&mut app, "the file to open", |a, _| a.has_document());
         app.edit.dirty = true;
-        let asked = app.event(Event::Command(CMD_COMPRESS));
+        // (The flag was set by hand, so the window is told the new title along with the question.)
+        let asked: Vec<Action> = app.event(Event::Command(CMD_COMPRESS)).into_iter().filter(|a| !matches!(a, Action::SetTitle(_))).collect();
         let [Action::Confirm { tag, text, .. }] = &asked[..] else { panic!("{asked:?}") };
         assert_eq!(*tag, TAG_COMPRESS_SAVE);
         assert!(text.contains("not saved"));

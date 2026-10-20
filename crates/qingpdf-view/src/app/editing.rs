@@ -49,8 +49,10 @@ pub(super) enum Tool {
 /// What is to be done once the changes are saved (or given up).
 #[derive(Clone, Debug)]
 pub(super) enum After {
+    /// The window is to close (the tabs with changes are asked about one after the other).
     Quit,
-    Open(PathBuf),
+    /// The shown tab is to close.
+    CloseTab,
     /// The box for compressing the file is shown (the changes were saved first).
     Compress,
 }
@@ -135,6 +137,18 @@ pub(super) struct EditState {
 }
 
 impl EditState {
+    /// What the person has chosen about annotations (the name, the colour, the width of the line, the size of the text, the watermark) goes from tab
+    /// to tab: taken from `from`, the state of the tab that was shown (its name is moved, not copied).
+    pub(super) fn take_prefs(&mut self, from: &mut EditState) {
+        std::mem::swap(&mut self.author, &mut from.author);
+        (self.color, self.width, self.ae.fill, self.forms.text_size, self.forms.wm) = (from.color, from.width, from.ae.fill, from.forms.text_size, from.forms.wm);
+    }
+
+    /// Something this tab has asked of the engine is not answered yet, or a save or an export is going: the tab is not to be left.
+    pub(super) fn busy(&self) -> bool {
+        self.saving.is_some() || self.exporting.is_some() || !self.asked.is_empty()
+    }
+
     pub(super) fn new(author: String) -> EditState {
         EditState {
             tool: Tool::Select,
@@ -801,15 +815,15 @@ impl App {
                 self.menus_dirty = true;
                 // (A file written again as a whole has no history to go back through.)
                 (self.edit.can_undo, self.edit.can_redo) = (self.edit.can_undo && !whole, self.edit.can_redo && !whole);
-                let renamed = self.path.as_ref() != Some(&path);
+                // The file is what was just written: later it is told from a file that was changed by another program by this (and where the
+                // reader was in it is noted with it).
+                self.stamp = crate::places::stamp_of(&path);
                 self.path = Some(path);
-                if renamed {
-                    self.remember_position();
-                }
+                self.remember_position();
                 let mut actions = vec![Action::SetTitle(self.title()), Action::Invalidate];
                 match self.edit.after.take() {
-                    Some(After::Quit) => actions.extend(self.exit_now()),
-                    Some(After::Open(p)) => actions.extend(self.open_path_now(&p, "")),
+                    Some(After::Quit) => actions.extend(self.quit()),
+                    Some(After::CloseTab) => actions.extend(self.close_current()),
                     Some(After::Compress) => actions.push(Action::AskForm(self.compress_form())),
                     None => actions.extend(self.say(t(lang, Msg::NoteSaved).to_string())),
                 }
@@ -830,7 +844,11 @@ impl App {
             return None;
         }
         self.edit.after = Some(then);
-        Some(vec![Action::AskSave { tag: TAG_UNSAVED, title: t(self.lang, Msg::UnsavedTitle).to_string(), text: t(self.lang, Msg::UnsavedAsk).to_string() }])
+        // (With several files open, which one is asked about is said.)
+        let name = self.path.as_deref().map(crate::tabs::label).unwrap_or_default();
+        Some(vec![Action::AskSave { tag: TAG_UNSAVED, title: t(self.lang, Msg::UnsavedTitle).to_string(), text: format!("{}
+
+{name}", t(self.lang, Msg::UnsavedAsk)) }])
     }
 
     pub(super) fn unsaved_answered(&mut self, choice: SaveChoice) -> Vec<Action> {
@@ -844,15 +862,20 @@ impl App {
                 }
                 actions
             }
-            SaveChoice::Discard => {
-                self.edit.dirty = false;
-                match after {
-                    After::Quit => self.exit_now(),
-                    After::Open(p) => self.open_path_now(&p, ""),
-                    After::Compress => Vec::new(),
+            // (The changes stay where they are until the tab or the window is gone: the person may still cancel at the next question, and
+            // then the tab has its changes and its mark. For this round of questions the tab is not asked about again.)
+            SaveChoice::Discard => match after {
+                After::Quit => {
+                    self.discarded.push(self.doc_id);
+                    self.quit()
                 }
+                After::CloseTab => self.close_current(),
+                After::Compress => Vec::new(),
+            },
+            SaveChoice::Cancel => {
+                self.discarded.clear();
+                Vec::new()
             }
-            SaveChoice::Cancel => Vec::new(),
         }
     }
 
@@ -860,6 +883,7 @@ impl App {
         // A print job that is going is stopped first (AbortDoc, and the printer is let go of).
         let mut actions = self.cancel_print_for_new_document();
         self.remember_position();
+        self.flush_places();
         actions.push(Action::Quit);
         actions
     }

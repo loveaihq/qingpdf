@@ -20,6 +20,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::clicks::ClickCounter;
+use crate::copydata;
 use crate::placement::{self, Placement};
 use crate::toolbar::{self, IconFont};
 use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ToolItem, ToolbarSpec, ToolbarState};
@@ -57,6 +58,23 @@ struct Msg {
     time: u32,
     pt: Point,
     private: u32,
+}
+
+/// `COPYDATASTRUCT`: a number of the sender's choice, and some bytes.
+#[repr(C)]
+struct CopyData {
+    id: usize,
+    size: u32,
+    data: *const c_void,
+}
+
+/// `TRACKMOUSEEVENT`.
+#[repr(C)]
+struct TrackMouse {
+    size: u32,
+    flags: u32,
+    hwnd: isize,
+    hover_time: u32,
 }
 
 type WndProc = unsafe extern "system" fn(isize, u32, usize, isize) -> isize;
@@ -398,6 +416,11 @@ unsafe extern "system" {
     fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
     fn IsZoomed(hwnd: isize) -> i32;
     fn IsIconic(hwnd: isize) -> i32;
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn SendMessageTimeoutW(hwnd: isize, msg: u32, wparam: usize, lparam: isize, flags: u32, timeout: u32, result: *mut usize) -> isize;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+    fn AllowSetForegroundWindow(pid: u32) -> i32;
+    fn TrackMouseEvent(track: *mut TrackMouse) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -439,6 +462,8 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> isize;
+    fn CreateMutexW(attributes: *const c_void, owner: i32, name: *const u16) -> isize;
+    fn GetLastError() -> u32;
     fn GetLocalTime(time: *mut LocalTime);
     fn AttachConsole(pid: u32) -> i32;
     fn GetStdHandle(which: u32) -> isize;
@@ -516,6 +541,15 @@ const WM_MOUSEWHEEL: u32 = 0x020A;
 const WM_MOUSEHWHEEL: u32 = 0x020E;
 const WM_DPICHANGED: u32 = 0x02E0;
 const WM_DROPFILES: u32 = 0x0233;
+const WM_COPYDATA: u32 = 0x004A;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_MOUSELEAVE: u32 = 0x02A3;
+const TME_LEAVE: u32 = 2;
+const SMTO_ABORTIFHUNG: u32 = 2;
+const SW_RESTORE: i32 = 9;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+/// The class of the window (found by a second copy of the program, to hand it files).
+const WINDOW_CLASS: &str = "QingpdfView";
 const WM_DESTROY: u32 = 0x0002;
 /// The engine thread posts this to say it has something to hand over.
 const WM_WAKE: u32 = 0x8001;
@@ -954,6 +988,11 @@ struct WindowState {
     normal: Cell<Option<WinRect>>,
     remember_window: bool,
     clicks: RefCell<ClickCounter>,
+    /// How many calls of `execute` are on the stack (more than one: a box is open), the files that came from outside meanwhile, and whether
+    /// the system is told when the pointer leaves the window.
+    depth: Cell<u32>,
+    deferred: RefCell<Vec<PathBuf>>,
+    tracking: Cell<bool>,
 }
 
 /// A printer's device context, and the file it writes if it was told to write one (zero-terminated UTF-16).
@@ -981,20 +1020,33 @@ fn dispatch(state: &WindowState, event: Event) {
 }
 
 fn deliver(state: &WindowState, event: Event) -> Vec<Action> {
+    try_deliver(state, event).unwrap_or_default()
+}
+
+/// [`deliver`], saying whether the reader took the event: it does not when the window is closing, or when the reader is busy (a message arrived
+/// while it was handling one): the event is dropped then, not queued.
+fn try_deliver(state: &WindowState, event: Event) -> Option<Vec<Action>> {
     if state.closing.get() {
-        return Vec::new();
+        return None;
     }
-    match state.handler.try_borrow_mut() {
-        Ok(mut guard) => match guard.as_mut() {
-            Some(h) => h.event(event),
-            None => Vec::new(),
-        },
-        // The reader is busy (a message arrived while it was handling one): the event is dropped, not queued.
-        Err(_) => Vec::new(),
-    }
+    let mut guard = state.handler.try_borrow_mut().ok()?;
+    Some(guard.as_mut()?.event(event))
 }
 
 fn execute(state: &WindowState, actions: Vec<Action>) {
+    state.depth.set(state.depth.get() + 1);
+    run_actions(state, actions);
+    state.depth.set(state.depth.get().saturating_sub(1));
+    // Files that came from outside while a box was open are opened now that it is closed.
+    if state.depth.get() == 0 {
+        let waiting = std::mem::take(&mut *state.deferred.borrow_mut());
+        if !waiting.is_empty() {
+            dispatch(state, Event::Drop(waiting));
+        }
+    }
+}
+
+fn run_actions(state: &WindowState, actions: Vec<Action>) {
     let mut queue: VecDeque<Action> = actions.into();
     while let Some(action) = queue.pop_front() {
         // A box that was up while the window was closed (the task bar, Alt+F4 on the owner) leaves the window gone: what is
@@ -1312,11 +1364,49 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 0;
         }
         WM_MOUSEMOVE => {
+            let (x, y) = mouse_place(lparam);
             if wparam & MK_LBUTTON != 0 {
-                let (x, y) = mouse_place(lparam);
                 dispatch(state, Event::MouseMove { x, y: y - content_top(state), shift: wparam & MK_SHIFT != 0 });
+            } else {
+                // (The system says when the pointer leaves the window, once, after this.)
+                if !state.tracking.replace(true) {
+                    let mut track = TrackMouse { size: std::mem::size_of::<TrackMouse>() as u32, flags: TME_LEAVE, hwnd, hover_time: 0 };
+                    // SAFETY: `track` is a live TRACKMOUSEEVENT of the size it declares; the window is ours.
+                    unsafe { TrackMouseEvent(&mut track) };
+                }
+                dispatch(state, Event::Hover { x, y: y - content_top(state) });
             }
             return 0;
+        }
+        WM_MOUSELEAVE => {
+            state.tracking.set(false);
+            dispatch(state, Event::HoverEnd);
+            return 0;
+        }
+        WM_MBUTTONUP => {
+            let (x, y) = mouse_place(lparam);
+            dispatch(state, Event::MiddleClick { x, y: y - content_top(state) });
+            return 0;
+        }
+        WM_COPYDATA => {
+            // Another program sent this (the other copy of the reader does, with files to open; any program can): it is read as a list of paths
+            // of PDF files and nothing else, and thrown away whole if it is anything but that (`copydata.rs`).
+            // SAFETY: for WM_COPYDATA, lparam points to a COPYDATASTRUCT that is valid for the duration of this message; it is only read.
+            let sent = unsafe { (lparam as *const CopyData).as_ref() };
+            let paths = sent.and_then(|cd| {
+                let len = usize::try_from(cd.size).ok().filter(|&n| n <= copydata::MAX_BYTES && !cd.data.is_null())?;
+                // SAFETY: the sender of a WM_COPYDATA says `size` bytes at `data` are there, and the system keeps them valid until this message
+                // is answered; `len` is held to the limit above before they are read, and `decode` copies what it keeps.
+                let bytes = unsafe { std::slice::from_raw_parts(cd.data.cast::<u8>(), len) };
+                copydata::decode(cd.id, bytes)
+            });
+            let Some(paths) = paths else { return 0 };
+            // (The sender is told whether the files were taken: if not, it opens them in a window of its own.)
+            if !open_from_outside(state, paths) {
+                return 0;
+            }
+            bring_to_front(hwnd);
+            return 1;
         }
         WM_LBUTTONUP => {
             // The reader hears the button come up first: giving the mouse back makes Windows say that the window lost it
@@ -1451,7 +1541,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         }
         WM_DROPFILES => {
             let files = dropped_files(wparam as isize);
-            dispatch(state, Event::Drop(files));
+            open_from_outside(state, files);
             return 0;
         }
         WM_DPICHANGED => {
@@ -1501,9 +1591,73 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// Files that came from outside (dropped on the window, handed over by another copy of the program): opened at once, or, with a box open on
+/// the window, when it is closed.
+/// `false`: they were not taken (the reader is busy, the window is closing, or too many wait already).
+fn open_from_outside(state: &WindowState, files: Vec<PathBuf>) -> bool {
+    if state.depth.get() > 0 {
+        copydata::keep_waiting(&mut state.deferred.borrow_mut(), files, crate::tabs::MAX_DROPPED)
+    } else {
+        match try_deliver(state, Event::Drop(files)) {
+            Some(actions) => {
+                execute(state, actions);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Show the window to the person (out of the task bar if it was minimised, in front of the others).
+fn bring_to_front(hwnd: isize) {
+    // SAFETY: plain handle of our window and plain numbers.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        SetForegroundWindow(hwnd);
+    }
+}
+
+/// Is this the first copy of the program on this desktop? (The first one takes a name that the others find taken; the handle is kept for as long
+/// as the program runs.)
+pub fn first_copy() -> bool {
+    let name = wide("Local\\QingpdfViewFirstCopy");
+    // SAFETY: a null security descriptor, no initial owner and a zero-terminated name that outlives the call; the handle is never closed.
+    let handle = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
+    // SAFETY: reads the last error of this thread, set by the call just made.
+    handle != 0 && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
+}
+
+/// Hand these files to the copy of the program that is running (its window is found by its class): `true` if it took them (they are what
+/// `copydata::decode` accepts), and it comes to the front.
+pub fn hand_over(paths: &[PathBuf]) -> bool {
+    let data = copydata::encode(paths);
+    let class = wide(WINDOW_CLASS);
+    // SAFETY: the class is a zero-terminated string that outlives the call; no window title (null).
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), null()) };
+    let Ok(size) = u32::try_from(data.len()) else { return false };
+    if hwnd == 0 || size == 0 {
+        return false;
+    }
+    let (mut pid, mut result) = (0u32, 0usize);
+    let message = CopyData { id: copydata::ID, size, data: data.as_ptr().cast() };
+    // SAFETY: `pid` is a live u32 that Windows fills in; `message` is a live COPYDATASTRUCT whose data points to `size` bytes of `data`, which
+    // outlive the call (SendMessageTimeoutW does not return before the other window has answered or the time is out, and the system copies
+    // the bytes for the other process); a window that does not answer in 3 seconds, or hangs, is given up on.
+    let sent = unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        AllowSetForegroundWindow(pid);
+        SendMessageTimeoutW(hwnd, WM_COPYDATA, 0, (&raw const message) as isize, SMTO_ABORTIFHUNG, 3000, &mut result)
+    };
+    sent != 0 && result == 1
+}
+
 fn dropped_files(drop: isize) -> Vec<PathBuf> {
     // SAFETY: `drop` is the HDROP of a WM_DROPFILES message, valid until DragFinish. 0xFFFFFFFF asks for the count.
     let count = unsafe { DragQueryFileW(drop, u32::MAX, null_mut(), 0) };
+    // (The first few dozen only: the rest of a very long list is not looked at.)
+    let count = count.min(crate::tabs::MAX_DROPPED as u32);
     let mut files = Vec::new();
     for i in 0..count {
         // SAFETY: with a null buffer the call returns the length in characters without writing anything.
@@ -3251,7 +3405,7 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Optio
     unsafe { InitCommonControlsEx(&icc) };
     // SAFETY: the print box needs COM on its thread (a single-threaded apartment); a failure only means the box may not open.
     unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED) };
-    let class = wide("QingpdfView");
+    let class = wide(WINDOW_CLASS);
     // SAFETY: a null module name means the module of this program.
     let instance = unsafe { GetModuleHandleW(null()) };
     // SAFETY: no arguments; reads a system setting.
@@ -3348,6 +3502,9 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Optio
         normal: Cell::new(None),
         remember_window: remember && client.is_none(),
         clicks: RefCell::new(ClickCounter::default()),
+        depth: Cell::new(0),
+        deferred: RefCell::new(Vec::new()),
+        tracking: Cell::new(false),
     });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.

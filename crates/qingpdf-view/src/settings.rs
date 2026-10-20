@@ -1,7 +1,9 @@
 //! What the reader keeps between runs, in one small UTF-8 text file, `%APPDATA%\qingpdf\author.txt` (the name it has had since the
 //! name put on the annotations, 4a, was kept there). The first line is that name, as it always was, so that an older build still reads
 //! it; the lines after it are `key=value` settings: `lang` (`system`, `zh` or `en`), `toolbar` (`1` or `0`), `sidebar` (the width of
-//! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks`, `pages` or `annots`: the tab of the sidebar last used) and `window` (`x,y,w,h,maximized`, see [`Placement`]). Nothing is sent anywhere. The file is
+//! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks`, `pages` or `annots`: the tab of the sidebar last used), `window` (`x,y,w,h,maximized`, see [`Placement`]),
+//! and (2026-10-17) `single_window` and `remember_place` (`0` turns off handing a file to the copy of the program that is running, and opening a
+//! file where it was left; both are on unless they are `0`). Nothing is sent anywhere. The file is
 //! not trusted (another program may have written it): a name that is too long or has control characters in it is not used, a setting
 //! that is not understood or is out of range is ignored.
 
@@ -56,11 +58,14 @@ pub struct Settings {
     /// The tab of the sidebar last used (none: the bookmarks).
     pub tab: Option<Tab>,
     pub window: Option<Placement>,
+    /// A file opened from outside goes to the copy of the program that is running (else a window of its own), and a file opens where it was left.
+    pub single_window: bool,
+    pub remember_place: bool,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { author: None, lang: LangChoice::System, toolbar: true, sidebar: None, tab: None, window: None }
+        Settings { author: None, lang: LangChoice::System, toolbar: true, sidebar: None, tab: None, window: None, single_window: true, remember_place: true }
     }
 }
 
@@ -78,6 +83,8 @@ impl Settings {
                 "sidebar" => s.sidebar = value.trim().parse::<i32>().ok().filter(|w| SIDEBAR_RANGE.contains(w)),
                 "tab" => s.tab = Tab::parse(value),
                 "window" => s.window = Placement::parse(value),
+                "single_window" => s.single_window = value.trim() != "0",
+                "remember_place" => s.remember_place = value.trim() != "0",
                 _ => {}
             }
         }
@@ -95,6 +102,12 @@ impl Settings {
         }
         if let Some(w) = self.window {
             out.push_str(&format!("window={}\n", w.to_text()));
+        }
+        if !self.single_window {
+            out.push_str("single_window=0\n");
+        }
+        if !self.remember_place {
+            out.push_str("remember_place=0\n");
         }
         out
     }
@@ -169,6 +182,8 @@ mod tests {
             sidebar: Some(310),
             tab: Some(Tab::Pages),
             window: Some(Placement { x: -1500, y: 20, w: 1100, h: 760, maximized: true }),
+            single_window: false,
+            remember_place: false,
         };
         let text = s.render();
         assert_eq!(text.lines().next(), Some("张三"));
@@ -191,6 +206,13 @@ mod tests {
         assert_eq!(Settings::parse("N\nsidebar=200\nsidebar=oops\n").sidebar, None);
         assert_eq!(Settings::parse("N\nsidebar=200\n").sidebar, Some(200));
         assert_eq!(Settings::parse("N\ntab=pages\n").tab, Some(Tab::Pages));
+        // Both are on unless they say 0 (anything else, or nothing, leaves them on).
+        let on = Settings::parse("N\nsingle_window=yes\n");
+        assert!(on.single_window && on.remember_place);
+        let off = Settings::parse("N\nsingle_window=0\nremember_place= 0 \n");
+        assert!(!off.single_window && !off.remember_place);
+        assert!(!Settings::parse(&off.render()).single_window);
+        assert!(!Settings::parse(&Settings::default().render()).render().contains("single_window"));
         assert_eq!(Settings::parse("N\ntab=thumbnails\n").tab, None);
         // Too long a first line is not a name, and does not stop the rest.
         let long = format!("{}\nlang=en\n", "x".repeat(MAX_AUTHOR_CHARS + 1));

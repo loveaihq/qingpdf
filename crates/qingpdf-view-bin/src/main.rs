@@ -2,7 +2,8 @@
 //!
 //! The program is only the command line (and the manifest, `build.rs`): the reader is the library `qingpdf-view`.
 //!
-//! Run `qingpdf-view [file.pdf]`. The hidden `--bench <file.pdf>` opens the file, goes through its pages by itself,
+//! Run `qingpdf-view [file.pdf ...]`: each file opens in a tab; if a copy of the program is running already, the files go to its window (and this
+//! program ends), unless the settings say `single_window=0`. The hidden `--bench <file.pdf>` opens the file, goes through its pages by itself,
 //! prints times and the memory peak and quits; `--bench-size WxH` gives the window of that test a client area of that
 //! many pixels (it may be bigger than the screen); `--bench-thumbs` opens the sidebar on the thumbnails in it. The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
 //! (the first three by default) to the printer "Microsoft Print to PDF", which writes `out.pdf`, with no box, says how it went
@@ -17,6 +18,7 @@ use std::time::Instant;
 
 use qingpdf_view::app::{App, PrintTest};
 use qingpdf_view::bench::Bench;
+use qingpdf_view::copydata;
 use qingpdf_view::i18n::{Lang, Msg, t};
 use qingpdf_view::{settings, win32};
 
@@ -58,7 +60,7 @@ fn main() {
     let mut bench_size: Option<(i32, i32)> = None;
     // The speed test with the sidebar open on the thumbnails.
     let mut bench_thumbs = false;
-    let mut open: Option<PathBuf> = None;
+    let mut open: Vec<std::ffi::OsString> = Vec::new();
     // The hidden print test: the file, the file to write, the pages.
     let mut print_test: Option<(PathBuf, PathBuf, (u32, u32))> = None;
     // The hidden OCR test: the file, the file to write, the pages (all the scans by default), Chinese or the person's languages.
@@ -85,8 +87,8 @@ fn main() {
             }
         } else if arg == "--ocr-lang" {
             ocr_chinese = args.next().map(|s| s.to_string_lossy().to_ascii_lowercase().starts_with("zh"));
-        } else if open.is_none() && !arg.to_string_lossy().starts_with("--") {
-            open = Some(PathBuf::from(arg));
+        } else if !arg.to_string_lossy().starts_with("--") {
+            open.push(arg);
         }
     }
     if bench_file.is_some() || print_test.is_some() || ocr_test.is_some() {
@@ -98,6 +100,21 @@ fn main() {
     let tests = bench_file.is_some() || print_test.is_some() || ocr_test.is_some();
     let kept = if tests { settings::Settings::default() } else { settings::load_all() };
     let lang = kept.lang.resolve(system_lang);
+    let open = copydata::paths_of(open);
+    // One window for all the files: a copy that is running (or is just starting) takes the files and this one ends.
+    if !tests && kept.single_window {
+        let first = win32::first_copy();
+        let mut tries = if first { 1 } else { 30 };
+        while !open.is_empty() && tries > 0 {
+            if win32::hand_over(&open) {
+                std::process::exit(0);
+            }
+            tries -= 1;
+            if tries > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
     if let Some((file, out, pages)) = ocr_test {
         let chinese = ocr_chinese.unwrap_or(lang == Lang::Zh);
         std::process::exit(qingpdf_view::ocr::ocr_test(&file.to_string_lossy(), &out.to_string_lossy(), pages, chinese));
@@ -125,8 +142,8 @@ fn main() {
         } else if let Some((file, output, (first, last))) = print_test {
             app.set_print_test(PrintTest { output, first, last });
             app.open_when_ready(file);
-        } else if let Some(file) = open {
-            app.open_when_ready(file);
+        } else {
+            app.open_all_when_ready(open);
         }
         Box::new(app)
     });

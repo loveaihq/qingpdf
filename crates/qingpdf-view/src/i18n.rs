@@ -351,11 +351,18 @@ pub enum Msg {
     CzDone,
     CzKept,
     CzFailed,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    TooManyTabs,
+    TabBusy,
+    NoRoomTabs,
+    TabFileChanged,
 }
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 298] = [
+pub const ALL: [Msg; 305] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -654,6 +661,13 @@ pub const ALL: [Msg; 298] = [
     Msg::CzDone,
     Msg::CzKept,
     Msg::CzFailed,
+    Msg::CloseTab,
+    Msg::NextTab,
+    Msg::PrevTab,
+    Msg::TooManyTabs,
+    Msg::TabBusy,
+    Msg::NoRoomTabs,
+    Msg::TabFileChanged,
 ];
 
 pub fn t(lang: Lang, m: Msg) -> &'static str {
@@ -956,6 +970,13 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::CzDone => ("Compressed: {before} to {after}, {pct}% smaller.\nOpen the new file?", "压缩完成：{before} 变成 {after}，小了 {pct}%。\n要打开压缩后的文件吗？"),
         Msg::CzKept => ("The file would not get smaller ({before}), so no new file was written.", "这个文件压缩后不会变小（{before}），所以没有生成新文件。"),
         Msg::CzFailed => ("The file could not be compressed:", "没能压缩："),
+        Msg::CloseTab => ("Close &tab\tCtrl+W", "关闭标签(&T)\tCtrl+W"),
+        Msg::NextTab => ("N&ext tab\tCtrl+Tab", "下一个标签(&E)\tCtrl+Tab"),
+        Msg::PrevTab => ("Previous t&ab\tCtrl+Shift+Tab", "上一个标签(&B)\tCtrl+Shift+Tab"),
+        Msg::TooManyTabs => ("16 files are open: close a tab first.", "已经打开 16 个文件，请先关掉一个标签。"),
+        Msg::TabBusy => ("This tab is busy: wait for it to finish, or press Esc to stop it.", "这个标签正忙：等它做完，或按 Esc 停下。"),
+        Msg::NoRoomTabs => ("No memory left for another file: save or close some tabs first.", "先保存或关闭一些标签：内存放不下再多一个文件了。"),
+        Msg::TabFileChanged => ("The file changed on the disk meanwhile. It is shown as it is now.", "文件在磁盘上被改过，现在显示的是它现在的样子。"),
     };
     match lang {
         Lang::En => en,
@@ -1027,7 +1048,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 298);
+        assert_eq!(ALL.len(), 305);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

@@ -25,8 +25,10 @@ mod recents;
 mod searching;
 mod selecting;
 mod sidebar;
+mod tabbar;
+mod tabset;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,9 +41,11 @@ use crate::cache::{BitmapCache, Entry, Focus, Key};
 use crate::find::SearchState;
 use crate::i18n::{self, Lang, LangChoice, Msg, t};
 use crate::layout::Layout;
+use crate::places::{self, Place, Places, Stamp};
 use crate::recent;
 use crate::sched::{self, Scene, Want};
 use crate::select::Selection;
+use crate::tabs::Tabs;
 use crate::thumbs::{self, Tab};
 use crate::tiles;
 use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
@@ -142,6 +146,10 @@ pub const CMD_PG_DELETE: u32 = 122;
 pub const CMD_PG_INS_BEFORE: u32 = 123;
 pub const CMD_PG_INS_AFTER: u32 = 124;
 pub const CMD_PG_EXTRACT: u32 = 125;
+/// The tabs (2026-10-17): close the one shown, show the next one, show the one before.
+pub const CMD_CLOSE_TAB: u32 = 140;
+pub const CMD_NEXT_TAB: u32 = 141;
+pub const CMD_PREV_TAB: u32 = 142;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
@@ -219,148 +227,217 @@ struct Doc {
     max_tile_pixels: u32,
 }
 
-pub struct App {
-    lang: Lang,
-    engine: Engine,
-    /// The most pixels the window can show (its screen's work area), for sizing the bitmaps' share of the memory.
-    max_view_pixels: u64,
-    /// The scale the pieces in view are drawn at: the zoom's own, or a smaller one when they would not fit the cache.
-    draw_scale: u64,
-    /// The whole client area's width; the pages are `view_w` wide, from `view_x` (the bookmarks are to their left).
-    client_w: i64,
-    view_x: i64,
-    view_w: i64,
-    view_h: i64,
-    dpi: u32,
-    doc_id: u64,
-    path: Option<PathBuf>,
-    opening: bool,
-    doc: Option<Doc>,
-    mode: ZoomMode,
-    zoom: u32,
-    /// Turns of the view in degrees, added to each page's own.
-    rotation: u16,
-    scroll_x: i64,
-    scroll_y: i64,
-    /// Scrolling or zooming goes on: nothing sharp is asked for until it stops.
-    moving: bool,
-    cache: BitmapCache,
-    /// The requests the engine has: by the piece, and by the request.
-    in_flight: HashMap<Key, u64>,
-    asked: IdMap<u64, Want>,
-    /// Pieces the engine could not draw: not asked for again.
-    failed: HashSet<Key>,
-    notices: IdMap<u32, Notice>,
-    next_id: u64,
-    wrong_password: bool,
-    /// What the scroll bars show now, so that they are set only when it changes.
-    bars: (Option<ScrollInfo>, Option<ScrollInfo>),
-    /// Whether the last picture drawn had every piece of the pages in view at the zoom they are seen at.
-    sharp_on_screen: bool,
-    /// A file to open as soon as the window has its size (from the command line).
-    pending_open: Option<PathBuf>,
-    /// Wakes the window's loop (from any thread).
-    wake: Arc<dyn Fn() + Send + Sync>,
-    first_bitmap: Option<Instant>,
-    last_sharp: Option<Instant>,
-    pub bench: Option<Bench>,
-    pub(crate) started: Instant,
+/// The fields of the reader, in two lists: the ones that belong to the window (`global`) and the ones that belong to the file that is shown
+/// (`tab`, each with the value a tab starts with). A tab that is not shown keeps its `tab` fields in a [`TabState`]; showing a tab is
+/// swapping them (`App::exchange`). One list, so that a field cannot be in one place and forgotten in the other.
+macro_rules! app_fields {
+    (
+        global { $( $(#[$gm:meta])* $gv:vis $gf:ident : $gt:ty, )* }
+        tab { $( $(#[$tm:meta])* $tv:vis $tf:ident : $tt:ty = $ti:expr, )* }
+    ) => {
+        pub struct App {
+            $( $(#[$gm])* $gv $gf: $gt, )*
+            $( $(#[$tm])* $tv $tf: $tt, )*
+        }
 
-    // --- 3d-2 ---
-    /// What the file allows (all of it when none is open).
-    rights: Rights,
-    /// The bookmarks of the open file, and whether the sidebar is wanted (it is shown when there are bookmarks, or when it is open on the thumbnails).
-    outline: Vec<OutlineItem>,
-    show_sidebar: bool,
-    /// The links of the pages near the window, and the engine's requests for them (request, page).
-    links: IdMap<u32, Vec<Link>>,
-    links_asked: IdMap<u64, u32>,
-    /// The boxes of the characters of the pages the pointer has been on, and the requests for them.
-    boxes: IdMap<u32, PageBoxes>,
-    boxes_asked: IdMap<u64, u32>,
-    /// The left button is down: where, and on what.
-    press: Option<Press>,
-    /// Where the pointer was last, in the client area.
-    mouse: (i64, i64),
-    selection: Option<Selection>,
-    /// The request for the text of the selection that is being copied.
-    copy_asked: Option<u64>,
-    /// What to say when the clipboard has taken the text that was copied.
-    copy_note: Option<String>,
-    find_open: bool,
-    /// What is in the find box now.
-    find_text: String,
-    search: Option<SearchState>,
-    print: Option<PrintJob>,
-    /// A line for the status bar, between the page number and the zoom.
-    note: Option<String>,
-    recent: Vec<recent::Entry>,
-    recent_path: Option<PathBuf>,
-    /// An address of a link, waiting for the person to say yes.
-    pending_uri: Option<String>,
-    /// The menus have to be put again (what is greyed, checked or listed has changed).
-    menus_dirty: bool,
-    /// The hidden `--print-test`: print to a printer that writes a file, with no box, and quit.
-    print_test: Option<PrintTest>,
+        /// What the window holds apart from the tabs.
+        struct Globals {
+            $( $gf: $gt, )*
+        }
 
-    // --- 4a ---
-    /// The tool, the annotations, the history of the changes and the saving.
-    edit: EditState,
+        /// What the reader keeps of the file that is shown: all of it for a tab that is not shown, a blank one for a tab not yet made.
+        pub(crate) struct TabState {
+            $( $tf: $tt, )*
+        }
 
-    // --- 5c ---
-    /// The run of text recognition that is going on, if one is; and (for tests) the recogniser to use instead of Windows' own.
-    ocr: Option<crate::ocr::Run>,
-    pub(crate) ocr_test_opener: Option<crate::ocr::Opener>,
+        impl TabState {
+            fn blank() -> TabState {
+                TabState { $( $tf: $ti, )* }
+            }
+        }
 
-    // --- the interface (2026-10-14) ---
-    /// What the person chose in View > Language, and the language of Windows (what "follow the system" means).
-    lang_choice: LangChoice,
-    system_lang: Lang,
-    /// The toolbar is shown (View > Toolbar); it is told to the window with the next answer when `toolbar_dirty`.
-    toolbar_on: bool,
-    toolbar_dirty: bool,
-    /// What the toolbar and the status bar were last told to say, so that they are told only when it changes.
-    last_toolbar: Option<ToolbarState>,
-    last_status: Option<StatusText>,
-    /// The width of the bookmarks the person has made them (at 96 dpi), and the start of a drag of their edge: where the pointer was
-    /// and the width then.
-    sidebar_pref: i64,
-    split_drag: Option<(i64, i64)>,
-    /// The page and the place on it (points) the menu on the page was opened at, for "add note here" and "select all on the page".
-    ctx_at: Option<(u32, f32, f32)>,
-    /// A double click, a triple click or "select all" that waits for the characters of its page.
-    pending_select: Option<chrome::PendingSelect>,
-    /// Whether changes to the settings are written to the file (the tests do not).
-    pub(crate) persist: bool,
+        impl App {
+            fn assemble(g: Globals) -> App {
+                App { $( $gf: g.$gf, )* $( $tf: $ti, )* }
+            }
 
-    // --- the thumbnails (2026-10-14) ---
-    /// The tab of the sidebar the person chose, and whether the sidebar is open on the thumbnails for a file without bookmarks.
-    tab: Tab,
-    thumbs_alone: bool,
-    /// The rows of the thumbnails, where they are scrolled to, the pictures and the requests for them.
-    thumbs: thumbs::Thumbs,
-    /// The keys belong to the list of thumbnails (it was clicked last), and its bar is being dragged.
-    thumb_focus: bool,
-    /// ... or to the list of annotations (the third tab).
-    annots_focus: bool,
-    al: annotlist::AnnotList,
-    thumb_drag: bool,
-    /// The page the list of thumbnails moved to (it is the page shown as current while it is in view), and whether that move is going on.
-    thumb_target: Option<usize>,
-    thumb_nav: bool,
-    /// The speed test shows the sidebar on the thumbnails (`--bench-thumbs`).
-    bench_sidebar: bool,
+            /// Swap the fields of the file that is shown with those of `other`.
+            fn swap_tab(&mut self, other: &mut TabState) {
+                $( std::mem::swap(&mut self.$tf, &mut other.$tf); )*
+            }
+        }
+    };
+}
 
-    // --- the pages (2026-10-15) ---
-    /// Which thumbnails are chosen, the drag of them, and the pages put in or extracted.
-    pg: PageWork,
-    /// What the box of Insert > Page numbers... holds.
-    pn: pagenum::Pagenum,
-
-    // --- passwords and permissions (2026-10-16) ---
-    /// How the open file is protected, and the box that changes it.
-    pt: protect::Protect,
-    cz: compress::Squeeze,
+app_fields! {
+    global {
+        lang: Lang,
+        engine: Engine,
+        /// The most pixels the window can show (its screen's work area), for sizing the bitmaps' share of the memory.
+        max_view_pixels: u64,
+        /// The scale the pieces in view are drawn at: the zoom's own, or a smaller one when they would not fit the cache.
+        draw_scale: u64,
+        /// The whole client area's width and height; the pages are `view_w` wide, from `view_x` (the bookmarks are to their left), and
+        /// `view_h` high, from `bar_h()` down (the strip of tabs is above them when there are two files or more).
+        client_w: i64,
+        client_h: i64,
+        view_x: i64,
+        view_w: i64,
+        view_h: i64,
+        dpi: u32,
+        next_id: u64,
+        /// The number the next document opened gets (a number is never used twice), and the number of changes of tab so far.
+        next_doc: u64,
+        left_count: u64,
+        /// The memory goal handed to the engine for all the files together (the tests make it small to see files let go of).
+        pub(crate) total: u64,
+        /// What the scroll bars show now, so that they are set only when it changes.
+        bars: (Option<ScrollInfo>, Option<ScrollInfo>),
+        /// Files to open, one after the other (those named on the command line, dropped on the window, handed over by another copy of
+        /// the program), and whether the window has its size yet (nothing is opened before).
+        queue: VecDeque<PathBuf>,
+        ready: bool,
+        /// Wakes the window's loop (from any thread).
+        wake: Arc<dyn Fn() + Send + Sync>,
+        first_bitmap: Option<Instant>,
+        last_sharp: Option<Instant>,
+        pub bench: Option<Bench>,
+        pub(crate) started: Instant,
+        /// Where the pointer was last, in the client area.
+        mouse: (i64, i64),
+        find_open: bool,
+        /// What is in the find box now.
+        find_text: String,
+        /// A line for the status bar, between the page number and the zoom.
+        note: Option<String>,
+        recent: Vec<recent::Entry>,
+        recent_path: Option<PathBuf>,
+        /// An address of a link, waiting for the person to say yes.
+        pending_uri: Option<String>,
+        /// The menus have to be put again (what is greyed, checked or listed has changed).
+        menus_dirty: bool,
+        /// The hidden `--print-test`: print to a printer that writes a file, with no box, and quit.
+        print_test: Option<PrintTest>,
+        pub(crate) ocr_test_opener: Option<crate::ocr::Opener>,
+        /// What the person chose in View > Language, and the language of Windows (what "follow the system" means).
+        lang_choice: LangChoice,
+        system_lang: Lang,
+        /// The toolbar is shown (View > Toolbar); it is told to the window with the next answer when `toolbar_dirty`.
+        toolbar_on: bool,
+        toolbar_dirty: bool,
+        /// What the toolbar and the status bar were last told to say, so that they are told only when it changes.
+        last_toolbar: Option<ToolbarState>,
+        last_status: Option<StatusText>,
+        /// The width of the bookmarks the person has made them (at 96 dpi), and the start of a drag of their edge: where the pointer was
+        /// and the width then.
+        sidebar_pref: i64,
+        split_drag: Option<(i64, i64)>,
+        /// Whether changes to the settings are written to the file (the tests do not).
+        pub(crate) persist: bool,
+        /// The speed test shows the sidebar on the thumbnails (`--bench-thumbs`).
+        bench_sidebar: bool,
+        /// What the box of Insert > Page numbers... holds.
+        pn: pagenum::Pagenum,
+        /// The tabs (2026-10-17): the files that are open, and the state of those that are not shown.
+        tabs: Tabs<TabState>,
+        /// Where the reader was in the last files (`remember_place`: the person turned that off with `remember_place=0` in the settings),
+        /// where they are kept, and whether they have changed since they were written.
+        places: Places,
+        places_path: Option<PathBuf>,
+        places_dirty: bool,
+        remember_place: bool,
+        /// The pointer is over this tab of the strip, and a click that began in the strip is not over yet.
+        tab_hover: Option<usize>,
+        strip_press: bool,
+        /// A document that waited was asked for: nothing is drawn of it until the engine says what the plan is now.
+        activating: bool,
+        /// The tab asked for while a file was being read again (it is shown when that is done).
+        pending_tab: Option<usize>,
+        /// The title the window was last given.
+        last_title: String,
+        /// The documents whose changes the person gave up in the round of questions that is going on before the window is closed.
+        discarded: Vec<u64>,
+        // What the shown file has going or has drawn that is let go of when the tab is left (`release`) or that cannot be going when it is
+        // (`tab_busy`), so that it is the window's and not each tab's:
+        /// Scrolling or zooming goes on: nothing sharp is asked for until it stops.
+        moving: bool,
+        /// The requests the engine has: by the piece, and by the request.
+        in_flight: HashMap<Key, u64>,
+        asked: IdMap<u64, Want>,
+        /// Pieces the engine could not draw: not asked for again.
+        failed: HashSet<Key>,
+        notices: IdMap<u32, Notice>,
+        wrong_password: bool,
+        /// Whether the last picture drawn had every piece of the pages in view at the zoom they are seen at.
+        sharp_on_screen: bool,
+        /// The links of the pages near the window, and the engine's requests for them (request, page).
+        links: IdMap<u32, Vec<Link>>,
+        links_asked: IdMap<u64, u32>,
+        /// The boxes of the characters of the pages the pointer has been on, and the requests for them.
+        boxes: IdMap<u32, PageBoxes>,
+        boxes_asked: IdMap<u64, u32>,
+        /// The left button is down: where, and on what.
+        press: Option<Press>,
+        /// The request for the text of the selection that is being copied, and what to say when the clipboard has taken it.
+        copy_asked: Option<u64>,
+        copy_note: Option<String>,
+        search: Option<SearchState>,
+        print: Option<PrintJob>,
+        /// The page and the place on it (points) the menu on the page was opened at, for "add note here" and "select all on the page".
+        ctx_at: Option<(u32, f32, f32)>,
+        /// A double click, a triple click or "select all" that waits for the characters of its page.
+        pending_select: Option<chrome::PendingSelect>,
+        /// The run of text recognition that is going on, if one is.
+        ocr: Option<crate::ocr::Run>,
+        /// The rows of the thumbnails, where they are scrolled to, the pictures and the requests for them.
+        thumbs: thumbs::Thumbs,
+        /// The keys belong to the list of thumbnails (it was clicked last), and its bar is being dragged; or to the list of annotations.
+        thumb_focus: bool,
+        annots_focus: bool,
+        al: annotlist::AnnotList,
+        thumb_drag: bool,
+        /// The page the list of thumbnails moved to (it is the page shown as current while it is in view), and whether that move is going on.
+        thumb_target: Option<usize>,
+        thumb_nav: bool,
+        cz: compress::Squeeze,
+    }
+    tab {
+        doc_id: u64 = 0,
+        path: Option<PathBuf> = None,
+        /// The size and time of the file when it was read, to tell later whether it is the same file.
+        stamp: Option<Stamp> = None,
+        /// Where to put the view when the file is read again (a tab the engine let go of is wanted).
+        restore: Option<Place> = None,
+        opening: bool = false,
+        doc: Option<Doc> = None,
+        mode: ZoomMode = ZoomMode::FitWidth,
+        zoom: u32 = zoom::ACTUAL_SIZE,
+        /// Turns of the view in degrees, added to each page's own.
+        rotation: u16 = 0,
+        scroll_x: i64 = 0,
+        scroll_y: i64 = 0,
+        cache: BitmapCache = BitmapCache::new(0),
+        // --- 3d-2 ---
+        /// What the file allows (all of it when none is open).
+        rights: Rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true },
+        /// The bookmarks of the open file, and whether the sidebar is wanted (it is shown when there are bookmarks, or when it is open on the thumbnails).
+        outline: Vec<OutlineItem> = Vec::new(),
+        show_sidebar: bool = true,
+        selection: Option<Selection> = None,
+        // --- 4a ---
+        /// The tool, the annotations, the history of the changes and the saving.
+        edit: EditState = EditState::new(String::new()),
+        // --- the thumbnails (2026-10-14) ---
+        /// The tab of the sidebar the person chose, and whether the sidebar is open on the thumbnails for a file without bookmarks.
+        tab: Tab = Tab::Bookmarks,
+        thumbs_alone: bool = false,
+        // --- the pages (2026-10-15) ---
+        /// Which thumbnails are chosen, the drag of them, and the pages put in or extracted.
+        pg: PageWork = PageWork::new(),
+        // --- passwords and permissions (2026-10-16) ---
+        /// How the open file is protected, and the box that changes it.
+        pt: protect::Protect = protect::Protect::new(),
+    }
 }
 
 impl App {
@@ -368,65 +445,40 @@ impl App {
         let for_engine = wake.clone();
         let recent_path = recent::file_path();
         let recent = recent_path.as_deref().map(recent::load).unwrap_or_default();
-        App {
+        let places_path = places::file_path();
+        let places = places_path.as_deref().map(places::load).unwrap_or_default();
+        let globals = Globals {
             lang,
             engine: Engine::start(Box::new(move || for_engine())),
             max_view_pixels,
             draw_scale: sched::scale_key(zoom::ACTUAL_SIZE, 96),
             client_w: 0,
+            client_h: 0,
             view_x: 0,
             view_w: 0,
             view_h: 0,
             dpi: 96,
-            doc_id: 0,
-            path: None,
-            opening: false,
-            doc: None,
-            mode: ZoomMode::FitWidth,
-            zoom: zoom::ACTUAL_SIZE,
-            rotation: 0,
-            scroll_x: 0,
-            scroll_y: 0,
-            moving: false,
-            cache: BitmapCache::new(0),
-            in_flight: HashMap::new(),
-            asked: IdMap::new(),
-            failed: HashSet::new(),
-            notices: IdMap::new(),
             next_id: 1,
-            wrong_password: false,
+            next_doc: 1,
+            left_count: 0,
+            total: TOTAL_BYTES,
             bars: (None, None),
-            sharp_on_screen: false,
-            pending_open: None,
+            queue: VecDeque::new(),
+            ready: false,
             wake,
             first_bitmap: None,
             last_sharp: None,
             bench: None,
             started,
-            rights: Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true },
-            outline: Vec::new(),
-            show_sidebar: true,
-            links: IdMap::new(),
-            links_asked: IdMap::new(),
-            boxes: IdMap::new(),
-            boxes_asked: IdMap::new(),
-            press: None,
             mouse: (0, 0),
-            selection: None,
-            copy_asked: None,
-            copy_note: None,
             find_open: false,
             find_text: String::new(),
-            search: None,
-            print: None,
             note: None,
             recent,
             recent_path,
             pending_uri: None,
             menus_dirty: true,
             print_test: None,
-            edit: EditState::new(author),
-            ocr: None,
             ocr_test_opener: None,
             lang_choice: LangChoice::System,
             system_lang: lang,
@@ -436,11 +488,39 @@ impl App {
             last_status: None,
             sidebar_pref: sidebar::DEFAULT_WIDTH,
             split_drag: None,
+            persist: true,
+            bench_sidebar: false,
+            pn: pagenum::Pagenum::new(),
+            tabs: Tabs::new(),
+            places,
+            places_path,
+            places_dirty: false,
+            remember_place: true,
+            tab_hover: None,
+            strip_press: false,
+            activating: false,
+            pending_tab: None,
+            last_title: String::new(),
+            discarded: Vec::new(),
+            moving: false,
+            in_flight: HashMap::new(),
+            asked: IdMap::new(),
+            failed: HashSet::new(),
+            notices: IdMap::new(),
+            wrong_password: false,
+            sharp_on_screen: false,
+            links: IdMap::new(),
+            links_asked: IdMap::new(),
+            boxes: IdMap::new(),
+            boxes_asked: IdMap::new(),
+            press: None,
+            copy_asked: None,
+            copy_note: None,
+            search: None,
+            print: None,
             ctx_at: None,
             pending_select: None,
-            persist: true,
-            tab: Tab::Bookmarks,
-            thumbs_alone: false,
+            ocr: None,
             thumbs: thumbs::Thumbs::new(),
             thumb_focus: false,
             annots_focus: false,
@@ -448,17 +528,27 @@ impl App {
             thumb_drag: false,
             thumb_target: None,
             thumb_nav: false,
-            bench_sidebar: false,
-            pg: PageWork::new(),
-            pn: pagenum::Pagenum::new(),
-            pt: protect::Protect::new(),
             cz: compress::Squeeze::new(),
-        }
+        };
+        let mut app = App::assemble(globals);
+        app.edit = EditState::new(author);
+        app
     }
 
     /// Open this file once the window has its size.
     pub fn open_when_ready(&mut self, path: PathBuf) {
-        self.pending_open = Some(path);
+        self.queue.push_back(path);
+    }
+
+    /// The memory goal handed to the engine for all the files together, in bytes (200 MB by default; the speed test of the tabs makes it small, to see
+    /// files let go of).
+    pub fn set_memory_goal(&mut self, bytes: u64) {
+        self.total = bytes;
+    }
+
+    /// Open these files, each in a tab, once the window has its size (those named on the command line).
+    pub fn open_all_when_ready(&mut self, paths: Vec<PathBuf>) {
+        self.queue.extend(paths);
     }
 
     fn px(&self, at96: i64) -> i64 {
@@ -473,36 +563,6 @@ impl App {
 
     // --- opening ---------------------------------------------------------------------------------------------
 
-    /// Open a file (the engine reads it; this does not wait). With changes that are not saved, the person is asked first.
-    pub fn open_path(&mut self, path: &Path, password: &str) -> Vec<Action> {
-        if let Some(actions) = self.ask_unsaved(After::Open(path.to_path_buf())) {
-            return actions;
-        }
-        self.open_path_now(path, password)
-    }
-
-    fn open_path_now(&mut self, path: &Path, password: &str) -> Vec<Action> {
-        // Where the reader was in the file it leaves is kept.
-        self.remember_position();
-        let mut actions = self.drop_document();
-        if self.engine.start_error().is_some() {
-            // No drawing thread: nothing would ever answer, so say so instead of showing "Opening..." for ever.
-            self.opening = false;
-            self.path = None;
-            let lang = self.lang;
-            actions.extend([Action::SetTitle(self.title()), Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::EngineFailed).to_string() }, Action::Invalidate]);
-            return actions;
-        }
-        self.doc_id += 1;
-        // The full path, so that the same file opened by another route is the same file in the list of recent ones.
-        self.path = Some(std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
-        self.opening = true;
-        let view = u64::try_from(self.view_w.max(0)).unwrap_or(0).saturating_mul(u64::try_from(self.view_h.max(0)).unwrap_or(0));
-        self.engine.open_file(self.doc_id, &self.path_text(), password, TOTAL_BYTES, view.max(self.max_view_pixels));
-        actions.extend([Action::SetTitle(self.title()), Action::Invalidate]);
-        actions
-    }
-
     fn path_text(&self) -> String {
         self.path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
     }
@@ -511,27 +571,13 @@ impl App {
     fn drop_document(&mut self) -> Vec<Action> {
         // What is being drawn for the old file is not wanted: stop it (opening another file stops it too, but the
         // file may fail to open, and the old requests are not to go on).
-        for (id, _) in self.asked.drain() {
-            self.engine.cancel(id);
-        }
-        let mut actions = self.cancel_print_for_new_document();
+        let mut actions = self.release();
+        self.cache.clear();
+        actions.extend(self.cancel_print_for_new_document());
         self.drop_ocr();
-        for id in self.links_asked.drain().map(|(id, _)| id).chain(self.boxes_asked.drain().map(|(id, _)| id)).chain(self.thumbs.asked.drain().map(|(id, _)| id)) {
-            self.engine.cancel(id);
-        }
-        self.thumbs.reset(0);
         self.pg.reset();
         self.thumb_focus = false;
         self.annots_focus = false;
-        self.reset_annot_list();
-        self.thumb_drag = false;
-        self.thumb_target = None;
-        if let Some(s) = self.search.take() {
-            self.engine.cancel(s.id);
-        }
-        if let Some(id) = self.copy_asked.take() {
-            self.engine.cancel(id);
-        }
         self.edit.reset();
         self.pt.reset();
         if let Some(id) = self.cz.reset() {
@@ -539,23 +585,12 @@ impl App {
         }
         let had_outline = !self.outline.is_empty();
         self.doc = None;
-        self.cache.clear();
-        self.in_flight.clear();
-        self.asked.clear();
-        self.failed.clear();
-        self.notices.clear();
-        self.links.clear();
-        self.boxes.clear();
-        // A double click that waited for the characters of a page of the file that has just gone is not for this one.
-        self.pending_select = None;
         self.outline.clear();
-        self.press = None;
         self.selection = None;
         self.note = None;
         self.rights = Rights { copy: true, print: true, print_high_quality: true, annotate: true, fill_forms: true, modify: true, assemble: true };
         self.scroll_x = 0;
         self.scroll_y = 0;
-        self.moving = false;
         self.sharp_on_screen = false;
         self.menus_dirty = true;
         if had_outline {
@@ -595,29 +630,26 @@ impl App {
         self.view_x = self.sidebar_width();
         self.view_w = (self.client_w - self.view_x).max(0);
         self.relayout(0, 0, None);
-        // Where the reader was in this file last time.
-        let mut go_to = None;
-        if let Some(e) = recent::find(&self.recent, &self.path_text()).cloned() {
-            let mode = match e.mode {
-                recent::MODE_FIT_PAGE => ZoomMode::FitPage,
-                recent::MODE_CUSTOM => ZoomMode::Custom,
-                _ => ZoomMode::FitWidth,
-            };
-            self.relayout(0, 0, Some((mode, e.zoom)));
-            go_to = Some(e.page as usize);
+        // Where the reader was: in this tab before the file was read again, else in this file last time (if it is the same file).
+        let restore = self.restore.take();
+        let start = restore.or_else(|| self.stored_place());
+        if let Some(place) = start {
+            self.apply_place(&place);
         }
         actions.extend(self.after_view_change(false));
-        if let Some(page) = go_to {
-            actions.extend(self.go_to_page(page));
-        }
         actions.extend(self.chrome());
         self.remember_position();
+        self.flush_places();
         self.menus_dirty = true;
         if self.bench.is_none() {
             actions.extend(self.ask_for_outline());
         }
         self.ask_for_annot_list();
         actions.extend(self.start_print_test());
+        actions.extend(self.open_queued());
+        if let Some(i) = self.pending_tab.take() {
+            actions.extend(self.show_tab(i));
+        }
         actions
     }
 
@@ -653,10 +685,13 @@ impl App {
                 self.menus_dirty = true;
             }
             OpenFailure::Damaged => actions.push(Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::NotPdf).to_string() }),
+            OpenFailure::NoRoom => actions.push(Action::Message { title: t(lang, Msg::Error).to_string(), text: t(lang, Msg::NoRoomTabs).to_string() }),
         }
         if failure != OpenFailure::NeedsPassword && failure != OpenFailure::WrongPassword {
-            self.path = None;
-            actions.push(Action::SetTitle(self.title()));
+            // The tab made for the file goes again (the one before it is shown), and the next file that waits is opened.
+            self.pending_tab = None;
+            actions.extend(self.close_current());
+            actions.extend(self.open_queued());
         }
         actions
     }
@@ -794,7 +829,8 @@ impl App {
 
     /// Ask the engine for what is missing and take back what is not wanted any more.
     fn schedule(&mut self) {
-        let Some(scene) = self.scene() else { return };
+        // (A document that waited and was asked for is not drawn until the engine says what the plan is now.)
+        let Some(scene) = self.scene().filter(|_| !self.activating) else { return };
         let scale = sched::draw_scale(&scene);
         let mut wanted = sched::wanted(&scene, &self.cache);
         self.draw_scale = scale;
@@ -839,6 +875,8 @@ impl App {
             match event {
                 EngineEvent::Opened(o) => actions.extend(self.on_opened(o)),
                 EngineEvent::OpenFailed { doc, failure, message } => actions.extend(self.on_open_failed(doc, failure, &message)),
+                EngineEvent::Activated { doc, bitmap_cache_bytes, thumb_cache_bytes, max_tile_pixels } => actions.extend(self.on_activated(doc, bitmap_cache_bytes, thumb_cache_bytes, max_tile_pixels)),
+                EngineEvent::Dropped { doc } => actions.extend(self.on_dropped(doc)),
                 EngineEvent::Rendered(r) => redraw |= self.on_rendered(r),
                 other => actions.extend(self.on_other_event(other)),
             }
@@ -1016,10 +1054,10 @@ impl App {
                 let filters = vec![(t(self.lang, Msg::FilterPdf).to_string(), "*.pdf".to_string()), (t(self.lang, Msg::FilterAll).to_string(), "*.*".to_string())];
                 vec![Action::PickFile { title: t(self.lang, Msg::OpenTitle).to_string(), filters }]
             }
-            CMD_EXIT => match self.ask_unsaved(After::Quit) {
-                Some(actions) => actions,
-                None => self.exit_now(),
-            },
+            CMD_EXIT => self.quit_asked(),
+            CMD_CLOSE_TAB => self.close_tab_command(),
+            CMD_NEXT_TAB => self.step_tab(true),
+            CMD_PREV_TAB => self.step_tab(false),
             CMD_SAVE => self.save(),
             CMD_SAVE_AS => self.save_as(),
             CMD_EXPORT_DOCX | CMD_EXPORT_XLSX => self.export_file(cmd == CMD_EXPORT_XLSX),
@@ -1114,6 +1152,8 @@ impl App {
         if ctrl {
             return match key {
                 vk::O => self.command(CMD_OPEN),
+                vk::TAB => self.command(if shift { CMD_PREV_TAB } else { CMD_NEXT_TAB }),
+                vk::W | vk::F4 => self.command(CMD_CLOSE_TAB),
                 vk::G => self.command(CMD_GOTO),
                 vk::F => self.command(CMD_FIND),
                 vk::P => self.command(CMD_PRINT),
@@ -1268,22 +1308,136 @@ fn fit_zoom(l: &Layout, mode: ZoomMode, page: usize, view_w: i64, view_h: i64, m
     }
 }
 
+/// Move the places in an action that the window puts in its client area down by the height of the strip of tabs (the reader thinks in the
+/// coordinates of the pages' area, which is below the strip).
+fn below_strip(action: &mut Action, dy: i32) {
+    match action {
+        Action::Sidebar(r) | Action::FieldMove(r) | Action::Find(Some(r)) => r.y = r.y.saturating_add(dy),
+        Action::FieldEdit(Some(b)) => b.rect.y = b.rect.y.saturating_add(dy),
+        Action::Choose { at, .. } | Action::ContextMenu { at, .. } => at.1 = at.1.saturating_add(dy),
+        _ => {}
+    }
+}
+
+impl App {
+    /// An event as the strip of tabs sees it: `Err` with the actions when the strip took it (a click on a tab, the pointer moving over it); `Ok`
+    /// with the event in the coordinates of the pages' area, which is below the strip, when it is for the pages.
+    fn route(&mut self, event: Event) -> Result<Event, Vec<Action>> {
+        let bar = self.bar_h();
+        let dy = clamp32(bar);
+        // A click that began in the strip is not for the pages, nor is what follows it.
+        match event {
+            Event::MouseMove { .. } if self.strip_press => return Err(Vec::new()),
+            Event::MouseUp { .. } if std::mem::take(&mut self.strip_press) => return Err(Vec::new()),
+            Event::HoverEnd => return Err(self.strip_hover(None)),
+            _ => {}
+        }
+        if bar == 0 {
+            return match event {
+                Event::Hover { .. } | Event::MiddleClick { .. } => Err(self.strip_hover(None)),
+                other => Ok(other),
+            };
+        }
+        match event {
+            Event::MouseDown { x, y, .. } if y < dy => Err(self.strip_down(i64::from(x))),
+            Event::MouseDown { x, y, ctrl, shift, clicks } => Ok(Event::MouseDown { x, y: y - dy, ctrl, shift, clicks }),
+            Event::MouseMove { x, y, shift } => Ok(Event::MouseMove { x, y: y - dy, shift }),
+            Event::MouseUp { x, y } => Ok(Event::MouseUp { x, y: y - dy }),
+            Event::Wheel { y, .. } | Event::ContextMenu { y, .. } if y < dy => Err(Vec::new()),
+            Event::Wheel { delta, ctrl, shift, x, y } => Ok(Event::Wheel { delta, ctrl, shift, x, y: y - dy }),
+            Event::ContextMenu { x, y } => Ok(Event::ContextMenu { x, y: y - dy }),
+            Event::Hover { x, y } => Err(self.strip_hover((y < dy).then_some(i64::from(x)))),
+            Event::MiddleClick { x, y } if y < dy => Err(self.strip_middle(i64::from(x))),
+            Event::MiddleClick { .. } => Err(Vec::new()),
+            other => Ok(other),
+        }
+    }
+
+    /// Whatever the event was, the engine may have something waiting; the speed test may have its next step.
+    fn finish(&mut self, mut actions: Vec<Action>) -> Vec<Action> {
+        self.sync_tab();
+        // The window's title is always the shown file's (whatever else was said about it).
+        let title = self.title();
+        if title != self.last_title {
+            actions.push(Action::SetTitle(title.clone()));
+            self.last_title = title;
+        }
+        if self.menus_dirty {
+            self.menus_dirty = false;
+            actions.push(Action::SetMenus(self.menus()));
+        }
+        actions.extend(self.chrome_updates());
+        if let Some(mut bench) = self.bench.take() {
+            actions.extend(bench.step(self));
+            self.bench = Some(bench);
+        }
+        actions
+    }
+}
+
 impl Handler for App {
     fn event(&mut self, event: Event) -> Vec<Action> {
-        let mut actions = match event {
+        // The pointer moving over the window is heard all the time: only the strip of tabs has anything to do with it.
+        if matches!(event, Event::Hover { .. } | Event::HoverEnd) {
+            return self.route(event).err().unwrap_or_default();
+        }
+        let mut actions = match self.route(event) {
+            Ok(event) => self.handle(event),
+            Err(actions) => self.finish(actions),
+        };
+        // (The strip may have come or gone while the event was handled: what the reader says is by the pages' area as it is now.)
+        let dy = clamp32(self.bar_h());
+        if dy > 0 {
+            actions.iter_mut().for_each(|a| below_strip(a, dy));
+        }
+        actions
+    }
+
+    fn paint(&mut self, p: &mut dyn Painter) -> bool {
+        let dy = clamp32(self.bar_h());
+        if dy == 0 {
+            return self.paint_pages(p);
+        }
+        let drawn = self.paint_pages(&mut tabbar::Shifted { inner: &mut *p, dy });
+        self.draw_tabbar(p);
+        drawn
+    }
+
+    fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
+        let dy = clamp32(self.bar_h());
+        if y < dy {
+            return Cursor::Arrow;
+        }
+        let (x, y) = (i64::from(x), i64::from(y - dy));
+        match self.cursor_over(x, y) {
+            Cursor::Arrow => self.text_cursor(x, y),
+            shape => shape,
+        }
+    }
+
+    fn unsaved_reason(&self) -> Option<String> {
+        let shown = self.tabs.active();
+        let any = self.tabs.iter().enumerate().any(|(i, t)| if Some(i) == shown { self.edit.dirty } else { t.dirty });
+        ((self.edit.dirty && self.doc.is_some()) || any).then(|| t(self.lang, Msg::ShutdownReason).to_string())
+    }
+}
+
+impl App {
+    fn handle(&mut self, event: Event) -> Vec<Action> {
+        let actions = match event {
             Event::Size { w, h } => {
                 self.client_w = i64::from(w);
+                self.client_h = i64::from(h).max(0);
+                self.ready = true;
                 self.view_x = self.sidebar_width();
                 self.view_w = (i64::from(w) - self.view_x).max(0);
-                self.view_h = i64::from(h).max(0);
+                self.view_h = (self.client_h - self.bar_h()).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
                 self.clamp_annots_scroll();
                 let mut actions = self.after_view_change(false);
                 actions.extend(self.chrome());
-                if let Some(path) = self.pending_open.take() {
-                    actions.extend(self.open_path(&path, ""));
-                }
+                actions.extend(self.open_queued());
                 actions
             }
             Event::Dpi(dpi) => {
@@ -1292,6 +1446,7 @@ impl Handler for App {
                 self.forget_bitmaps();
                 self.view_x = self.sidebar_width();
                 self.view_w = (self.client_w - self.view_x).max(0);
+                self.view_h = (self.client_h - self.bar_h()).max(0);
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
                 let mut actions = self.after_view_change(false);
@@ -1323,10 +1478,7 @@ impl Handler for App {
                 actions.extend(self.command(cmd));
                 actions
             }
-            Event::Drop(files) => match files.first() {
-                Some(f) => self.open_path(f, ""),
-                None => Vec::new(),
-            },
+            Event::Drop(files) => self.dropped(files),
             Event::Wake => self.pump_engine(),
             Event::Timer(TIMER_SETTLE) => {
                 self.moving = false;
@@ -1356,9 +1508,10 @@ impl Handler for App {
             }
             Event::FieldDone { text, exit } => self.field_done(text, exit),
             Event::Chosen(item) => self.chosen(item),
-            Event::Text { tag: TAG_PASSWORD, text } => match (text, self.path.clone()) {
-                (Some(mut pw), Some(path)) => {
-                    let actions = self.open_path(&path, &pw);
+            Event::Text { tag: TAG_PASSWORD, text } => match (text, self.path.is_some()) {
+                // (The tab made for the file is still there: it is read again with the password.)
+                (Some(mut pw), true) => {
+                    let actions = self.begin_open(&pw);
                     // The password has gone to the engine; overwrite our copy.
                     let mut bytes = std::mem::take(&mut pw).into_bytes();
                     bytes.fill(0);
@@ -1366,8 +1519,9 @@ impl Handler for App {
                     actions
                 }
                 _ => {
-                    self.path = None;
-                    vec![Action::SetTitle(self.title()), Action::Invalidate]
+                    let mut actions = self.close_current();
+                    actions.extend(self.open_queued());
+                    actions
                 }
             },
             Event::Text { tag: TAG_SRC_PASSWORD, text } => self.source_password_answered(text),
@@ -1394,10 +1548,8 @@ impl Handler for App {
             Event::MouseMove { x, y, shift } => self.mouse_move(i64::from(x), i64::from(y), shift),
             Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
             Event::MouseLost => self.mouse_lost(),
-            Event::CloseRequested => match self.ask_unsaved(After::Quit) {
-                Some(actions) => actions,
-                None => self.exit_now(),
-            },
+            Event::CloseRequested => self.quit_asked(),
+            Event::Hover { .. } | Event::HoverEnd | Event::MiddleClick { .. } => Vec::new(),
             Event::SavePicked(path) => self.save_picked(path),
             Event::SaveChoice { tag: TAG_UNSAVED, choice } => self.unsaved_answered(choice),
             Event::SaveChoice { .. } => Vec::new(),
@@ -1412,20 +1564,11 @@ impl Handler for App {
             Event::PrintError(message) => self.print_error(&message),
             Event::ClipboardSet(ok) => self.on_clipboard(ok),
         };
-        // Whatever the event was, the engine may have something waiting; the speed test may have its next step.
-        if self.menus_dirty {
-            self.menus_dirty = false;
-            actions.push(Action::SetMenus(self.menus()));
-        }
-        actions.extend(self.chrome_updates());
-        if let Some(mut bench) = self.bench.take() {
-            actions.extend(bench.step(self));
-            self.bench = Some(bench);
-        }
-        actions
+        self.finish(actions)
     }
 
-    fn paint(&mut self, p: &mut dyn Painter) -> bool {
+    /// Draw the pages' area (below the strip of tabs, when it is there).
+    fn paint_pages(&mut self, p: &mut dyn Painter) -> bool {
         let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h));
         p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, BACKGROUND);
         if self.view_x > 0 {
@@ -1465,15 +1608,4 @@ impl Handler for App {
         self.bench.is_none() || self.sharp_on_screen
     }
 
-    fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
-        let (x, y) = (i64::from(x), i64::from(y));
-        match self.cursor_over(x, y) {
-            Cursor::Arrow => self.text_cursor(x, y),
-            shape => shape,
-        }
-    }
-
-    fn unsaved_reason(&self) -> Option<String> {
-        (self.edit.dirty && self.doc.is_some()).then(|| t(self.lang, Msg::ShutdownReason).to_string())
-    }
 }

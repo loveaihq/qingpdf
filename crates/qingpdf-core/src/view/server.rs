@@ -24,6 +24,7 @@ use crate::text::{PageChars, TextExtractor};
 
 use super::editing::{EditStatus, SaveStatus, Session, write_atomic};
 use super::forms;
+use super::store::Store;
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
@@ -224,9 +225,19 @@ enum Pending {
 
 /// Why the serving of one document ended.
 enum Exit {
-    Done(Option<Command>),
+    /// A command ended it; the document, to be kept for a tab (none: it could not be read at all).
+    Done(Option<Command>, Option<Box<OpenDoc>>),
     /// Go on with this document (the edited one, or the one before it if the change did not open) and the waiting requests.
     Again { open: Box<OpenDoc>, carry: Carry },
+}
+
+/// What the window is told when the serving of a document starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Start {
+    /// The file was just opened: [`Event::Opened`].
+    Opened,
+    /// A document that waited is served again: [`Event::Activated`].
+    Activated,
 }
 
 struct Server<'a> {
@@ -247,6 +258,8 @@ struct Server<'a> {
     commands: &'a Receiver<Command>,
     send: &'a dyn Fn(Event),
     shared: &'a Shared,
+    /// The documents that wait (a request to close one of them is done at once, without stopping this one).
+    store: &'a mut Store,
     /// The editing state (what can be undone, whether the file was saved).
     session: &'a mut Session,
     /// Edits, undos, redos and saves, in the order they came: done before anything else, one at a time.
@@ -260,14 +273,22 @@ struct Server<'a> {
     text_budget: u64,
 }
 
-/// Serve one open document until a command ends it; that command is returned for the caller to carry out. An edit replaces the
-/// document by the changed one and goes on with the requests that were waiting.
-pub(super) fn serve(open: OpenDoc, session: &mut Session, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Option<Command> {
+/// Serve one open document until a command ends it; that command is returned for the caller to carry out, with the document and its
+/// session to be kept for a tab. An edit replaces the document by the changed one and goes on with the requests that were waiting.
+pub(super) fn serve(
+    open: OpenDoc,
+    mut session: Session,
+    start: Start,
+    store: &mut Store,
+    commands: &Receiver<Command>,
+    send: &dyn Fn(Event),
+    shared: &Shared,
+) -> (Option<Command>, Option<(OpenDoc, Session)>) {
     let mut open = open;
     let mut carry: Option<Carry> = None;
     loop {
-        match serve_once(open, carry.take(), session, commands, send, shared) {
-            Exit::Done(end) => return end,
+        match serve_once(open, carry.take(), start, &mut session, store, commands, send, shared) {
+            Exit::Done(end, kept) => return (end, kept.map(|k| (*k, session))),
             Exit::Again { open: next, carry: waiting } => {
                 open = *next;
                 carry = Some(waiting);
@@ -276,27 +297,32 @@ pub(super) fn serve(open: OpenDoc, session: &mut Session, commands: &Receiver<Co
     }
 }
 
-fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Exit {
+#[allow(clippy::too_many_arguments)]
+fn serve_once(open: OpenDoc, carry: Option<Carry>, start: Start, session: &mut Session, store: &mut Store, commands: &Receiver<Command>, send: &dyn Fn(Event), shared: &Shared) -> Exit {
     let OpenDoc { doc_id, mut document, plan, rights } = open;
     let pages = match document.pages() {
         Ok(p) => p,
         Err(e) => {
             send(Event::OpenFailed { doc: doc_id, failure: OpenFailure::Damaged, message: e.to_string() });
-            return Exit::Done(None);
+            return Exit::Done(None, None);
         }
     };
     if carry.is_none() {
-        let infos: Vec<PageInfo> = pages.iter().map(page_info).collect();
-        send(Event::Opened(Opened {
-            doc: doc_id,
-            pages: infos,
-            file_bytes: plan.file_bytes,
-            bitmap_cache_bytes: plan.bitmap_cache_bytes,
-            thumb_cache_bytes: plan.thumb_cache_bytes,
-            max_tile_pixels: plan.max_tile_pixels,
-            rights,
-            protection: super::protection_of(&document, session.password()),
-        }));
+        if start == Start::Opened {
+            let infos: Vec<PageInfo> = pages.iter().map(page_info).collect();
+            send(Event::Opened(Opened {
+                doc: doc_id,
+                pages: infos,
+                file_bytes: plan.file_bytes,
+                bitmap_cache_bytes: plan.bitmap_cache_bytes,
+                thumb_cache_bytes: plan.thumb_cache_bytes,
+                max_tile_pixels: plan.max_tile_pixels,
+                rights,
+                protection: super::protection_of(&document, session.password()),
+            }));
+        } else {
+            send(Event::Activated { doc: doc_id, bitmap_cache_bytes: plan.bitmap_cache_bytes, thumb_cache_bytes: plan.thumb_cache_bytes, max_tile_pixels: plan.max_tile_pixels });
+        }
     }
     let Carry { queue, jobs, edits } = carry.unwrap_or(Carry { queue: Vec::new(), jobs: VecDeque::new(), edits: VecDeque::new() });
     let to_usize = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
@@ -327,6 +353,7 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
         commands,
         send,
         shared,
+        store,
         session: &mut *session,
         edits,
         swap: None,
@@ -335,14 +362,12 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, session: &mut Session, comman
         plan,
     };
     let end = server.run();
-    let Some(pending) = server.swap.take() else { return Exit::Done(end) };
+    let pending = server.swap.take();
     // (The number of pages now: a change to the pages made while this document was served has changed it.)
     let page_count = server.pages.len();
-    if !matches!(end, Some(Command::Swap)) {
-        return Exit::Done(end);
-    }
     let mut carry = Carry { queue: std::mem::take(&mut server.queue), jobs: std::mem::take(&mut server.jobs), edits: std::mem::take(&mut server.edits) };
     drop(server);
+    let Some(pending) = pending.filter(|_| matches!(end, Some(Command::Swap))) else { return Exit::Done(end, Some(Box::new(OpenDoc { doc_id, document, plan, rights }))) };
 
     match pending {
         // The file as it will be, made as a copy so that the document it replaces is still there if the new one does not open.
@@ -409,6 +434,9 @@ impl Server<'_> {
             // An edit, an undo or a save is done as soon as it is asked for, before the rest, one at a time: a person is waiting
             // for the page to change. (No job is in hand here, so a swap of the document loses none of them.)
             if let Some(command) = self.edits.pop_front() {
+                if matches!(command, Command::Open { .. } | Command::Activate { .. } | Command::CloseDoc { .. }) {
+                    return Some(command);
+                }
                 if let Some(end) = self.do_edit(command) {
                     return Some(end);
                 }
@@ -477,6 +505,15 @@ impl Server<'_> {
                 None
             }
             Command::Swap => None,
+            // The served document is asked for: it is told again what it has (nothing else happens). One that waits is closed at once.
+            Command::Activate { doc, .. } if doc == self.doc_id => {
+                (self.send)(Event::Activated { doc, bitmap_cache_bytes: self.plan.bitmap_cache_bytes, thumb_cache_bytes: self.plan.thumb_cache_bytes, max_tile_pixels: self.plan.max_tile_pixels });
+                None
+            }
+            Command::CloseDoc { doc } if doc != self.doc_id => {
+                self.store.remove(doc);
+                None
+            }
             Command::PrintNext(id) => {
                 for job in &mut self.jobs {
                     if let Job::Print(p) = job
@@ -492,7 +529,13 @@ impl Server<'_> {
                 self.jobs.retain(|j| j.id() != id);
                 None
             }
-            end @ (Command::Open { .. } | Command::Close | Command::Quit) => Some(end),
+            // A command that ends the document comes after the edits, saves and exports asked for before it (the window waits for their answers):
+            // it stands in line with them.
+            end @ (Command::Open { .. } | Command::Activate { .. } | Command::CloseDoc { .. }) if !self.edits.is_empty() => {
+                self.edits.push_back(end);
+                None
+            }
+            end @ (Command::Open { .. } | Command::Activate { .. } | Command::CloseDoc { .. } | Command::Close | Command::Quit) => Some(end),
         }
     }
 

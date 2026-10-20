@@ -124,13 +124,18 @@ const RENAME_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
 /// write into each other's file: of two that save together the one that renames last wins, and the list is always whole. Errors
 /// are told to the caller, who may ignore them (a list that cannot be kept is no reason to stop reading).
 pub fn save(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
+    write_atomic(path, &serialize(entries))
+}
+
+/// Write `text` to `path` the way [`save`] does: the folder is made if need be, the text goes to a file of its own whose name no other writer uses and is
+/// written out to the disk, and then put in place. (The list of recent files and the places in files use it.)
+pub fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let text = serialize(entries);
     // A name of this process and this call; `create_new` makes sure no other file (a left-over of an earlier run, say) is written into.
     let (temp, mut file) = loop {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);

@@ -4,7 +4,8 @@ use super::*;
 use crate::recent::{Entry, MODE_CUSTOM, MODE_FIT_PAGE, MODE_FIT_WIDTH};
 
 impl App {
-    /// Remember the page and zoom of the open file in the list (the file goes to the front), and keep the list.
+    /// Remember the page and zoom of the open file in the list (the file goes to the front); the lists are written to the disk by `flush_places`
+    /// (not here: showing another tab leaves the tab, and that is not to wait for the disk).
     pub(super) fn remember_position(&mut self) {
         let Some(page) = self.visible().map(|v| v.0) else { return };
         // The speed test and the print test open files of their own: the person's list is not touched by them.
@@ -18,7 +19,13 @@ impl App {
         };
         let path = self.path_text();
         recent::touch(&mut self.recent, Entry { path, page, zoom: self.zoom, mode });
-        self.save_recent();
+        self.places_dirty = true;
+        // ... and, further, how far down and across and the turn of the view (only in the places, which know the file by its size and time).
+        if self.remember_place
+            && let Some(place) = self.current_place()
+        {
+            self.places.touch(place);
+        }
         self.menus_dirty = true;
     }
 
@@ -31,7 +38,8 @@ impl App {
 
     pub(super) fn clear_recent(&mut self) -> Vec<Action> {
         self.recent.clear();
-        self.save_recent();
+        // (Where the reader was in the files is a history of the files too.)
+        self.forget_places();
         self.menus_dirty = true;
         Vec::new()
     }

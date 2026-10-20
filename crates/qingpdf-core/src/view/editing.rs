@@ -228,6 +228,16 @@ impl Session {
         self.undo.iter().chain(&self.redo).fold(0usize, |sum, s| sum.saturating_add(s.bytes))
     }
 
+    /// What the history that undoes and redoes the edits takes (the objects of the edits themselves are the document's).
+    pub(crate) fn held_bytes(&self) -> usize {
+        self.history_bytes()
+    }
+
+    /// Text recognised for a file that may not be written to is kept (it is in no file): a session that has some must not be let go of.
+    pub(crate) fn keeps_text(&self) -> bool {
+        self.memory_chars > 0
+    }
+
     /// Make room for `extra` more bytes in front of the file: the oldest steps of the history that do not fit go (what they did
     /// stays done). `false`: the objects in front of the file alone would be over what is allowed; save the file.
     pub(crate) fn make_room(&mut self, doc: &Document, extra: usize) -> bool {

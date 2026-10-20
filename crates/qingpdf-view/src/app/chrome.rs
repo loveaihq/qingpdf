@@ -45,6 +45,7 @@ impl App {
         self.lang_choice = s.lang;
         self.lang = s.lang.resolve(self.system_lang);
         self.toolbar_on = s.toolbar;
+        self.remember_place = s.remember_place;
         if let Some(w) = s.sidebar {
             self.sidebar_pref = i64::from(w);
         }

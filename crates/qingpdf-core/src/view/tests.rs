@@ -287,3 +287,165 @@ fn a_page_with_a_huge_box_is_told_at_the_limit_and_can_be_drawn() {
     // The engine still works afterwards.
     assert_eq!(open(&engine, pdf(1, square)).pages.len(), 1);
 }
+
+// --- several documents (2026-10-17) ----------------------------------------------------------------------------------
+
+/// A total with which two tiny documents do not both fit with room left for serving one: the second one finds the first one in the way.
+fn tight() -> u64 {
+    ACTIVE_FLOOR + (2 << 20)
+}
+
+fn next_event(engine: &Engine) -> Event {
+    engine.wait(10_000).expect("an event")
+}
+
+fn open_more(engine: &Engine, doc: u64, bytes: Vec<u8>, total: u64) -> Event {
+    engine.open_bytes(doc, bytes, "", total, 1920 * 1080);
+    next_event(engine)
+}
+
+fn drawn(engine: &Engine, doc: u64, id: u64) -> Rendered {
+    engine.render(RenderRequest { doc, ..request(id, 0, 0) });
+    rendered(engine)
+}
+
+#[test]
+fn a_second_file_waits_for_the_first_and_each_is_served_in_its_turn() {
+    let engine = Engine::start(Box::new(|| {}));
+    assert!(matches!(open_more(&engine, 1, pdf(3, square), TOTAL_BYTES), Event::Opened(o) if o.doc == 1 && o.pages.len() == 3));
+    assert!(matches!(open_more(&engine, 2, pdf(1, square), TOTAL_BYTES), Event::Opened(o) if o.doc == 2 && o.pages.len() == 1));
+    // The second one is served; the first one waits and is not drawn.
+    assert_eq!(drawn(&engine, 2, 1).id, 1);
+    engine.render(RenderRequest { doc: 1, ..request(2, 0, 0) });
+    assert!(engine.wait(200).is_none(), "a document that waits is not drawn");
+    engine.activate(1, TOTAL_BYTES, 1920 * 1080);
+    match next_event(&engine) {
+        Event::Activated { doc: 1, bitmap_cache_bytes, thumb_cache_bytes, max_tile_pixels } => {
+            assert!(bitmap_cache_bytes >= 8_000_000 && thumb_cache_bytes == THUMB_CACHE_BYTES && max_tile_pixels > 1 << 20);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(drawn(&engine, 1, 3).id, 3);
+    // Asking for the one that is served says what it has again and changes nothing.
+    engine.activate(1, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Activated { doc: 1, .. }));
+    assert_eq!(drawn(&engine, 1, 4).id, 4);
+    // Closing the one that waits is done without disturbing the one that is served; it can no longer be served.
+    engine.close_doc(2);
+    assert_eq!(drawn(&engine, 1, 5).id, 5);
+    engine.activate(2, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Dropped { doc: 2 }));
+    assert!(engine.wait(200).is_none());
+}
+
+#[test]
+fn the_edits_of_a_document_that_waits_are_kept_with_their_history() {
+    let engine = Engine::start(Box::new(|| {}));
+    open_more(&engine, 1, pdf(2, square), TOTAL_BYTES);
+    engine.add_note(1, 10, 0, [20.0, 20.0], "kept", [255, 235, 0], "A");
+    match next_event(&engine) {
+        Event::Edited(r) => assert!(r.status == EditStatus::Done && r.dirty && r.can_undo, "{r:?}"),
+        other => panic!("{other:?}"),
+    }
+    // Another file is opened and served, then the first one again: its edit is still there, can be undone, and is not saved.
+    open_more(&engine, 2, pdf(1, square), TOTAL_BYTES);
+    engine.activate(1, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Activated { doc: 1, .. }));
+    engine.annot_list(1, 11);
+    match next_event(&engine) {
+        Event::AnnotList { items, .. } => assert_eq!(items.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    engine.undo(1, 12);
+    match next_event(&engine) {
+        Event::Edited(r) => assert!(r.status == EditStatus::Done && !r.dirty && !r.can_undo && r.can_redo, "{r:?}"),
+        other => panic!("{other:?}"),
+    }
+    // An edit asked for just before the document stops being served is done first, and answered.
+    engine.add_note(1, 13, 0, [20.0, 20.0], "last", [255, 235, 0], "A");
+    engine.activate(2, TOTAL_BYTES, 1920 * 1080);
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        seen.push(next_event(&engine));
+    }
+    assert!(matches!(&seen[0], Event::Edited(r) if r.id == 13 && r.status == EditStatus::Done), "{seen:?}");
+    assert!(matches!(&seen[1], Event::Activated { doc: 2, .. }), "{seen:?}");
+}
+
+#[test]
+fn a_new_file_pushes_out_the_least_recently_served_ones_that_may_go() {
+    let engine = Engine::start(Box::new(|| {}));
+    let total = tight();
+    assert!(matches!(open_more(&engine, 1, pdf(1, square), total), Event::Opened(_)));
+    // The second file finds the first in the way: it is let go of (nothing in it is unsaved), and the window is told before the new file.
+    assert!(matches!(open_more(&engine, 2, pdf(1, square), total), Event::Dropped { doc: 1 }));
+    assert!(matches!(next_event(&engine), Event::Opened(o) if o.doc == 2));
+    // A document that was let go of is not served: it is opened from the disk again by the window.
+    engine.activate(1, total, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Dropped { doc: 1 }));
+    // With room for both (the usual total) nothing is let go of.
+    assert!(matches!(open_more(&engine, 3, pdf(1, square), TOTAL_BYTES), Event::Opened(o) if o.doc == 3));
+    engine.activate(2, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Activated { doc: 2, .. }));
+}
+
+#[test]
+fn a_file_with_unsaved_edits_or_a_password_is_never_let_go_of() {
+    let total = tight();
+    let engine = Engine::start(Box::new(|| {}));
+    open_more(&engine, 1, pdf(1, square), total);
+    engine.add_note(1, 5, 0, [20.0, 20.0], "unsaved", [255, 235, 0], "A");
+    assert!(matches!(next_event(&engine), Event::Edited(_)));
+    // There is no room for a second file beside the first, which cannot go: the new file is refused, and the first is still there.
+    match open_more(&engine, 2, pdf(1, square), total) {
+        Event::OpenFailed { doc: 2, failure: OpenFailure::NoRoom, message } => assert!(message.contains("no room"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    engine.activate(1, total, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Activated { doc: 1, .. }));
+    // One opened with a password stays too, however it is used.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/public/encrypted/qpdf-generated/bookmarks.r2-40-user.pdf");
+    let engine = Engine::start(Box::new(|| {}));
+    engine.open_file(1, path, "user", total, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Opened(_)));
+    assert!(matches!(open_more(&engine, 2, pdf(1, square), total), Event::OpenFailed { failure: OpenFailure::NoRoom, .. }));
+    // After the edit is undone nothing is unsaved and the file can go again.
+    let engine = Engine::start(Box::new(|| {}));
+    open_more(&engine, 1, pdf(1, square), total);
+    engine.add_note(1, 5, 0, [20.0, 20.0], "unsaved", [255, 235, 0], "A");
+    assert!(matches!(next_event(&engine), Event::Edited(_)));
+    engine.undo(1, 6);
+    assert!(matches!(next_event(&engine), Event::Edited(_)));
+    assert!(matches!(open_more(&engine, 2, pdf(1, square), total), Event::Dropped { doc: 1 }));
+}
+
+#[test]
+fn a_file_that_does_not_open_leaves_nothing_served_and_the_one_before_it_waits() {
+    let engine = Engine::start(Box::new(|| {}));
+    open_more(&engine, 1, pdf(2, square), TOTAL_BYTES);
+    match open_more(&engine, 2, b"this is not a PDF file".to_vec(), TOTAL_BYTES) {
+        Event::OpenFailed { doc: 2, failure: OpenFailure::Damaged, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    engine.render(RenderRequest { doc: 1, ..request(1, 0, 0) });
+    assert!(engine.wait(200).is_none(), "nothing is served until the window says which");
+    engine.activate(1, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Activated { doc: 1, .. }));
+    assert_eq!(drawn(&engine, 1, 2).status, RenderStatus::Complete);
+}
+
+#[test]
+fn many_files_can_be_open_together_and_each_draws() {
+    let engine = Engine::start(Box::new(|| {}));
+    for doc in 1..=16u64 {
+        assert!(matches!(open_more(&engine, doc, pdf(2 + doc as u32 % 3, square), TOTAL_BYTES), Event::Opened(o) if o.doc == doc));
+    }
+    for doc in (1..=16u64).rev() {
+        engine.activate(doc, TOTAL_BYTES, 1920 * 1080);
+        assert!(matches!(next_event(&engine), Event::Activated { doc: d, .. } if d == doc));
+        assert_eq!(drawn(&engine, doc, 100 + doc).status, RenderStatus::Complete);
+    }
+    engine.close();
+    engine.activate(3, TOTAL_BYTES, 1920 * 1080);
+    assert!(matches!(next_event(&engine), Event::Dropped { doc: 3 }));
+}

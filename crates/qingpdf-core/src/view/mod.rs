@@ -1,6 +1,8 @@
 //! The reader engine (3d-1, 3d-2): what a viewer window talks to.
 //!
-//! One thread owns the open document. The window sends requests (open a file, draw this part of that page at this
+//! One thread owns the open documents, and serves one of them at a time (the tab that is shown); the others wait, with their file and
+//! their edits that are not saved, until [`Engine::activate`] makes one of them the served one, or are let go of ([`Event::Dropped`]) to
+//! make room for another file. The window sends requests (open a file, draw this part of that page at this
 //! size, find these words, forget a request) and gets results back, all through channels; it never waits for the engine.
 //! Every type on this boundary is a plain one (integers, floats, strings, byte vectors, enums without data of Rust's
 //! own), so a C interface or a HarmonyOS NAPI wrapper can be put on it later without changing the engine
@@ -25,6 +27,7 @@ mod outline;
 mod plan;
 mod search;
 mod server;
+mod store;
 mod targets;
 mod textcache;
 #[cfg(test)]
@@ -55,7 +58,7 @@ pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
 pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind, ShapeKind, keep_on_page};
-pub use plan::{MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
+pub use plan::{ACTIVE_FLOOR, MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
 
 /// The biggest file the reader compresses: the file, the new file and the new pictures are held at once, with the pictures being
 /// worked on (`docs/decisions.md`, compressing); a bigger one is for `qingpdf compress`.
@@ -85,7 +88,7 @@ pub struct PageInfo {
 /// `priority`: the smaller the number, the sooner it is drawn; requests of the same priority go in the order they
 /// were made. A request below [`BACKGROUND_PRIORITY`] is drawn before the quick requests (bookmarks, links, boxes of
 /// characters), one at or above it after them. `id` names the request for [`Engine::cancel`] and in the result; the caller makes the ids up and keeps
-/// them different. A request for a document that is not the open one is dropped.
+/// them different. A request for a document that is not the served one is dropped.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderRequest {
     pub doc: u64,
@@ -142,6 +145,9 @@ pub enum OpenFailure {
     Unreadable = 3,
     /// Not a PDF, or too damaged to read, or it asks for more than is safe.
     Damaged = 4,
+    /// The documents kept for the other tabs leave no room for this one (the file alone is small enough to open): none of them can be let go
+    /// of, since each has edits that are not saved or was opened with a password. Save or close some, and try again.
+    NoRoom = 5,
 }
 
 /// What the file's author allows whoever opened it to do, worked out like the `text` command does: a file that is not
@@ -315,6 +321,14 @@ pub enum PrintStatus {
 pub enum Event {
     Opened(Opened),
     OpenFailed { doc: u64, failure: OpenFailure, message: String },
+    /// A document the engine kept for a tab is served again (the answer to [`Engine::activate`]): what the window may keep of bitmaps and
+    /// thumbnails now (the other documents kept take their share of the total, so it is not what it was), and the most pixels of a request.
+    /// Whatever was asked of the document before is forgotten (see [`Engine::activate`]).
+    Activated { doc: u64, bitmap_cache_bytes: u64, thumb_cache_bytes: u64, max_tile_pixels: u32 },
+    /// The engine let go of a document it kept for a tab, to make room for another: it is not open any more, and the window opens the file
+    /// again ([`Engine::open_file`]) when the tab is wanted. Only a document with no edits that are not saved and no password goes. Also the
+    /// answer to [`Engine::activate`] for a document that is not there.
+    Dropped { doc: u64 },
     Rendered(Rendered),
     /// The bookmarks (the answer to [`Engine::outline`]), in display order. `truncated`: there were more than the reader reads.
     Outline { doc: u64, id: u64, items: Vec<OutlineItem>, truncated: bool },
@@ -394,6 +408,8 @@ pub(crate) enum Request {
 
 pub(crate) enum Command {
     Open { doc: u64, source: Source, password: String, total: u64, view_pixels: u64 },
+    Activate { doc: u64, total: u64, view_pixels: u64 },
+    CloseDoc { doc: u64 },
     Render(RenderRequest),
     Request { doc: u64, id: u64, what: Request },
     Edit { doc: u64, id: u64, edit: crate::edit::Edit },
@@ -408,6 +424,7 @@ pub(crate) enum Command {
     Swap,
     PrintNext(u64),
     Cancel(u64),
+    /// Every document.
     Close,
     Quit,
 }
@@ -469,11 +486,15 @@ impl Engine {
         self.start_error.as_deref()
     }
 
-    /// Open the file at `path` (read by the engine thread, so the caller does not wait for the disk). `doc` names the
-    /// document in everything that follows; a document that was open is closed first, the request being drawn is
-    /// stopped, and its requests are dropped. `password` is tried after the empty one (it is used once and not kept).
-    /// `total` is the memory goal in bytes ([`TOTAL_BYTES`]); `view_pixels` the most pixels the window can show (0: not
-    /// known): the window's bitmaps are sized from it and the engine's caches give way when the total is short.
+    /// Open the file at `path` (read by the engine thread, so the caller does not wait for the disk) and serve it. `doc` names the
+    /// document in everything that follows (a number not used before). The document that was served waits: the request being drawn is
+    /// stopped and its requests are dropped, but the document, with its edits that are not saved, is kept for [`Engine::activate`] (a
+    /// document with the same number is closed). `password` is tried after the empty one (it is used once and not kept).
+    /// `total` is the memory goal in bytes ([`TOTAL_BYTES`]) for all the documents together; `view_pixels` the most pixels the window can
+    /// show (0: not known): the window's bitmaps are sized from it and the engine's caches give way when the total is short. The
+    /// documents that wait take their bytes off the total; when there is not enough left, the ones that can be let go of go
+    /// ([`Event::Dropped`], the least recently served first), and when that is not enough the answer is [`OpenFailure::NoRoom`]. A file that
+    /// does not open leaves no document served until [`Engine::activate`] is called for one.
     pub fn open_file(&self, doc: u64, path: &str, password: &str, total: u64, view_pixels: u64) {
         let _ = self.commands.send(Command::Open { doc, source: Source::Path(path.to_string()), password: password.to_string(), total, view_pixels });
         // The command goes first: the engine that finds itself stopped looks for it.
@@ -484,6 +505,24 @@ impl Engine {
     #[cfg(test)]
     pub fn open_bytes(&self, doc: u64, bytes: Vec<u8>, password: &str, total: u64, view_pixels: u64) {
         let _ = self.commands.send(Command::Open { doc, source: Source::Bytes(bytes), password: password.to_string(), total, view_pixels });
+        self.shared.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Serve the document `doc` that waits (it was opened and then another was opened or activated), the served one waiting instead: the
+    /// request being drawn is stopped and the requests of the document that stops being served are dropped, so the window asks for what it
+    /// wants of `doc` after [`Event::Activated`] (which says what the plan is now; requests sent before it are fine, they are served in
+    /// order). A document that is being served already is answered again, nothing else happens. One that is not there (let go of: the answer
+    /// is [`Event::Dropped`]) must be opened again. Edits, saves and exports asked of the served document are done before it stops being
+    /// served; searches, prints and the like are not (the window waits for them or cancels them first).
+    pub fn activate(&self, doc: u64, total: u64, view_pixels: u64) {
+        let _ = self.commands.send(Command::Activate { doc, total, view_pixels });
+        self.shared.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Close a document, the served one or one that waits, with whatever it holds (its edits that are not saved too). Nothing is told. If
+    /// it is the served one no document is served until [`Engine::activate`].
+    pub fn close_doc(&self, doc: u64) {
+        let _ = self.commands.send(Command::CloseDoc { doc });
         self.shared.stop.store(true, Ordering::SeqCst);
     }
 
@@ -843,7 +882,7 @@ impl Engine {
         }
     }
 
-    /// Close the document and drop every request.
+    /// Close every document and drop every request.
     pub fn close(&self) {
         let _ = self.commands.send(Command::Close);
         self.shared.stop.store(true, Ordering::SeqCst);
@@ -868,13 +907,15 @@ impl Drop for Engine {
     }
 }
 
-/// The engine thread: wait for a file to open, serve it until another command ends it, repeat.
+/// The engine thread: wait for a file to open or a document to serve, serve it until another command ends it (the document then waits in
+/// the store), repeat.
 fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() + Send), shared: &Shared) {
     let send = |event: Event| {
         if events.send(event).is_ok() {
             notify();
         }
     };
+    let mut store = store::Store::default();
     let mut next: Option<Command> = None;
     loop {
         let command = match next.take() {
@@ -884,13 +925,35 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
                 Err(_) => return,
             },
         };
-        match command {
+        let to_serve = match command {
             Command::Quit => return,
-            Command::Open { doc, source, password, total, view_pixels } => match open(doc, source, password, total, view_pixels) {
-                Ok((opened, mut session)) => next = server::serve(opened, &mut session, commands, &send, shared),
-                Err((failure, message)) => send(Event::OpenFailed { doc, failure, message }),
+            Command::Open { doc, source, password, total, view_pixels } => {
+                // (A document with this number is gone: it is replaced.)
+                store.remove(doc);
+                match open(doc, source, password, total, view_pixels, &mut store, &send) {
+                    Ok((opened, session)) => Some((opened, session, server::Start::Opened)),
+                    Err((failure, message)) => {
+                        send(Event::OpenFailed { doc, failure, message });
+                        None
+                    }
+                }
+            }
+            Command::Activate { doc, total, view_pixels } => match store.take(doc) {
+                Some(waiting) => Some(wake_up(waiting, total, view_pixels, &store)),
+                None => {
+                    send(Event::Dropped { doc });
+                    None
+                }
             },
-            // Requests with no document open.
+            Command::CloseDoc { doc } => {
+                store.remove(doc);
+                None
+            }
+            Command::Close => {
+                store.clear();
+                None
+            }
+            // Requests with no document served.
             Command::Render(_)
             | Command::Request { .. }
             | Command::Edit { .. }
@@ -903,10 +966,26 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Compress { .. }
             | Command::Swap
             | Command::PrintNext(_)
-            | Command::Cancel(_)
-            | Command::Close => {}
+            | Command::Cancel(_) => None,
+        };
+        if let Some((opened, session, start)) = to_serve {
+            let (end, kept) = server::serve(opened, session, start, &mut store, commands, &send, shared);
+            if let Some((opened, session)) = kept {
+                store.park(opened, session);
+            }
+            next = end;
         }
     }
+}
+
+/// A document that waited, to be served: it gets the plan the total allows now, with the other documents that wait taking their bytes.
+fn wake_up(waiting: store::Parked, total: u64, view_pixels: u64, others: &store::Store) -> (OpenDoc, editing::Session, server::Start) {
+    let store::Parked { mut open, session, .. } = waiting;
+    let size = open.document.data().len() as u64;
+    // (A plan always exists when the documents were let in as they should be; if not, one with the least room, over the total, rather than none.)
+    open.plan = plan(total.saturating_sub(others.bytes()), size, view_pixels).or_else(|| plan(size.saturating_add(ACTIVE_FLOOR), size, view_pixels)).unwrap_or(open.plan);
+    open.document.set_object_stream_cache_limit(usize::try_from(open.plan.object_streams).unwrap_or(usize::MAX));
+    (open, session, server::Start::Activated)
 }
 
 pub(crate) struct OpenDoc {
@@ -916,14 +995,36 @@ pub(crate) struct OpenDoc {
     pub(crate) rights: Rights,
 }
 
-fn open(doc_id: u64, source: Source, mut password: String, total: u64, view_pixels: u64) -> Result<(OpenDoc, editing::Session), (OpenFailure, String)> {
-    let result = open_inner(doc_id, source, &password, total, view_pixels);
+fn open(doc_id: u64, source: Source, mut password: String, total: u64, view_pixels: u64, store: &mut store::Store, send: &dyn Fn(Event)) -> Result<(OpenDoc, editing::Session), (OpenFailure, String)> {
+    let result = open_inner(doc_id, source, &password, total, view_pixels, store, send);
     // The editing session keeps the password for as long as the file is open (to open the edited file again), and wipes it
     // when it ends; this copy is used and gone: overwrite it before it is freed.
     let budget = result.as_ref().map_or(0, |o| o.plan.edit_bytes);
     let session = editing::Session::new(&password, budget);
     wipe(&mut password);
     result.map(|opened| (opened, session))
+}
+
+/// Make room for a file of `size` bytes among the documents that wait: if the total does not hold it with them (and the least the one
+/// that is served needs, `active_floor`), the ones that can be let go of go, the least recently served first, and the window is told
+/// ([`Event::Dropped`]). `TooLarge`: the file is too big for the total on its own; `NoRoom`: it is not, but the documents that cannot be let
+/// go of leave too little.
+fn make_room(store: &mut store::Store, send: &dyn Fn(Event), total: u64, size: u64, view_pixels: u64) -> Result<(), (OpenFailure, String)> {
+    if plan(total, size, view_pixels).is_none() {
+        return Err((OpenFailure::TooLarge, format!("the file is bigger than {} MB, the most this reader opens", MAX_FILE_BYTES / 1_000_000)));
+    }
+    let need = store::short_by(total, store.bytes(), size.saturating_add(store::guess_for(size)), ACTIVE_FLOOR);
+    if need == 0 {
+        return Ok(());
+    }
+    let Some(drops) = store::pick_drops(&store.droppable(), need) else {
+        return Err((OpenFailure::NoRoom, "the other open files leave no room for this one: save or close some of them".to_string()));
+    };
+    for doc in drops {
+        store.remove(doc);
+        send(Event::Dropped { doc });
+    }
+    Ok(())
 }
 
 /// Open the bytes of an edited file (the same document with changes appended or cut off) again. `pages` is how many pages it
@@ -944,15 +1045,13 @@ pub(crate) fn reopen(doc_id: u64, plan: MemoryPlan, rights: Rights, bytes: Vec<u
     Ok(OpenDoc { doc_id, document, plan, rights })
 }
 
-fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixels: u64) -> Result<OpenDoc, (OpenFailure, String)> {
+fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixels: u64, store: &mut store::Store, send: &dyn Fn(Event)) -> Result<OpenDoc, (OpenFailure, String)> {
     let too_large = || (OpenFailure::TooLarge, format!("the file is bigger than {} MB, the most this reader opens", MAX_FILE_BYTES / 1_000_000));
     let bytes = match source {
         Source::Path(path) => {
             let unreadable = |e: std::io::Error| (OpenFailure::Unreadable, e.to_string());
             let size = std::fs::metadata(&path).map_err(unreadable)?.len();
-            if plan(total, size, view_pixels).is_none() {
-                return Err(too_large());
-            }
+            make_room(store, send, total, size, view_pixels)?;
             // With room after the file for the update that saving appends, so that appending does not copy the file.
             let mut file = std::fs::File::open(&path).map_err(unreadable)?;
             let mut bytes = Vec::new();
@@ -961,9 +1060,13 @@ fn open_inner(doc_id: u64, source: Source, password: &str, total: u64, view_pixe
             bytes
         }
         #[cfg(test)]
-        Source::Bytes(b) => b,
+        Source::Bytes(b) => {
+            make_room(store, send, total, b.len() as u64, view_pixels)?;
+            b
+        }
     };
-    let plan = plan(total, bytes.len() as u64, view_pixels).ok_or_else(too_large)?;
+    // (What is left of the total once the documents that wait have their bytes.)
+    let plan = plan(total.saturating_sub(store.bytes()), bytes.len() as u64, view_pixels).ok_or_else(too_large)?;
     let document = Document::from_bytes_with_password(bytes, password).map_err(|e| match e {
         Error::PasswordRequired => (OpenFailure::NeedsPassword, e.to_string()),
         Error::WrongPassword => (OpenFailure::WrongPassword, e.to_string()),

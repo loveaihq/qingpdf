@@ -69,7 +69,6 @@ impl BitmapCache {
         self.budget
     }
 
-    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -114,7 +113,6 @@ impl BitmapCache {
     }
 
     /// Hold the cache to `budget` bytes from now on.
-    #[cfg(test)]
     pub fn set_budget(&mut self, budget: u64, focus: &Focus) -> Vec<Key> {
         self.budget = budget;
         self.make_room(focus)

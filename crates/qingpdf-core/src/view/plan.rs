@@ -202,6 +202,12 @@ pub fn plan(total: u64, file_bytes: u64, view_pixels: u64) -> Option<MemoryPlan>
     (p.bitmap_cache_bytes >= MIN_BITMAP_CACHE.max(u64::from(p.max_tile_pixels) * 4)).then_some(p)
 }
 
+/// The least a file that is being read needs beyond its own bytes (docs/decisions.md, several files): a bit more than the smallest total for
+/// which a file of no size has a plan (72.66 MB, the same for every window: the engine's parts are cut to their floor and the bitmaps to the
+/// least `plan` accepts). Documents the engine keeps besides the one it serves are held within the total less this, so that any of them can be
+/// served in its turn.
+pub const ACTIVE_FLOOR: u64 = 73_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +284,17 @@ mod tests {
         // A window bigger than anything sensible does not starve the engine below its floor.
         let huge = plan(TOTAL_BYTES, 5_000_000, HUGE).expect("a plan");
         assert!(huge.render_caches >= RENDER_CACHES * MIN_SHARE / 1000 - 1, "{huge:?}");
+    }
+
+    #[test]
+    fn the_floor_is_just_over_the_least_total_that_has_a_plan() {
+        for view in [0, HD, UHD, HUGE] {
+            // A file of no size has a plan at the floor and none a little under it; a file of some size needs its bytes as well.
+            assert!(plan(ACTIVE_FLOOR, 0, view).is_some(), "{view}");
+            assert!(plan(ACTIVE_FLOOR - 500_000, 0, view).is_none(), "{view}: the floor is too high");
+            assert!(plan(ACTIVE_FLOOR + 5_000_000, 5_000_000, view).is_some(), "{view}");
+        }
+        const { assert!(ACTIVE_FLOOR < TOTAL_BYTES / 2) };
     }
 
     #[test]

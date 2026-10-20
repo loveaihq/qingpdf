@@ -59,6 +59,7 @@ pub enum ScrollCode {
 
 /// Virtual-key codes the reader uses (winuser.h).
 pub mod vk {
+    pub const TAB: u32 = 0x09;
     pub const RETURN: u32 = 0x0D;
     pub const ESCAPE: u32 = 0x1B;
     pub const SPACE: u32 = 0x20;
@@ -83,6 +84,7 @@ pub mod vk {
     pub const R: u32 = 0x52;
     pub const S: u32 = 0x53;
     pub const Y: u32 = 0x59;
+    pub const W: u32 = 0x57;
     pub const Z: u32 = 0x5A;
     pub const NUMPAD0: u32 = 0x60;
     pub const ADD: u32 = 0x6B;
@@ -128,6 +130,11 @@ pub enum Event {
     MouseUp { x: i32, y: i32 },
     /// The window lost the mouse while the button was down (another window took it).
     MouseLost,
+    /// The pointer moved with no button down, or left the window (2026-10-17: the strip of tabs shows the path of the tab it is over).
+    Hover { x: i32, y: i32 },
+    HoverEnd,
+    /// The middle button came up (it closes the tab under it).
+    MiddleClick { x: i32, y: i32 },
     /// The person asked to close the window (the close button, Alt+F4): it stays open unless the reader answers with
     /// [`Action::Quit`] (it may ask first whether to save).
     CloseRequested,

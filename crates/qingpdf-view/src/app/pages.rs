@@ -73,6 +73,11 @@ impl PageWork {
         *self = PageWork::new();
     }
 
+    /// Pages are being changed, put in or written to a file, and the engine has not answered yet.
+    pub(super) fn busy(&self) -> bool {
+        !self.then.is_empty() || self.inserting.is_some() || self.extracting.is_some()
+    }
+
     /// The box that asks for a file of pages is open.
     pub(super) fn insert_pending(&self) -> bool {
         self.insert_at.is_some()

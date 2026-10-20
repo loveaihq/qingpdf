@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_another_file_while_one_is_being_written_forgets_that_request_and_its_password() {
+    fn closing_the_tab_while_a_file_is_being_written_forgets_that_request_and_its_password() {
         let dir = std::env::temp_dir().join(format!("qingpdf-view-protect-reset-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (first, second, target) = (dir.join("first.pdf"), dir.join("second.pdf"), dir.join("locked.pdf"));
@@ -491,9 +491,13 @@ mod tests {
         app.event(answer(&values(["pw-one", "pw-one", "pw-two", "pw-two"], "0", "0", ALL_ON), None));
         app.event(Event::SavePicked(Some(target.clone())));
         assert!(app.pt.running.is_some(), "the request is on its way");
+        // The tab is busy with it: another file is not opened beside it (a note says why), and the request goes on.
         app.open_path(&second, "");
-        // Nothing of it is kept, the password with it, and the box is not told "busy" for the rest of the session.
-        assert!(app.pt.running.is_none() && app.pt.waiting.is_none());
+        assert!(app.pt.running.is_some() && app.tabs.len() == 1 && app.note.as_deref().is_some_and(|n| n.contains("busy")), "{:?}", app.note);
+        // Closing the tab: nothing of the request is kept, the password with it, and the box is not told "busy" for the rest of the session.
+        app.event(Event::Command(CMD_CLOSE_TAB));
+        assert!(app.pt.running.is_none() && app.pt.waiting.is_none() && app.tabs.is_empty());
+        app.open_path(&second, "");
         pump(&mut app, "the second file to open", |a| a.has_document() && a.path.as_deref().is_some_and(|p| p.ends_with("second.pdf")));
         let asked = app.event(Event::Command(CMD_PROTECT));
         let form = form_of(&asked);
