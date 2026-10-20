@@ -196,7 +196,7 @@ impl App {
     fn nearest_page_point(&self, x: i64, y: i64) -> Option<(u32, f32, f32)> {
         let l = &self.doc.as_ref()?.layout;
         let dy = y + self.scroll_y;
-        let page = l.page_at(dy);
+        let page = l.page_under(x - self.view_x, dy, self.view_w, self.scroll_x);
         let map = l.page_map(page)?;
         let (px, py) = ((x - self.view_x - l.left(page, self.view_w, self.scroll_x)) as f64, (dy - l.top(page)) as f64);
         let (xp, yp) = map.to_pt(px, py);
@@ -338,7 +338,7 @@ impl App {
                 let current = s.current.is_some_and(|c| c.page == page as u32 && c.index == i);
                 let (color, alpha) = if current { (CURRENT_HIT_COLOR, CURRENT_HIT_ALPHA) } else { (HIT_COLOR, HIT_ALPHA) };
                 for r in &hit.rects {
-                    p.fill_rect_alpha(area(map.rect_to_px(*r)), color, alpha);
+                    p.fill_rect_alpha(area(map.rect_to_px(*r)), color, self.boost(alpha));
                 }
             }
         }
@@ -348,7 +348,7 @@ impl App {
             && let Some(chars) = boxes.boxes.get(a..b)
         {
             for r in line_rects(chars) {
-                p.fill_rect_alpha(area(map.rect_to_px(r)), SELECTION_COLOR, SELECTION_ALPHA);
+                p.fill_rect_alpha(area(map.rect_to_px(r)), SELECTION_COLOR, self.boost(SELECTION_ALPHA));
             }
         }
     }

@@ -7,12 +7,14 @@
 //! further than its range, and at most [`MAX_PLACES`] lines are looked at.
 //!
 //! The format: the first line is `qingpdf-places 1`, then one file to a line, newest first: size, modified (seconds since 1970), page,
-//! mode (0 fit width, 1 fit page, 2 a zoom of its own), zoom (thousandths), across and down (tenths of a percent), turn (degrees) and the
+//! mode (0 fit width, 1 fit page, 2 a zoom of its own), zoom (thousandths), across and down (tenths of a percent), turn (degrees), since
+//! 2026-10-20 the layout (0 one page a row, 1 two, 2 two with the first alone; a line without it is read as having none kept) and the
 //! path, separated by tabs (the path last: it may hold anything but a tab or a line end).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::layout::Spread;
 use crate::recent::{MODE_CUSTOM, write_atomic};
 use crate::zoom;
 
@@ -90,22 +92,30 @@ pub struct Place {
     pub down: u32,
     /// The turn of the view, in degrees: 0, 90, 180 or 270.
     pub rotation: u16,
+    /// How the pages were laid out (2026-10-20); none for a place kept before that, or with a number that is not one of the three.
+    pub layout: Option<Spread>,
 }
 
 impl Place {
     /// The place of the first page, at the zoom that fits the width.
     #[cfg(test)]
     pub fn start(path: &str, stamp: Stamp) -> Place {
-        Place { path: path.to_string(), stamp, page: 0, mode: 0, zoom: zoom::ACTUAL_SIZE, across: 0, down: 0, rotation: 0 }
+        Place { path: path.to_string(), stamp, page: 0, mode: 0, zoom: zoom::ACTUAL_SIZE, across: 0, down: 0, rotation: 0, layout: None }
     }
 }
 
-/// One line of the file: eight numbers and a path, tab between; none if anything is wrong with it.
+/// One line of the file: eight numbers, the layout (not in a line from before 2026-10-20) and a path, tab between; none if anything is wrong with it.
 fn parse_line(line: &str) -> Option<Place> {
-    let mut parts = line.splitn(9, '\t');
+    let mut parts = line.splitn(10, '\t');
     let mut number = || parts.next()?.trim().parse::<u64>().ok();
     let (size, modified, page, mode, z, across, down, turn) = (number()?, number()?, number()?, number()?, number()?, number()?, number()?, number()?);
-    let path = parts.next().filter(|p| line.len() <= MAX_LINE_BYTES && path_ok(p))?;
+    // A ninth number and then the path: the layout. A line from before it has the path as its ninth field (a path is never only digits).
+    let (layout, path) = match (parts.next()?, parts.next()) {
+        (n, Some(p)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => (n.parse::<u8>().ok().and_then(Spread::from_code), p),
+        (p, None) => (None, p),
+        _ => return None,
+    };
+    let path = Some(path).filter(|p| line.len() <= MAX_LINE_BYTES && path_ok(p))?;
     let rotation = u16::try_from(turn).ok().filter(|t| [0, 90, 180, 270].contains(t))?;
     Some(Place {
         path: path.to_string(),
@@ -116,6 +126,7 @@ fn parse_line(line: &str) -> Option<Place> {
         across: u32::try_from(across).ok()?.min(FULL),
         down: u32::try_from(down).ok()?.min(FULL),
         rotation,
+        layout,
     })
 }
 
@@ -156,7 +167,8 @@ impl Places {
         let mut out = String::from(HEADER);
         out.push('\n');
         for p in self.list.iter().filter(|p| path_ok(&p.path)).take(MAX_PLACES) {
-            out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", p.stamp.size, p.stamp.modified, p.page, p.mode, p.zoom, p.across, p.down, p.rotation, p.path));
+            let layout = p.layout.map_or_else(String::new, |s| format!("{}\t", s.code()));
+            out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{layout}{}\n", p.stamp.size, p.stamp.modified, p.page, p.mode, p.zoom, p.across, p.down, p.rotation, p.path));
         }
         out
     }
@@ -215,7 +227,7 @@ mod tests {
     const STAMP: Stamp = Stamp { size: 4_400_000, modified: 1_760_000_000 };
 
     fn place(path: &str, page: u32) -> Place {
-        Place { path: path.to_string(), stamp: STAMP, page, mode: MODE_CUSTOM, zoom: 1500, across: 250, down: 640, rotation: 90 }
+        Place { path: path.to_string(), stamp: STAMP, page, mode: MODE_CUSTOM, zoom: 1500, across: 250, down: 640, rotation: 90, layout: Some(Spread::Pair) }
     }
 
     #[test]
@@ -239,6 +251,12 @@ mod tests {
         assert!(text.starts_with("qingpdf-places 1\n"));
         assert_eq!(Places::parse(&text), places);
         assert_eq!(places.find("c:\\docs\\公文 一.pdf", STAMP).map(|p| p.page), Some(4));
+        // A place with a layout has it written; one with none is written without (as the older builds did) and comes back with none.
+        assert!(text.contains("\t90\t1\tc:\\docs\\公文 一.pdf\n") && text.contains("\t0\td:\\b c\\d.pdf\n"), "{text}");
+        assert_eq!((places.list[1].layout, places.list[0].layout), (Some(Spread::Pair), None));
+        // A line of the older kind, and one with a layout that is no layout.
+        let got = Places::parse("100\t200\t3\t0\t1000\t0\t0\t0\tC:\\old.pdf\n100\t200\t3\t0\t1000\t0\t0\t0\t2\tC:\\new.pdf\n100\t200\t3\t0\t1000\t0\t0\t0\t9\tC:\\odd.pdf\n100\t200\t3\t0\t1000\t0\t0\t0\t1\t\n");
+        assert_eq!(got.list.iter().map(|p| (p.path.as_str(), p.layout)).collect::<Vec<_>>(), [("C:\\old.pdf", None), ("C:\\new.pdf", Some(Spread::Cover)), ("C:\\odd.pdf", None)]);
     }
 
     #[test]
@@ -319,7 +337,7 @@ mod tests {
         places.touch(place("c:\\secret.pdf", 2));
         let text = places.serialize();
         assert_eq!(text.lines().count(), 2);
-        assert!(text.lines().nth(1).unwrap().split('\t').count() == 9);
+        assert!(text.lines().nth(1).unwrap().split('\t').count() == 10);
         // A path with a line end in it is not written (it would make a second entry).
         places.touch(place("c:\\a\nb.pdf", 1));
         assert_eq!(places.serialize().lines().count(), 2);

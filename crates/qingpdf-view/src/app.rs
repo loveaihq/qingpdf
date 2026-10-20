@@ -4,7 +4,8 @@
 //! The parts of it that came with 3d-2 are in the modules below, each an `impl App` of its own: `outline` (the bookmarks, links
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
 //! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans), `sidebar` (the tabs, and the
-//! thumbnails: the list is drawn and handled there).
+//! thumbnails: the list is drawn and handled there). `looks` (2026-10-20) is how the pages go in rows, how the window looks and in what colours the pages are
+//! shown; `screen` is full screen and the presentation.
 
 #[cfg(test)]
 mod annot_tests;
@@ -14,6 +15,7 @@ mod chrome;
 mod compress;
 mod editing;
 mod forms;
+mod looks;
 mod menus;
 mod ocr;
 mod outline;
@@ -22,6 +24,7 @@ mod pages;
 mod printjob;
 mod protect;
 mod recents;
+mod screen;
 mod searching;
 mod selecting;
 mod sidebar;
@@ -34,18 +37,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use qingpdf_core::idmap::IdMap;
+use qingpdf_core::render::recolor::recolor;
 use qingpdf_core::view::{Engine, Event as EngineEvent, Link, OpenFailure, Opened, OutlineItem, RenderRequest, RenderStatus, Rendered, Rights, TOTAL_BYTES};
 
 use crate::bench::Bench;
 use crate::cache::{BitmapCache, Entry, Focus, Key};
 use crate::find::SearchState;
 use crate::i18n::{self, Lang, LangChoice, Msg, t};
-use crate::layout::Layout;
+use crate::layout::{Arrangement, Layout, Spread};
 use crate::places::{self, Place, Places, Stamp};
 use crate::recent;
 use crate::sched::{self, Scene, Want};
 use crate::select::Selection;
 use crate::tabs::Tabs;
+use crate::theme::{self, Palette, ThemeChoice, Tint};
 use crate::thumbs::{self, Tab};
 use crate::tiles;
 use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
@@ -150,6 +155,18 @@ pub const CMD_PG_EXTRACT: u32 = 125;
 pub const CMD_CLOSE_TAB: u32 = 140;
 pub const CMD_NEXT_TAB: u32 = 141;
 pub const CMD_PREV_TAB: u32 = 142;
+/// View (2026-10-20): the layout of the pages, full screen and the presentation, the look of the window, the colours of the pages.
+pub const CMD_LAYOUT_SINGLE: u32 = 150;
+pub const CMD_LAYOUT_SPREAD: u32 = 151;
+pub const CMD_LAYOUT_COVER: u32 = 152;
+pub const CMD_FULLSCREEN: u32 = 153;
+pub const CMD_PRESENT: u32 = 154;
+pub const CMD_THEME_SYSTEM: u32 = 155;
+pub const CMD_THEME_LIGHT: u32 = 156;
+pub const CMD_THEME_DARK: u32 = 157;
+pub const CMD_TINT_ORIGINAL: u32 = 158;
+pub const CMD_TINT_NIGHT: u32 = 159;
+pub const CMD_TINT_SEPIA: u32 = 160;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
@@ -184,6 +201,9 @@ const DRAG_MS: u32 = 50;
 const TIMER_THUMB_DRAG: u32 = 5;
 /// The arrow keys have been left alone for a moment: the nudges are sent as one move.
 const TIMER_NUDGE: u32 = 6;
+/// The pointer has been still for two seconds in the presentation: it is hidden.
+const TIMER_CURSOR: u32 = 7;
+const CURSOR_MS: u32 = 2000;
 
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
@@ -192,22 +212,13 @@ const MARGIN: i64 = 12;
 const SPLIT_GAP: i64 = 6;
 const WHEEL_STEP: i64 = 96;
 const LINE_STEP: i64 = 48;
-const SPLIT_COLOR: u32 = 0xA0A0A0;
 /// The find box: the edit box, the room for the count to its left, the gap to the top and right edges.
 const FIND_EDIT_W: i64 = 220;
 const FIND_EDIT_H: i64 = 24;
 const FIND_LABEL_W: i64 = 190;
 const FIND_MARGIN: i64 = 10;
 
-// Colours.
-const BACKGROUND: u32 = 0xC8C8C8;
-const PAPER: u32 = 0xFFFFFF;
-const BORDER: u32 = 0x8C8C8C;
-const STATUS_BG: u32 = 0xF0F0F0;
-const STATUS_FG: u32 = 0x202020;
-const NOTICE_BG: u32 = 0xFFF1B8;
-const NOTICE_FG: u32 = 0x6B4E00;
-const HINT_FG: u32 = 0x505050;
+// Colours of the marks over the pages (the colours of the parts of the window are in `theme.rs`).
 const HIT_COLOR: u32 = 0xFFD400;
 const HIT_ALPHA: u8 = 120;
 const CURRENT_HIT_COLOR: u32 = 0xFF7A00;
@@ -400,6 +411,21 @@ app_fields! {
         thumb_target: Option<usize>,
         thumb_nav: bool,
         cz: compress::Squeeze,
+        /// The look of the window (2026-10-20): what the person chose in View > Interface, whether Windows is set to dark apps, the colours in use, and
+        /// whether the window is to be told them (`Action::Theme`) with the next answer.
+        theme_choice: ThemeChoice,
+        system_dark: bool,
+        pal: &'static Palette,
+        theme_dirty: bool,
+        /// The colours of the pages (View > Page colours), and how the pages go in rows for a file nothing is kept about (the last choice made).
+        tint: Tint,
+        default_spread: Spread,
+        /// The window is full screen (F11); the presentation that is going on (F5); the page to put at the top once the window has its old size back.
+        full: bool,
+        present: Option<screen::Present>,
+        restore_page: Option<usize>,
+        /// The speed test goes through the pages in the presentation (`--bench-present`).
+        bench_present: bool,
     }
     tab {
         doc_id: u64 = 0,
@@ -437,6 +463,11 @@ app_fields! {
         // --- passwords and permissions (2026-10-16) ---
         /// How the open file is protected, and the box that changes it.
         pt: protect::Protect = protect::Protect::new(),
+        // --- the looks (2026-10-20) ---
+        /// How the pages go in rows, whether they read from the right (the file's own word), and the colours the pictures in `cache` were made in.
+        spread: Spread = Spread::Single,
+        r2l: bool = false,
+        cache_tint: Tint = Tint::Original,
     }
 }
 
@@ -529,6 +560,16 @@ impl App {
             thumb_target: None,
             thumb_nav: false,
             cz: compress::Squeeze::new(),
+            theme_choice: ThemeChoice::System,
+            system_dark: false,
+            pal: &theme::LIGHT,
+            theme_dirty: true,
+            tint: Tint::Original,
+            default_spread: Spread::Single,
+            full: false,
+            present: None,
+            restore_page: None,
+            bench_present: false,
         };
         let mut app = App::assemble(globals);
         app.edit = EditState::new(author);
@@ -571,7 +612,9 @@ impl App {
     fn drop_document(&mut self) -> Vec<Action> {
         // What is being drawn for the old file is not wanted: stop it (opening another file stops it too, but the
         // file may fail to open, and the old requests are not to go on).
-        let mut actions = self.release();
+        // (A presentation is of the document that goes: it ends first.)
+        let mut actions = self.end_present(true);
+        actions.extend(self.release());
         self.cache.clear();
         actions.extend(self.cancel_print_for_new_document());
         self.drop_ocr();
@@ -625,11 +668,19 @@ impl App {
         self.rotation = 0;
         self.scroll_x = 0;
         self.scroll_y = 0;
+        // How the pages go in rows: what the file asks for, else what was last chosen (a place that was kept says so itself, below).
+        self.r2l = o.right_to_left;
+        self.spread = Spread::from_hint(o.spread_hint).unwrap_or(self.default_spread);
+        self.cache_tint = self.tint;
         let mut actions = vec![Action::SetTitle(self.title())];
         // The sidebar is there from the start when it is open on the thumbnails (the bookmarks, if there are any, come later).
         self.view_x = self.sidebar_width();
         self.view_w = (self.client_w - self.view_x).max(0);
         self.relayout(0, 0, None);
+        // (The speed test of the presentation starts it before anything is asked for.)
+        if std::mem::take(&mut self.bench_present) {
+            actions.extend(self.start_present());
+        }
         // Where the reader was: in this tab before the file was read again, else in this file last time (if it is the same file).
         let restore = self.restore.take();
         let start = restore.or_else(|| self.stored_place());
@@ -701,30 +752,48 @@ impl App {
     /// Lay the pages out again for the zoom, the rotation and the size of the window. The place that is `anchor_y`
     /// pixels down the window (and `anchor_x` across) stays where it is. `mode`: set the zoom from a fit first.
     fn relayout(&mut self, anchor_x: i64, anchor_y: i64, zoom_to: Option<(ZoomMode, u32)>) {
-        let (dpi, rotation, gap, margin) = (self.dpi, self.rotation, self.px(GAP), self.px(MARGIN));
+        // The presentation shows one page at a time, fitted to the screen, with no margin and a gap as high as the screen so that the pages
+        // next to it are never in view; the page is kept by its middle (the anchor is the middle of the screen).
+        let presenting = self.present.is_some();
+        let (dpi, rotation) = (self.dpi, self.rotation);
+        let (gap, margin) = if presenting { (self.view_h.max(1), 0) } else { (self.px(GAP), self.px(MARGIN)) };
+        let (anchor_x, anchor_y) = if presenting { (0, self.view_h / 2) } else { (anchor_x, anchor_y) };
         let (view_w, view_h) = (self.view_w, self.view_h);
+        let arrangement = self.arrangement();
         let Some(doc) = self.doc.as_mut() else { return };
         let l = &mut doc.layout;
         let (page, fraction) = l.locate(self.scroll_y + anchor_y);
         let old_w = l.content_width().max(1);
         let x_fraction = (self.scroll_x + anchor_x) as f64 / old_w as f64;
-        // The rotation first: the fit works on the pages as they are shown.
+        // The rotation and the rows first: the fit works on the pages as they are shown.
+        l.arrange(arrangement);
         l.set(l.scale(), rotation, gap, margin);
+        if presenting {
+            self.mode = ZoomMode::FitPage;
+        }
         if let Some((mode, z)) = zoom_to {
             self.mode = mode;
             self.zoom = zoom::clamp(z);
         }
         if self.mode != ZoomMode::Custom {
-            self.zoom = fit_zoom(l, self.mode, page, view_w, view_h, margin, dpi);
+            self.zoom = fit_zoom(l, self.mode, page, (view_w, view_h), margin, dpi, presenting);
         }
         l.set(zoom::scale(self.zoom, dpi), rotation, gap, margin);
         self.scroll_y = l.y_of(page, fraction) - anchor_y;
         self.scroll_x = (x_fraction * l.content_width() as f64).round() as i64 - anchor_x;
+        if presenting {
+            let ph = l.size_px(page).1;
+            (self.scroll_x, self.scroll_y) = (0, l.scroll_to_page(page, (view_h - ph) / 2));
+        }
         self.clamp_scroll();
     }
 
     fn clamp_scroll(&mut self) {
         let Some(doc) = &self.doc else { return };
+        // (The presentation is put where it is by `presented_at`, in the middle of the screen: that may be above the top of the document.)
+        if self.present.is_some() {
+            return;
+        }
         let (mx, my) = doc.layout.max_scroll(self.view_w, self.view_h);
         self.scroll_x = self.scroll_x.clamp(0, mx);
         self.scroll_y = self.scroll_y.clamp(0, my);
@@ -824,6 +893,7 @@ impl App {
             moving: self.moving,
             max_tile_pixels: doc.max_tile_pixels,
             budget: self.cache.budget(),
+            present: self.present.is_some(),
         })
     }
 
@@ -890,7 +960,7 @@ impl App {
     }
 
     /// A piece came back. `true`: it is in view, so the window needs a new picture.
-    fn on_rendered(&mut self, r: Rendered) -> bool {
+    fn on_rendered(&mut self, mut r: Rendered) -> bool {
         if r.doc != self.doc_id {
             return false;
         }
@@ -910,6 +980,8 @@ impl App {
         if r.status == RenderStatus::Incomplete && !want.preview {
             self.notices.insert(page, Notice::Incomplete);
         }
+        // The picture is kept in the colours it is shown in (View > Page colours): working them out now means scrolling costs nothing more.
+        recolor(&mut r.bgra, self.tint);
         let entry = Entry {
             key: want.key,
             width: r.width,
@@ -1018,6 +1090,9 @@ impl App {
     }
 
     pub fn go_to_page(&mut self, page: usize) -> Vec<Action> {
+        if self.present.is_some() {
+            return self.present_goto(page);
+        }
         let Some(doc) = &self.doc else { return Vec::new() };
         let page = page.min(doc.layout.len().saturating_sub(1));
         let y = doc.layout.scroll_to_page(page, self.px(MARGIN) / 2);
@@ -1098,6 +1173,17 @@ impl App {
             CMD_FIT_PAGE => self.set_zoom(ZoomMode::FitPage, self.zoom, None),
             CMD_ACTUAL => self.set_zoom(ZoomMode::Custom, zoom::ACTUAL_SIZE, None),
             CMD_ROTATE => self.rotate(1),
+            CMD_LAYOUT_SINGLE => self.set_spread(Spread::Single),
+            CMD_LAYOUT_SPREAD => self.set_spread(Spread::Pair),
+            CMD_LAYOUT_COVER => self.set_spread(Spread::Cover),
+            CMD_FULLSCREEN => self.toggle_full(),
+            CMD_PRESENT => self.start_present(),
+            CMD_THEME_SYSTEM => self.set_theme(ThemeChoice::System),
+            CMD_THEME_LIGHT => self.set_theme(ThemeChoice::Light),
+            CMD_THEME_DARK => self.set_theme(ThemeChoice::Dark),
+            CMD_TINT_ORIGINAL => self.set_tint(Tint::Original),
+            CMD_TINT_NIGHT => self.set_tint(Tint::Night),
+            CMD_TINT_SEPIA => self.set_tint(Tint::Sepia),
             CMD_PREV_PAGE => self.step_page(false),
             CMD_NEXT_PAGE => self.step_page(true),
             CMD_TOOLBAR => self.toggle_toolbar(),
@@ -1129,6 +1215,10 @@ impl App {
     }
 
     fn key(&mut self, key: u32, ctrl: bool, shift: bool) -> Vec<Action> {
+        // In the presentation the keys turn the pages, and nothing else is done by them.
+        if self.present.is_some() {
+            return self.present_key(key, shift);
+        }
         // The arrow keys nudge the annotation that is picked; anything else ends the nudging, which is sent as one move first.
         if !ctrl && matches!(key, vk::LEFT | vk::RIGHT | vk::UP | vk::DOWN) && let Some(actions) = self.nudge_key(key, shift) {
             return actions;
@@ -1192,6 +1282,8 @@ impl App {
             },
             vk::F3 => self.find_step(!shift),
             vk::F4 => self.command(CMD_BOOKMARKS),
+            vk::F5 => self.command(CMD_PRESENT),
+            vk::F11 => self.command(CMD_FULLSCREEN),
             // In the list of thumbnails Delete takes pages out; over the pages it takes the annotation picked out.
             vk::DELETE if self.thumb_focus && self.thumbs_shown() => self.command(CMD_PG_DELETE),
             vk::DELETE if self.annots_focus && self.annots_shown() => self.annots_delete(),
@@ -1249,8 +1341,8 @@ impl App {
         let (pw, ph) = l.size_px(page);
         let (left, top) = (l.left(page, self.view_w, self.scroll_x) + self.view_x, l.top(page) - self.scroll_y);
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
-        p.fill_rect(rect(left - 1, top - 1, pw + 2, ph + 2), BORDER);
-        p.fill_rect(rect(left, top, pw, ph), PAPER);
+        p.fill_rect(rect(left - 1, top - 1, pw + 2, ph + 2), self.page_border());
+        p.fill_rect(rect(left, top, pw, ph), self.tint.paper());
         let want = self.draw_scale;
         let mut entries: Vec<&Entry> = self.cache.page(page as u32).filter(|e| e.key.rotation == self.rotation).collect();
         let exact = entries.iter().filter(|e| !e.preview && e.key.scale == want).count() as u64;
@@ -1277,13 +1369,13 @@ impl App {
         match self.notices.get(&(page as u32)) {
             Some(Notice::Incomplete) => {
                 let strip = i64::from(p.line_height()) + 8;
-                p.fill_rect(rect(left, top, pw, strip), NOTICE_BG);
-                p.text(clamp32(left + 8), clamp32(top + 4), t(self.lang, Msg::NoticeIncomplete), NOTICE_FG);
+                p.fill_rect(rect(left, top, pw, strip), self.pal.notice_bg);
+                p.text(clamp32(left + 8), clamp32(top + 4), t(self.lang, Msg::NoticeIncomplete), self.pal.notice_fg);
             }
             Some(Notice::Failed) => {
                 let s = t(self.lang, Msg::NoticeFailed);
                 let w = i64::from(p.text_width(s));
-                p.text(clamp32(left + (pw - w) / 2), clamp32(top + 24), s, NOTICE_FG);
+                p.text(clamp32(left + (pw - w) / 2), clamp32(top + 24), s, self.pal.notice_fg);
             }
             None => {}
         }
@@ -1298,12 +1390,17 @@ fn clamp32(v: i64) -> i32 {
 /// The zoom that fits the pages into the window: across, the widest page (so that no page is wider than the window
 /// and the window never needs a horizontal bar; the narrower ones have room at the sides); for a whole page, the
 /// height of page `page` too.
-fn fit_zoom(l: &Layout, mode: ZoomMode, page: usize, view_w: i64, view_h: i64, margin: i64, dpi: u32) -> u32 {
-    let Some((_, h_pt)) = l.size_pt(page) else { return zoom::ACTUAL_SIZE };
-    let across = zoom::fit((view_w - 2 * margin) as f64, l.widest_pt(), dpi);
+fn fit_zoom(l: &Layout, mode: ZoomMode, page: usize, (view_w, view_h): (i64, i64), margin: i64, dpi: u32, alone: bool) -> u32 {
+    let Some((w_pt, _)) = l.size_pt(page) else { return zoom::ACTUAL_SIZE };
+    // (In a spread it is the widest row, with the gap between its pages, and the height of the row the page is in; for a page shown alone, its own.)
+    let (widest, between) = if alone { (w_pt, 0) } else { l.widest_pt() };
+    if alone && mode == ZoomMode::FitPage && margin == 0 {
+        return zoom::fit_screen(w_pt, l.row_height_pt(page), view_w, view_h, dpi);
+    }
+    let across = zoom::fit((view_w - 2 * margin - between) as f64, widest, dpi);
     match mode {
         ZoomMode::FitWidth => across,
-        ZoomMode::FitPage => across.min(zoom::fit((view_h - 2 * margin) as f64, h_pt, dpi)),
+        ZoomMode::FitPage => across.min(zoom::fit((view_h - 2 * margin) as f64, l.row_height_pt(page), dpi)),
         ZoomMode::Custom => zoom::ACTUAL_SIZE,
     }
 }
@@ -1377,6 +1474,12 @@ impl App {
 
 impl Handler for App {
     fn event(&mut self, event: Event) -> Vec<Action> {
+        // In the presentation the pointer moving is what keeps it on the screen.
+        if let Event::Hover { x, y } = &event
+            && self.present.is_some()
+        {
+            return self.present_pointer(i64::from(*x), i64::from(*y));
+        }
         // The pointer moving over the window is heard all the time: only the strip of tabs has anything to do with it.
         if matches!(event, Event::Hover { .. } | Event::HoverEnd) {
             return self.route(event).err().unwrap_or_default();
@@ -1404,6 +1507,9 @@ impl Handler for App {
     }
 
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
+        if self.pointer_hidden_at(i64::from(x), i64::from(y)) {
+            return Cursor::Hidden;
+        }
         let dy = clamp32(self.bar_h());
         if y < dy {
             return Cursor::Arrow;
@@ -1435,7 +1541,10 @@ impl App {
                 let (ax, ay) = (self.view_w / 2, self.view_h / 2);
                 self.relayout(ax, ay, None);
                 self.clamp_annots_scroll();
-                let mut actions = self.after_view_change(false);
+                let mut actions = match self.restore_page.take() {
+                    Some(page) => self.go_to_page(page),
+                    None => self.after_view_change(false),
+                };
                 actions.extend(self.chrome());
                 actions.extend(self.open_queued());
                 actions
@@ -1455,7 +1564,9 @@ impl App {
             }
             Event::Key { vk, ctrl, shift } => self.key(vk, ctrl, shift),
             Event::Wheel { delta, ctrl, shift, x, y } => {
-                if !ctrl && !shift && self.over_thumbs(i64::from(x), i64::from(y)) {
+                if self.present.is_some() {
+                    self.present_wheel(delta)
+                } else if !ctrl && !shift && self.over_thumbs(i64::from(x), i64::from(y)) {
                     self.thumb_wheel(delta)
                 } else if !ctrl && !shift && self.over_annots(i64::from(x), i64::from(y)) {
                     self.annots_wheel(delta)
@@ -1478,8 +1589,14 @@ impl App {
                 actions.extend(self.command(cmd));
                 actions
             }
-            Event::Drop(files) => self.dropped(files),
+            Event::Drop(files) => {
+                // (A file that comes in the presentation ends it.)
+                let mut actions = self.end_present(false);
+                actions.extend(self.dropped(files));
+                actions
+            }
             Event::Wake => self.pump_engine(),
+            Event::SystemDark(dark) => self.set_system_dark(dark),
             Event::Timer(TIMER_SETTLE) => {
                 self.moving = false;
                 self.schedule();
@@ -1493,6 +1610,7 @@ impl App {
             Event::Timer(TIMER_DRAG) => self.drag_timer(),
             Event::Timer(TIMER_THUMB_DRAG) => self.thumb_drag_tick(),
             Event::Timer(TIMER_NUDGE) => self.flush_nudge(),
+            Event::Timer(TIMER_CURSOR) => self.present_idle(),
             Event::Timer(_) => Vec::new(),
             Event::FilePicked(path) if self.pg.insert_pending() => self.insert_picked(path).unwrap_or_default(),
             Event::FilePicked(Some(path)) => {
@@ -1538,13 +1656,18 @@ impl App {
             Event::Form { tag: TAG_PROTECT, answer } => self.protect_answered(answer),
             Event::Form { tag: TAG_COMPRESS, answer } => self.compress_answered(answer),
             Event::Form { .. } => Vec::new(),
+            Event::MouseDown { x, y, .. } if self.present.is_some() => self.present_click(i64::from(x), i64::from(y)),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
+            // (In the presentation the right button goes back a page.)
+            Event::ContextMenu { .. } if self.present.is_some() => self.present_turn(-1),
             Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),
             Event::FindFocus => self.find_focused(),
             Event::PageBox(text) => match crate::toolbar::parse_page_box(&text, self.page_count()) {
                 Some(page) => self.go_to_page(page),
                 None => Vec::new(),
             },
+            Event::MouseMove { x, y, .. } if self.present.is_some() => self.present_pointer(i64::from(x), i64::from(y)),
+            Event::MouseUp { .. } if self.present.is_some() => Vec::new(),
             Event::MouseMove { x, y, shift } => self.mouse_move(i64::from(x), i64::from(y), shift),
             Event::MouseUp { x, y } => self.mouse_up(i64::from(x), i64::from(y)),
             Event::MouseLost => self.mouse_lost(),
@@ -1570,11 +1693,11 @@ impl App {
     /// Draw the pages' area (below the strip of tabs, when it is there).
     fn paint_pages(&mut self, p: &mut dyn Painter) -> bool {
         let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h));
-        p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, BACKGROUND);
+        p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, self.page_background());
         if self.view_x > 0 {
             // The edge of the bookmarks, which can be dragged: a thin line in the middle of its strip.
             let line = clamp32(self.px(1).max(1));
-            p.fill_rect(Rect { x: clamp32(self.view_x - self.px(SPLIT_GAP) / 2), y: 0, w: line, h: full_h }, SPLIT_COLOR);
+            p.fill_rect(Rect { x: clamp32(self.view_x - self.px(SPLIT_GAP) / 2), y: 0, w: line, h: full_h }, self.pal.split);
         }
         self.draw_sidebar(p);
         let mut drew = false;
@@ -1587,7 +1710,7 @@ impl App {
             None => {
                 let s = t(self.lang, if self.opening { Msg::Opening } else { Msg::Hint });
                 let w = p.text_width(s);
-                p.text(clamp32(self.view_x) + (clamp32(self.view_w) - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, HINT_FG);
+                p.text(clamp32(self.view_x) + (clamp32(self.view_w) - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, self.pal.hint_fg);
             }
         }
         self.draw_find_panel(p);

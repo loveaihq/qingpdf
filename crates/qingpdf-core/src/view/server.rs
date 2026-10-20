@@ -310,6 +310,7 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, start: Start, session: &mut S
     if carry.is_none() {
         if start == Start::Opened {
             let infos: Vec<PageInfo> = pages.iter().map(page_info).collect();
+            let (spread_hint, right_to_left) = super::layout_hint_of(&document);
             send(Event::Opened(Opened {
                 doc: doc_id,
                 pages: infos,
@@ -319,6 +320,8 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, start: Start, session: &mut S
                 max_tile_pixels: plan.max_tile_pixels,
                 rights,
                 protection: super::protection_of(&document, session.password()),
+                spread_hint,
+                right_to_left,
             }));
         } else {
             send(Event::Activated { doc: doc_id, bitmap_cache_bytes: plan.bitmap_cache_bytes, thumb_cache_bytes: plan.thumb_cache_bytes, max_tile_pixels: plan.max_tile_pixels });

@@ -23,7 +23,7 @@ use crate::clicks::ClickCounter;
 use crate::copydata;
 use crate::placement::{self, Placement};
 use crate::toolbar::{self, IconFont};
-use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ToolItem, ToolbarSpec, ToolbarState};
+use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ThemeSpec, ToolItem, ToolbarSpec, ToolbarState};
 
 // --- declarations ------------------------------------------------------------------------------------------------
 
@@ -179,6 +179,44 @@ struct MonitorInfo {
     monitor: WinRect,
     work: WinRect,
     flags: u32,
+}
+
+/// A window's place (WINDOWPLACEMENT): how it is shown, where it is when it is minimized or maximized, and where it is when it is neither.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WindowPlacement {
+    length: u32,
+    flags: u32,
+    show: u32,
+    min: Point,
+    max: Point,
+    normal: WinRect,
+}
+
+/// What a toolbar says while it is drawn (the start of NMTBCUSTOMDRAW, which is NMCUSTOMDRAW).
+#[repr(C)]
+struct NmCustomDraw {
+    hdr: NmHdr,
+    stage: u32,
+    hdc: isize,
+    rect: WinRect,
+    item: usize,
+    state: u32,
+    param: isize,
+}
+
+/// What a window is given to draw an item it owns (DRAWITEMSTRUCT).
+#[repr(C)]
+struct DrawItem {
+    kind: u32,
+    id: u32,
+    item: u32,
+    action: u32,
+    state: u32,
+    window: isize,
+    hdc: isize,
+    rect: WinRect,
+    data: usize,
 }
 
 /// A button of a toolbar (the 64-bit layout of TBBUTTON).
@@ -421,6 +459,11 @@ unsafe extern "system" {
     fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
     fn AllowSetForegroundWindow(pid: u32) -> i32;
     fn TrackMouseEvent(track: *mut TrackMouse) -> i32;
+    fn GetWindowPlacement(hwnd: isize, place: *mut WindowPlacement) -> i32;
+    fn SetWindowPlacement(hwnd: isize, place: *const WindowPlacement) -> i32;
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn DrawTextW(hdc: isize, text: *const u16, len: i32, rect: *mut WinRect, format: u32) -> i32;
+    fn RedrawWindow(hwnd: isize, rect: *const WinRect, region: isize, flags: u32) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -451,6 +494,7 @@ unsafe extern "system" {
     fn GdiFlush() -> i32;
     fn GetClipBox(hdc: isize, rect: *mut WinRect) -> i32;
     fn GetTextFaceW(hdc: isize, count: i32, buffer: *mut u16) -> i32;
+    fn SetBkColor(hdc: isize, color: u32) -> u32;
 }
 
 #[link(name = "msimg32")]
@@ -494,6 +538,13 @@ unsafe extern "system" {
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn GetUserNameW(buffer: *mut u16, size: *mut u32) -> i32;
+    /// Reads one value of the registry (only read: nothing in it is ever written).
+    fn RegGetValueW(key: isize, sub_key: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
+}
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const c_void, size: u32) -> i32;
 }
 
 #[link(name = "bcrypt")]
@@ -515,6 +566,7 @@ unsafe extern "system" {
     fn ImageList_Create(cx: i32, cy: i32, flags: u32, initial: i32, grow: i32) -> isize;
     fn ImageList_Add(list: isize, bitmap: isize, mask: isize) -> i32;
     fn ImageList_Destroy(list: isize) -> i32;
+    fn ImageList_Draw(list: isize, index: i32, hdc: isize, x: i32, y: i32, style: u32) -> i32;
 }
 
 // --- constants ---------------------------------------------------------------------------------------------------
@@ -775,6 +827,44 @@ const BOX_H: i32 = 24;
 /// The colours of the pictures: ink, and the same greyed.
 const ICON_INK: u32 = 0x1F1F1F;
 const ICON_GREY: u32 = 0xA0A0A0;
+/// The look of the window (2026-10-20): the attribute of the title bar that makes it dark (DWMWA_USE_IMMERSIVE_DARK_MODE), the messages and styles that colour
+/// the tree of bookmarks, the status bar and the toolbar, and what a window is told when it is drawn by its owner.
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+const TVM_SETBKCOLOR: u32 = 0x111D;
+const TVM_SETTEXTCOLOR: u32 = 0x111E;
+const TVM_SETLINECOLOR: u32 = 0x1128;
+/// CLR_DEFAULT, the colour a tree or a status bar has when none is set.
+const CLR_DEFAULT: isize = 0xFF00_0000;
+const SB_SETBKCOLOR: u32 = 0x2001;
+const SBT_OWNERDRAW: usize = 0x1000;
+const WM_DRAWITEM: u32 = 0x002B;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+const WM_CTLCOLORSTATIC: u32 = 0x0138;
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const NM_CUSTOMDRAW: u32 = -12i32 as u32;
+const CDDS_PREPAINT: u32 = 1;
+const CDDS_ITEMPREPAINT: u32 = 0x10001;
+const CDRF_NOTIFYITEMDRAW: isize = 0x20;
+const CDRF_SKIPDEFAULT: isize = 4;
+const CDIS_SELECTED: u32 = 1;
+const CDIS_DISABLED: u32 = 4;
+const CDIS_CHECKED: u32 = 8;
+const CDIS_HOT: u32 = 0x40;
+const TB_GETBITMAP: u32 = WM_USER + 44;
+const DT_LEFT: u32 = 0;
+const DT_RIGHT: u32 = 2;
+const DT_VCENTER: u32 = 4;
+const DT_SINGLELINE: u32 = 0x20;
+const DT_NOPREFIX: u32 = 0x800;
+const RDW_INVALIDATE_ALL: u32 = 0x1 | 0x4 | 0x80;
+const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+const RRF_RT_REG_DWORD: u32 = 0x10;
+/// Full screen: the style of a window's frame, the monitor nearest a window, and what SetWindowPos is told to keep.
+const GWL_STYLE: i32 = -16;
+const MONITOR_DEFAULTTONEAREST: u32 = 2;
+const SWP_NOSIZE: u32 = 0x1;
+const SWP_NOOWNERZORDER: u32 = 0x200;
+const SWP_FRAMECHANGED: u32 = 0x20;
 /// Most characters of the box of a form field or text box, and most items of a list of choices shown.
 const MAX_FIELD_CHARS: usize = 8000;
 const MAX_CHOICES: usize = 1000;
@@ -993,6 +1083,24 @@ struct WindowState {
     depth: Cell<u32>,
     deferred: RefCell<Vec<PathBuf>>,
     tracking: Cell<bool>,
+    /// How the reader last said the window looks (none before it has), the brushes of the face of a dark window and of its boxes, and the words of the status bar
+    /// (it is drawn by the window when it is dark).
+    theme: Cell<Option<ThemeSpec>>,
+    face_brush: Cell<isize>,
+    field_brush: Cell<isize>,
+    status_text: RefCell<StatusText>,
+    /// The window is full screen, and what it was before (put back exactly when it is not).
+    fullscreen: Cell<bool>,
+    full_saved: RefCell<Option<FullSaved>>,
+}
+
+/// A window as it was before full screen: its place, its style, its menu bar.
+struct FullSaved {
+    place: WindowPlacement,
+    style: u32,
+    menu: isize,
+    /// The dots per inch of the screen then (the place is in the pixels of that).
+    dpi: u32,
 }
 
 /// A printer's device context, and the file it writes if it was told to write one (zero-terminated UTF-16).
@@ -1151,6 +1259,12 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
                 apply_toolbar_state(state);
             }
             Action::Status(st) => set_status(state, &st),
+            Action::Theme(spec) => apply_theme(state, spec),
+            Action::FullScreen(on) => set_full_screen(state, on),
+            Action::HideCursor => {
+                // SAFETY: a null cursor hides the pointer, until it moves and Windows asks for a cursor again.
+                unsafe { SetCursor(0) };
+            }
             Action::OpenUri(uri) => {
                 // The reader has checked the address; it is checked again here, the last place before the system, so that nothing
                 // that is not a plain http, https or mailto address (an environment variable like %USERNAME%, say) reaches it.
@@ -1257,10 +1371,10 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             let dc = wparam as isize;
             let mut r = WinRect::default();
             // SAFETY: `dc` is the device context that came with the message; `r` is a live RECT that Windows fills in; the brush is the
-            // system's own, shared and never freed. A DC that is this window's own is left alone.
+            // system's own, shared and never freed, or the window's own face (a dark window). A DC that is this window's own is left alone.
             unsafe {
                 if WindowFromDC(dc) != hwnd && GetClipBox(dc, &mut r) != 0 {
-                    FillRect(dc, &r, GetSysColorBrush(COLOR_BTNFACE));
+                    FillRect(dc, &r, face_brush(state));
                 }
             }
             return 1;
@@ -1435,6 +1549,11 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                     Ok(mut guard) => guard.as_mut().map_or(Cursor::Arrow, |h| h.cursor_at(p.x, p.y - content_top(state))),
                     Err(_) => Cursor::Arrow,
                 };
+                if shape == Cursor::Hidden {
+                    // SAFETY: a null cursor hides the pointer.
+                    unsafe { SetCursor(0) };
+                    return 1;
+                }
                 let id = match shape {
                     Cursor::SizeWE => IDC_SIZEWE,
                     Cursor::Move => IDC_SIZEALL,
@@ -1444,6 +1563,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                     Cursor::Cross => IDC_CROSS,
                     Cursor::Text => IDC_IBEAM,
                     Cursor::Arrow => IDC_ARROW,
+                    Cursor::Hidden => IDC_ARROW,
                 };
                 // SAFETY: LoadCursorW with a stock cursor id (a small integer in the pointer slot) gives a shared cursor that
                 // is never freed; SetCursor takes it.
@@ -1455,6 +1575,13 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             // SAFETY: for WM_NOTIFY, lparam points to the NMHDR (or the bigger notification that starts with one) of the
             // notification, valid for the duration of this message; it is only read here.
             let hdr = unsafe { (lparam as *const NmHdr).as_ref() };
+            if let Some(hdr) = hdr
+                && hdr.code == NM_CUSTOMDRAW
+                && hdr.from != 0
+                && hdr.from == state.toolbar.get()
+            {
+                return draw_toolbar(state, lparam);
+            }
             if let Some(hdr) = hdr
                 && hdr.from != 0
                 && hdr.from == state.tree.get()
@@ -1488,6 +1615,40 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                     dispatch(state, Event::ContextMenu { x, y });
                 }
                 return 0;
+            }
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+            // The boxes of a dark window are dark.
+            if let Some(t) = dark_theme(state) {
+                // SAFETY: `wparam` is the device context of the box, valid for this message; plain colours.
+                unsafe {
+                    SetTextColor(wparam as isize, colorref(t.text));
+                    SetBkColor(wparam as isize, colorref(t.field_bg));
+                }
+                return state.field_brush.get();
+            }
+        }
+        WM_DRAWITEM if wparam as isize == ID_STATUS => {
+            // SAFETY: for WM_DRAWITEM, lparam points to a DRAWITEMSTRUCT that is valid for the duration of this message and is only read here.
+            if let Some(item) = unsafe { (lparam as *const DrawItem).as_ref() } {
+                draw_status_part(state, item);
+                return 1;
+            }
+        }
+        WM_SETTINGCHANGE => {
+            // "ImmersiveColorSet" is what the system says when Windows was set to light or dark apps; anything else it says is not for the reader.
+            if lparam != 0 {
+                let name: Vec<u16> = (0..32usize)
+                    .map_while(|i| {
+                        // SAFETY: when a WM_SETTINGCHANGE has a name, lparam points to a zero-terminated UTF-16 string that is valid for this message; the units
+                        // are read one by one and no further than the zero, and at most 32 of them.
+                        let c = unsafe { *(lparam as *const u16).add(i) };
+                        (c != 0).then_some(c)
+                    })
+                    .collect();
+                if name.iter().copied().eq("ImmersiveColorSet".encode_utf16()) {
+                    dispatch(state, Event::SystemDark(system_uses_dark()));
+                }
             }
         }
         WM_SELECT_BOX => {
@@ -1549,7 +1710,10 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             // SAFETY: for WM_DPICHANGED, lparam points to a RECT (the suggested new window rectangle) that is
             // valid for the duration of this message; it is only read here.
             let suggested = unsafe { (lparam as *const WinRect).as_ref() }.copied();
-            if let Some(r) = suggested {
+            if state.fullscreen.get() {
+                // Full screen is the monitor, whatever Windows suggests for a window of the old size.
+                fit_monitor(hwnd);
+            } else if let Some(r) = suggested {
                 // SAFETY: plain numbers and the handle of this window.
                 unsafe { SetWindowPos(hwnd, 0, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZOMORDER | SWP_NOACTIVATE) };
             }
@@ -1985,12 +2149,12 @@ fn paint_to(state: &WindowState, hdc: isize) {
         return;
     }
     let top = top.max(0);
-    if state.hbar_on.get() {
+    if state.hbar_on.get() && !state.fullscreen.get() {
         // Where the two scroll bars meet, nothing is drawn by either: the colour of the window.
         let (vw, hh) = (metric(SM_CXVSCROLL, state.dpi.get()), metric(SM_CYHSCROLL, state.dpi.get()));
         let corner = WinRect { left: w, top: top + h, right: w + vw, bottom: top + h + hh };
         // SAFETY: `hdc` is the valid DC of this paint; `corner` is a live RECT; the brush is the system's own, shared and never freed.
-        unsafe { FillRect(hdc, &corner, GetSysColorBrush(COLOR_BTNFACE)) };
+        unsafe { FillRect(hdc, &corner, face_brush(state)) };
     }
     let Ok(mut back) = state.back.try_borrow_mut() else { return };
     if back.dc == 0 || back.w != w || back.h != h {
@@ -2518,6 +2682,15 @@ fn set_menus(state: &WindowState, hwnd: isize, menus: Vec<Menu>) {
     if menu == 0 {
         return;
     }
+    // Full screen has no menu bar: the new one waits for the window to come back (the one that waited is destroyed).
+    if state.fullscreen.get() {
+        let old = state.full_saved.borrow_mut().as_mut().map(|s| std::mem::replace(&mut s.menu, menu));
+        if let Some(old) = old.filter(|&o| o != 0) {
+            // SAFETY: a menu bar of ours that is on no window now.
+            unsafe { DestroyMenu(old) };
+        }
+        return;
+    }
     // SAFETY: `menu` is a menu bar just made; the window takes it over, and the one it had (a menu of ours) is destroyed after
     // it is replaced, with everything under it.
     unsafe {
@@ -2931,16 +3104,19 @@ fn apply_layout(state: &WindowState) {
     if cw <= 0 || ch <= 0 {
         return;
     }
+    // (Full screen has none of the toolbar, the scroll bars and the status bar: the page area is the window.)
+    let shown = !state.fullscreen.get();
     let tb_h = state.tb_height.get();
-    let top = if state.tb_visible.get() { tb_h } else { 0 };
-    let (vw, hh) = (metric(SM_CXVSCROLL, dpi), metric(SM_CYHSCROLL, dpi));
-    let sb_h = scale(dpi, STATUS_HEIGHT);
-    let hbar_h = if state.hbar_on.get() { hh } else { 0 };
+    let top = if state.tb_visible.get() && shown { tb_h } else { 0 };
+    let (vw, hh) = if shown { (metric(SM_CXVSCROLL, dpi), metric(SM_CYHSCROLL, dpi)) } else { (0, 0) };
+    let sb_h = if shown { scale(dpi, STATUS_HEIGHT) } else { 0 };
+    let hbar_on = state.hbar_on.get() && shown;
+    let hbar_h = if hbar_on { hh } else { 0 };
     let (w, h) = ((cw - vw).max(0), (ch - top - sb_h - hbar_h).max(0));
-    put(state.toolbar.get(), 0, 0, cw, tb_h, state.tb_visible.get());
-    put(state.vbar.get(), w, top, vw, h, true);
-    put(state.hbar.get(), 0, top + h, w, hh, state.hbar_on.get());
-    put(state.status.get(), 0, ch - sb_h, cw, sb_h, true);
+    put(state.toolbar.get(), 0, 0, cw, tb_h, state.tb_visible.get() && shown);
+    put(state.vbar.get(), w, top, vw, h, shown);
+    put(state.hbar.get(), 0, top + h, w, hh, hbar_on);
+    put(state.status.get(), 0, ch - sb_h, cw, sb_h, shown);
     set_status_parts(state, cw, dpi);
     place_tool_boxes(state, dpi);
     let now = (top, w, h);
@@ -2967,13 +3143,215 @@ fn set_status(state: &WindowState, st: &StatusText) {
     if bar == 0 {
         return;
     }
+    *state.status_text.borrow_mut() = st.clone();
+    // A dark window draws the words itself (the bar only knows one colour for them): its parts are left to `draw_status_part`.
+    let dark = dark_theme(state).is_some();
     // Two tabs right-align the text of the last part.
     let zoom = if st.zoom.is_empty() { String::new() } else { format!("\t\t{}", st.zoom) };
     for (part, text) in [&st.page, &st.note, &zoom].into_iter().enumerate() {
-        let w = wide(text);
-        // SAFETY: SB_SETTEXTW takes the part in the low word (drawn as it is) and a pointer to a zero-terminated UTF-16 string, which
-        // `w` outlives (the control copies it).
-        unsafe { SendMessageW(bar, SB_SETTEXTW, part, w.as_ptr() as isize) };
+        let w = wide(if dark { "" } else { text });
+        // SAFETY: SB_SETTEXTW takes the part in the low word (drawn as it is, or by the owner with SBT_OWNERDRAW) and a pointer to a
+        // zero-terminated UTF-16 string, which `w` outlives (the control copies it); for a part drawn by the owner it is not looked at.
+        unsafe { SendMessageW(bar, SB_SETTEXTW, part | if dark { SBT_OWNERDRAW } else { 0 }, w.as_ptr() as isize) };
+    }
+    if dark {
+        invalidate(bar);
+    }
+}
+
+/// The theme the reader gave the window, if it is a dark one.
+fn dark_theme(state: &WindowState) -> Option<ThemeSpec> {
+    state.theme.get().filter(|t| t.dark)
+}
+
+/// The brush a dark window is filled with (its face), or the system's for a light one.
+fn face_brush(state: &WindowState) -> isize {
+    match state.face_brush.get() {
+        0 => {
+            // SAFETY: the system's own brush, shared and never freed.
+            unsafe { GetSysColorBrush(COLOR_BTNFACE) }
+        }
+        brush => brush,
+    }
+}
+
+/// A brush of a colour, or 0 if there is none to make.
+fn brush_of(color: Rgb) -> isize {
+    // SAFETY: plain number; the brush is the caller's, deleted by whoever replaces it.
+    unsafe { CreateSolidBrush(colorref(color)) }
+}
+
+/// Take how the reader says the window looks (View > Interface): the title bar, the face of the window and its boxes, the bookmarks, the status bar and
+/// the toolbar are made light or dark. What stays as the system has it: the menus, the dialogs, the scroll bars and the tool tips.
+fn apply_theme(state: &WindowState, spec: ThemeSpec) {
+    let hwnd = state.hwnd.get();
+    state.theme.set(Some(spec));
+    let (face, field) = if spec.dark { (brush_of(spec.face), brush_of(spec.field_bg)) } else { (0, 0) };
+    for (cell, new) in [(&state.face_brush, face), (&state.field_brush, field)] {
+        let old = cell.replace(new);
+        if old != 0 {
+            // SAFETY: a brush made by `brush_of` for this window; the window is not drawn with it any more (it is redrawn below).
+            unsafe { DeleteObject(old) };
+        }
+    }
+    let on = i32::from(spec.dark);
+    // SAFETY: DwmSetWindowAttribute takes this window, the number of an attribute and a pointer to a value of the size told (a 4-byte BOOL that lives
+    // through the call); a system that does not know the attribute answers with an error, which does not matter.
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const on).cast(), 4) };
+    let colors = if spec.dark { [colorref(spec.tree_bg) as isize, colorref(spec.text) as isize, colorref(spec.tree_line) as isize] } else { [-1, -1, CLR_DEFAULT] };
+    for (message, color) in [(TVM_SETBKCOLOR, colors[0]), (TVM_SETTEXTCOLOR, colors[1]), (TVM_SETLINECOLOR, colors[2])] {
+        // SAFETY: plain messages to the tree of bookmarks, with a colour (or the default one); a window that is not there is not an error.
+        unsafe { SendMessageW(state.tree.get(), message, 0, color) };
+    }
+    // SAFETY: a plain message to the status bar: the colour of its face (the default when light).
+    unsafe { SendMessageW(state.status.get(), SB_SETBKCOLOR, 0, if spec.dark { colorref(spec.face) as isize } else { CLR_DEFAULT }) };
+    let words = state.status_text.borrow().clone();
+    set_status(state, &words);
+    if state.tb_visible.get() {
+        // The pictures of the toolbar are drawn in the colour of the ink.
+        rebuild_toolbar(state);
+        apply_layout(state);
+    }
+    // SAFETY: this window and everything in it is invalidated and erased (no rectangle, no region).
+    unsafe { RedrawWindow(hwnd, null(), 0, RDW_INVALIDATE_ALL) };
+}
+
+/// Draw one part of the status bar of a dark window (WM_DRAWITEM): the face, and the words in the light colour.
+fn draw_status_part(state: &WindowState, item: &DrawItem) {
+    let Some(t) = dark_theme(state) else { return };
+    let text = {
+        let st = state.status_text.borrow();
+        match item.item {
+            0 => st.page.clone(),
+            1 => st.note.clone(),
+            _ => st.zoom.clone(),
+        }
+    };
+    let w = wide(&text);
+    let (inset, mut r) = (scale(state.dpi.get(), 6), item.rect);
+    r.left += inset;
+    r.right -= inset;
+    // SAFETY: `item.hdc` is the device context of this draw, valid for the message; the rectangle is a live copy; `w` is a zero-terminated UTF-16 string
+    // that outlives the call; the face is the window's own brush.
+    unsafe {
+        FillRect(item.hdc, &item.rect, face_brush(state));
+        SetBkMode(item.hdc, TRANSPARENT);
+        SetTextColor(item.hdc, colorref(t.text));
+        DrawTextW(item.hdc, w.as_ptr(), -1, &mut r, DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | if item.item == 2 { DT_RIGHT } else { DT_LEFT });
+    }
+}
+
+/// The toolbar of a dark window draws its buttons itself (NM_CUSTOMDRAW): a face, a lighter one under the pointer or pressed, and the picture in the
+/// light ink. The answer is what the toolbar is to do next.
+fn draw_toolbar(state: &WindowState, lparam: isize) -> isize {
+    // SAFETY: for NM_CUSTOMDRAW of a toolbar, lparam points to an NMTBCUSTOMDRAW, which starts with the NMCUSTOMDRAW read here; it is valid for the
+    // duration of the message and only read.
+    let Some(nm) = (unsafe { (lparam as *const NmCustomDraw).as_ref() }) else { return 0 };
+    let (Some(t), lists) = (dark_theme(state), state.tb_lists.get()) else { return 0 };
+    if lists.0 == 0 {
+        return 0;
+    }
+    match nm.stage {
+        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
+        CDDS_ITEMPREPAINT => {
+            let color = if nm.state & (CDIS_SELECTED | CDIS_CHECKED) != 0 { t.down } else if nm.state & CDIS_HOT != 0 { t.hot } else { t.face };
+            let brush = brush_of(color);
+            if brush != 0 {
+                // SAFETY: `nm.hdc` is the device context of this draw and `nm.rect` the button's rectangle; the brush is made, checked and deleted here.
+                unsafe {
+                    FillRect(nm.hdc, &nm.rect, brush);
+                    DeleteObject(brush);
+                }
+            }
+            // A button with a command has a picture (the places of the boxes and the gaps between groups have none).
+            let command = nm.item as i32;
+            if command != 0 && command != BOX_COMMAND && command != BOX_COMMAND + 1 {
+                let px = scale(state.dpi.get(), TOOL_ICON);
+                let (x, y) = (nm.rect.left + (nm.rect.right - nm.rect.left - px) / 2, nm.rect.top + (nm.rect.bottom - nm.rect.top - px) / 2);
+                // SAFETY: asks the toolbar for the picture of the button of this command, and the list (made by `icon_list`, kept by the window) draws it.
+                unsafe {
+                    let index = SendMessageW(state.toolbar.get(), TB_GETBITMAP, command as usize, 0) as i32;
+                    ImageList_Draw(if nm.state & CDIS_DISABLED != 0 { lists.1 } else { lists.0 }, index, nm.hdc, x, y, 0);
+                }
+            }
+            CDRF_SKIPDEFAULT
+        }
+        _ => 0,
+    }
+}
+
+/// Is Windows set to dark apps? Read from the registry (`AppsUseLightTheme` of the current user's Personalize key), never written.
+pub fn system_uses_dark() -> bool {
+    let (key, name) = (wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), wide("AppsUseLightTheme"));
+    let (mut data, mut size) = (1u32, 4u32);
+    // SAFETY: RegGetValueW takes a predefined key, two zero-terminated UTF-16 strings that outlive the call, the kind of value allowed (a DWORD), no kind
+    // out, and a pointer to 4 bytes with their size, which `data` and `size` are; it only reads.
+    let err = unsafe { RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, null_mut(), (&raw mut data).cast(), &mut size) };
+    err == 0 && data == 0
+}
+
+/// The rectangle of the monitor the window is on (nearest it), if Windows says.
+fn monitor_rect(hwnd: isize) -> Option<WinRect> {
+    let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: WinRect::default(), work: WinRect::default(), flags: 0 };
+    // SAFETY: `info` is a live struct of the size it declares, which Windows fills in; the handles are this window's and the monitor nearest it.
+    let ok = unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) } != 0;
+    ok.then_some(info.monitor)
+}
+
+/// The full-screen window is as big as its monitor (it was made so, and again when the monitor's dots per inch changed).
+fn fit_monitor(hwnd: isize) {
+    if let Some(m) = monitor_rect(hwnd) {
+        // SAFETY: plain numbers and the handle of this window; no restack, no focus.
+        unsafe { SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE) };
+    }
+}
+
+/// The window goes full screen on the monitor it is on, or comes back as it was. Full screen: no frame, no menu bar, and `apply_layout` gives up the
+/// toolbar, the scroll bars and the status bar; the page area is the monitor. Coming back: the style, the menu bar and the place (also maximized or
+/// not) are put back.
+fn set_full_screen(state: &WindowState, on: bool) {
+    let hwnd = state.hwnd.get();
+    if on && !state.fullscreen.get() {
+        let mut place = WindowPlacement { length: std::mem::size_of::<WindowPlacement>() as u32, ..WindowPlacement::default() };
+        // SAFETY: `place` is a live struct of the size it declares, which Windows fills in; the handle is this window's. The style and the menu bar
+        // are read to be put back.
+        let (style, menu) = unsafe {
+            GetWindowPlacement(hwnd, &mut place);
+            (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32, GetMenu(hwnd))
+        };
+        let Some(m) = monitor_rect(hwnd) else { return };
+        *state.full_saved.borrow_mut() = Some(FullSaved { place, style, menu, dpi: state.dpi.get() });
+        state.fullscreen.set(true);
+        // SAFETY: plain numbers and the handle of this window: the menu bar is taken off it but not destroyed (the state keeps it), the frame is taken
+        // off, and the window is made as big as the monitor. The keyboard goes to the pages: the box or the tree that had it is hidden now, and keys
+        // sent to a hidden window go nowhere.
+        unsafe {
+            SetMenu(hwnd, 0);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !WS_OVERLAPPEDWINDOW) as isize);
+            SetWindowPos(hwnd, 0, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            SetFocus(hwnd);
+        }
+        apply_layout(state);
+    } else if !on && let Some(saved) = state.full_saved.borrow_mut().take() {
+        state.fullscreen.set(false);
+        // The place was kept in the pixels of the screen as it was: with another number of dots per inch now (it changed while the window was full screen)
+        // the window is as many pixels bigger or smaller as the dots are more or fewer, in the same place; a maximized one is maximized again as it was.
+        let (now, then) = (i64::from(state.dpi.get()), i64::from(saved.dpi.max(1)));
+        let n = saved.place.normal;
+        let scaled = |v: i32| (i64::from(v) * now / then) as i32;
+        // SAFETY: plain numbers, the handle of this window and the menu bar it had (still ours, not destroyed): the style and the menu bar come back, the
+        // place is put as it was (and, when the dots per inch changed, the size is put right), and the frame is drawn again.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, saved.style as isize);
+            SetMenu(hwnd, saved.menu);
+            SetWindowPlacement(hwnd, &saved.place);
+            if now != then && IsZoomed(hwnd) == 0 {
+                SetWindowPos(hwnd, 0, n.left, n.top, scaled(n.right - n.left), scaled(n.bottom - n.top), SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            } else {
+                SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            }
+        }
+        apply_layout(state);
     }
 }
 
@@ -3127,7 +3505,10 @@ fn rebuild_toolbar(state: &WindowState) {
     let glyphs: Vec<char> = spec.items.iter().filter_map(|i| if let ToolItem::Button { glyph, .. } = i { Some(*glyph) } else { None }).collect();
     let px = scale(dpi, TOOL_ICON).max(8);
     let (mut normal, mut grey) = match icon_font(state).face() {
-        Some(face) => (icon_list(face, &glyphs, px, ICON_INK), icon_list(face, &glyphs, px, ICON_GREY)),
+        Some(face) => {
+            let (ink, grey) = dark_theme(state).map_or((ICON_INK, ICON_GREY), |t| (t.text, t.dim));
+            (icon_list(face, &glyphs, px, ink), icon_list(face, &glyphs, px, grey))
+        },
         None => (0, 0),
     };
     if normal == 0 || grey == 0 {
@@ -3318,6 +3699,10 @@ fn fill_tip(spec: Option<&ToolbarSpec>, info: &mut NmTtDispInfo) {
 /// Remember where the window is while it is neither maximized nor minimized (that is the place that is kept for the next run).
 fn remember_normal(state: &WindowState) {
     let hwnd = state.hwnd.get();
+    // (Full screen is no place to come back to: the one from before it is in the saved state.)
+    if state.fullscreen.get() {
+        return;
+    }
     // SAFETY: plain handle of this window; reads its state.
     if unsafe { IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 } {
         return;
@@ -3505,6 +3890,12 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Optio
         depth: Cell::new(0),
         deferred: RefCell::new(Vec::new()),
         tracking: Cell::new(false),
+        theme: Cell::new(None),
+        face_brush: Cell::new(0),
+        field_brush: Cell::new(0),
+        status_text: RefCell::new(StatusText::default()),
+        fullscreen: Cell::new(false),
+        full_saved: RefCell::new(None),
     });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.
@@ -3639,7 +4030,7 @@ fn forward_key(state: &WindowState, msg: &Msg) -> bool {
     let (ctrl, shift) = (modifier(0x11), modifier(0x10));
     let wanted = match vk {
         0x0D => in_find,
-        0x1B | 0x72 | 0x73 => true,
+        0x1B | 0x72..=0x74 | 0x7A => true,
         _ if ctrl => !(in_find && matches!(vk, 0x43 | 0x56 | 0x58 | 0x41 | 0x5A)),
         _ => false,
     };

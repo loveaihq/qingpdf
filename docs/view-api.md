@@ -30,6 +30,8 @@
 ## 结果（引擎 → 界面）
 
 - `Opened { doc, pages: [{宽, 高}], file_bytes, bitmap_cache_bytes, max_tile_pixels }`：每页大小（点，1/72 英寸，已按 `/Rotate` 转过；每边最多 14400，更大的页按 14400 截（取页面左上角），`/UserUnit` 引擎不处理）；`bitmap_cache_bytes` 是在总预算里留给界面存位图的字节数；`max_tile_pixels` 是一个请求最多该要多少像素。
+- `Opened` 多两项（2026-10-20，看的方式）：`spread_hint`（`u8`：`SPREAD_NONE` = 0 一栏、也包括文件什么都没写；`SPREAD_FIRST_LEFT` = 1 两栏、第一页在左，`/PageLayout` 是 `TwoColumnLeft` 或 `TwoPageLeft`；`SPREAD_FIRST_RIGHT` = 2 两栏、第一页在右并且单独一行，是 `TwoColumnRight` 或 `TwoPageRight`；不认识的名字、类型不对的条目都当没写）和 `right_to_left`（`/ViewerPreferences` 的 `/Direction` 是 `/R2L`；可以是直接写的字典，也可以是引用）。引擎不排版，只告诉界面文件的意思；界面一页一页怎么摆见 `docs/decisions.md` 的“看的方式（2026-10-20）”。
+- 屏幕上页面的颜色（夜间、护眼）不在这个接口里：位图原样交给界面，界面在存进缓存之前调 `qingpdf_core::render::recolor::recolor(&mut bgra, Tint)`（`Tint` 是 `Original`/`Night`/`Sepia`，`#[repr(u8)]`；`Tint::paper()` 是白纸变成什么颜色）。打印（`print` 的 `PrintBand`）、`copy_text`、导出和保存都不经过它。
 - `OpenFailed { doc, failure, message }`：`failure` 是 `NeedsPassword`（要密码，界面问了再 `open_file` 一次）、`WrongPassword`、`TooLarge`（文件超过 100 MB，或在总预算里怎么也放不下）、`Unreadable`（读不了，`message` 是系统的话）、`Damaged`（不是 PDF 或坏得太厉害）、`NoRoom`（文件本身放得下，但别的存着的文档占了地方，又都放不掉：有没保存的改动、或用密码打开的；界面说“先保存或关闭一些标签”）。
 - `Activated { doc, bitmap_cache_bytes, thumb_cache_bytes, max_tile_pixels }`：`activate` 的答复：这个文档又被服务了，按**现在**的总预算算出的数（别的存着的文档占着地方，所以不一定和打开时一样）。界面在收到它以前先不要排画页的请求（排了也行，按顺序做，但位图缓存的大小要按这里的数）。
 - `Dropped { doc }`：引擎为了给新文件腾地方，把存着的文档 `doc` 放掉了（它不再打开）；界面在要用这个标签时用 `open_file`（新的文档号）重新读文件。只会放：没有没保存的改动、不是用密码打开的、没有“只留在内存里”的识别文字的文档。`activate` 一个不在的文档也答它。

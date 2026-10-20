@@ -37,6 +37,11 @@ pub(super) struct MenuState {
     /// The toolbar is shown, and the choice made in View > Language.
     pub toolbar: bool,
     pub lang_choice: LangChoice,
+    /// How the pages go in rows, whether the window is full screen, what the person chose for the look of the window and the colours of the pages.
+    pub spread: Spread,
+    pub full: bool,
+    pub theme: ThemeChoice,
+    pub tint: Tint,
 }
 
 impl MenuState {
@@ -63,6 +68,10 @@ impl MenuState {
             can_ocr: false,
             toolbar: true,
             lang_choice: LangChoice::System,
+            spread: Spread::Single,
+            full: false,
+            theme: ThemeChoice::System,
+            tint: Tint::Original,
         }
     }
 }
@@ -78,6 +87,12 @@ fn shorten(path: &str, most: usize) -> String {
         chars.iter().take(head).chain(std::iter::once(&'\u{2026}')).chain(chars.iter().skip(chars.len() - tail)).collect()
     };
     cut.replace('&', "&&")
+}
+
+/// A submenu of choices of one kind, the one made ticked.
+fn choices<T: PartialEq + Copy>(lang: Lang, title: Msg, enabled: bool, chosen: T, list: &[(u32, Msg, T)]) -> MenuEntry {
+    let entries = list.iter().map(|&(id, m, v)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: chosen == v, enabled }).collect();
+    MenuEntry::Submenu { title: t(lang, title).to_string(), entries }
 }
 
 pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
@@ -142,6 +157,13 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 item(CMD_ACTUAL, Msg::ActualSize, st.has_doc),
                 MenuEntry::Separator,
                 item(CMD_ROTATE, Msg::Rotate, st.has_doc),
+                MenuEntry::Separator,
+                choices(lang, Msg::LayoutMenu, st.has_doc, st.spread, &[(CMD_LAYOUT_SINGLE, Msg::LayoutSingle, Spread::Single), (CMD_LAYOUT_SPREAD, Msg::LayoutSpread, Spread::Pair), (CMD_LAYOUT_COVER, Msg::LayoutCover, Spread::Cover)]),
+                MenuEntry::Item { id: CMD_FULLSCREEN, label: t(lang, Msg::FullScreen).to_string(), checked: st.full, enabled: true },
+                item(CMD_PRESENT, Msg::Present, st.has_doc),
+                MenuEntry::Separator,
+                choices(lang, Msg::ThemeMenu, true, st.theme, &[(CMD_THEME_SYSTEM, Msg::LangSystem, ThemeChoice::System), (CMD_THEME_LIGHT, Msg::ThemeLight, ThemeChoice::Light), (CMD_THEME_DARK, Msg::ThemeDark, ThemeChoice::Dark)]),
+                choices(lang, Msg::PageColorMenu, st.has_doc, st.tint, &[(CMD_TINT_ORIGINAL, Msg::PcOriginal, Tint::Original), (CMD_TINT_NIGHT, Msg::PcNight, Tint::Night), (CMD_TINT_SEPIA, Msg::PcSepia, Tint::Sepia)]),
                 MenuEntry::Separator,
                 MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowSidebar).to_string(), checked: st.show_sidebar, enabled: st.has_doc },
                 MenuEntry::Item { id: CMD_TOOLBAR, label: t(lang, Msg::ShowToolbar).to_string(), checked: st.toolbar, enabled: true },
@@ -278,6 +300,10 @@ impl App {
             can_ocr: self.doc.is_some() && self.ocr.is_none(),
             toolbar: self.toolbar_on,
             lang_choice: self.lang_choice,
+            spread: self.spread,
+            full: self.full,
+            theme: self.theme_choice,
+            tint: self.tint,
         };
         build_menus(self.lang, &st)
     }
@@ -327,7 +353,7 @@ mod tests {
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.
@@ -343,6 +369,13 @@ mod tests {
         assert_eq!(enabled(CMD_OPEN), Some(true));
         assert_eq!(enabled(CMD_EXIT), Some(true));
         assert_eq!(enabled(CMD_ABOUT), Some(true));
+        // The look of the window and full screen need no file; the layout, the presentation and the colours of the pages do.
+        for cmd in [CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_FULLSCREEN] {
+            assert_eq!(enabled(cmd), Some(true), "{cmd}");
+        }
+        for cmd in [CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_PRESENT, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
+            assert_eq!(enabled(cmd), Some(false), "{cmd}");
+        }
         for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }

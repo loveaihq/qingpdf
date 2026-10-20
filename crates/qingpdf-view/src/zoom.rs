@@ -60,6 +60,11 @@ pub fn fit(room_px: f64, page_pt: f64, dpi: u32) -> u32 {
     clamp(zoom.floor().clamp(0.0, f64::from(MAX_ZOOM)) as u32)
 }
 
+/// The zoom at which a page of `w_pt` by `h_pt` points fits a screen of `view_w` by `view_h` pixels, all of it (the presentation).
+pub fn fit_screen(w_pt: f64, h_pt: f64, view_w: i64, view_h: i64, dpi: u32) -> u32 {
+    fit(view_w as f64, w_pt, dpi).min(fit(view_h as f64, h_pt, dpi))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

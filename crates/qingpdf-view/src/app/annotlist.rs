@@ -7,7 +7,7 @@
 use qingpdf_core::view::ListedAnnot;
 
 use super::editing::Asked;
-use super::sidebar::{BAR_COLOR, DISABLED_FG, HEADER_BG, LIST_BG, NUMBER_FG, SELECTED_BG, SELECTED_BORDER, SELECTED_FG, TAB_H};
+use super::sidebar::TAB_H;
 use super::*;
 use crate::thumbs::{self, ListKey};
 use crate::toolbar::plain_label;
@@ -19,7 +19,6 @@ const PAD: i64 = 8;
 const BAR_W: i64 = 6;
 const BAR_EDGE: i64 = 3;
 const GUTTER: i64 = 12;
-const DIM_FG: u32 = 0x707070;
 
 /// One row of the list: the heading of a page, or an annotation (its place in the list of all).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,12 +296,12 @@ impl App {
     pub(super) fn draw_annot_list(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
         let list_h = self.list_h();
-        p.fill_rect(rect(0, tabs, width, list_h), LIST_BG);
+        p.fill_rect(rect(0, tabs, width, list_h), self.pal.list_bg);
         if self.al.rows.is_empty() {
             if self.al.loaded {
                 let s = t(self.lang, Msg::AnnotsEmpty);
                 let w = i64::from(p.text_width(s));
-                p.text(clamp32((width - w) / 2), clamp32(tabs + self.px(40)), s, DISABLED_FG);
+                p.text(clamp32((width - w) / 2), clamp32(tabs + self.px(40)), s, self.pal.disabled_fg);
             }
             return;
         }
@@ -326,9 +325,9 @@ impl App {
             let (top, h) = (tabs + self.row_top(r) - self.al.scroll, self.row_h(r));
             match self.al.rows.get(r).copied() {
                 Some(Row::Page(page)) => {
-                    p.fill_rect(rect(0, top, width, h), HEADER_BG);
+                    p.fill_rect(rect(0, top, width, h), self.pal.header_bg);
                     let s = t(self.lang, Msg::ListPage).replace("{n}", &(page + 1).to_string());
-                    p.text(clamp32(pad), clamp32(top + (h - line) / 2), &s, NUMBER_FG);
+                    p.text(clamp32(pad), clamp32(top + (h - line) / 2), &s, self.pal.number_fg);
                 }
                 Some(Row::Item(i)) => {
                     let Some(l) = self.al.items.get(i as usize) else { continue };
@@ -336,16 +335,16 @@ impl App {
                     let chosen = self.al.selected == Some(key) || picked == Some(key);
                     if chosen {
                         let edge = self.px(2);
-                        p.fill_rect(rect(self.px(4), top + 1, width - 2 * self.px(4), h - 2), SELECTED_BORDER);
-                        p.fill_rect(rect(self.px(4) + edge, top + 1 + edge, width - 2 * (self.px(4) + edge), h - 2 - 2 * edge), SELECTED_BG);
+                        p.fill_rect(rect(self.px(4), top + 1, width - 2 * self.px(4), h - 2), self.pal.selected_border);
+                        p.fill_rect(rect(self.px(4) + edge, top + 1 + edge, width - 2 * (self.px(4) + edge), h - 2 - 2 * edge), self.pal.selected_bg);
                     }
                     let room = width - 2 * pad - self.px(BAR_W + BAR_EDGE);
                     // The kind and the author on the first line, the text under it, the date under that.
                     let head = if l.info.author.is_empty() { self.kind_name(&l.info.subtype) } else { format!("{} - {}", self.kind_name(&l.info.subtype), l.info.author) };
-                    let color = if chosen { SELECTED_FG } else if l.info.locked() { DIM_FG } else { NUMBER_FG };
+                    let color = if chosen { self.pal.selected_fg } else if l.info.locked() { self.pal.dim_fg } else { self.pal.number_fg };
                     let y = top + self.px(4);
                     // (A line with nothing in it is left out.)
-                    let lines = [(head.as_str(), color), (l.info.contents.as_str(), DIM_FG), (l.info.modified.as_str(), DIM_FG)];
+                    let lines = [(head.as_str(), color), (l.info.contents.as_str(), self.pal.dim_fg), (l.info.modified.as_str(), self.pal.dim_fg)];
                     for (n, (s, c)) in lines.into_iter().filter(|(s, _)| !s.is_empty()).enumerate() {
                         let s = fit(p, s, room);
                         p.text(clamp32(pad), clamp32(y + n as i64 * (line + self.px(1))), &s, c);
@@ -355,7 +354,7 @@ impl App {
             }
         }
         if let Some((bar_top, bar_len)) = thumbs::bar(self.al.scroll, list_h, self.annots_total()) {
-            p.fill_rect(rect(width - self.px(BAR_W + BAR_EDGE), tabs + bar_top, self.px(BAR_W), bar_len), BAR_COLOR);
+            p.fill_rect(rect(width - self.px(BAR_W + BAR_EDGE), tabs + bar_top, self.px(BAR_W), bar_len), self.pal.bar_color);
         }
     }
 }

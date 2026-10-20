@@ -19,9 +19,6 @@ const SHAPE_AFTER: i64 = 5;
 const LEAST_SIDE: f32 = 8.0;
 /// How long the arrow keys are waited for before the nudges are sent as one move (so that holding a key is one step to undo, not a hundred).
 pub(super) const NUDGE_MS: u32 = 400;
-/// The colour of the frame and the handles of the annotation picked.
-const FRAME: u32 = 0x0066FF;
-
 /// A shape being dragged out: the page, where the pointer went down and where it is (points of the page), where it went down in the window
 /// (pixels) and whether Shift is held.
 pub(super) struct ShapeDraft {
@@ -534,10 +531,10 @@ impl App {
             (left + x0.floor() as i64 - 1, top + y0.floor() as i64 - 1, left + x1.ceil() as i64 + 1, top + y1.ceil() as i64 + 1)
         };
         let frame = |p: &mut dyn Painter, (x0, y0, x1, y1): (i64, i64, i64, i64), thick: i64| {
-            p.fill_rect(rect(x0, y0, x1 - x0, thick), FRAME);
-            p.fill_rect(rect(x0, y1 - thick, x1 - x0, thick), FRAME);
-            p.fill_rect(rect(x0, y0, thick, y1 - y0), FRAME);
-            p.fill_rect(rect(x1 - thick, y0, thick, y1 - y0), FRAME);
+            p.fill_rect(rect(x0, y0, x1 - x0, thick), self.frame_color());
+            p.fill_rect(rect(x0, y1 - thick, x1 - x0, thick), self.frame_color());
+            p.fill_rect(rect(x0, y0, thick, y1 - y0), self.frame_color());
+            p.fill_rect(rect(x1 - thick, y0, thick, y1 - y0), self.frame_color());
         };
         if let (Some(d), Tool::Shape(kind)) = (self.edit.ae.draft.as_ref().filter(|d| d.page as usize == page), self.edit.tool) {
             let width = WIDTHS.get(self.edit.width).map_or(2.0, |w| w.1);

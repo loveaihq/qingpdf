@@ -13,7 +13,7 @@ use crate::ui::Action;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pass {
-    /// Going from page to page, each turn after everything wanted has come in (a person reads a page before turning).
+    /// Going from page to page (from row to row when two pages are in a row), each turn after everything wanted has come in (a person reads a page before turning).
     Reading,
     /// The same, but each turn right after the picture of the last one (the prefetch is cut short: holding Page Down).
     Rapid,
@@ -86,7 +86,7 @@ impl Bench {
                 let Some(t) = app.last_sharp_paint() else { return Vec::new() };
                 self.first_sharp = Some(t.duration_since(app.started));
                 self.pages = app.page_count();
-                self.state = State::Pass { pass: Pass::Reading, next: 1 };
+                self.state = State::Pass { pass: Pass::Reading, next: app.next_row_start(0) };
                 self.step(app)
             }
             State::Pass { pass, next } => self.turn(app, pass, next),
@@ -118,13 +118,13 @@ impl Bench {
                 Pass::Rapid => Pass::Cold,
                 Pass::Cold => return self.finish(app),
             };
-            self.state = State::Pass { pass: following, next: 1 };
+            self.state = State::Pass { pass: following, next: app.next_row_start(0) };
             // Back to the first page for the next pass (not timed), then on.
             let actions = app.go_to_page(0);
             app.clear_last_sharp_paint();
             self.turn_started = None;
             let mut all = actions;
-            all.extend(self.settle_then_turn(app, following, 1));
+            all.extend(self.settle_then_turn(app, following, app.next_row_start(0)));
             return all;
         }
         self.settle_then_turn(app, pass, next)
@@ -133,14 +133,14 @@ impl Bench {
     /// Start the turn to page `next`, after waiting (for the reading pass) until nothing is asked of the engine.
     fn settle_then_turn(&mut self, app: &mut App, pass: Pass, next: usize) -> Vec<Action> {
         self.state = State::Pass { pass, next };
-        if (pass == Pass::Reading || next == 1) && !(app.visible_ready() && app.is_idle()) {
+        if (pass == Pass::Reading || next == app.next_row_start(0)) && !(app.visible_ready() && app.is_idle()) {
             // Everything wanted is not in yet: the next event (the engine's answer) comes here again.
             return Vec::new();
         }
         if pass == Pass::Cold {
             app.forget_bitmaps();
         }
-        self.state = State::Pass { pass, next: next + 1 };
+        self.state = State::Pass { pass, next: app.next_row_start(next) };
         app.clear_last_sharp_paint();
         self.turn_started = Some(Instant::now());
         let actions = app.go_to_page(next);

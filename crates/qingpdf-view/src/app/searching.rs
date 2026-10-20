@@ -61,7 +61,8 @@ impl App {
         if self.selection.take().is_some() {
             return vec![Action::Invalidate];
         }
-        Vec::new()
+        // Nothing else wanted Esc: full screen is over.
+        self.escape_full()
     }
 
     /// The text of the find box changed: look for it when it has been left alone for a moment.
@@ -179,8 +180,8 @@ impl App {
         let label_w = if self.toolbar_visible() { p.text_width(&label) } else { clamp32(self.px(FIND_LABEL_W)) };
         let pad = clamp32(self.px(8));
         let panel = Rect { x: (e.x - label_w - pad).max(clamp32(self.view_x)), y: e.y - pad / 2, w: e.w + label_w + 2 * pad, h: e.h + pad };
-        p.fill_rect(Rect { x: panel.x - 1, y: panel.y - 1, w: panel.w + 2, h: panel.h + 2 }, BORDER);
-        p.fill_rect(panel, STATUS_BG);
-        p.text(panel.x + pad, e.y + (e.h - p.line_height()) / 2, &label, STATUS_FG);
+        p.fill_rect(Rect { x: panel.x - 1, y: panel.y - 1, w: panel.w + 2, h: panel.h + 2 }, self.pal.border);
+        p.fill_rect(panel, self.pal.status_bg);
+        p.text(panel.x + pad, e.y + (e.h - p.line_height()) / 2, &label, self.pal.status_fg);
     }
 }

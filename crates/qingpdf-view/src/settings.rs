@@ -3,7 +3,9 @@
 //! it; the lines after it are `key=value` settings: `lang` (`system`, `zh` or `en`), `toolbar` (`1` or `0`), `sidebar` (the width of
 //! the sidebar, in pixels at 96 dpi), `tab` (`bookmarks`, `pages` or `annots`: the tab of the sidebar last used), `window` (`x,y,w,h,maximized`, see [`Placement`]),
 //! and (2026-10-17) `single_window` and `remember_place` (`0` turns off handing a file to the copy of the program that is running, and opening a
-//! file where it was left; both are on unless they are `0`). Nothing is sent anywhere. The file is
+//! file where it was left; both are on unless they are `0`), and (2026-10-20) `theme` (`system`, `light` or `dark`: the look of the window), `page_color`
+//! (`original`, `night` or `sepia`) and `layout` (`single`, `spread` or `cover`: how the pages of a file nothing is kept about are laid out); those three are
+//! written only when they are not the first of their words. Nothing is sent anywhere. The file is
 //! not trusted (another program may have written it): a name that is too long or has control characters in it is not used, a setting
 //! that is not understood or is out of range is ignored.
 
@@ -13,7 +15,9 @@ use std::path::PathBuf;
 use qingpdf_core::view::MAX_AUTHOR_CHARS;
 
 use crate::i18n::LangChoice;
+use crate::layout::Spread;
 use crate::placement::Placement;
+use crate::theme::{self, ThemeChoice, Tint};
 use crate::thumbs::Tab;
 
 /// Most bytes of the file that are read.
@@ -61,11 +65,28 @@ pub struct Settings {
     /// A file opened from outside goes to the copy of the program that is running (else a window of its own), and a file opens where it was left.
     pub single_window: bool,
     pub remember_place: bool,
+    /// How the window looks (View > Interface), the colours of the pages (View > Page colours) and how the pages of a file with nothing kept about it are laid
+    /// out (View > Page layout: the last one chosen).
+    pub theme: ThemeChoice,
+    pub page_color: Tint,
+    pub layout: Spread,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { author: None, lang: LangChoice::System, toolbar: true, sidebar: None, tab: None, window: None, single_window: true, remember_place: true }
+        Settings {
+            author: None,
+            lang: LangChoice::System,
+            toolbar: true,
+            sidebar: None,
+            tab: None,
+            window: None,
+            single_window: true,
+            remember_place: true,
+            theme: ThemeChoice::System,
+            page_color: Tint::Original,
+            layout: Spread::Single,
+        }
     }
 }
 
@@ -85,6 +106,9 @@ impl Settings {
                 "window" => s.window = Placement::parse(value),
                 "single_window" => s.single_window = value.trim() != "0",
                 "remember_place" => s.remember_place = value.trim() != "0",
+                "theme" => s.theme = ThemeChoice::parse(value).unwrap_or_default(),
+                "page_color" => s.page_color = theme::parse_tint(value).unwrap_or_default(),
+                "layout" => s.layout = Spread::parse(value).unwrap_or_default(),
                 _ => {}
             }
         }
@@ -108,6 +132,12 @@ impl Settings {
         }
         if !self.remember_place {
             out.push_str("remember_place=0\n");
+        }
+        // (The look and the layout are written when they are not the usual.)
+        for (key, value, usual) in [("theme", self.theme.word(), "system"), ("page_color", theme::tint_word(self.page_color), "original"), ("layout", self.layout.word(), "single")] {
+            if value != usual {
+                out.push_str(&format!("{key}={value}\n"));
+            }
         }
         out
     }
@@ -184,6 +214,9 @@ mod tests {
             window: Some(Placement { x: -1500, y: 20, w: 1100, h: 760, maximized: true }),
             single_window: false,
             remember_place: false,
+            theme: ThemeChoice::Dark,
+            page_color: Tint::Sepia,
+            layout: Spread::Cover,
         };
         let text = s.render();
         assert_eq!(text.lines().next(), Some("张三"));

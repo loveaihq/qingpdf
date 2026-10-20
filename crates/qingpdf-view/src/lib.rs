@@ -7,7 +7,8 @@
 //! Layout: `app.rs` is the reader (state, scheduling, drawing) and knows nothing of Windows; `win32.rs` is the one module that
 //! calls Windows (and the only one with `unsafe`); `ui.rs` is the plain-types contract between them. `layout`, `zoom`, `tiles`,
 //! `cache` and `sched` are plain logic with tests, and so are `toolbar` (what the buttons are and when they can be used), `wordsel`
-//! (the word and the line a double and a triple click take), `clicks`, `placement` (where the window starts), `settings` and `thumbs` (the rows, the cache and the requests of the list of thumbnails in the sidebar).
+//! (the word and the line a double and a triple click take), `clicks`, `placement` (where the window starts), `settings`, `theme` (the colours of the window and the words for the
+//! looks that are kept) and `thumbs` (the rows, the cache and the requests of the list of thumbnails in the sidebar).
 
 pub mod app;
 pub mod bench;
@@ -26,6 +27,7 @@ pub mod sched;
 pub mod settings;
 pub mod select;
 pub mod tabs;
+pub mod theme;
 pub mod thumbs;
 pub mod tiles;
 pub mod toolbar;

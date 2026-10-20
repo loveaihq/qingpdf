@@ -24,7 +24,6 @@ const STAMP_MIN: f32 = 16.0;
 const HANDLE: i64 = 9;
 /// How far (pixels at 96 dpi) the pointer must go to drag a box out rather than click.
 const BOX_DRAG: i64 = 6;
-const FRAME_COLOR: u32 = 0x0066FF;
 const FIELD_COLOR: u32 = 0x3390FF;
 
 /// What is typed in the box over the page.
@@ -653,16 +652,16 @@ impl App {
         let t = self.px(2).max(1);
         if let Some((pg, a, b)) = self.edit.forms.dragging.filter(|d| d.0 as usize == page) {
             let _ = pg;
-            outline(p, to_window([a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]), FRAME_COLOR, t);
+            outline(p, to_window([a[0].min(b[0]), a[1].min(b[1]), a[0].max(b[0]), a[1].max(b[1])]), self.frame_color(), t);
         }
         if let Some(d) = self.edit.forms.stamp.as_ref().filter(|d| d.page as usize == page) {
             let (x0, y0, x1, y1) = to_window(d.rect);
-            p.fill_rect_alpha(rect(x0, y0, x1 - x0, y1 - y0), FRAME_COLOR, 40);
-            outline(p, (x0, y0, x1, y1), FRAME_COLOR, t);
+            p.fill_rect_alpha(rect(x0, y0, x1 - x0, y1 - y0), self.frame_color(), 40);
+            outline(p, (x0, y0, x1, y1), self.frame_color(), t);
             let h = self.px(HANDLE);
             for (cx, cy) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
                 p.fill_rect(rect(cx - h / 2, cy - h / 2, h, h), 0xFFFFFF);
-                outline(p, (cx - h / 2, cy - h / 2, cx - h / 2 + h, cy - h / 2 + h), FRAME_COLOR, t.min(2));
+                outline(p, (cx - h / 2, cy - h / 2, cx - h / 2 + h, cy - h / 2 + h), self.frame_color(), t.min(2));
             }
         }
         // The fields a person can fill in show faintly when the pointer is over the page with nothing else going on.

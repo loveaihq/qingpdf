@@ -24,24 +24,6 @@ const BAR_EDGE: i64 = 3;
 /// The width of the sidebar when none was kept: a thumbnail with room on each side for the bar at the edge and the margin.
 pub(super) const DEFAULT_WIDTH: i64 = THUMB_W + 2 * (THUMB_MARGIN + BAR_W + BAR_EDGE);
 
-// Colours.
-pub(super) const LIST_BG: u32 = 0xEEEEEE;
-pub(super) const HEADER_BG: u32 = 0xE0E0E0;
-const TAB_ON_BG: u32 = 0xFAFAFA;
-const TAB_LINE: u32 = 0x2B7CFF;
-const HEADER_EDGE: u32 = 0xB4B4B4;
-pub(super) const SELECTED_BORDER: u32 = 0x3390FF;
-/// The page in view, when the chosen pages are others: a thin frame.
-const CURRENT_FRAME: u32 = 0x8FB8F0;
-pub(super) const SELECTED_BG: u32 = 0xD3E3FB;
-const THUMB_BORDER: u32 = 0x8C8C8C;
-const PLACEHOLDER: u32 = 0xF7F7F7;
-const DAMAGED: u32 = 0xCDCDCD;
-pub(super) const NUMBER_FG: u32 = 0x404040;
-pub(super) const SELECTED_FG: u32 = 0x0B4FB3;
-pub(super) const DISABLED_FG: u32 = 0x9A9A9A;
-pub(super) const BAR_COLOR: u32 = 0xB4B4B4;
-
 /// The key of the list a key of the keyboard is, if it is one.
 pub(super) fn list_key(key: u32) -> Option<ListKey> {
     match key {
@@ -64,7 +46,7 @@ impl App {
     /// hidden, or there are no bookmarks and it is not open on the thumbnails).
     pub(super) fn sidebar_width(&self) -> i64 {
         let wanted = self.show_sidebar && (!self.outline.is_empty() || self.thumbs_alone);
-        if self.doc.is_some() && wanted && (self.bench.is_none() || self.bench_sidebar) {
+        if self.doc.is_some() && wanted && !self.full && (self.bench.is_none() || self.bench_sidebar) {
             (self.px(self.sidebar_pref) + self.px(SPLIT_GAP)).min(self.client_w / 2)
         } else {
             0
@@ -245,7 +227,7 @@ impl App {
     }
 
     /// A picture came back. `true`: its row is in view, so the window needs a new picture.
-    pub(super) fn on_thumb_rendered(&mut self, page: u32, r: Rendered) -> bool {
+    pub(super) fn on_thumb_rendered(&mut self, page: u32, mut r: Rendered) -> bool {
         let whole = r.width > 0 && r.height > 0 && r.bgra.len() as u64 == u64::from(r.width) * u64::from(r.height) * 4;
         let view = self.thumbs.strip.rows_in(self.thumbs.scroll, self.thumbs.scroll + self.list_h());
         if r.status == RenderStatus::Failed || !whole {
@@ -253,6 +235,7 @@ impl App {
             self.thumbs.note_failure(page);
         } else if let Some(row) = self.thumbs.strip.row(page as usize) {
             let (first, last) = (view.start as u32, view.end.saturating_sub(1) as u32);
+            recolor(&mut r.bgra, self.tint);
             let thumb = Thumb { page, rotation: self.rotation, scale: row.scale, width: r.width, height: r.height, bgra: r.bgra };
             self.thumbs.cache.insert(thumb, first, last);
         }
@@ -366,30 +349,32 @@ impl App {
     }
 
     fn draw_tabs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
-        p.fill_rect(rect(0, 0, width, tabs), HEADER_BG);
+        p.fill_rect(rect(0, 0, width, tabs), self.pal.header_bg);
         let active = self.active_tab();
         let (third, two_thirds) = (width / 3, width * 2 / 3);
         for (tab, x0, x1, msg) in [(Tab::Bookmarks, 0, third, Msg::TabBookmarks), (Tab::Pages, third, two_thirds, Msg::TabPages), (Tab::Annots, two_thirds, width, Msg::TabAnnots)] {
             let on = tab == active;
             let enabled = tab != Tab::Bookmarks || !self.outline.is_empty();
             if on {
-                p.fill_rect(rect(x0, 0, x1 - x0, tabs), TAB_ON_BG);
-                p.fill_rect(rect(x0, tabs - self.px(3), x1 - x0, self.px(3)), TAB_LINE);
+                p.fill_rect(rect(x0, 0, x1 - x0, tabs), self.pal.tab_on_bg);
+                p.fill_rect(rect(x0, tabs - self.px(3), x1 - x0, self.px(3)), self.pal.accent);
             }
             let s = t(self.lang, msg);
             let w = i64::from(p.text_width(s));
-            let color = if !enabled { DISABLED_FG } else if on { SELECTED_FG } else { NUMBER_FG };
+            let color = if !enabled { self.pal.disabled_fg } else if on { self.pal.selected_fg } else { self.pal.number_fg };
             p.text(clamp32(x0 + (x1 - x0 - w) / 2), clamp32((tabs - i64::from(p.line_height())) / 2 - self.px(1)), s, color);
         }
-        p.fill_rect(rect(0, tabs - self.px(1).max(1), width, self.px(1).max(1)), HEADER_EDGE);
-        p.fill_rect(rect(third, 0, self.px(1).max(1), tabs), HEADER_EDGE);
-        p.fill_rect(rect(two_thirds, 0, self.px(1).max(1), tabs), HEADER_EDGE);
+        p.fill_rect(rect(0, tabs - self.px(1).max(1), width, self.px(1).max(1)), self.pal.header_edge);
+        p.fill_rect(rect(third, 0, self.px(1).max(1), tabs), self.pal.header_edge);
+        p.fill_rect(rect(two_thirds, 0, self.px(1).max(1), tabs), self.pal.header_edge);
     }
 
     fn draw_thumbs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
         let (strip, scroll, list_h) = (&self.thumbs.strip, self.thumbs.scroll, self.list_h());
-        p.fill_rect(rect(0, tabs, width, list_h), LIST_BG);
+        p.fill_rect(rect(0, tabs, width, list_h), self.pal.list_bg);
         let current = self.thumb_current();
+        // (In a spread both pages of the row in view are the page in view.)
+        let shown = self.doc.as_ref().map_or(current..current + 1, |d| d.layout.pages_in_row(current));
         let chosen = &self.pg.chosen;
         let (above, inset, edge) = (self.px(THUMB_ABOVE), self.px(4), self.px(2));
         let label_top = self.px(THUMB_GAP);
@@ -398,30 +383,30 @@ impl App {
             let Some(row) = strip.row(i) else { continue };
             let top = tabs + row.top - scroll;
             // The chosen rows are marked; with none chosen the page in view is (as it always was), and when others are chosen it has a frame.
-            let picked = chosen.contains(i) || (chosen.is_empty() && i == current);
+            let picked = chosen.contains(i) || (chosen.is_empty() && shown.contains(&i));
             if picked {
-                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), SELECTED_BORDER);
-                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), SELECTED_BG);
-            } else if i == current {
-                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), CURRENT_FRAME);
-                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), LIST_BG);
+                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), self.pal.selected_border);
+                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), self.pal.selected_bg);
+            } else if shown.contains(&i) {
+                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), self.pal.current_frame);
+                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), self.pal.list_bg);
             }
             let (x, y) = ((width - row.img_w) / 2, top + above);
-            p.fill_rect(rect(x - 1, y - 1, row.img_w + 2, row.img_h + 2), THUMB_BORDER);
+            p.fill_rect(rect(x - 1, y - 1, row.img_w + 2, row.img_h + 2), self.pal.thumb_border);
             // A picture drawn for another turn of the view is not the shape of the row: it waits for the new one.
             let picture = self.thumbs.cache.get(i as u32).filter(|t| t.rotation == self.rotation);
             match picture {
                 Some(t) => p.draw_bgra(rect(x, y, row.img_w, row.img_h), clamp32(i64::from(t.width)), clamp32(i64::from(t.height)), &t.bgra),
-                None => p.fill_rect(rect(x, y, row.img_w, row.img_h), if self.thumbs.failed.contains(&(i as u32)) { DAMAGED } else { PLACEHOLDER }),
+                None => p.fill_rect(rect(x, y, row.img_w, row.img_h), if self.thumbs.failed.contains(&(i as u32)) { self.pal.damaged } else { self.pal.placeholder }),
             }
             let number = (i + 1).to_string();
             let w = i64::from(p.text_width(&number));
             let ty = y + row.img_h + label_top + (label_h - i64::from(p.line_height())) / 2;
-            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if picked { SELECTED_FG } else { NUMBER_FG });
+            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if picked { self.pal.selected_fg } else { self.pal.number_fg });
         }
         self.draw_drop_mark(p, width, tabs);
         if let Some((bar_top, bar_len)) = thumbs::bar(scroll, list_h, strip.total()) {
-            p.fill_rect(rect(width - self.px(BAR_W + BAR_EDGE), tabs + bar_top, self.px(BAR_W), bar_len), BAR_COLOR);
+            p.fill_rect(rect(width - self.px(BAR_W + BAR_EDGE), tabs + bar_top, self.px(BAR_W), bar_len), self.pal.bar_color);
         }
     }
 }
@@ -466,8 +451,13 @@ pub(super) mod tests {
 
     /// A PDF of pages of the given sizes and own turns (a rectangle drawn on each); the pages in `broken` have a content stream that is garbage.
     pub(in crate::app) fn pages_pdf(sizes: &[(u32, u32, u32)], broken: &[usize]) -> Vec<u8> {
+        pages_pdf_with(sizes, broken, "")
+    }
+
+    /// [`pages_pdf`] with more in the catalog (`/PageLayout /TwoColumnLeft`, say).
+    pub(in crate::app) fn pages_pdf_with(sizes: &[(u32, u32, u32)], broken: &[usize], catalog: &str) -> Vec<u8> {
         let n = sizes.len() as u32;
-        let mut objects: Vec<(u32, String)> = vec![(1, "<< /Type /Catalog /Pages 2 0 R >>".to_string())];
+        let mut objects: Vec<(u32, String)> = vec![(1, format!("<< /Type /Catalog /Pages 2 0 R {catalog} >>"))];
         let kids: String = (0..n).map(|i| format!("{} 0 R ", 3 + 2 * i)).collect();
         objects.push((2, format!("<< /Type /Pages /Kids [{kids}] /Count {n} >>")));
         for (i, &(w, h, rotate)) in sizes.iter().enumerate() {
@@ -518,9 +508,17 @@ pub(super) mod tests {
         open_broken(name, sizes, &[], thumbs_tab)
     }
 
+    pub(in crate::app) fn open_with_catalog(name: &str, sizes: &[(u32, u32, u32)], catalog: &str) -> App {
+        open_file(name, &pages_pdf_with(sizes, &[], catalog), false)
+    }
+
     fn open_broken(name: &str, sizes: &[(u32, u32, u32)], broken: &[usize], thumbs_tab: bool) -> App {
+        open_file(name, &pages_pdf(sizes, broken), thumbs_tab)
+    }
+
+    fn open_file(name: &str, bytes: &[u8], thumbs_tab: bool) -> App {
         let file = std::env::temp_dir().join(format!("qingpdf-thumbs-{}-{name}.pdf", std::process::id()));
-        std::fs::write(&file, pages_pdf(sizes, broken)).expect("writes");
+        std::fs::write(&file, bytes).expect("writes");
         let mut app = app();
         if thumbs_tab {
             app.apply_settings(&Settings { tab: Some(Tab::Pages), ..Settings::default() });
@@ -756,7 +754,7 @@ pub(super) mod tests {
         // The garbage page is either a partial picture or a grey box; either way it is drawn and nothing else is the worse for it.
         assert!(app.thumbs.cache.get(3).is_some() || app.thumbs.failed.contains(&3));
         if app.thumbs.failed.contains(&3) {
-            assert!(rec.fills.iter().any(|(_, c)| *c == DAMAGED));
+            assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.damaged));
         }
     }
 
@@ -901,7 +899,7 @@ pub(super) mod tests {
         assert!(app.thumbs.asked.is_empty());
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert!(rec.fills.iter().any(|(_, c)| *c == DAMAGED));
+        assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.damaged));
         // A page that was changed gets another chance.
         app.forget_thumb(1);
         assert!(!app.thumbs.failed.contains(&1));
@@ -930,8 +928,8 @@ pub(super) mod tests {
         }
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert!(rec.fills.iter().any(|(_, c)| *c == SELECTED_BG), "the current row is highlighted");
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == SELECTED_BG).count(), 1);
+        assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.selected_bg), "the current row is highlighted");
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), 1);
         // The pictures are inside the list, centred, and the placeholders are lighter than the list.
         let width = app.list_w() as i32;
         assert!(rec.pictures.iter().any(|(r, ..)| r.x > 0 && r.x + r.w < width));

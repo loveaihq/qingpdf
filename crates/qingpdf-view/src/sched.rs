@@ -12,6 +12,7 @@ use std::ops::Range;
 use crate::cache::{BitmapCache, Key};
 use crate::layout::Layout;
 use crate::tiles;
+use crate::zoom;
 
 /// The most pixels of a preview (a small picture of a whole page).
 pub const PREVIEW_PIXELS: f64 = 64_000.0;
@@ -48,6 +49,8 @@ pub struct Scene<'a> {
     pub max_tile_pixels: u32,
     /// What the cache may hold.
     pub budget: u64,
+    /// The presentation: a page is drawn whole at the zoom that fits it to the screen, each at its own (pages of one file are seldom exactly one size).
+    pub present: bool,
 }
 
 /// What the small pictures round about take in the cache at most.
@@ -245,6 +248,12 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
         }
     };
     let page_top = |page: usize| {
+        if scene.present {
+            // The next page and the one before are drawn whole, at the zoom each will be shown at (what the person turns to is in the cache).
+            let (pw, ph) = layout.size_px(page);
+            let alone = |(w, h): (f64, f64)| scale_key(zoom::fit_screen(w, h, scene.view_w, scene.view_h, scene.dpi), scene.dpi);
+            return layout.size_pt(page).map_or_else(Vec::new, |pt| pieces(scene, page, alone(pt), [0, 0, pw, ph]));
+        }
         let left = layout.left(page, scene.view_w, scene.scroll_x);
         pieces(scene, page, scale, [-left, 0, scene.view_w - left, scene.view_h])
     };
@@ -260,17 +269,26 @@ pub fn wanted(scene: &Scene<'_>, cache: &BitmapCache) -> Vec<Want> {
     };
     let last = visible.end.saturating_sub(1);
     let (below, above) = (scene.scroll_y.saturating_add(scene.view_h), scene.scroll_y);
+    // (A row is a page or, in a spread, two: the next row, the one before and the one after the next are asked for whole.)
+    let row_top = |page: usize| -> Vec<Want> { layout.pages_in_row(page).flat_map(page_top).collect() };
     if last + 1 < layout.len() {
-        add(1, page_top(last + 1));
+        add(1, row_top(last + 1));
     }
-    add(2, band(below, below.saturating_add(scene.view_h)));
+    // (The presentation has gaps as high as the screen between its pages: no rows to scroll to.)
+    if !scene.present {
+        add(2, band(below, below.saturating_add(scene.view_h)));
+    }
     if visible.start > 0 {
-        add(3, page_top(visible.start - 1));
+        add(3, row_top(visible.start - 1));
     }
-    if last + 2 < layout.len() {
-        add(4, page_top(last + 2));
+    // (At the end of the document there is no row after: `pages_in_row` of a page that is not there is nothing, not the first row.)
+    let after = if last + 1 < layout.len() { layout.pages_in_row(last + 1).end } else { layout.len() };
+    if after < layout.len() {
+        add(4, row_top(after));
     }
-    add(5, band(above.saturating_sub(scene.view_h), above));
+    if !scene.present {
+        add(5, band(above.saturating_sub(scene.view_h), above));
+    }
     qingpdf_core::order::sort_by_key(&mut ring, |w| u64::from(w.priority));
     for w in ring {
         if seen.contains(&w.key) {
@@ -330,7 +348,7 @@ mod tests {
     }
 
     fn scene<'a>(l: &'a Layout, scroll_y: i64, moving: bool) -> Scene<'a> {
-        Scene { layout: l, scroll_x: 0, scroll_y, view_w: 1400, view_h: 900, zoom: 1500, dpi: 96, moving, max_tile_pixels: MAX, budget: 100_000_000 }
+        Scene { layout: l, scroll_x: 0, scroll_y, view_w: 1400, view_h: 900, zoom: 1500, dpi: 96, moving, max_tile_pixels: MAX, budget: 100_000_000, present: false }
     }
 
     fn pages_of(w: &[Want], preview: bool) -> Vec<u32> {
@@ -386,7 +404,7 @@ mod tests {
         let mut l = Layout::new(vec![(595.0, 842.0); 3]);
         // 800 percent at 96 dpi: 10.67 pixels a point; the page is 6347 by 8981 pixels.
         l.set(scale_from(8000, 96), 0, 8, 8);
-        let s = Scene { layout: &l, scroll_x: 2000, scroll_y: 3000, view_w: 1400, view_h: 900, zoom: 8000, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 100_000_000 };
+        let s = Scene { layout: &l, scroll_x: 2000, scroll_y: 3000, view_w: 1400, view_h: 900, zoom: 8000, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 100_000_000, present: false };
         let w = wanted(&s, &BitmapCache::new(100_000_000));
         let sharp: Vec<&Want> = w.iter().filter(|w| !w.preview && w.key.page == 0).collect();
         // The window shows 1400 by 900 pixels at an offset: at most 2 by 2 tiles of 2048 are in view.
@@ -485,7 +503,7 @@ mod tests {
         let scale = 1896.0 / 595.0;
         l.set(scale, 0, 10, 12);
         let zoom = (scale * 72.0 / 96.0 * 1000.0) as u32;
-        let s = Scene { layout: &l, scroll_x: 0, scroll_y: l.top(4) - 6, view_w: 1920, view_h: 1054, zoom, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 60_000_000 };
+        let s = Scene { layout: &l, scroll_x: 0, scroll_y: l.top(4) - 6, view_w: 1920, view_h: 1054, zoom, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 60_000_000, present: false };
         let w = wanted(&s, &BitmapCache::new(60_000_000));
         let sharp: Vec<&Want> = w.iter().filter(|w| !w.preview).collect();
         let in_view = sharp.iter().filter(|w| w.priority < P_RING).count();
@@ -494,5 +512,84 @@ mod tests {
         assert!(sharp.iter().any(|w| w.key.page == 5 && w.key.ty == 0 && w.priority >= P_RING));
         assert!(sharp.iter().all(|w| w.w <= 2048 && w.h <= 2048));
     }
-}
 
+    #[test]
+    fn in_a_spread_the_row_in_view_comes_first_and_the_rows_round_it_whole_after_it() {
+        use crate::layout::{Arrangement, Spread};
+        let mut l = Layout::new(vec![(595.0, 842.0); 12]);
+        l.arrange(Arrangement { spread: Spread::Pair, r2l: false });
+        // One pixel a point (75 percent at 96 dpi): a row is 842 pixels and the gap 8.
+        l.set(1.0, 0, 8, 8);
+        let s = Scene { layout: &l, scroll_x: 0, scroll_y: l.scroll_to_page(4, 0), view_w: 1400, view_h: 800, zoom: 750, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 100_000_000, present: false };
+        assert_eq!(visible_pages(&s), 4..6);
+        let w = wanted(&s, &BitmapCache::new(100_000_000));
+        let sharp = pages_of(&w, false);
+        // The two pages of the row, the whole next row, the one before it, and the one after the next.
+        let set = |a: usize, b: usize| sharp[a..b].iter().copied().collect::<HashSet<u32>>();
+        assert_eq!(sharp.len(), 8, "{sharp:?}");
+        assert_eq!((set(0, 2), set(2, 4), set(4, 6), set(6, 8)), ([4, 5].into(), [6, 7].into(), [2, 3].into(), [8, 9].into()));
+        // Only the pages in view are asked for before the rest of the engine's quick requests.
+        assert!(w.iter().filter(|w| !w.preview && w.priority < P_RING).all(|w| (4..6).contains(&w.key.page)));
+        // At the end of the document there is no row to ask for beyond it, and a lone last page is a row of its own.
+        let mut odd = Layout::new(vec![(595.0, 842.0); 5]);
+        odd.arrange(Arrangement { spread: Spread::Pair, r2l: true });
+        odd.set(1.0, 0, 8, 8);
+        let s = Scene { layout: &odd, scroll_y: odd.scroll_to_page(2, 0), ..s };
+        let sharp = pages_of(&wanted(&s, &BitmapCache::new(100_000_000)), false);
+        assert_eq!(sharp.iter().copied().collect::<HashSet<u32>>(), [0, 1, 2, 3, 4].into());
+    }
+
+    #[test]
+    fn in_the_presentation_the_pages_next_to_the_one_shown_are_drawn_whole_each_at_the_zoom_that_fits_it() {
+        // Pages of nearly one size, as the pages of a scanned book are.
+        let sizes = [(370.8, 520.0), (414.0, 522.0), (414.0, 524.0), (414.0, 519.0)];
+        let (vw, vh, dpi) = (1920i64, 1080i64, 96u32);
+        let mut l = Layout::new(sizes.to_vec());
+        let z = zoom::fit_screen(414.0, 522.0, vw, vh, dpi);
+        // As the reader lays it out: no margin, a gap as high as the screen, the page shown in the middle of the screen.
+        l.set(zoom::scale(z, dpi), 0, vh, 0);
+        let scroll_y = l.scroll_to_page(1, (vh - l.size_px(1).1) / 2);
+        let s = Scene { layout: &l, scroll_x: 0, scroll_y, view_w: vw, view_h: vh, zoom: z, dpi, moving: false, max_tile_pixels: MAX, budget: 100_000_000, present: true };
+        let w = wanted(&s, &BitmapCache::new(100_000_000));
+        // The page shown, then the next, the one before and the one after the next, whole, each at its own fit.
+        assert_eq!(pages_of(&w, false), vec![1, 2, 0, 3]);
+        for want in w.iter().filter(|w| !w.preview) {
+            let (pw, ph) = sizes[want.key.page as usize];
+            assert_eq!(want.key.scale, scale_key(zoom::fit_screen(pw, ph, vw, vh, dpi), dpi), "page {}", want.key.page);
+            assert_eq!((want.x, want.y, want.w, want.h), (0, 0, want.page_w, want.page_h), "all of the page");
+        }
+        // The scales are not all the same (that is what the pages being of different sizes does), and there are no rows asked for beyond.
+        assert!(w.iter().filter(|w| !w.preview).map(|w| w.key.scale).collect::<HashSet<_>>().len() > 1);
+        assert!(w.iter().filter(|w| !w.preview).all(|w| w.priority < P_RING + 500));
+    }
+
+    #[test]
+    fn at_the_end_of_the_document_nothing_of_the_first_row_is_asked_for() {
+        use crate::layout::{Arrangement, Spread};
+        // A column: the last page in view, the one before it is next to it, and that is all (the first page is not "the page after the last").
+        let l = layout(30);
+        let w = wanted(&scene(&l, l.top(29), false), &BitmapCache::new(100_000_000));
+        assert_eq!(pages_of(&w, false), vec![29, 28], "{:?}", pages_of(&w, false));
+        // The same one page from the end, where the page after is the last.
+        let w = wanted(&scene(&l, l.top(28), false), &BitmapCache::new(100_000_000));
+        assert_eq!(pages_of(&w, false), vec![28, 29, 27]);
+        // Two to a row: the last row (an odd page alone, or a pair) has the row before it and nothing after.
+        for count in [11usize, 12] {
+            let mut p = Layout::new(vec![(595.0, 842.0); count]);
+            p.arrange(Arrangement { spread: Spread::Pair, r2l: false });
+            p.set(1.0, 0, 8, 8);
+            let s = Scene { layout: &p, scroll_x: 0, scroll_y: p.scroll_to_page(count - 1, 0), view_w: 1400, view_h: 800, zoom: 750, dpi: 96, moving: false, max_tile_pixels: MAX, budget: 100_000_000, present: false };
+            let sharp: HashSet<u32> = pages_of(&wanted(&s, &BitmapCache::new(100_000_000)), false).into_iter().collect();
+            let want: HashSet<u32> = (8..count as u32).collect();
+            assert_eq!(sharp, want, "{count} pages");
+        }
+        // The presentation of the last page: the page before it, and not the first.
+        let sizes = [(612.0, 792.0); 6];
+        let (vw, vh, dpi) = (1920i64, 1080i64, 96u32);
+        let mut p = Layout::new(sizes.to_vec());
+        let z = zoom::fit_screen(612.0, 792.0, vw, vh, dpi);
+        p.set(zoom::scale(z, dpi), 0, vh, 0);
+        let s = Scene { layout: &p, scroll_x: 0, scroll_y: p.scroll_to_page(5, (vh - p.size_px(5).1) / 2), view_w: vw, view_h: vh, zoom: z, dpi, moving: false, max_tile_pixels: MAX, budget: 100_000_000, present: true };
+        assert_eq!(pages_of(&wanted(&s, &BitmapCache::new(100_000_000)), false), vec![5, 4]);
+    }
+}

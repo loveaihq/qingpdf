@@ -59,6 +59,7 @@ pub enum ScrollCode {
 
 /// Virtual-key codes the reader uses (winuser.h).
 pub mod vk {
+    pub const BACK: u32 = 0x08;
     pub const TAB: u32 = 0x09;
     pub const RETURN: u32 = 0x0D;
     pub const ESCAPE: u32 = 0x1B;
@@ -91,6 +92,8 @@ pub mod vk {
     pub const SUBTRACT: u32 = 0x6D;
     pub const F3: u32 = 0x72;
     pub const F4: u32 = 0x73;
+    pub const F5: u32 = 0x74;
+    pub const F11: u32 = 0x7A;
     pub const OEM_PLUS: u32 = 0xBB;
     pub const OEM_MINUS: u32 = 0xBD;
     /// `[` and `]` of a US keyboard.
@@ -168,6 +171,8 @@ pub enum Event {
     PageBox(String),
     /// The answer to [`Action::AskForm`]: what was filled in, or none if it was cancelled.
     Form { tag: u32, answer: Option<FormAnswer> },
+    /// Windows is set to dark apps (`true`) or to light ones, as it was at the start or has become (the person changed it).
+    SystemDark(bool),
 }
 
 /// One thing in a form box ([`Action::AskForm`]): what it is, what it says, and where it is in the box (`x, y, w, h` in units of a 96th of
@@ -336,6 +341,8 @@ pub enum Cursor {
     Move,
     SizeNWSE,
     SizeNESW,
+    /// No pointer at all (the presentation hides it when it has been still for a while).
+    Hidden,
 }
 
 /// What the reader asks the window to do (after it has finished with an event).
@@ -397,6 +404,29 @@ pub enum Action {
     ToolbarState(ToolbarState),
     /// The words of the status bar.
     Status(StatusText),
+    /// How the window looks (View > Interface): the parts that are Windows' own take the colours.
+    Theme(ThemeSpec),
+    /// Make the window full screen, on the monitor it is on, with no frame, menu, toolbar or status bar; or give it back its place exactly as it was.
+    FullScreen(bool),
+    /// Hide the pointer until it moves.
+    HideCursor,
+}
+
+/// The colours Windows' own parts of the window (the title bar, the toolbar, the status bar, the boxes typed in, the tree of bookmarks) are given when the
+/// window is dark; when it is light they keep the system's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThemeSpec {
+    pub dark: bool,
+    /// The face of the toolbar and the status bar, the words on it, the words of what is greyed, a button under the pointer, a button pressed.
+    pub face: Rgb,
+    pub text: Rgb,
+    pub dim: Rgb,
+    pub hot: Rgb,
+    pub down: Rgb,
+    /// The boxes the person types in, and the tree of bookmarks with the lines in it.
+    pub field_bg: Rgb,
+    pub tree_bg: Rgb,
+    pub tree_line: Rgb,
 }
 
 /// One thing in the toolbar, in order.

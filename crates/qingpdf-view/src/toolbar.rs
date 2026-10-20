@@ -153,8 +153,9 @@ pub fn spec(lang: Lang, visible: bool) -> ToolbarSpec {
 #[derive(Clone, Copy, Debug)]
 pub struct Inputs {
     pub has_doc: bool,
-    /// The page in view (from 0) and the number of pages.
+    /// The page in view (from 0), the last page of its row (the same, or the second page of a spread) and the number of pages.
     pub page: usize,
+    pub last: usize,
     pub pages: usize,
     /// Annotations may be added.
     pub can_edit: bool,
@@ -177,7 +178,7 @@ pub fn state(i: &Inputs) -> ToolbarState {
                     Rule::Always => true,
                     Rule::Doc => i.has_doc,
                     Rule::Prev => i.has_doc && i.page > 0,
-                    Rule::Next => i.has_doc && i.page + 1 < i.pages,
+                    Rule::Next => i.has_doc && i.last + 1 < i.pages,
                     Rule::Edit => i.has_doc && i.can_edit,
                 };
                 Some((d.cmd, enabled, d.toggle && i.tool == d.cmd))
@@ -259,7 +260,7 @@ mod tests {
     }
 
     fn inputs() -> Inputs {
-        Inputs { has_doc: true, page: 2, pages: 120, can_edit: true, tool: CMD_TOOL_SELECT }
+        Inputs { has_doc: true, page: 2, last: 2, pages: 120, can_edit: true, tool: CMD_TOOL_SELECT }
     }
 
     fn of(st: &ToolbarState, cmd: u32) -> (bool, bool) {
@@ -268,7 +269,7 @@ mod tests {
 
     #[test]
     fn without_a_file_only_open_works() {
-        let st = state(&Inputs { has_doc: false, page: 0, pages: 0, can_edit: false, tool: CMD_TOOL_SELECT });
+        let st = state(&Inputs { has_doc: false, page: 0, last: 0, pages: 0, can_edit: false, tool: CMD_TOOL_SELECT });
         assert_eq!(of(&st, CMD_OPEN), (true, false));
         for cmd in commands().into_iter().filter(|&c| c != CMD_OPEN) {
             assert_eq!(of(&st, cmd), (false, false), "{cmd}");
@@ -285,7 +286,7 @@ mod tests {
         assert!(of(&st, CMD_PREV_PAGE).0 && of(&st, CMD_NEXT_PAGE).0);
         let first = state(&Inputs { page: 0, ..inputs() });
         assert!(!of(&first, CMD_PREV_PAGE).0 && of(&first, CMD_NEXT_PAGE).0);
-        let last = state(&Inputs { page: 119, ..inputs() });
+        let last = state(&Inputs { page: 119, last: 119, ..inputs() });
         assert!(of(&last, CMD_PREV_PAGE).0 && !of(&last, CMD_NEXT_PAGE).0);
         let one = state(&Inputs { page: 0, pages: 1, ..inputs() });
         assert!(!of(&one, CMD_PREV_PAGE).0 && !of(&one, CMD_NEXT_PAGE).0);

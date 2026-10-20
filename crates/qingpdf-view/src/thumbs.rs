@@ -400,6 +400,13 @@ impl Thumbs {
         self.cache = ThumbCache::new(cap);
     }
 
+    /// Let go of the pictures (they were made in other colours): they are asked for again.
+    pub fn forget_pictures(&mut self) {
+        self.cache.clear();
+        self.failed.clear();
+        self.retried.clear();
+    }
+
     /// Make the rows again if what they depend on has changed (`build` makes them). The place in the list stays on the same row.
     /// `true`: they were made again, so the requests out are for rows that are gone.
     pub fn ensure(&mut self, now: Built, build: impl FnOnce() -> Strip) -> bool {

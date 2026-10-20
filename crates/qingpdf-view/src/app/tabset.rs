@@ -19,7 +19,7 @@ const PARKED_PICTURES: u64 = 40_000_000;
 impl App {
     /// The height of the strip of tabs, in pixels (0: it is not there, with fewer than two files open).
     pub(super) fn bar_h(&self) -> i64 {
-        if self.tabs.len() >= 2 { self.px(crate::tabs::BAR_H) } else { 0 }
+        if self.tabs.len() >= 2 && !self.full { self.px(crate::tabs::BAR_H) } else { 0 }
     }
 
     /// The most pixels the pages can be shown in (for the engine's plan).
@@ -38,6 +38,8 @@ impl App {
     fn exchange(&mut self, mut incoming: TabState) -> TabState {
         let random = self.pt.random;
         self.swap_tab(&mut incoming);
+        // (The pictures it brings were made in the colours of the time.)
+        self.recheck_tint();
         self.pt.random = random;
         self.edit.take_prefs(&mut incoming.edit);
         incoming
@@ -91,7 +93,9 @@ impl App {
     /// state is put away in its place in the strip.
     fn leave_tab(&mut self) -> Vec<Action> {
         let Some(a) = self.tabs.active() else { return Vec::new() };
-        let actions = self.release();
+        // (A presentation is the shown tab's: it ends before the tab goes, or its zoom and layout would be put away with the tab.)
+        let mut actions = self.end_present(true);
+        actions.extend(self.release());
         // (What the engine answers about this tab from now on is not waited for.)
         self.activating = false;
         // The sharp pieces of the pages in view stay (see `trim_pictures`), so that showing the tab again is not drawing it again.
@@ -482,8 +486,11 @@ impl App {
     /// The person asked to close the window (the close button, Alt+F4, File > Exit): the tabs whose changes were given up in an earlier
     /// round of questions that was not carried through are asked about again.
     pub(super) fn quit_asked(&mut self) -> Vec<Action> {
+        // A presentation ends first: the window is closed from the window, not from the screen, and another tab may be shown for a question.
+        let mut actions = self.end_present(true);
         self.discarded.clear();
-        self.quit()
+        actions.extend(self.quit());
+        actions
     }
 
     /// Close the window ("what next" of a question about changes): the tabs with changes are asked about one after the other. The changes
@@ -520,10 +527,13 @@ impl App {
     pub(super) fn current_place(&self) -> Option<Place> {
         let doc = self.doc.as_ref()?;
         let path = self.path.as_deref()?;
-        let (page, fraction) = doc.layout.locate(self.scroll_y);
+        // (In a presentation the view is in the middle of the page shown, above its top when it is not as high as the screen: the page is the one in the middle.)
+        let (page, fraction) = if self.present.is_some() { (self.current_page(), 0.0) } else { doc.layout.locate(self.scroll_y) };
         let width = doc.layout.content_width().max(1);
         let permille = |v: f64| (v * f64::from(FULL)).round().clamp(0.0, f64::from(FULL)) as u32;
-        let mode = match self.mode {
+        // (In the presentation it is the zoom from before it that is kept.)
+        let (zoom_mode, zoom) = self.present.as_ref().map_or((self.mode, self.zoom), |p| (p.saved.mode, p.saved.zoom));
+        let mode = match zoom_mode {
             ZoomMode::FitWidth => MODE_FIT_WIDTH,
             ZoomMode::FitPage => MODE_FIT_PAGE,
             ZoomMode::Custom => MODE_CUSTOM,
@@ -533,10 +543,11 @@ impl App {
             stamp: self.stamp?,
             page: u32::try_from(page).unwrap_or(0),
             mode,
-            zoom: self.zoom,
+            zoom,
             across: permille(self.scroll_x as f64 / width as f64),
             down: permille(fraction),
             rotation: self.rotation,
+            layout: Some(self.spread),
         })
     }
 
@@ -551,6 +562,9 @@ impl App {
             place.rotation % 360,
         );
         self.rotation = rotation;
+        if let Some(spread) = place.layout {
+            self.spread = spread;
+        }
         self.relayout(0, 0, Some((mode, place.zoom)));
         let Some(doc) = self.doc.as_ref() else { return };
         let page = (place.page as usize).min(doc.layout.len().saturating_sub(1));
@@ -1308,5 +1322,47 @@ mod tests {
         assert!(told.iter().any(|x| matches!(x, Action::Message { text, .. } if text.contains("qingpdf-no-such-pipe.pdf"))), "{told:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
 
+    #[test]
+    fn a_presentation_ends_before_the_window_is_closed_or_another_tab_is_shown_and_the_tab_it_was_in_is_as_it_was() {
+        let dir = folder("present-leave");
+        let (a, b) = (file(&dir, "a.pdf", 4), file(&dir, "b.pdf", 4));
+        let mut app = app();
+        open(&mut app, &a);
+        app.edit.dirty = true;
+        app.event(Event::Wake);
+        open(&mut app, &b);
+        // A zoom of the person's own (the fit ones are worked out again whenever the window has a size).
+        app.event(Event::Command(CMD_ZOOM_IN));
+        let (mode, zoom) = (app.mode, app.zoom);
+        assert_eq!(mode, ZoomMode::Custom);
+        // The presentation of b; the window is to be closed: a has changes, so a is shown and asked about.
+        app.event(Event::Key { vk: vk::F5, ctrl: false, shift: false });
+        app.event(Event::Size { w: 1920, h: 1080 });
+        assert!(app.present.is_some() && app.full);
+        let asked = app.event(Event::CloseRequested);
+        assert!(app.present.is_none() && !app.full && asked.iter().any(|x| matches!(x, Action::FullScreen(false))), "the presentation is over");
+        assert!(asked_to_save(&asked) && app.title().contains("a.pdf"));
+        // The person cancels: the window stays. Tab b, which was presenting, was put away as it was before: its zoom is the one it had.
+        let stay = app.event(Event::SaveChoice { tag: TAG_UNSAVED, choice: SaveChoice::Cancel });
+        assert!(!stay.iter().any(|x| matches!(x, Action::Quit)));
+        app.event(Event::Size { w: 900, h: 700 });
+        ready(&mut app);
+        let parked = app.tabs.get(1).and_then(|t| t.kept.as_ref()).expect("tab b is parked");
+        assert_eq!((parked.mode, parked.zoom), (mode, zoom));
+        let shown = key(&mut app, vk::TAB, false);
+        assert!(app.title().contains("b.pdf"), "{}: {shown:?}", app.title());
+        assert_eq!((app.mode, app.zoom), (mode, zoom));
+        // Another tab shown during a presentation ends it as well.
+        app.event(Event::Key { vk: vk::F5, ctrl: false, shift: false });
+        app.event(Event::Size { w: 1920, h: 1080 });
+        assert!(app.present.is_some());
+        let switched = app.event(Event::Command(CMD_NEXT_TAB));
+        assert!(app.present.is_none() && !app.full && switched.iter().any(|x| matches!(x, Action::FullScreen(false))));
+        app.event(Event::Size { w: 900, h: 700 });
+        ready(&mut app);
+        assert!(app.title().contains("a.pdf"));
+        assert_eq!(app.tabs.get(1).and_then(|t| t.kept.as_ref()).map(|k| (k.mode, k.zoom)), Some((mode, zoom)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

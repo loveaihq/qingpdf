@@ -39,6 +39,9 @@ impl App {
 
     /// Move so that a place of a page (`y` points down it, as the page is shown) is near the top of the window.
     pub(super) fn go_to_target(&mut self, page: u32, y: Option<f32>) -> Vec<Action> {
+        if self.present.is_some() {
+            return self.present_goto(page as usize);
+        }
         let Some(doc) = &self.doc else { return Vec::new() };
         let page = (page as usize).min(doc.layout.len().saturating_sub(1));
         let offset = match (y, doc.layout.page_map(page)) {
@@ -110,7 +113,7 @@ impl App {
         }
         let l = &doc.layout;
         let dy = y + self.scroll_y;
-        let page = l.page_at(dy);
+        let page = l.page_under(vx, dy, self.view_w, self.scroll_x);
         let (pw, ph) = l.size_px(page);
         let (px, py) = (vx - l.left(page, self.view_w, self.scroll_x), dy - l.top(page));
         (px >= 0 && py >= 0 && px < pw && py < ph).then_some((page, px as f64, py as f64))

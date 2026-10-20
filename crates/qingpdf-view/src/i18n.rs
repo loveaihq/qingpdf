@@ -275,6 +275,19 @@ pub enum Msg {
     LangSystem,
     LangChinese,
     LangEnglish,
+    LayoutMenu,
+    LayoutSingle,
+    LayoutSpread,
+    LayoutCover,
+    FullScreen,
+    Present,
+    ThemeMenu,
+    ThemeLight,
+    ThemeDark,
+    PageColorMenu,
+    PcOriginal,
+    PcNight,
+    PcSepia,
     CtxHighlight,
     CtxNote,
     CtxSelectAll,
@@ -362,7 +375,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 305] = [
+pub const ALL: [Msg; 318] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -585,6 +598,19 @@ pub const ALL: [Msg; 305] = [
     Msg::LangSystem,
     Msg::LangChinese,
     Msg::LangEnglish,
+    Msg::LayoutMenu,
+    Msg::LayoutSingle,
+    Msg::LayoutSpread,
+    Msg::LayoutCover,
+    Msg::FullScreen,
+    Msg::Present,
+    Msg::ThemeMenu,
+    Msg::ThemeLight,
+    Msg::ThemeDark,
+    Msg::PageColorMenu,
+    Msg::PcOriginal,
+    Msg::PcNight,
+    Msg::PcSepia,
     Msg::CtxHighlight,
     Msg::CtxNote,
     Msg::CtxSelectAll,
@@ -894,6 +920,19 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::LangSystem => ("Follow &system", "跟随系统(&S)"),
         Msg::LangChinese => ("中文", "中文"),
         Msg::LangEnglish => ("English", "English"),
+        Msg::LayoutMenu => ("Page la&yout", "页面布局(&Y)"),
+        Msg::LayoutSingle => ("&Single page, continuous", "单页连续(&S)"),
+        Msg::LayoutSpread => ("&Two pages", "双页(&T)"),
+        Msg::LayoutCover => ("Two pages, &cover alone", "双页（封面单独）(&C)"),
+        Msg::FullScreen => ("&Full screen\tF11", "全屏(&F)\tF11"),
+        Msg::Present => ("Pr&esentation\tF5", "放映(&E)\tF5"),
+        Msg::ThemeMenu => ("Appeara&nce", "界面(&N)"),
+        Msg::ThemeLight => ("&Light", "浅色(&L)"),
+        Msg::ThemeDark => ("&Dark", "深色(&D)"),
+        Msg::PageColorMenu => ("Page &colours", "页面颜色(&C)"),
+        Msg::PcOriginal => ("&Original", "原色(&O)"),
+        Msg::PcNight => ("&Night", "夜间(&N)"),
+        Msg::PcSepia => ("E&ye-care (sepia)", "护眼(&E)"),
         Msg::CtxHighlight => ("&Highlight selection", "高亮所选文字(&H)"),
         Msg::CtxNote => ("Add &note here", "在此添加便签(&N)"),
         Msg::CtxSelectAll => ("Select &all on this page", "选择本页全部文字(&A)"),
@@ -984,11 +1023,12 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
     }
 }
 
-/// "Page 3 / 468" or "第 3 / 468 页".
-pub fn page_of(lang: Lang, page: usize, total: usize) -> String {
+/// "Page 3 / 468" or "第 3 / 468 页"; the two pages of a spread: "Page 2-3 / 468" or "第 2-3 / 468 页".
+pub fn page_of(lang: Lang, page: usize, last: usize, total: usize) -> String {
+    let pages = if last > page { format!("{page}-{last}") } else { page.to_string() };
     match lang {
-        Lang::En => format!("{} {page} / {total}", t(lang, Msg::PageWord)),
-        Lang::Zh => format!("{} {page} / {total} 页", t(lang, Msg::PageWord)),
+        Lang::En => format!("{} {pages} / {total}", t(lang, Msg::PageWord)),
+        Lang::Zh => format!("{} {pages} / {total} 页", t(lang, Msg::PageWord)),
     }
 }
 
@@ -1048,7 +1088,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 305);
+        assert_eq!(ALL.len(), 318);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");
@@ -1090,8 +1130,10 @@ mod tests {
 
     #[test]
     fn numbers_in_sentences_read_naturally() {
-        assert_eq!(page_of(Lang::En, 3, 468), "Page 3 / 468");
-        assert_eq!(page_of(Lang::Zh, 3, 468), "第 3 / 468 页");
+        assert_eq!(page_of(Lang::En, 3, 3, 468), "Page 3 / 468");
+        assert_eq!(page_of(Lang::Zh, 3, 3, 468), "第 3 / 468 页");
+        assert_eq!(page_of(Lang::En, 2, 3, 468), "Page 2-3 / 468");
+        assert_eq!(page_of(Lang::Zh, 2, 3, 468), "第 2-3 / 468 页");
         assert_eq!(copied(Lang::En, 1), "Copied 1 character");
         assert_eq!(copied(Lang::Zh, 12), "已复制 12 个字");
         assert_eq!(printing(Lang::Zh, 2, 3), "正在打印第 2 / 3 页（按 Esc 取消）");

@@ -434,6 +434,7 @@ impl App {
             let (page, fraction) = doc.layout.locate(self.scroll_y + ay);
             let scale = doc.layout.scale();
             let mut layout = Layout::new(infos.iter().map(|p| (p.width, p.height)).collect());
+            layout.arrange(doc.layout.arrangement());
             layout.set(scale, rotation, gap, margin);
             self.scroll_y = layout.y_of(page.min(count.saturating_sub(1)), fraction) - ay;
             doc.layout = layout;
@@ -564,12 +565,12 @@ mod tests {
         let in_view = app.thumbs.strip.rows_in(app.thumbs.scroll, app.thumbs.scroll + list_h).len();
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == super::super::sidebar::SELECTED_BG).count(), in_view);
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), in_view);
         // Nothing chosen: the page in view has the mark, as it always had.
         app.pg.chosen.clear();
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == super::super::sidebar::SELECTED_BG).count(), 1);
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), 1);
         // One page chosen follows the page in view when the pages are moved some other way.
         click_row(&mut app, 1, false, false);
         app.event(Event::Wheel { delta: -120, ctrl: false, shift: false, x: 600, y: 300 });

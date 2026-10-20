@@ -33,6 +33,7 @@ pub mod jpx;
 mod mq;
 mod oc;
 mod pngout;
+pub mod recolor;
 pub mod outline;
 mod shading;
 pub mod sysfont;

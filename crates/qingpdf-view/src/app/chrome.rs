@@ -37,7 +37,7 @@ impl PendingSelect {
 impl App {
     /// The toolbar is on the window (the speed test has none: its page area is the size it was asked for).
     pub(super) fn toolbar_visible(&self) -> bool {
-        self.toolbar_on && self.bench.is_none()
+        self.toolbar_on && self.bench.is_none() && !self.full
     }
 
     /// Take what was kept between runs: the language, whether the toolbar is shown, the width of the bookmarks.
@@ -46,6 +46,11 @@ impl App {
         self.lang = s.lang.resolve(self.system_lang);
         self.toolbar_on = s.toolbar;
         self.remember_place = s.remember_place;
+        self.theme_choice = s.theme;
+        self.apply_theme();
+        self.tint = s.page_color;
+        self.cache_tint = s.page_color;
+        self.default_spread = s.layout;
         if let Some(w) = s.sidebar {
             self.sidebar_pref = i64::from(w);
         }
@@ -68,12 +73,17 @@ impl App {
     /// What the window is to be told about its toolbar and status bar after an event: only what has changed since it was last told.
     pub(super) fn chrome_updates(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
+        if std::mem::take(&mut self.theme_dirty) {
+            actions.push(Action::Theme(self.theme_spec()));
+            // (The toolbar's pictures are drawn in the colour of its ink: the window draws them again.)
+            self.last_toolbar = None;
+        }
         if std::mem::take(&mut self.toolbar_dirty) {
             actions.push(Action::Toolbar(toolbar::spec(self.lang, self.toolbar_visible())));
             // The buttons are made again, from nothing: they are told how they are.
             self.last_toolbar = None;
         }
-        let inputs = Inputs { has_doc: self.doc.is_some(), page: self.current_page(), pages: self.page_count(), can_edit: self.doc.is_some() && self.rights.annotate, tool: self.tool_command() };
+        let inputs = Inputs { has_doc: self.doc.is_some(), page: self.current_page(), last: self.last_of_row().saturating_sub(1), pages: self.page_count(), can_edit: self.doc.is_some() && self.rights.annotate, tool: self.tool_command() };
         let state = toolbar::state(&inputs);
         if self.last_toolbar.as_ref() != Some(&state) {
             self.last_toolbar = Some(state.clone());
@@ -88,12 +98,12 @@ impl App {
     }
 
     /// The status bar: the page, a note, the zoom.
-    fn status_text(&self) -> StatusText {
+    pub(super) fn status_text(&self) -> StatusText {
         if self.doc.is_none() {
             return StatusText::default();
         }
         StatusText {
-            page: i18n::page_of(self.lang, self.current_page() + 1, self.page_count()),
+            page: i18n::page_of(self.lang, self.current_page() + 1, self.last_of_row(), self.page_count()),
             note: self.note.clone().unwrap_or_default(),
             zoom: format!("{}%", (f64::from(self.zoom) / 10.0).round() as u32),
         }
@@ -132,8 +142,9 @@ impl App {
         if self.doc.is_none() {
             return Vec::new();
         }
+        // (A row at a time: in a spread the next row starts after the second page, and the page before the first is in the row before.)
         let here = self.current_page();
-        let to = if forward { here + 1 } else { here.saturating_sub(1) };
+        let to = if forward { self.last_of_row() } else { here.saturating_sub(1) };
         self.go_to_page(to.min(self.page_count().saturating_sub(1)))
     }
 

@@ -449,3 +449,41 @@ fn many_files_can_be_open_together_and_each_draws() {
     engine.activate(3, TOTAL_BYTES, 1920 * 1080);
     assert!(matches!(next_event(&engine), Event::Dropped { doc: 3 }));
 }
+
+/// A one-page document whose catalog is `catalog_extra` after the usual entries.
+fn pdf_with_catalog(catalog_extra: &str, more: impl Fn(&mut PdfBuilder)) -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"));
+    b.obj(2, "<< /Type /Pages /Kids [10 0 R] /Count 1 >>");
+    b.obj(10, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 11 0 R >>");
+    b.stream_obj(11, "", b"0 g 0 0 10 10 re f");
+    more(&mut b);
+    b.finish_classic(30, "/Root 1 0 R")
+}
+
+#[test]
+fn the_page_layout_and_the_direction_the_file_asks_for_are_told_with_the_pages() {
+    let asked = |extra: &str, more: &dyn Fn(&mut PdfBuilder)| {
+        let engine = Engine::start(Box::new(|| {}));
+        let o = open(&engine, pdf_with_catalog(extra, more));
+        (o.spread_hint, o.right_to_left)
+    };
+    let none: &dyn Fn(&mut PdfBuilder) = &|_| {};
+    assert_eq!(asked("", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout /SinglePage", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout /OneColumn", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout /TwoColumnLeft", none), (SPREAD_FIRST_LEFT, false));
+    assert_eq!(asked("/PageLayout /TwoPageLeft", none), (SPREAD_FIRST_LEFT, false));
+    assert_eq!(asked("/PageLayout /TwoColumnRight", none), (SPREAD_FIRST_RIGHT, false));
+    assert_eq!(asked("/PageLayout /TwoPageRight", none), (SPREAD_FIRST_RIGHT, false));
+    // The direction is in /ViewerPreferences, directly or through a reference.
+    assert_eq!(asked("/ViewerPreferences << /Direction /R2L >>", none), (SPREAD_NONE, true));
+    assert_eq!(asked("/ViewerPreferences << /Direction /L2R >>", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout /TwoColumnRight /ViewerPreferences 20 0 R", &|b| {
+        b.obj(20, "<< /Direction /R2L >>");
+    }), (SPREAD_FIRST_RIGHT, true));
+    // A name the engine does not know, and entries of the wrong type, ask for nothing.
+    assert_eq!(asked("/PageLayout /ThreeColumns /ViewerPreferences << /Direction /Sideways >>", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout 7 /ViewerPreferences [ /Direction /R2L ]", none), (SPREAD_NONE, false));
+    assert_eq!(asked("/PageLayout (TwoColumnLeft) /ViewerPreferences 99 0 R", none), (SPREAD_NONE, false));
+}

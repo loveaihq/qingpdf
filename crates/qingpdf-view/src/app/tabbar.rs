@@ -6,15 +6,6 @@ use super::*;
 use crate::tabs::{self, CLOSE_EDGE, CLOSE_SIDE, Hit, MAX_TAB_W, MIN_TAB_W, WIDE_TAB};
 use crate::ui::Rgb;
 
-const BAR_BG: u32 = 0xD4D4D4;
-const TAB_OFF: u32 = 0xE2E2E2;
-const TAB_ON: u32 = 0xF8F8F8;
-const TAB_LINE: u32 = 0x2B7CFF;
-const TAB_EDGE: u32 = 0xA8A8A8;
-const TAB_FG: u32 = 0x303030;
-const DIRTY_FG: u32 = 0xD0560B;
-const TIP_BG: u32 = 0xFFFFE1;
-const TIP_FG: u32 = 0x202020;
 /// Space left and right of a name, and the room a dot before it takes, at 96 dpi.
 const PAD: i64 = 8;
 const DOT: i64 = 12;
@@ -116,31 +107,31 @@ impl App {
             return;
         }
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
-        p.fill_rect(rect(0, 0, self.client_w, bar), BAR_BG);
+        p.fill_rect(rect(0, 0, self.client_w, bar), self.pal.strip_bg);
         let w = self.tab_w();
         let line = self.px(1).max(1);
         let ty = clamp32((bar - i64::from(p.line_height())) / 2);
         for (i, tab) in self.tabs.iter().enumerate() {
             let x = i as i64 * w;
             let shown = self.tabs.active() == Some(i);
-            p.fill_rect(rect(x, 0, w - line, bar), if shown { TAB_ON } else { TAB_OFF });
+            p.fill_rect(rect(x, 0, w - line, bar), if shown { self.pal.tab_on } else { self.pal.tab_off });
             if shown {
-                p.fill_rect(rect(x, 0, w - line, self.px(2)), TAB_LINE);
+                p.fill_rect(rect(x, 0, w - line, self.px(2)), self.pal.accent);
             } else {
-                p.fill_rect(rect(x, bar - line, w, line), TAB_EDGE);
+                p.fill_rect(rect(x, bar - line, w, line), self.pal.tab_edge);
             }
             let close = self.shows_close(i, w);
             let mut left = x + self.px(PAD);
             let mut room = w - 2 * self.px(PAD) - if close { self.px(CLOSE_SIDE) } else { 0 };
             if tab.dirty {
-                p.text(clamp32(left), ty, "\u{25CF}", DIRTY_FG);
+                p.text(clamp32(left), ty, "\u{25CF}", self.pal.dirty_fg);
                 (left, room) = (left + self.px(DOT), room - self.px(DOT));
             }
             let name = tabs::shorten_to(&tabs::label(&tab.path), |s| i64::from(p.text_width(s)) <= room);
-            p.text(clamp32(left), ty, &name, TAB_FG);
+            p.text(clamp32(left), ty, &name, self.pal.tab_fg);
             if close {
                 let cross = p.text_width("\u{00D7}");
-                p.text(clamp32(x + w - self.px(CLOSE_EDGE) - (self.px(CLOSE_SIDE) + i64::from(cross)) / 2), ty, "\u{00D7}", TAB_FG);
+                p.text(clamp32(x + w - self.px(CLOSE_EDGE) - (self.px(CLOSE_SIDE) + i64::from(cross)) / 2), ty, "\u{00D7}", self.pal.tab_fg);
             }
         }
         // The full path of the tab under the pointer, just under the strip.
@@ -150,8 +141,8 @@ impl App {
             let text = tab.path.to_string_lossy();
             let (tw, th) = (i64::from(p.text_width(&text)), i64::from(p.line_height()));
             let (bw, bx) = (tw + 2 * self.px(6), (i as i64 * w).min((self.client_w - tw - 2 * self.px(6)).max(0)));
-            p.fill_rect(rect(bx, bar + self.px(2), bw, th + 2 * self.px(3)), TIP_BG);
-            p.text(clamp32(bx + self.px(6)), clamp32(bar + self.px(5)), &text, TIP_FG);
+            p.fill_rect(rect(bx, bar + self.px(2), bw, th + 2 * self.px(3)), self.pal.tip_bg);
+            p.text(clamp32(bx + self.px(6)), clamp32(bar + self.px(5)), &text, self.pal.tip_fg);
         }
     }
 }

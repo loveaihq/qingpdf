@@ -225,7 +225,18 @@ pub struct Opened {
     pub max_tile_pixels: u32,
     pub rights: Rights,
     pub protection: Protected,
+    /// How the file asks to have its pages laid out (`/PageLayout`): [`SPREAD_NONE`] for one column, one page after the other (also
+    /// when it says nothing), [`SPREAD_FIRST_LEFT`] for two columns with the first page on the left (`TwoColumnLeft`, `TwoPageLeft`),
+    /// [`SPREAD_FIRST_RIGHT`] for two columns with the first page alone on the right (`TwoColumnRight`, `TwoPageRight`).
+    pub spread_hint: u8,
+    /// The file says the pages read from right to left (`/ViewerPreferences` `/Direction` `/R2L`): in two columns the first page of a pair
+    /// goes on the right.
+    pub right_to_left: bool,
 }
+
+pub const SPREAD_NONE: u8 = 0;
+pub const SPREAD_FIRST_LEFT: u8 = 1;
+pub const SPREAD_FIRST_RIGHT: u8 = 2;
 
 /// Whether text could be had.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1099,6 +1110,27 @@ fn protection_of(document: &Document, password: &str) -> Protected {
         may_change: has_owner_rights(document, &encryption, password) || encryption.permissions.allows_everything(),
         signed: crate::edit::signature::look(document).any(),
     }
+}
+
+/// What the file asks for in laying out its pages: `(spread_hint, right_to_left)` of [`Opened`] (spec 12.2, Table 28 `/PageLayout`, Table 150
+/// `/ViewerPreferences` `/Direction`). A name that is not one of the known ones, or an entry of another type, asks for nothing.
+fn layout_hint_of(document: &Document) -> (u8, bool) {
+    use crate::object::{Dict, Object};
+    let Ok(catalog) = document.catalog() else { return (SPREAD_NONE, false) };
+    let name = |d: &Dict, key: &str| match d.get(key).and_then(|o| document.resolve(o).ok()) {
+        Some(Object::Name(n)) => n.as_bytes().to_vec(),
+        _ => Vec::new(),
+    };
+    let spread = match name(&catalog, "PageLayout").as_slice() {
+        b"TwoColumnLeft" | b"TwoPageLeft" => SPREAD_FIRST_LEFT,
+        b"TwoColumnRight" | b"TwoPageRight" => SPREAD_FIRST_RIGHT,
+        _ => SPREAD_NONE,
+    };
+    let right_to_left = match catalog.get("ViewerPreferences").and_then(|o| document.resolve(o).ok()) {
+        Some(Object::Dict(prefs)) => name(&prefs, "Direction") == b"R2L",
+        _ => false,
+    };
+    (spread, right_to_left)
 }
 
 /// What the file allows, for whoever opened it with `password` (see [`Rights`]).

@@ -5,7 +5,8 @@
 //! Run `qingpdf-view [file.pdf ...]`: each file opens in a tab; if a copy of the program is running already, the files go to its window (and this
 //! program ends), unless the settings say `single_window=0`. The hidden `--bench <file.pdf>` opens the file, goes through its pages by itself,
 //! prints times and the memory peak and quits; `--bench-size WxH` gives the window of that test a client area of that
-//! many pixels (it may be bigger than the screen); `--bench-thumbs` opens the sidebar on the thumbnails in it. The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
+//! many pixels (it may be bigger than the screen); `--bench-thumbs` opens the sidebar on the thumbnails in it; `--bench-spread` lays the pages out two to a row (a turn is a row),
+//! `--bench-color night|sepia` shows the pages in those colours and `--bench-present` goes through the pages in the presentation. The hidden `--print-test <file.pdf> <out.pdf> [first-last]` prints those pages
 //! (the first three by default) to the printer "Microsoft Print to PDF", which writes `out.pdf`, with no box, says how it went
 //! and the memory peak, and quits. The hidden `--ocr-test <in.pdf> <out.pdf> [--ocr-pages first-last] [--ocr-lang zh|en]` recognises the text of
 //! the scanned pages with the same chain the window uses, saves the file with the text layer, prints how long each page took and quits.
@@ -18,6 +19,8 @@ use std::time::Instant;
 
 use qingpdf_view::app::{App, PrintTest};
 use qingpdf_view::bench::Bench;
+use qingpdf_view::layout::Spread;
+use qingpdf_view::theme::{self, Tint};
 use qingpdf_view::copydata;
 use qingpdf_view::i18n::{Lang, Msg, t};
 use qingpdf_view::{settings, win32};
@@ -60,6 +63,8 @@ fn main() {
     let mut bench_size: Option<(i32, i32)> = None;
     // The speed test with the sidebar open on the thumbnails.
     let mut bench_thumbs = false;
+    // The speed test with two pages to a row, in other colours, or in the presentation.
+    let (mut bench_spread, mut bench_color, mut bench_present) = (false, Tint::Original, false);
     let mut open: Vec<std::ffi::OsString> = Vec::new();
     // The hidden print test: the file, the file to write, the pages.
     let mut print_test: Option<(PathBuf, PathBuf, (u32, u32))> = None;
@@ -71,6 +76,12 @@ fn main() {
             bench_file = args.next().map(PathBuf::from);
         } else if arg == "--bench-thumbs" {
             bench_thumbs = true;
+        } else if arg == "--bench-spread" {
+            bench_spread = true;
+        } else if arg == "--bench-present" {
+            bench_present = true;
+        } else if arg == "--bench-color" {
+            bench_color = args.next().and_then(|s| theme::parse_tint(&s.to_string_lossy())).unwrap_or(Tint::Original);
         } else if arg == "--bench-size" {
             bench_size = args.next().and_then(|s| parse_size(&s.to_string_lossy()));
         } else if arg == "--print-test" {
@@ -131,6 +142,7 @@ fn main() {
         let author = kept.author.clone().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
         let mut app = App::new(system_lang, wake, started, max_view_pixels, author);
         app.apply_settings(&kept);
+        app.set_system_dark(win32::system_uses_dark());
         app.set_clock(win32::local_date);
         app.set_random(win32::random_bytes);
         if let Some(file) = bench_file {
@@ -138,6 +150,7 @@ fn main() {
             if bench_thumbs {
                 app.bench_thumbs();
             }
+            app.bench_looks(if bench_spread { Spread::Pair } else { Spread::Single }, bench_color, bench_present);
             app.open_when_ready(file);
         } else if let Some((file, output, (first, last))) = print_test {
             app.set_print_test(PrintTest { output, first, last });
