@@ -17,6 +17,7 @@ pub(crate) mod fontsub;
 pub(crate) mod incremental;
 pub(crate) mod modify;
 mod ocr;
+pub(crate) mod outline;
 mod pagenum;
 mod pages;
 mod retext;
@@ -33,6 +34,7 @@ use crate::error::{Error, Result};
 use crate::object::{Dict, MAX_OBJECT_NUMBER, Name, ObjRef, Object, PdfString, Stream};
 use crate::render::work::Work;
 use crate::text::Shown;
+use crate::view::OutlineItem;
 
 use crate::layout::reals;
 use appearance::{Appearance, Quad};
@@ -44,8 +46,11 @@ pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES
 pub use pagenum::{MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, Pagination, SLOTS};
 pub use modify::keep_on_page;
 pub use shapes::ShapeKind;
+pub use outline::{check_outline_allowed, set_outline};
 pub use boxes::{MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MIN_FONT_SIZE};
 pub use crate::forms::{FieldInfo, FieldKind, FillValue, MAX_OPTION_BYTES, MAX_VALUE_CHARS};
+/// The page of an edit that is to no page (the bookmarks): nothing that is drawn changes.
+pub const NO_PAGE: u32 = u32::MAX - 1;
 /// Most points one drawing has (all its strokes together); a longer one is thinned out, its ends kept.
 pub const MAX_INK_POINTS: usize = 8_192;
 /// Most strokes in one drawing.
@@ -135,6 +140,8 @@ pub enum Edit {
     OcrLayer(Vec<OcrPage>),
     /// Pages turned, taken out, moved, or put in from another file (the pages, not what is on them).
     Pages(Box<PageOp>),
+    /// The bookmarks as they are to be (2026-10-20): the whole list, each item with the object it was read from (or 0 for a new one).
+    Outline(Vec<OutlineItem>),
 }
 
 /// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
@@ -169,6 +176,7 @@ impl Edit {
             | Edit::AddImage { page, .. }
             | Edit::ReplaceLine { page, .. } => *page,
             Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) => ALL_PAGES,
+            Edit::Outline(_) => NO_PAGE,
         }
     }
 
@@ -176,7 +184,7 @@ impl Edit {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
             Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::ReplaceLine { .. } | Edit::OcrLayer(_) => EditClass::Content,
-            Edit::Pages(_) => EditClass::Assemble,
+            Edit::Pages(_) | Edit::Outline(_) => EditClass::Assemble,
             _ => EditClass::Annotate,
         }
     }
@@ -369,9 +377,13 @@ pub(crate) type Applied = (Vec<(u32, Object)>, Vec<String>);
 /// [`apply_noted`] for every kind of edit, those that turn, take out, move and put in pages too. (They are kept apart so that the command line,
 /// which makes the other edits through `apply_noted`, does not carry the code of the pages.)
 pub(crate) fn apply_any(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Applied> {
-    if let Edit::Pages(op) = edit {
+    if let Edit::Pages(_) | Edit::Outline(_) = edit {
         let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
-        pages::apply(&mut ctx, pages, op)?;
+        match edit {
+            Edit::Pages(op) => pages::apply(&mut ctx, pages, op)?,
+            Edit::Outline(items) => outline::apply(&mut ctx, pages, items)?,
+            _ => {}
+        }
         return Ok((ctx.objects, ctx.notes));
     }
     // Shapes and changes to the annotations that are there (2026-10-17) are the reader's alone, like the pages.
@@ -433,7 +445,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::Outline(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));

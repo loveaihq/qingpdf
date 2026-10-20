@@ -170,6 +170,20 @@ pub enum Msg {
     NoteNoteHint,
     NoteEditFailed,
     NoteBusy,
+    BmAdd,
+    BmRename,
+    BmDelete,
+    BmIndent,
+    BmOutdent,
+    BmHere,
+    BmAuto,
+    BmAutoAsk,
+    BmAutoReplace,
+    BmPageTitle,
+    NoteBmDenied,
+    NoteBmNo,
+    NoteBmNoHeadings,
+    NoteBmSearching,
     ToolTextBox,
     ToolStamp,
     TextSizeMenu,
@@ -375,7 +389,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 318] = [
+pub const ALL: [Msg; 332] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -493,6 +507,20 @@ pub const ALL: [Msg; 318] = [
     Msg::NoteNoteHint,
     Msg::NoteEditFailed,
     Msg::NoteBusy,
+    Msg::BmAdd,
+    Msg::BmRename,
+    Msg::BmDelete,
+    Msg::BmIndent,
+    Msg::BmOutdent,
+    Msg::BmHere,
+    Msg::BmAuto,
+    Msg::BmAutoAsk,
+    Msg::BmAutoReplace,
+    Msg::BmPageTitle,
+    Msg::NoteBmDenied,
+    Msg::NoteBmNo,
+    Msg::NoteBmNoHeadings,
+    Msg::NoteBmSearching,
     Msg::ToolTextBox,
     Msg::ToolStamp,
     Msg::TextSizeMenu,
@@ -815,6 +843,20 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteNoteHint => ("Click where the note goes (Esc ends).", "点一下放便签的位置（按 Esc 结束）。"),
         Msg::NoteEditFailed => ("The change was not made:", "没能改成："),
         Msg::NoteBusy => ("Wait for the printing to finish first.", "请先等打印结束。"),
+        Msg::BmAdd => ("Add &Bookmark\tCtrl+B", "添加书签(&B)\tCtrl+B"),
+        Msg::BmRename => ("&Rename\tF2", "重命名(&R)\tF2"),
+        Msg::BmDelete => ("&Delete\tDel", "删除(&D)\tDel"),
+        Msg::BmIndent => ("Make a &Child of the One Above\tTab", "降级(&I)\tTab"),
+        Msg::BmOutdent => ("Move &Up a Level\tShift+Tab", "升级(&U)\tShift+Tab"),
+        Msg::BmHere => ("&Set to the Current Position", "设为当前位置(&S)"),
+        Msg::BmAuto => ("Bookmarks from &Headings...", "自动生成书签(&H)..."),
+        Msg::BmAutoAsk => ("{n} headings were found (up to 3 levels). Make them the bookmarks?", "找到 {n} 个标题（最多 3 级），用它们生成书签吗？"),
+        Msg::BmAutoReplace => ("The {m} bookmarks the file has are replaced.", "文件原有的 {m} 个书签会被替换。"),
+        Msg::BmPageTitle => ("Page {n}", "第 {n} 页"),
+        Msg::NoteBmDenied => ("The file's author does not allow changing the bookmarks (the owner password is needed).", "文件作者不允许修改书签（需要所有者密码）。"),
+        Msg::NoteBmNo => ("That cannot be done: bookmarks go at most 32 levels deep and 20,000 in all, not into themselves, and a link keeps its place.", "做不了：书签最多 32 级、20000 个，不能放进自己里面，链接类书签不改位置。"),
+        Msg::NoteBmNoHeadings => ("No headings were found.", "没有找到标题。"),
+        Msg::NoteBmSearching => ("Looking for headings...", "正在查找标题…"),
         Msg::ToolTextBox => ("&Text box", "文字框(&T)"),
         Msg::ToolStamp => ("Signature &image...", "签名图片(&I)..."),
         Msg::TextSizeMenu => ("Text si&ze", "字号(&Z)"),
@@ -1088,7 +1130,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 318);
+        assert_eq!(ALL.len(), 332);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

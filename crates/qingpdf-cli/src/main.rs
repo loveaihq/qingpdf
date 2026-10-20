@@ -18,7 +18,7 @@ use qingpdf_core::security::{Method, PasswordKind, Permissions, Protection};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
 use qingpdf_core::{Document, Error, Warning, docx, render, text, xlsx};
 
-use args::{Parsed, PrintLevel, Protect, Request, UsageError};
+use args::{BookmarkAction, Parsed, PrintLevel, Protect, Request, UsageError};
 
 /// An error message for the user; the exit code is 1.
 type Failure = String;
@@ -173,6 +173,7 @@ fn run(request: Request) -> Result<(), Failure> {
         }
         Request::Docx { input, pages, output, force, password } => docx_command(&input, pages.as_deref(), &output, force, &password),
         Request::Xlsx { input, pages, output, force, password } => xlsx_command(&input, pages.as_deref(), &output, force, &password),
+        Request::Bookmarks { input, action, output, force, password } => bookmarks_command(&input, &action, output.as_deref(), force, &password),
         Request::Replace { input, find, with, pages, output, force, password } => replace_command(&input, &find, &with, pages.as_deref(), &output, force, &password),
         Request::Addtext { input, page, at, size, text, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
@@ -315,6 +316,67 @@ fn compress_command(input: &Path, output: &Path, force: bool, password: &str, pr
             say(&format!("wrote {}: no smaller than the input ({} bytes), so it is a copy of the input\n", output.display(), grouped(before)));
         }
     }
+    Ok(())
+}
+
+/// Write the bookmarks of the input as text, or make them what a text file or the headings say (the input with the change appended).
+fn bookmarks_command(input: &Path, action: &BookmarkAction, output: Option<&Path>, force: bool, password: &str) -> Result<(), Failure> {
+    use qingpdf_core::bookmarks;
+    let doc = open_unlocked(input, password)?;
+    let input_path = input.to_path_buf();
+    let inputs = std::slice::from_ref(&input_path);
+    let (old, cut) = qingpdf_core::view::read_bookmarks(&doc).map_err(|e| op_error(input, &e))?;
+    if cut {
+        let (most, deep) = (qingpdf_core::view::MAX_OUTLINE_ITEMS, qingpdf_core::view::MAX_OUTLINE_DEPTH);
+        let rest = if matches!(action, BookmarkAction::Export(_)) { "the rest are not in the text" } else { "all of them are replaced" };
+        eprintln!("warning: the file has more bookmarks than are read (at most {most}, {deep} levels deep): {rest}");
+    }
+    let items = match action {
+        BookmarkAction::Export(file) => {
+            check_output(file, inputs, force)?;
+            write_file(file, bookmarks::export_text(&old).as_bytes())?;
+            say(&format!("wrote {} ({} bookmark{})\n", file.display(), old.len(), plural(old.len())));
+            return Ok(());
+        }
+        BookmarkAction::Import(file) => {
+            let size = fs::metadata(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?.len();
+            if size > bookmarks::MAX_IMPORT_BYTES {
+                return Err(format!("{} is too big ({size} bytes; at most {})", file.display(), bookmarks::MAX_IMPORT_BYTES));
+            }
+            let bytes = fs::read(file).map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+            let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", file.display()))?;
+            let pages = doc.page_count().map_err(|e| op_error(input, &e))?;
+            let items = bookmarks::parse_text(&text, pages).map_err(|e| format!("{}: {e}", file.display()))?;
+            if items.is_empty() {
+                return Err(format!("{} has no bookmarks in it", file.display()));
+            }
+            items
+        }
+        BookmarkAction::Auto => {
+            let found = docx::headings(&doc, password, None, None).map_err(|e| op_error(input, &e))?;
+            let (items, left_out) = bookmarks::from_headings(&found);
+            if items.is_empty() {
+                return Err(format!("no headings were found in {}", input.display()));
+            }
+            if left_out {
+                eprintln!("warning: there are more headings than bookmarks may be ({}); the rest are left out", qingpdf_core::view::MAX_OUTLINE_ITEMS);
+            }
+            items
+        }
+    };
+    let output = output.ok_or("-o <output file> is required")?;
+    check_output(output, inputs, force)?;
+    let count = items.len();
+    let added = edit::set_outline(&doc, password, items).map_err(|e| op_error(input, &e))?;
+    write_file(output, &added.data)?;
+    for warning in &added.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if added.rewritten {
+        eprintln!("warning: {} had damaged structure data, so it was written afresh as a whole; its original bytes are not kept", input.display());
+    }
+    let replaced = if old.is_empty() { String::new() } else { format!(", replacing {}", old.len()) };
+    say(&format!("wrote {} ({count} bookmark{}{replaced})\n", output.display(), plural(count)));
     Ok(())
 }
 

@@ -144,6 +144,63 @@ pub fn export_to_path(doc: &Document, password: &str, pages: Option<&[usize]>, p
     crate::zip::write_file(path, |sink| export(doc, password, pages, sink, cancel))
 }
 
+/// The headings of the document, for the bookmarks (2026-10-20): the paragraphs that [`export`] makes headings of, in reading order, with their
+/// page, level (1 is the biggest) and the words. The pages are read as for [`export`], and no picture is made. `only` is the one page (from 0)
+/// to look at (the levels are then those of that page alone). `cancel` stops the work when it is set ([`Error::Cancelled`]); a page that is
+/// too much for a limit has no headings.
+pub fn headings(doc: &Document, password: &str, only: Option<usize>, cancel: Option<Arc<AtomicBool>>) -> Result<Vec<crate::bookmarks::Heading>> {
+    text::check_extraction_allowed(doc, password)?;
+    let pages = doc.pages()?;
+    let all = match only {
+        Some(p) => pages.get(p..=p).ok_or_else(|| Error::Invalid(format!("the file has no page {}", p + 1)))?,
+        None => &pages[..],
+    };
+    if all.len() > MAX_PAGES {
+        return Err(Error::Limit(format!("{} pages are more than the {MAX_PAGES} headings are looked for in", all.len())));
+    }
+    let mut extractor = TextExtractor::new(doc);
+    let job = Work::with_allowance(JOB_WORK);
+    let mut done = Vec::with_capacity(all.len());
+    let (mut chars, mut runs) = (0u64, 0usize);
+    for page in all {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Cancelled);
+        }
+        let work = Work::new().with_cancel(cancel.clone()).with_decoder_memory(48 << 20);
+        let _budget = doc.page_decode_budget();
+        let analysed = extractor.page_layout(page, &work).and_then(|layout| {
+            if !work.charge(flow::cost(&layout)) {
+                return Err(Error::Limit("the page asks for more work than one page is allowed".to_string()));
+            }
+            let chars: u64 = layout.lines.iter().map(|l| l.text.chars().count() as u64).sum();
+            let none: Vec<Option<Pic>> = layout.images.iter().map(|_| None).collect();
+            let out = flow::analyze(&layout, &none);
+            Ok((out, chars))
+        });
+        match analysed {
+            Ok((out, n)) => {
+                chars += n;
+                runs += out.run_count();
+                if chars > MAX_CHARS || runs > MAX_RUNS {
+                    return Err(Error::Limit("the text of the document is too much to look for headings in".to_string()));
+                }
+                done.push(out);
+            }
+            // (A page that is too much stays as a page with nothing on it, so that the others keep their numbers.)
+            Err(Error::Limit(_)) => done.push(flow::PageOut { w: 0.0, h: 0.0, vertical: false, blocks: Vec::new(), filled: 0.0, table_work: 0.0 }),
+            Err(e) => return Err(e),
+        }
+        if !job.charge(work.used()) {
+            return Err(Error::Limit("the pages ask for more work than looking for headings is allowed".to_string()));
+        }
+    }
+    let mut found = write::heading_list(&mut done);
+    if let Some(p) = only {
+        found.iter_mut().for_each(|h| h.page = u32::try_from(p).unwrap_or(u32::MAX));
+    }
+    Ok(found)
+}
+
 /// The pictures written so far.
 #[derive(Default)]
 struct Images {

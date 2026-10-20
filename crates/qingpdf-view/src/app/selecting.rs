@@ -70,6 +70,7 @@ impl App {
         }
         self.thumb_focus = false;
         self.annots_focus = false;
+        self.bm.focus = false;
         // A drawing, a shape, a note or an annotation picked takes the pointer for itself.
         if let Some(actions) = self.edit_mouse_down(x, y, clicks) {
             return actions;
@@ -295,6 +296,10 @@ impl App {
     }
 
     pub(super) fn on_copied(&mut self, id: u64, status: TextStatus, text: String, truncated: bool) -> Vec<Action> {
+        // The text of a selection that is wanted for the title of a bookmark.
+        if let Some(actions) = self.bm_copied(id, status, &text) {
+            return actions;
+        }
         if self.copy_asked != Some(id) {
             return Vec::new();
         }

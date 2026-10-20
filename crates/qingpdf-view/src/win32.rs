@@ -23,6 +23,9 @@ use crate::clicks::ClickCounter;
 use crate::copydata;
 use crate::placement::{self, Placement};
 use crate::toolbar::{self, IconFont};
+use qingpdf_core::bookmarks::Place;
+
+use crate::treedrop;
 use crate::ui::{Action, Bar, Cursor, Event, FieldBox, FieldExit, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, ScrollCode, ScrollInfo, StatusText, ThemeSpec, ToolItem, ToolbarSpec, ToolbarState};
 
 // --- declarations ------------------------------------------------------------------------------------------------
@@ -337,6 +340,33 @@ struct NmTreeView {
     pt: Point,
 }
 
+/// NMTVDISPINFOW: what the tree says when a title starts or stops being typed over.
+#[repr(C)]
+struct NmTvDispInfo {
+    hdr: NmHdr,
+    item: TvItem,
+}
+
+/// Where a drop of an item of the tree would go: the item it is in relation to (its place in the reader's list), where in relation to it,
+/// and the item of the tree the mark is put on.
+#[derive(Clone, Copy, PartialEq)]
+struct DropMark {
+    to: usize,
+    place: Place,
+    on: isize,
+}
+
+/// An item of the tree that is being dragged: its handle and its place in the reader's list, and where it would land.
+#[derive(Clone, Copy)]
+struct TreeDrag {
+    item: isize,
+    index: usize,
+    mark: Option<DropMark>,
+    /// Where the pointer was last, in the tree's client area (the drag is followed by the messages the window gets, not by asking where the
+    /// pointer is now).
+    at: Point,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PrintPageRange {
@@ -430,6 +460,7 @@ unsafe extern "system" {
     fn SystemParametersInfoW(action: u32, param: u32, data: *mut c_void, flags: u32) -> i32;
     fn GetFocus() -> isize;
     fn GetCursorPos(point: *mut Point) -> i32;
+    fn GetMessagePos() -> u32;
     fn SetCursor(cursor: isize) -> isize;
     fn SetCapture(hwnd: isize) -> isize;
     fn ReleaseCapture() -> i32;
@@ -708,9 +739,30 @@ const TVS_HASBUTTONS: u32 = 0x1;
 const TVS_HASLINES: u32 = 0x2;
 const TVS_LINESATROOT: u32 = 0x4;
 const TVS_SHOWSELALWAYS: u32 = 0x20;
+const TVS_EDITLABELS: u32 = 0x8;
 const TVM_DELETEITEM: u32 = 0x1101;
 const TVM_EXPAND: u32 = 0x1102;
+const TVM_GETITEMRECT: u32 = 0x1104;
+const TVM_GETNEXTITEM: u32 = 0x110A;
+const TVM_SELECTITEM: u32 = 0x110B;
+const TVM_GETEDITCONTROL: u32 = 0x110F;
 const TVM_HITTEST: u32 = 0x1111;
+const TVM_SETINSERTMARK: u32 = 0x111A;
+const TVM_GETITEMSTATE: u32 = 0x1127;
+const TVM_EDITLABELW: u32 = 0x1141;
+const TVGN_FIRSTVISIBLE: usize = 5;
+const TVGN_PARENT: usize = 3;
+const TVGN_CHILD: usize = 4;
+const TVGN_DROPHILITE: usize = 8;
+const TVGN_CARET: usize = 9;
+const TVIS_EXPANDED: isize = 0x20;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+/// The tree says a title was typed over (posted by the tree's notification, so that the reader hears it after it), and the timer that scrolls
+/// the tree while an item is dragged to its edge.
+const WM_RENAMED: u32 = 0x8003;
+const TIMER_TREE_DRAG: usize = 0x7001;
+/// How far (pixels) from the top or bottom of the tree a dragged item has to be for the tree to scroll.
+const TREE_EDGE: i32 = 22;
 const TVM_ENSUREVISIBLE: u32 = 0x1114;
 const TVM_INSERTITEMW: u32 = 0x1132;
 const TVM_GETITEMW: u32 = 0x113E;
@@ -722,7 +774,12 @@ const TVI_ROOT: isize = -0x10000;
 const TVI_LAST: isize = -0xFFFE;
 const TVHT_ON_ITEM: u32 = 0x2 | 0x4;
 const NM_CLICK: u32 = -2i32 as u32;
+const NM_RCLICK: u32 = -5i32 as u32;
 const TVN_SELCHANGEDW: u32 = -451i32 as u32;
+const TVN_ITEMEXPANDEDW: u32 = -455i32 as u32;
+const TVN_BEGINDRAGW: u32 = -456i32 as u32;
+const TVN_BEGINLABELEDITW: u32 = -459i32 as u32;
+const TVN_ENDLABELEDITW: u32 = -460i32 as u32;
 const TVC_BYMOUSE: u32 = 1;
 const TVC_BYKEYBOARD: u32 = 2;
 const CF_UNICODETEXT: u32 = 13;
@@ -1042,6 +1099,13 @@ struct WindowState {
     /// The bookmarks tree and the find box, children of the window (0 if Windows would not make them).
     tree: Cell<isize>,
     find: Cell<isize>,
+    /// The tree's items by their place in the reader's list. The tree is being filled (what it says then is not the person's doing), a title
+    /// may be typed over (only when the reader asked), the title that was typed and not yet handed on, and the item that is being dragged.
+    tree_items: RefCell<Vec<isize>>,
+    tree_filling: Cell<bool>,
+    tree_rename: Cell<bool>,
+    renamed: RefCell<Option<(usize, String)>>,
+    tree_drag: Cell<Option<TreeDrag>>,
     /// The boxes a form field or a text box is typed in, and the one that is in use (0: none).
     field_single: Cell<isize>,
     field_multi: Cell<isize>,
@@ -1217,7 +1281,8 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
                 queue.extend(deliver(state, Event::Confirmed { tag, yes: answer == IDYES }));
             }
             Action::SetMenus(menus) => set_menus(state, hwnd, menus),
-            Action::Outline(nodes) => fill_tree(state.tree.get(), &nodes),
+            Action::Outline { nodes, select } => fill_tree(state, &nodes, select),
+            Action::OutlineRename(index) => start_rename(state, index),
             Action::Sidebar(r) => place_child(state.tree.get(), to_client(state, r)),
             Action::Find(rect) => show_find(state, hwnd, rect.map(|r| to_client(state, r))),
             Action::FieldEdit(Some(b)) => show_field(state, hwnd, FieldBox { rect: to_client(state, b.rect), ..b }),
@@ -1478,6 +1543,11 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 0;
         }
         WM_MOUSEMOVE => {
+            // An item of the tree is being dragged: the pointer is the tree's.
+            if state.tree_drag.get().is_some() {
+                tree_drag_over(state, in_tree(state, lparam));
+                return 0;
+            }
             let (x, y) = mouse_place(lparam);
             if wparam & MK_LBUTTON != 0 {
                 dispatch(state, Event::MouseMove { x, y: y - content_top(state), shift: wparam & MK_SHIFT != 0 });
@@ -1523,6 +1593,11 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 1;
         }
         WM_LBUTTONUP => {
+            // The item goes where the pointer is as the button comes up (the place in this message).
+            if state.tree_drag.get().is_some() {
+                tree_drag_end(state, Some(in_tree(state, lparam)));
+                return 0;
+            }
             // The reader hears the button come up first: giving the mouse back makes Windows say that the window lost it
             // (WM_CAPTURECHANGED), and the reader would take that for a drag cut short.
             let (x, y) = mouse_place(lparam);
@@ -1533,6 +1608,10 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
         }
         WM_CAPTURECHANGED => {
             // Another window took the mouse while the button was down: the drag is over.
+            if state.tree_drag.get().is_some() {
+                tree_drag_end(state, None);
+                return 0;
+            }
             dispatch(state, Event::MouseLost);
             return 0;
         }
@@ -1586,7 +1665,7 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
                 && hdr.from != 0
                 && hdr.from == state.tree.get()
             {
-                tree_notified(state, hwnd, hdr, lparam);
+                return tree_notified(state, hwnd, hdr, lparam);
             } else if let Some(hdr) = hdr
                 && hdr.code == TTN_GETDISPINFOW
             {
@@ -1693,7 +1772,18 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             return 0;
         }
         WM_TIMER => {
+            if wparam == TIMER_TREE_DRAG {
+                tree_drag_tick(state);
+                return 0;
+            }
             dispatch(state, Event::Timer(wparam as u32));
+            return 0;
+        }
+        WM_RENAMED => {
+            let typed = state.renamed.borrow_mut().take();
+            if let Some((index, text)) = typed {
+                dispatch(state, Event::OutlineRename { index, text });
+            }
             return 0;
         }
         WM_WAKE => {
@@ -1853,30 +1943,140 @@ fn window_text(hwnd: isize, max: usize) -> String {
     String::from_utf16_lossy(&buf)
 }
 
+/// The place in the reader's list of an item of the tree.
+fn tree_param(tree: isize, handle: isize) -> Option<usize> {
+    let mut item = tv_item(TVIF_PARAM | TVIF_HANDLE, null_mut(), -1);
+    item.item = handle;
+    // SAFETY: TVM_GETITEMW takes a pointer to a live TVITEMW and fills in the fields the mask names; nothing is kept.
+    unsafe { SendMessageW(tree, TVM_GETITEMW, 0, (&raw mut item) as isize) };
+    usize::try_from(item.param).ok()
+}
+
+/// Where the pointer was when the message being handled was sent, in the client area of `window` (not where it is now: a click that is handled
+/// late was made where it was made, and the pointer may have moved since).
+fn message_point(window: isize) -> Point {
+    // SAFETY: gives the place that goes with the message being handled; no arguments.
+    let at = unsafe { GetMessagePos() };
+    let (x, y) = mouse_place(at as isize);
+    let mut p = Point { x, y };
+    // SAFETY: `p` is a live POINT, turned from screen coordinates into the window's in place.
+    unsafe { ScreenToClient(window, &mut p) };
+    p
+}
+
+/// A place of the main window's client area (a mouse message's `lparam`) in the tree's own client area.
+fn in_tree(state: &WindowState, lparam: isize) -> Point {
+    let (x, y) = mouse_place(lparam);
+    let mut p = Point { x, y };
+    // SAFETY: `p` is a live POINT, turned from the window's coordinates into the screen's and into the tree's in place; both are windows of ours.
+    unsafe {
+        ClientToScreen(state.hwnd.get(), &mut p);
+        ScreenToClient(state.tree.get(), &mut p);
+    }
+    p
+}
+
+/// What the tree has at `pt` (a place in its client area): the item and what part of it, or none.
+fn tree_hit(tree: isize, pt: Point) -> TvHitTest {
+    let mut hit = TvHitTest { pt, flags: 0, item: 0 };
+    // SAFETY: TVM_HITTEST takes a pointer to a live TVHITTESTINFO, which it fills in and does not keep.
+    unsafe { SendMessageW(tree, TVM_HITTEST, 0, (&raw mut hit) as isize) };
+    hit
+}
+
 /// A notification from the bookmarks tree: a click on an item (a new item is selected by the click, and the same one can be clicked again),
-/// or the selection moved by the keyboard.
-fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) {
+/// the selection moved by the keyboard, an item opened or closed, the right button, a title typed over, an item dragged. The answer is what
+/// the tree is to be told (for a title that starts to be typed over: whether it may; for one that stops: whether the tree takes it).
+fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) -> isize {
     let tree = state.tree.get();
     match hdr.code {
         NM_CLICK => {
-            let mut hit = TvHitTest { pt: Point::default(), flags: 0, item: 0 };
-            // SAFETY: `hit.pt` is a live POINT filled in and rewritten in place.
-            unsafe {
-                GetCursorPos(&mut hit.pt);
-                ScreenToClient(tree, &mut hit.pt);
+            let hit = tree_hit(tree, message_point(tree));
+            if hit.item != 0
+                && hit.flags & TVHT_ON_ITEM != 0
+                && let Some(index) = tree_param(tree, hit.item)
+            {
+                dispatch(state, Event::OutlineClick(index));
+                // The pages get the keyboard back, so that the keys scroll them; not while a title is being typed over (the click may have started
+                // that, and the box would lose the keyboard and close with the title as it was).
+                // SAFETY: plain handle of the main window, and a message to the tree that answers the box it has over a title (0: none).
+                unsafe {
+                    if SendMessageW(tree, TVM_GETEDITCONTROL, 0, 0) == 0 {
+                        SetFocus(hwnd);
+                    }
+                }
             }
-            // SAFETY: TVM_HITTEST takes a pointer to a live TVHITTESTINFO, which it fills in and does not keep.
-            unsafe { SendMessageW(tree, TVM_HITTEST, 0, (&raw mut hit) as isize) };
-            if hit.item != 0 && hit.flags & TVHT_ON_ITEM != 0 {
-                let mut item = tv_item(TVIF_PARAM | TVIF_HANDLE, null_mut(), -1);
-                item.item = hit.item;
-                // SAFETY: TVM_GETITEMW takes a pointer to a live TVITEMW and fills in the fields the mask names; nothing is kept.
-                unsafe { SendMessageW(tree, TVM_GETITEMW, 0, (&raw mut item) as isize) };
-                if let Ok(index) = usize::try_from(item.param) {
-                    dispatch(state, Event::OutlineClick(index));
-                    // The pages get the keyboard back, so that the keys scroll them.
-                    // SAFETY: plain handle of the main window.
-                    unsafe { SetFocus(hwnd) };
+        }
+        NM_RCLICK => {
+            let at = message_point(tree);
+            let hit = tree_hit(tree, at);
+            let item = (hit.item != 0 && hit.flags & (TVHT_ON_ITEM | 0x20) != 0).then_some(hit.item);
+            // The item under the pointer is the one the menu is for (it is selected without the reader going to it).
+            if let Some(h) = item {
+                // SAFETY: plain messages to the tree with a handle it gave.
+                unsafe { SendMessageW(tree, TVM_SELECTITEM, TVGN_CARET, h) };
+            }
+            let mut p = at;
+            // SAFETY: `p` is a live POINT, turned from the tree's coordinates into the window's in place.
+            unsafe {
+                ClientToScreen(tree, &mut p);
+                ScreenToClient(hwnd, &mut p);
+            }
+            dispatch(state, Event::OutlineMenu { index: item.and_then(|h| tree_param(tree, h)), x: p.x, y: p.y - content_top(state) });
+            // (Nothing more is done by the tree itself.)
+            return 1;
+        }
+        TVN_ITEMEXPANDEDW => {
+            // SAFETY: for TVN_ITEMEXPANDEDW, lparam points to an NMTREEVIEWW valid for the duration of this message; it is only read.
+            let nm = unsafe { (lparam as *const NmTreeView).as_ref() };
+            if let Some(nm) = nm
+                && !state.tree_filling.get()
+                && let Ok(index) = usize::try_from(nm.new.param)
+            {
+                dispatch(state, Event::OutlineExpand { index, open: nm.action == TVE_EXPAND as u32 });
+            }
+        }
+        TVN_BEGINLABELEDITW => {
+            // Only the reader starts a title being typed over (the file may not allow it): the tree's own slow click is not allowed.
+            if !state.tree_rename.replace(false) {
+                return 1;
+            }
+            // SAFETY: plain messages to the tree and to the box it made for the title (a null handle does nothing).
+            unsafe {
+                let edit = SendMessageW(tree, TVM_GETEDITCONTROL, 0, 0);
+                SendMessageW(edit, EM_SETLIMITTEXT, qingpdf_core::view::MAX_TITLE_CHARS, 0);
+            }
+            return 0;
+        }
+        TVN_ENDLABELEDITW => {
+            // SAFETY: for TVN_ENDLABELEDITW, lparam points to an NMTVDISPINFOW valid for the duration of this message; it is only read, and its
+            // text (null when the typing was given up) is a zero-terminated string that is copied before the message ends.
+            let nm = unsafe { (lparam as *const NmTvDispInfo).as_ref() };
+            if let Some(nm) = nm
+                && !nm.item.text.is_null()
+                && let Ok(index) = usize::try_from(nm.item.param)
+            {
+                // SAFETY: the pointer is the string the box held, zero-terminated; at most 1024 characters are read.
+                let units: Vec<u16> = (0..1024usize).map_while(|i| Some(unsafe { nm.item.text.add(i).read() }).filter(|&u| u != 0)).collect();
+                *state.renamed.borrow_mut() = Some((index, String::from_utf16_lossy(&units)));
+                // SAFETY: plain handle and message of this window; the reader hears the title when this notification is over.
+                unsafe { PostMessageW(hwnd, WM_RENAMED, 0, 0) };
+            }
+            // (The tree is not given the text: what it shows is what the reader's list says, put there when the change is made.)
+            return 0;
+        }
+        TVN_BEGINDRAGW => {
+            // SAFETY: for TVN_BEGINDRAGW, lparam points to an NMTREEVIEWW valid for the duration of this message; it is only read.
+            let nm = unsafe { (lparam as *const NmTreeView).as_ref() };
+            if let Some(nm) = nm
+                && let Ok(index) = usize::try_from(nm.new.param)
+            {
+                state.tree_drag.set(Some(TreeDrag { item: nm.new.item, index, mark: None, at: nm.pt }));
+                // SAFETY: plain handle of the main window: it takes the pointer so that the drag is heard wherever the pointer goes, and a timer
+                // that scrolls the tree when the item is held at its edge.
+                unsafe {
+                    SetCapture(hwnd);
+                    SetTimer(hwnd, TIMER_TREE_DRAG, 60, null());
                 }
             }
         }
@@ -1892,22 +2092,145 @@ fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) {
         }
         _ => {}
     }
+    0
+}
+
+/// Mark where a dragged item would land (or take the marks away): a line before or after an item, or the item itself lit for "inside".
+fn tree_mark(tree: isize, mark: Option<DropMark>) {
+    let (after, line, lit) = match mark {
+        Some(DropMark { place: Place::Inside, on, .. }) => (false, 0, on),
+        Some(DropMark { place, on, .. }) => (place == Place::After, on, 0),
+        None => (false, 0, 0),
+    };
+    // SAFETY: plain messages to the tree with handles it gave (0 takes a mark away).
+    unsafe {
+        SendMessageW(tree, TVM_SETINSERTMARK, usize::from(after), line);
+        SendMessageW(tree, TVM_SELECTITEM, TVGN_DROPHILITE, lit);
+    }
+}
+
+/// Where a drop at `pt` (a place in the tree's client area) would put the dragged item: the top third of a row is before it, the bottom third
+/// after it (before its first child when it is open), the middle inside it (`treedrop`). Not on the item itself or on what is under it.
+fn tree_drop_target(tree: isize, dragged: isize, pt: Point) -> Option<DropMark> {
+    let hit = tree_hit(tree, pt);
+    if hit.item == 0 || hit.flags & (TVHT_ON_ITEM | 0x20 | 0x40) == 0 {
+        return None;
+    }
+    let mut up = hit.item;
+    for _ in 0..64 {
+        if up == dragged {
+            return None;
+        }
+        // SAFETY: a plain message to the tree with a handle it gave; 0 is no parent.
+        up = unsafe { SendMessageW(tree, TVM_GETNEXTITEM, TVGN_PARENT, up) };
+        if up == 0 {
+            break;
+        }
+    }
+    let to = tree_param(tree, hit.item)?;
+    // The rectangle of the row: the tree takes the handle where the rectangle will be.
+    let h = hit.item as u64;
+    let mut row = WinRect { left: h as i32, top: (h >> 32) as i32, right: 0, bottom: 0 };
+    // SAFETY: TVM_GETITEMRECT takes a pointer to a RECT that holds the handle (the size of two numbers) and is rewritten with the rectangle.
+    if unsafe { SendMessageW(tree, TVM_GETITEMRECT, 0, (&raw mut row) as isize) } == 0 {
+        return None;
+    }
+    // SAFETY: plain messages to the tree with handles it gave.
+    let (open, child) = unsafe { (SendMessageW(tree, TVM_GETITEMSTATE, hit.item as usize, TVIS_EXPANDED) & TVIS_EXPANDED != 0, SendMessageW(tree, TVM_GETNEXTITEM, TVGN_CHILD, hit.item)) };
+    let (place, first_child) = treedrop::landing(treedrop::zone(pt.y, row.top, row.bottom), open && child != 0);
+    if !first_child {
+        return Some(DropMark { to, place, on: hit.item });
+    }
+    // The line goes between the row and its first child, and the item cannot be put in front of itself.
+    (child != dragged).then_some(())?;
+    Some(DropMark { to: tree_param(tree, child)?, place, on: child })
+}
+
+/// The pointer moved to `pt` (a place in the tree's client area), or the tree scrolled, while an item is dragged: the marks follow.
+fn tree_drag_over(state: &WindowState, pt: Point) {
+    let Some(mut drag) = state.tree_drag.get() else { return };
+    let tree = state.tree.get();
+    let now = tree_drop_target(tree, drag.item, pt);
+    if now != drag.mark {
+        tree_mark(tree, now);
+        drag.mark = now;
+    }
+    drag.at = pt;
+    state.tree_drag.set(Some(drag));
+}
+
+/// The timer of a drag: the tree scrolls when the item is held at its top or bottom edge.
+fn tree_drag_tick(state: &WindowState) {
+    let Some(drag) = state.tree_drag.get() else { return };
+    let tree = state.tree.get();
+    let mut r = WinRect::default();
+    // SAFETY: `r` is a live RECT that is filled in; the tree is a window of ours.
+    unsafe { GetClientRect(tree, &mut r) };
+    if let Some(down) = treedrop::scroll_toward(drag.at.y, r.bottom, TREE_EDGE) {
+        // SAFETY: a scroll message (line up is 0, line down 1) to the tree; the bar is the tree's own.
+        unsafe { SendMessageW(tree, WM_VSCROLL, usize::from(down), 0) };
+        tree_drag_over(state, drag.at);
+    }
+}
+
+/// The drag is over: the marks go, the pointer is given back, and if the button came up (`drop` is the place, in the tree's client area) over a
+/// place that takes the item the reader hears where it went.
+fn tree_drag_end(state: &WindowState, drop: Option<Point>) {
+    let Some(drag) = state.tree_drag.take() else { return };
+    tree_mark(state.tree.get(), None);
+    // SAFETY: stops the timer made for the drag and gives the pointer back; fine to call when it was not captured.
+    unsafe {
+        KillTimer(state.hwnd.get(), TIMER_TREE_DRAG);
+        ReleaseCapture();
+    }
+    if let Some(pt) = drop
+        && let Some(DropMark { to, place, .. }) = tree_drop_target(state.tree.get(), drag.item, pt)
+    {
+        dispatch(state, Event::OutlineDrop { from: drag.index, to, place });
+    }
+}
+
+/// Start typing over the title of the item at this place of the reader's list, in the tree where it is.
+fn start_rename(state: &WindowState, index: usize) {
+    let tree = state.tree.get();
+    let handle = state.tree_items.borrow().get(index).copied().unwrap_or(0);
+    if tree == 0 || handle == 0 {
+        return;
+    }
+    state.tree_rename.set(true);
+    // SAFETY: plain handle of the tree and a message with a handle it gave: the tree takes the keyboard and puts a box over the title.
+    unsafe {
+        SetFocus(tree);
+        SendMessageW(tree, TVM_EDITLABELW, 0, handle);
+    }
+    state.tree_rename.set(false);
 }
 
 fn tv_item(mask: u32, text: *mut u16, param: isize) -> TvItem {
     TvItem { mask, item: 0, state: 0, state_mask: 0, text, text_max: 0, image: 0, selected_image: 0, children: 0, param }
 }
 
-/// Fill the tree with the bookmarks (what was in it goes).
-fn fill_tree(tree: isize, nodes: &[OutlineNode]) {
+/// Fill the tree with the bookmarks (what was in it goes): the items open that the list says are open, `select` selected and brought into view,
+/// and without one the item that was at the top still at the top.
+fn fill_tree(state: &WindowState, nodes: &[OutlineNode], select: Option<usize>) {
+    let tree = state.tree.get();
     if tree == 0 {
         return;
     }
-    // SAFETY: plain messages to the tree control: no redraw while it is filled, and all its items deleted.
-    unsafe {
+    // (A drag that is going on is given up: the items it has the handles of are not there after this.)
+    tree_drag_end(state, None);
+    state.tree_filling.set(true);
+    // SAFETY: plain messages to the tree control: the first item in view is asked for (to be put at the top again), no redraw while it is
+    // filled, and all its items deleted.
+    let top = unsafe {
+        let first = SendMessageW(tree, TVM_GETNEXTITEM, TVGN_FIRSTVISIBLE, 0);
         SendMessageW(tree, WM_SETREDRAW, 0, 0);
-        SendMessageW(tree, TVM_DELETEITEM, 0, TVI_ROOT);
-    }
+        first
+    };
+    let top = (top != 0).then(|| tree_param(tree, top)).flatten();
+    // SAFETY: as above.
+    unsafe { SendMessageW(tree, TVM_DELETEITEM, 0, TVI_ROOT) };
+    let mut handles: Vec<isize> = Vec::with_capacity(nodes.len());
     // The handle of the latest item at each depth of the branch being filled; an item goes under the latest one a level up,
     // and after the latest one of its own level (that is quick, where "last" would walk the whole row).
     let mut path: Vec<isize> = Vec::new();
@@ -1922,6 +2245,7 @@ fn fill_tree(tree: isize, nodes: &[OutlineNode]) {
         // SAFETY: TVM_INSERTITEMW takes a pointer to a live TVINSERTSTRUCTW (here with the bigger extended item) whose text
         // pointer is to a zero-terminated string that outlives the call; the control copies what it needs. 0 means failure.
         let handle = unsafe { SendMessageW(tree, TVM_INSERTITEMW, 0, (&raw mut insert) as isize) };
+        handles.push(handle);
         if handle == 0 {
             continue;
         }
@@ -1930,21 +2254,30 @@ fn fill_tree(tree: isize, nodes: &[OutlineNode]) {
         }
         path.truncate(depth);
         path.push(handle);
-        if node.open && node.depth < 2 {
+        if node.open {
             to_open.push(handle);
         }
     }
-    // SAFETY: plain messages to the tree control with handles it gave: open the items the file shows open, show the first one,
-    // and let it draw again.
+    let handle_of = |i: Option<usize>| i.and_then(|i| handles.get(i)).copied().unwrap_or(0);
+    // SAFETY: plain messages to the tree control with handles it gave: open the items the file shows open, show the item selected (else the
+    // one that was at the top, else the first), and let it draw again.
     unsafe {
         for h in to_open {
             SendMessageW(tree, TVM_EXPAND, TVE_EXPAND, h);
         }
-        if first != 0 {
+        let (selected, kept_top) = (handle_of(select), handle_of(top));
+        if selected != 0 {
+            SendMessageW(tree, TVM_SELECTITEM, TVGN_CARET, selected);
+            SendMessageW(tree, TVM_ENSUREVISIBLE, 0, selected);
+        } else if kept_top != 0 {
+            SendMessageW(tree, TVM_SELECTITEM, TVGN_FIRSTVISIBLE, kept_top);
+        } else if first != 0 {
             SendMessageW(tree, TVM_ENSUREVISIBLE, 0, first);
         }
         SendMessageW(tree, WM_SETREDRAW, 1, 0);
     }
+    *state.tree_items.borrow_mut() = handles;
+    state.tree_filling.set(false);
     invalidate(tree);
 }
 
@@ -3863,6 +4196,11 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Optio
         dpi: Cell::new(96),
         tree: Cell::new(0),
         find: Cell::new(0),
+        tree_items: RefCell::new(Vec::new()),
+        tree_filling: Cell::new(false),
+        tree_rename: Cell::new(false),
+        renamed: RefCell::new(None),
+        tree_drag: Cell::new(None),
         field_single: Cell::new(0),
         field_multi: Cell::new(0),
         field_active: Cell::new(0),
@@ -3902,7 +4240,7 @@ pub fn run(title: &str, menus: &[Menu], client: Option<(i32, i32)>, saved: Optio
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw as isize) };
     let Some(state) = state_of(hwnd) else { return 1 };
     // The bookmarks tree and the find box: children of the window, hidden until the reader says where to put them.
-    state.tree.set(make_child(hwnd, instance, "SysTreeView32", WS_EX_CLIENTEDGE, WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS, ID_TREE));
+    state.tree.set(make_child(hwnd, instance, "SysTreeView32", WS_EX_CLIENTEDGE, WS_TABSTOP | TVS_HASBUTTONS | TVS_HASLINES | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_EDITLABELS, ID_TREE));
     state.find.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIND));
     state.field_single.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIELD1));
     state.field_multi.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, ID_FIELD2));
@@ -4028,8 +4366,15 @@ fn forward_key(state: &WindowState, msg: &Msg) -> bool {
     let in_find = msg.hwnd == find || msg.hwnd == search;
     let vk = msg.wparam as u32;
     let (ctrl, shift) = (modifier(0x11), modifier(0x10));
+    // Esc while an item of the tree is dragged gives the drag up.
+    if vk == 0x1B && state.tree_drag.get().is_some() {
+        tree_drag_end(state, None);
+        return true;
+    }
     let wanted = match vk {
         0x0D => in_find,
+        // In the tree F2, Delete and Tab are the bookmarks' (type over the title, take out, a level deeper).
+        0x71 | 0x2E | 0x09 if msg.hwnd == tree && !ctrl => true,
         0x1B | 0x72..=0x74 | 0x7A => true,
         _ if ctrl => !(in_find && matches!(vk, 0x43 | 0x56 | 0x58 | 0x41 | 0x5A)),
         _ => false,

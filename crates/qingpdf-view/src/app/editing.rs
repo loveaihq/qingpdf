@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use qingpdf_core::idmap::IdMap;
-use qingpdf_core::view::{ALL_PAGES, AnnotInfo, EditResult, EditStatus, MarkupKind, SaveStatus, ShapeKind, line_rects};
+use qingpdf_core::view::{ALL_PAGES, AnnotInfo, NO_PAGE, EditResult, EditStatus, MarkupKind, SaveStatus, ShapeKind, line_rects};
 
 use super::annotedit::AnnotEdit;
 use super::forms::FormState;
@@ -85,6 +85,8 @@ pub(super) enum Asked {
     Unpagenum,
     /// An annotation was moved, resized, drawn again or given a text (2026-10-17).
     Change,
+    /// The bookmarks were changed (2026-10-20).
+    Bookmarks,
 }
 
 impl Asked {
@@ -116,8 +118,10 @@ pub(super) struct EditState {
     pub can_undo: bool,
     pub can_redo: bool,
     pub dirty: bool,
-    /// The structure of the file was damaged: it is written afresh, as a whole.
+    /// The structure of the file was damaged: it is written afresh, as a whole. And the bookmarks were asked for again because of it (the
+    /// objects have other numbers then, and the list the window has names the old ones).
     rewrote: bool,
+    rewrote_listed: bool,
     /// The save that is going on (its request) and where it writes; what to do when it is done.
     pub(super) saving: Option<(u64, PathBuf, bool)>,
     /// The Word export (5b): the box that asks where to write it is open, and the request that is writing it.
@@ -164,6 +168,7 @@ impl EditState {
             can_redo: false,
             dirty: false,
             rewrote: false,
+            rewrote_listed: false,
             saving: None,
             export_asked: None,
             exporting: None,
@@ -622,7 +627,7 @@ impl App {
                     actions.extend(self.pages_changed(infos, r.id));
                 }
                 // What was drawn of the page is out of date (of every page, for a watermark); everything else is as it was.
-                let changed = if listed.is_some() {
+                let changed = if listed.is_some() || r.page == NO_PAGE {
                     0..0
                 } else if r.page == ALL_PAGES {
                     0..self.page_count() as u32
@@ -642,6 +647,16 @@ impl App {
                         self.links_asked.remove(&id);
                     }
                     self.edit.drop_page(page);
+                }
+                // A change to the bookmarks, or the undo or redo of one: the engine is asked for them again. So are they when the file was written
+                // afresh by this change (a damaged file's first change): its objects are numbered anew.
+                if r.rewrote && !std::mem::replace(&mut self.edit.rewrote_listed, true) && !self.outline.is_empty() && r.page != NO_PAGE {
+                    self.bm.reload = true;
+                    actions.extend(self.ask_for_outline());
+                }
+                if r.page == NO_PAGE {
+                    self.bm.reload = true;
+                    actions.extend(self.ask_for_outline());
                 }
                 self.schedule();
                 self.ask_for_links();
@@ -670,7 +685,7 @@ impl App {
                         Asked::Remove => Some(Msg::NoteRemoved),
                         Asked::Pagenum => Some(Msg::NotePagenum),
                         Asked::Unpagenum => Some(Msg::NoteUnpagenum),
-                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert => None,
+                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert | Asked::Bookmarks => None,
                     }
                 };
                 if let Some(m) = note {
@@ -682,6 +697,8 @@ impl App {
             EditStatus::Denied => {
                 let m = if what.pages_note().is_some() {
                     Msg::NotePagesDenied
+                } else if what == Asked::Bookmarks {
+                    Msg::NoteBmDenied
                 } else if what == Asked::Fill {
                     Msg::NoteFillDenied
                 } else {
@@ -707,6 +724,10 @@ impl App {
         }
         if what == Asked::Ocr {
             actions.extend(self.ocr_layer_answered(r.id, r.status, &r.message));
+        }
+        // A change to the bookmarks that was not made: the tree is as the list has it.
+        if what == Asked::Bookmarks && r.status != EditStatus::Done {
+            actions.extend(self.bm_failed());
         }
         actions
     }
@@ -821,6 +842,11 @@ impl App {
                 self.path = Some(path);
                 self.remember_position();
                 let mut actions = vec![Action::SetTitle(self.title()), Action::Invalidate];
+                // A file written again as a whole has its objects numbered anew: the bookmarks are asked for again, with the numbers the file has now.
+                if whole && !self.outline.is_empty() {
+                    self.bm.reload = true;
+                    actions.extend(self.ask_for_outline());
+                }
                 match self.edit.after.take() {
                     Some(After::Quit) => actions.extend(self.quit()),
                     Some(After::CloseTab) => actions.extend(self.close_current()),

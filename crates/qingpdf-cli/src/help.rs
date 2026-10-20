@@ -27,6 +27,7 @@ Commands:
   replace   Find text in the pages and replace it with other text
   docx      Make a Word file (.docx) of a PDF: text, headings, lists, tables, pictures
   xlsx      Make an Excel file (.xlsx) of the tables of a PDF, one sheet for each table
+  bookmarks Write the bookmarks to a text file, or make them from a text file or the headings
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -504,6 +505,52 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const BOOKMARKS: &str = "Usage:
+  qingpdf bookmarks <file.pdf> --export <bookmarks.txt> [--force] [--password <password>]
+  qingpdf bookmarks <file.pdf> --import <bookmarks.txt> -o <output.pdf> [--force] [--password <password>]
+  qingpdf bookmarks <file.pdf> --auto -o <output.pdf> [--force] [--password <password>]
+
+--export writes the bookmarks (the outline) as a UTF-8 text file, a line for each: a tab for each level
+above the top one, the title, a tab, and the page number (from 1; empty for a bookmark that leads
+nowhere that could be found). Chapter 1 with section 1.1 on pages 3 and 4:
+
+  Chapter 1<TAB>3
+  <TAB>Section 1.1<TAB>4
+
+A bookmark with no title is written as (untitled), which --import takes back as that title.
+
+--import makes the bookmarks of the output the ones in the text file (all the bookmarks it had are
+replaced; a bookmark made this way leads to the top of its page). A UTF-8 file with or without a
+byte order mark (BOM), with DOS line ends and blank lines, is read too. The levels are tabs, one for
+each level (spaces are not levels); the blanks at the ends of a title and of a page number are
+taken off. A line that is not right is an error that names its number: a missing page number, a page
+that is not in the file, a title that is empty, that starts with a space (a level written with
+spaces) or that has a tab inside it, a title longer than 300 characters, a level more than one
+deeper than the line before it, or more than 32 levels or 20,000 bookmarks. The text file is at
+most 4 MB.
+
+A file with more bookmarks than are read (more than 20,000, or nested more than 32 levels deep) has
+the first ones exported, with a warning; --import and --auto replace all of its bookmarks, with the
+same warning.
+
+--auto makes them from the headings of the pages (found the way 'docx' finds them: by the size and
+weight of the lines), at most three levels, replacing the bookmarks the file has. A file whose author
+did not allow copying text is refused unless the owner password is given.
+
+The output is the input with the change appended (the input's bytes are kept as they are; a file
+with damaged structure data is written afresh). It is refused for a file that is signed, and for an
+encrypted file whose author did not allow changing it (permission bit 11 or 4) unless the owner
+password is given. Titles are stored as PDFDocEncoding where they can be, else as UTF-16.
+
+Options:
+  --export <file>       Write the bookmarks to this text file
+  --import <file>       Read the bookmarks from this text file
+  --auto                Make the bookmarks from the headings
+  -o, --output <file>   The PDF to write (--import and --auto)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 /// The help text for the tool or for one command.
 pub fn text(command: Option<Command>) -> String {
     match command {
@@ -526,5 +573,6 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Replace) => format!("{REPLACE}{PAGE_LIST}"),
         Some(Command::Docx) => format!("{DOCX}{PAGE_LIST}"),
         Some(Command::Xlsx) => format!("{XLSX}{PAGE_LIST}"),
+        Some(Command::Bookmarks) => BOOKMARKS.to_string(),
     }
 }

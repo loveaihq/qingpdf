@@ -31,6 +31,7 @@ pub mod theme;
 pub mod thumbs;
 pub mod tiles;
 pub mod toolbar;
+pub mod treedrop;
 pub mod ui;
 #[allow(unsafe_code)]
 pub mod win32;

@@ -31,6 +31,8 @@ pub(super) struct MenuState {
     pub text_size: usize,
     /// The page's content may be changed (the Insert menu), and what the watermark is like.
     pub can_modify: bool,
+    /// The bookmarks may be changed (Insert > Bookmark, Tools > Bookmarks from headings).
+    pub can_bookmarks: bool,
     pub wm: Watermarking,
     /// Text of scans can be recognized (a file is open and no recognition is going on).
     pub can_ocr: bool,
@@ -64,6 +66,7 @@ impl MenuState {
             width: 1,
             text_size: 1,
             can_modify: false,
+            can_bookmarks: false,
             wm: Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false },
             can_ocr: false,
             toolbar: true,
@@ -235,12 +238,19 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     switch(CMD_WM_PAGE, Msg::WmPage, st.wm.page_only),
                     MenuEntry::Separator,
                     item(CMD_INS_PAGENUM, Msg::InsertPagenum),
+                    MenuEntry::Separator,
+                    MenuEntry::Item { id: CMD_BM_ADD, label: t(lang, Msg::BmAdd).to_string(), checked: false, enabled: st.can_bookmarks },
                 ]
             },
         },
         Menu {
             title: t(lang, Msg::ToolsMenu).to_string(),
-            entries: vec![item(CMD_OCR_ALL, Msg::OcrAll, st.can_ocr), item(CMD_OCR_PAGE, Msg::OcrPageOnly, st.can_ocr)],
+            entries: vec![
+                item(CMD_OCR_ALL, Msg::OcrAll, st.can_ocr),
+                item(CMD_OCR_PAGE, Msg::OcrPageOnly, st.can_ocr),
+                MenuEntry::Separator,
+                MenuEntry::Item { id: CMD_BM_AUTO, label: t(lang, Msg::BmAuto).to_string(), checked: false, enabled: st.can_bookmarks },
+            ],
         },
         Menu {
             title: t(lang, Msg::GoMenu).to_string(),
@@ -296,6 +306,7 @@ impl App {
             width: self.edit.width,
             text_size: self.edit.forms.text_size,
             can_modify: self.doc.is_some() && self.rights.modify,
+            can_bookmarks: self.bm_allowed(),
             wm: self.edit.forms.wm,
             can_ocr: self.doc.is_some() && self.ocr.is_none(),
             toolbar: self.toolbar_on,
@@ -341,6 +352,7 @@ mod tests {
             can_redo: true,
             has_picked: true,
             can_modify: true,
+            can_bookmarks: true,
             can_ocr: true,
             ..MenuState::idle()
         };
@@ -353,7 +365,7 @@ mod tests {
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.
@@ -376,7 +388,7 @@ mod tests {
         for cmd in [CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_PRESENT, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }
-        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE] {
+        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }
         assert!(listed.iter().any(|(id, label, e)| *id == 0 && label == "(none)" && !e));

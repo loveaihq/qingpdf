@@ -125,7 +125,7 @@ impl App {
     }
 
     /// A tab was clicked: it is the one shown, and the one kept for the next time.
-    fn choose_tab(&mut self, tab: Tab) -> Vec<Action> {
+    pub(super) fn choose_tab(&mut self, tab: Tab) -> Vec<Action> {
         if tab == Tab::Bookmarks && self.outline.is_empty() {
             return Vec::new();
         }

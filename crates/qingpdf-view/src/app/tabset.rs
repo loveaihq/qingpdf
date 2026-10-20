@@ -47,11 +47,7 @@ impl App {
 
     /// The bookmarks as the window's tree shows them.
     pub(super) fn outline_nodes(&self) -> Vec<OutlineNode> {
-        let untitled = t(self.lang, Msg::Untitled);
-        self.outline
-            .iter()
-            .map(|i| OutlineNode { title: if i.title.trim().is_empty() { untitled.to_string() } else { i.title.clone() }, depth: i.depth, open: i.open })
-            .collect()
+        self.outline.iter().map(|i| OutlineNode { title: self.shown_title(i), depth: i.depth, open: i.open }).collect()
     }
 
     /// Take back everything the shown tab has asked of the engine and let go of what is drawn and listed for it (the view, the bookmarks and the
@@ -83,6 +79,7 @@ impl App {
         self.thumb_target = None;
         self.thumb_focus = false;
         self.annots_focus = false;
+        self.bm = BmWork::default();
         self.copy_note = None;
         self.moving = false;
         actions.push(Action::KillTimer(TIMER_SETTLE));
@@ -162,7 +159,7 @@ impl App {
         self.view_x = self.sidebar_width();
         self.view_w = (self.client_w - self.view_x).max(0);
         self.view_h = (self.client_h - self.bar_h()).max(0);
-        let mut actions = vec![Action::SetTitle(self.title()), Action::Outline(self.outline_nodes()), Action::Invalidate];
+        let mut actions = vec![Action::SetTitle(self.title()), self.outline_action(None), Action::Invalidate];
         if waiting {
             // Nothing is drawn until the engine says what the plan is now.
             self.activating = true;

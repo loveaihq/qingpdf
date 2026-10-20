@@ -27,10 +27,11 @@ pub enum Command {
     Replace,
     Docx,
     Xlsx,
+    Bookmarks,
 }
 
 impl Command {
-    pub const ALL: [Command; 18] = [
+    pub const ALL: [Command; 19] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -49,6 +50,7 @@ impl Command {
         Command::Replace,
         Command::Docx,
         Command::Xlsx,
+        Command::Bookmarks,
     ];
 
     pub fn name(self) -> &'static str {
@@ -71,6 +73,7 @@ impl Command {
             Command::Replace => "replace",
             Command::Docx => "docx",
             Command::Xlsx => "xlsx",
+            Command::Bookmarks => "bookmarks",
         }
     }
 
@@ -135,6 +138,20 @@ pub enum Request {
     Docx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
     /// Make an Excel file (.xlsx) of the tables of the pages (all of them when `pages` is none).
     Xlsx { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
+    /// Write the bookmarks to a text file, or replace them (from a text file, or from the headings): `output` is the PDF written by the second
+    /// and the third.
+    Bookmarks { input: PathBuf, action: BookmarkAction, output: Option<PathBuf>, force: bool, password: String },
+}
+
+/// What `bookmarks` is to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BookmarkAction {
+    /// `--export <file>`: write the bookmarks as text.
+    Export(PathBuf),
+    /// `--import <file>`: make the bookmarks the ones in the text file.
+    Import(PathBuf),
+    /// `--auto`: make them from the headings.
+    Auto,
 }
 
 /// How `encrypt` is to protect the file, as it was written on the command line.
@@ -219,6 +236,8 @@ struct Allowed {
     protect: bool,
     /// The options of `compress`: `--preset` and `--lossless`.
     compress: bool,
+    /// The options of `bookmarks`: `--export`, `--import` and `--auto`.
+    bookmarks: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
@@ -236,6 +255,7 @@ fn allowed(c: Command) -> Allowed {
         pagenum: false,
         protect: false,
         compress: false,
+        bookmarks: false,
     };
     match c {
         Command::Info => Allowed { password: true, ..none },
@@ -254,6 +274,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Stamp | Command::Addtext => Allowed { output: true, force: true, page: true, password: true, mark: true, ..none },
         Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
         Command::Docx | Command::Xlsx => Allowed { output: true, force: true, pages: true, password: true, ..none },
+        Command::Bookmarks => Allowed { output: true, force: true, password: true, bookmarks: true, ..none },
     }
 }
 
@@ -296,6 +317,10 @@ struct Collected {
     /// `compress`: the preset, and `--lossless`.
     preset: Option<String>,
     lossless: bool,
+    /// `bookmarks`: the files of `--export` and `--import`, and `--auto`.
+    export: Option<PathBuf>,
+    import: Option<PathBuf>,
+    auto: bool,
 }
 
 /// The switches of `encrypt` that take no value.
@@ -404,6 +429,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             }
             "--user-password" | "--owner-password" | "--password-file" | "--print" if ok.protect => {}
             "--preset" if ok.compress => {}
+            "--export" | "--import" if ok.bookmarks => {}
+            "--auto" if ok.bookmarks => {
+                if inline.is_some() {
+                    return Err(usage(c, "--auto does not take a value"));
+                }
+                got.auto = true;
+                continue;
+            }
             "--lossless" if ok.compress => {
                 if inline.is_some() {
                     return Err(usage(c, "--lossless does not take a value"));
@@ -491,6 +524,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--preset" => {
                 if got.preset.replace(text(value, "--preset", command)?).is_some() {
                     return Err(slot_taken("--preset"));
+                }
+            }
+            "--export" => {
+                if got.export.replace(PathBuf::from(value)).is_some() {
+                    return Err(slot_taken("--export"));
+                }
+            }
+            "--import" => {
+                if got.import.replace(PathBuf::from(value)).is_some() {
+                    return Err(slot_taken("--import"));
                 }
             }
             "--password-file" => {
@@ -601,7 +644,7 @@ fn hex_color(v: &str) -> Option<[u8; 3]> {
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless, export, import, auto } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -803,6 +846,23 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
         Command::Xlsx => {
             let input = one_input(&mut inputs)?;
             Ok(Request::Xlsx { input, pages, output: need_output(output)?, force, password })
+        }
+        Command::Bookmarks => {
+            let input = one_input(&mut inputs)?;
+            let action = match (export, import, auto) {
+                (Some(file), None, false) => BookmarkAction::Export(file),
+                (None, Some(file), false) => BookmarkAction::Import(file),
+                (None, None, true) => BookmarkAction::Auto,
+                (None, None, false) => return Err(usage(c, "bookmarks needs --export <file.txt>, --import <file.txt> or --auto")),
+                _ => return Err(usage(c, "use only one of --export, --import and --auto")),
+            };
+            match (&action, &output) {
+                (BookmarkAction::Export(_), Some(_)) => return Err(usage(c, "--export writes the text file it is given; -o is for --import and --auto")),
+                (BookmarkAction::Export(_), None) => {}
+                (_, None) => return Err(usage(c, "-o <output file> is required")),
+                (_, Some(_)) => {}
+            }
+            Ok(Request::Bookmarks { input, action, output, force, password })
         }
         Command::Replace => {
             let input = one_input(&mut inputs)?;

@@ -50,13 +50,14 @@ pub use forms::{MAX_FIELD_INFOS, MAX_FIELDS_BYTES};
 pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use crate::edit::{LineView, MAX_TEXT_CHARS};
-pub use crate::edit::{ALL_PAGES, MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Pagination, SLOTS, Watermark};
+pub use crate::edit::{ALL_PAGES, NO_PAGE, MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Pagination, SLOTS, Watermark};
 pub use crate::edit::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, order_after_move};
 pub use crate::edit::{MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, TARGET_DPI};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
 pub use geometry::{CharIndex, is_blank, line_rects, nearest_char};
 pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
-pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem};
+pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem, read_bookmarks};
+pub(crate) use outline::walk as walk_outline;
 pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind, ShapeKind, keep_on_page};
 pub use plan::{ACTIVE_FLOOR, MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
 
@@ -343,6 +344,9 @@ pub enum Event {
     Rendered(Rendered),
     /// The bookmarks (the answer to [`Engine::outline`]), in display order. `truncated`: there were more than the reader reads.
     Outline { doc: u64, id: u64, items: Vec<OutlineItem>, truncated: bool },
+    /// The bookmarks made from the headings of the document (the answer to [`Engine::headings`]): `Done` with the list (`truncated`: there
+    /// were more headings than bookmarks may be), or `Failed` (`message` says why, for instance that the file does not allow taking text out).
+    Headings { doc: u64, id: u64, status: SaveStatus, message: String, items: Vec<OutlineItem>, truncated: bool },
     /// The links of a page (the answer to [`Engine::links`]).
     Links { doc: u64, id: u64, page: u32, links: Vec<Link>, truncated: bool },
     CharBoxes(CharBoxes),
@@ -402,6 +406,7 @@ pub enum Event {
 /// What can be asked of the open document besides drawing.
 pub(crate) enum Request {
     Outline,
+    Headings(Option<u32>),
     Links(u32),
     CharBoxes(u32),
     Search { query: String, start: u32 },
@@ -549,6 +554,19 @@ impl Engine {
     /// Ask for the bookmarks of the file: answered by [`Event::Outline`] (no bookmarks: an empty list).
     pub fn outline(&self, doc: u64, id: u64) {
         self.request(doc, id, Request::Outline);
+    }
+
+    /// Ask for the bookmarks that the headings of the document make (or of the one page `only`, whose bookmarks all lead to it): answered by
+    /// [`Event::Headings`]. Reads every page for its text (cancelled by [`Engine::cancel`]).
+    pub fn headings(&self, doc: u64, id: u64, only: Option<u32>) {
+        self.request(doc, id, Request::Headings(only));
+    }
+
+    /// Make the bookmarks of the file the ones in `items` (the list as [`Event::Outline`] gave it, changed: each item still has the `id` it
+    /// had, a new one has 0): answered by [`Event::Edited`] like every edit; undone and redone with the others, and written when the file is
+    /// saved. The edit is to no page ([`NO_PAGE`]): after it, and after the undo or redo of one, ask for the bookmarks again.
+    pub fn set_bookmarks(&self, doc: u64, id: u64, items: Vec<OutlineItem>) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Outline(items) });
     }
 
     /// Ask for the links of a page: answered by [`Event::Links`].

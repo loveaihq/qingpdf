@@ -18,6 +18,8 @@
 | `cancel(id)` | 撤回请求（画页、搜索、复制、打印都用它）：没开始的直接丢；正在做的在下一个操作符处停下。撤回的请求没有结果（已经画完的可能还会到，界面按 `id` 认不出就丢掉）。 |
 | `close()` | 关所有文档（存着的也关），丢掉所有请求。 |
 | `outline(doc, id)` | （3d-2）取书签，答 `Outline`。 |
+| `headings(doc, id, only)` | （书签，2026-10-20）取页面标题做成的书签（`only` 是某一页就只看这一页），答 `Headings`；见“书签的请求和结果”。 |
+| `set_bookmarks(doc, id, items)` | （同上）把书签改成 `items`，答 `Edited`，页是 `NO_PAGE`。 |
 | `links(doc, id, page)` | （3d-2）取一页的链接，答 `Links`。 |
 | `char_boxes(doc, id, page)` | （3d-2）取一页每个字的框（选字用），答 `CharBoxes`。 |
 | `search(doc, id, 查询, 起始页)` | （3d-2）从起始页往后搜、绕回来，答一串 `SearchHits`、几个 `SearchProgress`、一个 `SearchDone`。 |
@@ -40,7 +42,7 @@
 ## 3d-2 的结果和限制
 
 - `Opened` 多一个 `rights { copy, print, print_high_quality, annotate, fill_forms, modify, assemble }`（`annotate` 是 4a 加的，`fill_forms` 是 4b 加的，`modify` 是 4c 加的，`assemble` 是页面管理加的，见下）：和 `qingpdf text` 的做法一样（`text::check_extraction_allowed`；有所有者密码或所有者密码为空就全部允许，否则看权限位）。不让复制：`copy_text` 答 `Denied`，一个字也不给；`char_boxes` 在**也不许批注**时答 `Denied`，许批注时照样给字框（只有位置，没有文字：选中文字来标记要用，复制仍然拒绝）；不让打印：`print` 立刻 `PrintDone(Failed)`；只许低质量打印（第 12 位没开）：最高 150 dpi。搜索不受限（它只给位置，不给文字）。
-- `Outline { items: [{title, depth, page?, y?, open}], truncated }`：展平的前序列表，深度从 0 数；`page` 是页码（从 0），`y` 是该页上往下多少点（按页面显示后的样子）。最多 `MAX_OUTLINE_ITEMS`（20000）项、`MAX_OUTLINE_DEPTH`（32）层，标题最多 `MAX_TITLE_CHARS`（300）字，兄弟链或子链绕回已读过的项就在那里断。目标先看 `/Dest`，再看 `/A` 里的 GoTo，命名目标走 `dests.rs`。
+- `Outline { items: [{title, depth, page?, y?, open, id, action, placed, x?}], truncated }`（后四项 2026-10-20 加：`id` 是书签在文件里的对象号，`action` 是它不是跳到某处而是别的动作，`placed` 和 `x` 写回去时用，读出来时是 `false` 和 `None`；见“书签的请求和结果”）：展平的前序列表，深度从 0 数；`page` 是页码（从 0），`y` 是该页上往下多少点（按页面显示后的样子）。最多 `MAX_OUTLINE_ITEMS`（20000）项、`MAX_OUTLINE_DEPTH`（32）层，标题最多 `MAX_TITLE_CHARS`（300）字，兄弟链或子链绕回已读过的项就在那里断。目标先看 `/Dest`，再看 `/A` 里的 GoTo，命名目标走 `dests.rs`。
 - `Links { links: [{rect, kind, page, y?, uri}] }`：`rect` 是页面显示后的点（左、上、右、下）；`kind` 是 `Page`（页内）或 `Uri`。每页最多 `MAX_LINKS`（2000）个；隐藏的、不显示的、没面积的不给。外部地址只留 http、https、mailto，并且全是 ASCII 可见字符、不含空格和 `" < > \ ^ ` { | }`、不超过 `MAX_URI_BYTES`（2048），`%` 只许作百分号转义（`%` 加两个十六进制数字，所以 `%USERNAME%` 这类会被系统当环境变量展开的写法不给），其余的丢掉；`view::safe_uri` 是同一套检查，界面在打开前再查一遍。
 - `CharBoxes { boxes, text }`（`text` 是和 `boxes` 一一对应的字符，空格是排版插的空格、行尾是换行符，双击选词、三击选行用；只许批注不许复制的文件 `text` 为空）：`boxes[i]` 是页文字（和 `text` 命令同一个顺序）第 i 个字符的 `[左, 上, 右, 下]`，单位点，**页面显示后的坐标（已按页自己的 /Rotate 转过，左上角为原点，y 向下）**，窗口再加的旋转由窗口自己转。排版插的空格和行尾是没有面积的点。每页最多 `text::MAX_PAGE_CHARS`（40 万）字。`view::line_rects` 把一段字的框并成每行一个矩形，`view::nearest_char` 找离某点最近的字（逐个看）；`view::CharIndex::new(&boxes)` 把一页的框切成一行一行，`nearest(&boxes, x, y)` 答案和 `nearest_char` 一样，但只看可能最近的几行，鼠标每动一下不必扫整页。
 - `SearchHits { page, hits: [{start, len, rects}] }`：`start`、`len` 是页文字里的字符位置，`rects` 是要涂色的矩形（每行一个）。搜索规则：大小写不分；全角半角一样（`２０２４` 和 `2024`，`，` 和 `,`，全角空格和空格），康熙部首和兼容汉字当成它代表的字，弯引号当直引号；换行是空格，汉字旁边的空格不算（中文行连起来，数字和汉字之间排版插的空格也不挡）；连续空格是一个，两端的空格不算。查询最多 `MAX_QUERY_CHARS`（200）字，每页最多 `MAX_HITS_PER_PAGE`（2000）处、全书最多 `MAX_SEARCH_HITS`（10000）处（到了就 `SearchDone(HitLimit)`）。搜索一页一步，夹在画页之间：先画 `priority` 小于 `BACKGROUND_PRIORITY` 的块（窗口里看得见的），再做快的请求（书签、链接、字框），再画其余的块，都没有时才搜一页。
@@ -241,6 +243,19 @@
 **命令顺序：** 结束服务的命令（`open_file`、`activate`、`close_doc`）排在它前面的编辑、保存、导出之后（它们先做完、先答复）；搜索、打印、识别这类长任务不续着做，界面在切走以前自己撤掉或不让切（见使用说明的“正忙的标签”）。存着的文档不处理请求：对它的请求直接丢掉。
 
 **界面怎么用：** 新标签 = `open_file`；切到另一个标签 = `activate`（收到 `Activated` 再排画页的请求）；关标签 = `close_doc`；收到 `Dropped` 的标签，下次要用时 `open_file` 重新读（界面自己记着那个标签的页、放大、滚动位置、旋转，读完恢复）。同一时刻最多 16 个文档（界面的限制，引擎本身只受内存限制）。测试：`view/tests.rs` 里新增的 6 个，和 `view/store.rs`、`view/plan.rs` 里的算术测试。
+
+## 书签的请求和结果（2026-10-20）
+
+读到的书签（`Outline`）本身就是改书签用的清单：界面在这份展平的清单上加、删、改、挪，再把**整份**清单交回来，引擎只写变了的对象。清单的操作（`qingpdf_core::bookmarks`，纯逻辑，没有文件也没有窗口）：`add`（放在某项和它下面的后面，同级；没有就放最后）、`remove`、`indent`/`outdent`、`move_branch`（放到另一项的前面、后面或里面，不许放进自己的下面、不许超过 32 级）、`counts`（每项的 `/Count` 和 `/Outlines` 的 `/Count`）、`check`、`export_text`/`parse_text`（命令行的 `bookmarks --export/--import`）、`from_headings`。
+
+| 调用 | 作用 |
+|---|---|
+| `set_bookmarks(doc, id, items)` | 书签改成 `items`（每项带读出来时的 `id`，新的是 0）。答 `Edited`（和别的编辑一样走撤销、重做、保存），`page` 是 `NO_PAGE`（`u32::MAX - 1`：没有哪一页变了，界面不要重画页）；**改完、撤销、重做之后都要再 `outline` 一次**（`Edited.page == NO_PAGE` 就是这个信号），新书签的 `id` 在那时才有；**整份文件重写之后也要再取一次**（`Edited.rewrote` 为真，或 `save_as` 答了 `Saved`）：重写给所有对象重新编号，手里的 `id` 就过时了。`Rights`：`assemble` 或 `modify` 为真才行，否则答 `Denied`；有签名答 `Failed`（和页面的编辑同一句话）。 |
+| `headings(doc, id, only)` | 按“转 Word”认标题的办法（`docx::headings`）认出整份文件（或 `only` 那一页）的标题，答 `Headings { status, message, items, truncated }`：`items` 是做好的书签（最多 3 级，没有 `id`，`placed` 为真，`y` 是标题上方 6 点），可以直接交给 `set_bookmarks`。文件不许取文字就是 `Failed`。做完要一整份文件的时间（468 页的书约 0.85 秒），`cancel(id)` 能停。 |
+
+引擎怎么写（`edit/outline.rs`）：一项是它原来的字典，加上 `/Parent`、`/Prev`、`/Next`、`/First`、`/Last`、`/Count`；标题变了才写 `/Title`，`placed` 的才写 `/Dest`（`[页 /XYZ 左 上 null]`，换掉 `/A` 和命名目的地）；`/C`、`/F`、`/SE` 和不是跳转的 `/A`（网址、命名动作、GoToR、脚本）照原样留着，`action` 为真的项 `placed` 不起作用。新字典和旧的一样的项不写。不在清单里的旧项留在文件里，没有任何东西指向它们。清单不是文件的（`id` 不是这份文件现在的书签、重复、层次跳级、第一项不在最上一级、深于 32 级、多于 20000 项、标题多于 300 字、页不在文件里、位置不是数字）答 `Failed`，什么也不改。有损坏结构数据的文件第一次改时整份重写（对象号变了）：排在重写后面的这次改动，引擎按位置把 `id` 换成新文件里同一位置的对象号（`view::outline::renumbered`：新旧两份文档各用 `walk` 走一遍，前序相同），所以这次改动照常做成；这以后手里的清单是过时的，要再取一次（见上）。**不是书签的对象不算书签：** `walk` 跳过 `/Type` 是 `Page`、`Pages`、`Catalog`、`Outlines` 的、目录本身的、带 `/Kids`、`/Subtype`、`/MediaBox`、`/Contents`、`/Resources`、`/Annots`、`/Pages`、`/Outlines` 的对象（沿它的 `/Next` 往下走，不进它的 `/First`），所以恶意文件让 `/First`、`/Next` 指到页面时，那个页面不会被当书签写。**读不全的书签**（超过 20000 项或 32 层，`Outline.truncated`）：清单里有 `id` 非 0 的项就答 `Failed`（没读到的会丢）；清单全是新项（`id` 都是 0）就整份换掉。`bookmarks::UNTITLED`（`"(untitled)"`）是 `export_text` 给没有标题的书签写的名字；`parse_text` 的层次只认制表符，标题两头的空白去掉，以空白开头或里面有制表符的标题报错。
+
+命令行用 `qingpdf_core::edit::set_outline(doc, 密码, items)`（返回追加了改动的整份文件的字节）、`check_outline_allowed`、`view::read_bookmarks(doc)`、`docx::headings(doc, 密码, only, cancel)`。
 
 ## 对接别的语言
 

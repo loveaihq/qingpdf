@@ -118,6 +118,7 @@ struct PrintJob {
 
 enum Job {
     Outline { id: u64 },
+    Headings { id: u64, only: Option<u32> },
     Links { id: u64, page: u32 },
     CharBoxes { id: u64, page: u32 },
     Annotations { id: u64, page: u32 },
@@ -136,7 +137,7 @@ enum Job {
 impl Job {
     fn id(&self) -> u64 {
         match self {
-            Job::Outline { id } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::AnnotText { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } | Job::TextLine { id, .. } => *id,
+            Job::Outline { id } | Job::Headings { id, .. } | Job::Links { id, .. } | Job::CharBoxes { id, .. } | Job::Annotations { id, .. } | Job::AnnotText { id, .. } | Job::Fields { id, .. } | Job::Options { id, .. } | Job::TextLine { id, .. } => *id,
             Job::AnnotList(a) => a.id,
             Job::Search(s) => s.id,
             Job::Copy(c) => c.id,
@@ -159,6 +160,7 @@ impl Job {
     fn new(id: u64, what: Request, pages: usize) -> Job {
         match what {
             Request::Outline => Job::Outline { id },
+            Request::Headings(only) => Job::Headings { id, only },
             Request::Links(page) => Job::Links { id, page },
             Request::CharBoxes(page) => Job::CharBoxes { id, page },
             Request::Annotations(page) => Job::Annotations { id, page },
@@ -377,8 +379,8 @@ fn serve_once(open: OpenDoc, carry: Option<Carry>, start: Start, session: &mut S
         Pending::Rewrite { bytes, then } => match reopen(doc_id, plan, rights, bytes, session.password(), page_count) {
             Ok(next) => {
                 session.rewritten();
-                // The edit that waited for the new file is done first of all.
-                carry.edits.push_front(then);
+                // The edit that waited for the new file is done first of all (a change to the bookmarks with the numbers the new file gives them).
+                carry.edits.push_front(outline::renumbered(then, &document, &next.document));
                 Exit::Again { open: Box::new(next), carry }
             }
             Err(message) => {
@@ -621,6 +623,7 @@ impl Server<'_> {
         }
         let step = match &mut job {
             Job::Outline { id } => self.outline(*id),
+            Job::Headings { id, only } => self.headings(*id, *only),
             Job::Links { id, page } => self.links(*id, *page),
             Job::CharBoxes { id, page } => self.char_boxes(*id, *page),
             Job::Annotations { id, page } => self.annotations(*id, *page),
@@ -685,6 +688,21 @@ impl Server<'_> {
             return Step::Cancelled;
         }
         self.tell(Event::Outline { doc: self.doc_id, id, items: found.items, truncated: found.truncated });
+        Step::Done
+    }
+
+    /// The headings of the document, as bookmarks (the whole document is read for them, in one step that the stop flag ends).
+    fn headings(&mut self, id: u64, only: Option<u32>) -> Step {
+        let found = crate::docx::headings(self.document, self.session.password(), only.map(|p| p as usize), Some(self.shared.stop.clone()));
+        let (status, message, items, truncated) = match found {
+            Err(Error::Cancelled) => return Step::Cancelled,
+            Err(e) => (SaveStatus::Failed, e.to_string(), Vec::new(), false),
+            Ok(list) => {
+                let (items, truncated) = crate::bookmarks::from_headings(&list);
+                (SaveStatus::Done, String::new(), items, truncated)
+            }
+        };
+        self.tell(Event::Headings { doc: self.doc_id, id, status, message, items, truncated });
         Step::Done
     }
 
@@ -879,6 +897,7 @@ impl Server<'_> {
                     EditClass::Fill => (self.rights.fill_forms, DENIED_FILL),
                     EditClass::Content => (self.rights.modify, DENIED_MODIFY),
                     EditClass::Annotate => (self.rights.annotate, DENIED_ANNOTATE),
+                    EditClass::Assemble if matches!(edit, edit::Edit::Outline(_)) => (self.rights.assemble || self.rights.modify, DENIED_BOOKMARKS),
                     EditClass::Assemble => (self.rights.assemble, DENIED_ASSEMBLE),
                 };
                 // Recognised text for a file that may not be changed is used in this window and not written (5c).
@@ -1531,6 +1550,8 @@ fn print_dpi(asked: f64, rights: Rights) -> f64 {
 const DENIED_FILL: &str = "the file's author did not allow filling in form fields, and the file was not opened with the owner password";
 
 const DENIED_ASSEMBLE: &str = "the file's author did not allow inserting, deleting, moving or turning pages, and the file was not opened with the owner password";
+
+const DENIED_BOOKMARKS: &str = "the file's author did not allow changing its bookmarks (permission bit 11 or 4), and the file was not opened with the owner password";
 
 const DENIED_EXTRACT: &str = "the file's author did not allow copying or extracting, and the file was not opened with the owner password";
 

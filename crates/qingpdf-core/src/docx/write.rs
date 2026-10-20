@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 
 use qingpdf_base::text::font::{STYLE_BOLD, STYLE_CJK_SHIFT, STYLE_FAMILY_SHIFT, STYLE_ITALIC};
 
+use crate::bookmarks::Heading;
 use crate::idmap::IdMap;
 use crate::xml::esc;
 use super::flow::{Align, Block, Cell, Mark, NumFmt, PageOut, Para, Pic, Run, Table, continues, round_size};
@@ -300,6 +301,26 @@ fn headings(pages: &mut [PageOut], look: &mut Look) {
     }
     // (The classes past the fourth level are heading 4 as well.)
     look.heads = levels.iter().take(MAX_LEVEL).map(|c| c.0 as f32 / 2.0).collect();
+}
+
+/// The headings of the document (the paragraphs `assemble` makes headings of): the page, the level, the words and how far down the page the
+/// first line starts (not for a page of vertical text). The pages' blocks stay.
+pub(super) fn heading_list(pages: &mut [PageOut]) -> Vec<Heading> {
+    let _ = bands(pages);
+    join_pages(pages);
+    let mut look = look(pages);
+    headings(pages, &mut look);
+    let mut found = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        for b in &page.blocks {
+            if let Block::Para(p) = b
+                && p.level > 0
+            {
+                found.push(Heading { page: u32::try_from(index).unwrap_or(u32::MAX), level: p.level, text: plain(p), y: (!page.vertical).then_some(p.c0) });
+            }
+        }
+    }
+    found
 }
 
 // --- fonts and runs ----------------------------------------------------------------------------------------------------------

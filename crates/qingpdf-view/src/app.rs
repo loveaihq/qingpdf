@@ -11,6 +11,7 @@
 mod annot_tests;
 mod annotedit;
 mod annotlist;
+mod bookmarks;
 mod chrome;
 mod compress;
 mod editing;
@@ -59,6 +60,7 @@ use crate::zoom::{self, ZoomMode};
 
 pub use printjob::PrintTest;
 use printjob::PrintJob;
+use bookmarks::BmWork;
 use editing::{After, EditState, Tool};
 use pages::PageWork;
 use selecting::{PageBoxes, Press};
@@ -167,6 +169,14 @@ pub const CMD_THEME_DARK: u32 = 157;
 pub const CMD_TINT_ORIGINAL: u32 = 158;
 pub const CMD_TINT_NIGHT: u32 = 159;
 pub const CMD_TINT_SEPIA: u32 = 160;
+/// The bookmarks (2026-10-20): add, type over the title, take out, one level deeper or shallower, lead to the top of the window, make from headings.
+pub const CMD_BM_ADD: u32 = 170;
+pub const CMD_BM_RENAME: u32 = 171;
+pub const CMD_BM_DELETE: u32 = 172;
+pub const CMD_BM_INDENT: u32 = 173;
+pub const CMD_BM_OUTDENT: u32 = 174;
+pub const CMD_BM_HERE: u32 = 175;
+pub const CMD_BM_AUTO: u32 = 176;
 
 // Questions asked of the user.
 const TAG_PASSWORD: u32 = 1;
@@ -183,6 +193,7 @@ const TAG_COMPRESS: u32 = 11;
 const TAG_COMPRESS_SAVE: u32 = 12;
 const TAG_COMPRESS_OPEN: u32 = 13;
 const TAG_NOTE_EDIT: u32 = 14;
+const TAG_BM_AUTO: u32 = 15;
 
 // Timers.
 /// The view has stopped moving.
@@ -405,6 +416,8 @@ app_fields! {
         /// The keys belong to the list of thumbnails (it was clicked last), and its bar is being dragged; or to the list of annotations.
         thumb_focus: bool,
         annots_focus: bool,
+        /// Editing the bookmarks (2026-10-20): the item selected, the keys, the changes waiting for the engine.
+        bm: BmWork,
         al: annotlist::AnnotList,
         thumb_drag: bool,
         /// The page the list of thumbnails moved to (it is the page shown as current while it is in view), and whether that move is going on.
@@ -555,6 +568,7 @@ impl App {
             thumbs: thumbs::Thumbs::new(),
             thumb_focus: false,
             annots_focus: false,
+            bm: BmWork::default(),
             al: annotlist::AnnotList::new(),
             thumb_drag: false,
             thumb_target: None,
@@ -636,8 +650,9 @@ impl App {
         self.scroll_y = 0;
         self.sharp_on_screen = false;
         self.menus_dirty = true;
+        self.bm = BmWork::default();
         if had_outline {
-            actions.push(Action::Outline(Vec::new()));
+            actions.push(Action::Outline { nodes: Vec::new(), select: None });
         }
         // The pages have the width of the window again.
         self.view_x = 0;
@@ -1199,6 +1214,12 @@ impl App {
             CMD_PG_INS_BEFORE | CMD_PG_INS_AFTER => self.ask_insert_file(cmd == CMD_PG_INS_AFTER),
             CMD_PG_EXTRACT => self.ask_extract(),
             CMD_BOOKMARKS => self.toggle_sidebar(),
+            CMD_BM_ADD => self.bm_add(),
+            CMD_BM_RENAME => self.bm_rename(),
+            CMD_BM_DELETE => self.bm_delete(),
+            CMD_BM_INDENT | CMD_BM_OUTDENT => self.bm_shift(cmd == CMD_BM_INDENT),
+            CMD_BM_HERE => self.bm_here(),
+            CMD_BM_AUTO => self.bm_auto(),
             CMD_COPY => self.copy_selection(),
             CMD_GOTO if self.doc.is_some() => {
                 let title = t(self.lang, Msg::GoToTitle).to_string();
@@ -1237,11 +1258,16 @@ impl App {
         if !ctrl && self.annots_focus && self.annots_shown() && let Some(list_key) = sidebar::list_key(key) {
             return self.annots_key(list_key);
         }
+        // ... and the tree of bookmarks: F2 types over the title, Delete takes the bookmark out, Tab and Shift+Tab move it a level.
+        if !ctrl && let Some(actions) = self.bm_key(key, shift) {
+            return actions;
+        }
         let page_step = (self.view_h * 9 / 10).max(1);
         let line = self.px(LINE_STEP);
         if ctrl {
             return match key {
                 vk::O => self.command(CMD_OPEN),
+                vk::B => self.command(CMD_BM_ADD),
                 vk::TAB => self.command(if shift { CMD_PREV_TAB } else { CMD_NEXT_TAB }),
                 vk::W | vk::F4 => self.command(CMD_CLOSE_TAB),
                 vk::G => self.command(CMD_GOTO),
@@ -1443,6 +1469,7 @@ impl App {
             Event::Wheel { y, .. } | Event::ContextMenu { y, .. } if y < dy => Err(Vec::new()),
             Event::Wheel { delta, ctrl, shift, x, y } => Ok(Event::Wheel { delta, ctrl, shift, x, y: y - dy }),
             Event::ContextMenu { x, y } => Ok(Event::ContextMenu { x, y: y - dy }),
+            Event::OutlineMenu { index, x, y } => Ok(Event::OutlineMenu { index, x, y: y - dy }),
             Event::Hover { x, y } => Err(self.strip_hover((y < dy).then_some(i64::from(x)))),
             Event::MiddleClick { x, y } if y < dy => Err(self.strip_middle(i64::from(x))),
             Event::MiddleClick { .. } => Err(Vec::new()),
@@ -1585,6 +1612,9 @@ impl App {
                 if cmd != CMD_BOOKMARKS && !pages::is_page_command(cmd) {
                     self.thumb_focus = false;
                 }
+                if !(CMD_BM_ADD..=CMD_BM_AUTO).contains(&cmd) {
+                    self.bm.focus = false;
+                }
                 let mut actions = self.flush_nudge();
                 actions.extend(self.command(cmd));
                 actions
@@ -1677,8 +1707,13 @@ impl App {
             Event::SaveChoice { tag: TAG_UNSAVED, choice } => self.unsaved_answered(choice),
             Event::SaveChoice { .. } => Vec::new(),
             Event::OutlineClick(i) => self.outline_click(i),
+            Event::OutlineRename { index, text } => self.bm_renamed(index, &text),
+            Event::OutlineDrop { from, to, place } => self.bm_moved(from, to, place),
+            Event::OutlineExpand { index, open } => self.bm_expanded(index, open),
+            Event::OutlineMenu { index, x, y } => self.bm_menu(index, x, y),
             Event::FindText(text) => self.find_text_changed(text),
             Event::Confirmed { tag: TAG_LINK, yes } => self.link_confirmed(yes),
+            Event::Confirmed { tag: TAG_BM_AUTO, yes } => self.bm_auto_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_SAVE, yes } => self.compress_save_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_OPEN, yes } => self.compress_open_answered(yes),
             Event::Confirmed { .. } => Vec::new(),

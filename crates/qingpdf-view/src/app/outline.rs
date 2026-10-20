@@ -3,7 +3,6 @@
 use qingpdf_core::view::{Event as EngineEvent, Link, LinkKind, OutlineItem, safe_uri};
 
 use super::*;
-use crate::ui::OutlineNode;
 
 /// Pages round the window whose links are kept.
 const LINK_PAGES_KEPT: u32 = 12;
@@ -18,18 +17,18 @@ impl App {
     }
 
     fn on_outline(&mut self, items: Vec<OutlineItem>) -> Vec<Action> {
-        let untitled = t(self.lang, Msg::Untitled);
-        let nodes: Vec<OutlineNode> = items
-            .iter()
-            .map(|i| OutlineNode { title: if i.title.trim().is_empty() { untitled.to_string() } else { i.title.clone() }, depth: i.depth, open: i.open })
-            .collect();
+        let first = self.outline.is_empty();
         self.outline = items;
-        let mut actions = vec![Action::Outline(nodes)];
+        let mut actions = self.bm_listed(first);
         actions.extend(self.apply_sidebar());
         actions
     }
 
     pub(super) fn outline_click(&mut self, index: usize) -> Vec<Action> {
+        // The second click on the item that is selected, a moment after the first, types over its title.
+        if self.bm_clicked(index) {
+            return vec![Action::OutlineRename(index)];
+        }
         let Some(item) = self.outline.get(index) else { return Vec::new() };
         match item.page {
             Some(page) => self.go_to_target(page, item.y),
@@ -178,6 +177,7 @@ impl App {
     pub(super) fn on_other_event(&mut self, event: EngineEvent) -> Vec<Action> {
         match event {
             EngineEvent::Outline { doc, items, .. } if doc == self.doc_id => self.on_outline(items),
+            EngineEvent::Headings { doc, id, status, message, items, .. } if doc == self.doc_id => self.on_headings(id, status, &message, items),
             EngineEvent::Links { doc, id, page, links, .. } if doc == self.doc_id => {
                 self.on_links(id, page, links);
                 Vec::new()

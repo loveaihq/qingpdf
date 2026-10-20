@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 
+use qingpdf_core::bookmarks::Place;
+
 /// A rectangle in pixels of the window's client area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -77,6 +79,7 @@ pub mod vk {
     pub const NUM1: u32 = 0x31;
     pub const NUM2: u32 = 0x32;
     pub const A: u32 = 0x41;
+    pub const B: u32 = 0x42;
     pub const C: u32 = 0x43;
     pub const F: u32 = 0x46;
     pub const G: u32 = 0x47;
@@ -90,6 +93,7 @@ pub mod vk {
     pub const NUMPAD0: u32 = 0x60;
     pub const ADD: u32 = 0x6B;
     pub const SUBTRACT: u32 = 0x6D;
+    pub const F2: u32 = 0x71;
     pub const F3: u32 = 0x72;
     pub const F4: u32 = 0x73;
     pub const F5: u32 = 0x74;
@@ -147,6 +151,12 @@ pub enum Event {
     SaveChoice { tag: u32, choice: SaveChoice },
     /// An item of the bookmarks was clicked (its number in the list given with [`Action::Outline`]).
     OutlineClick(usize),
+    /// The title of an item was typed over in the tree (2026-10-20), an item was dragged to a place of another (`from` to `place` of `to`), an
+    /// item was opened (`true`) or closed, and the right button was pressed (on an item, or on none) at this place of the pages' area.
+    OutlineRename { index: usize, text: String },
+    OutlineDrop { from: usize, to: usize, place: Place },
+    OutlineExpand { index: usize, open: bool },
+    OutlineMenu { index: Option<usize>, x: i32, y: i32 },
     /// The text in the find box changed.
     FindText(String),
     /// The answer to [`Action::Confirm`].
@@ -375,8 +385,10 @@ pub enum Action {
     Quit,
     /// Put the menus again (what is checked or greyed, the files in the list of recent ones, have changed).
     SetMenus(Vec<Menu>),
-    /// The bookmarks to show in the tree (an empty list clears it) ...
-    Outline(Vec<OutlineNode>),
+    /// The bookmarks to show in the tree (an empty list clears it), and the item to select and bring into view ...
+    Outline { nodes: Vec<OutlineNode>, select: Option<usize> },
+    /// ... the title of this item is typed over in the tree, where it is ...
+    OutlineRename(usize),
     /// ... and the place of the tree in the window (a width of 0 hides it).
     Sidebar(Rect),
     /// Show the find box at this place (and put the keyboard in it), or hide it.
