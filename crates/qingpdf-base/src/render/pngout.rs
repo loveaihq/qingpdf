@@ -92,22 +92,104 @@ pub fn png(width: u32, height: u32, channels: u8, data: &[u8]) -> Vec<u8> {
     assemble(width, height, depth, color, &raw, 6)
 }
 
-/// The page `qingpdf render` draws (`rgba`: 4 bytes a pixel, the fourth is not written) as a PNG of RGB: the filter Sub on every row and
-/// the quickest level of the compression, which is what a page of some megabytes needs (the pictures of a Word file are worth the time
-/// to find the filters, this is not).
-pub(super) fn page(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-    let stride = (width as usize * 4).max(1);
-    let mut raw = Vec::with_capacity((width as usize * 3 + 1) * height as usize);
-    for row in rgba.chunks_exact(stride) {
-        raw.push(1);
-        let mut left = [0u8; 3];
-        for &[r, g, b, _] in row.as_chunks::<4>().0 {
-            let here = [r, g, b];
-            raw.extend(here.iter().zip(&left).map(|(&v, &l)| v.wrapping_sub(l)));
-            left = here;
+/// A page as a PNG of RGB, written to `sink` a band of rows at a time: the filter Sub on every row and the quickest level of the
+/// compression, which is what a page of some megabytes needs (the pictures of a Word file are worth the time to find the filters,
+/// this is not). Only the compressor and the rows of one band are held, whatever the size of the page, so a page of hundreds of
+/// megabytes can be drawn in pieces and written as they come; the compressed data goes out as it is made, in `IDAT` chunks.
+pub struct PageWriter<W: std::io::Write> {
+    sink: W,
+    deflate: Box<miniz_oxide::deflate::core::CompressorOxide>,
+    width: usize,
+    rows_left: u32,
+    out: Vec<u8>,
+}
+
+/// The size of the pieces the compressed data is cut into (the data of one `IDAT` chunk).
+const IDAT_BYTES: usize = 1 << 16;
+
+impl<W: std::io::Write> PageWriter<W> {
+    /// Start a PNG of `width` by `height` pixels: the signature and the header are written now.
+    pub fn new(mut sink: W, width: u32, height: u32) -> std::io::Result<PageWriter<W>> {
+        let mut head = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        chunk(&mut head, b"IHDR", &ihdr);
+        sink.write_all(&head)?;
+        let level = miniz_oxide::deflate::CompressionLevel::BestSpeed;
+        let deflate = Box::new(miniz_oxide::deflate::core::CompressorOxide::with_format_and_level(miniz_oxide::DataFormat::Zlib, level));
+        Ok(PageWriter { sink, deflate, width: width as usize, rows_left: height, out: vec![0; IDAT_BYTES] })
+    }
+
+    /// Push `data` into the compressor (`last`: it is all there is), writing what comes out.
+    fn push(&mut self, mut data: &[u8], last: bool) -> std::io::Result<()> {
+        use miniz_oxide::deflate::core::{TDEFLFlush, TDEFLStatus, compress};
+        let flush = if last { TDEFLFlush::Finish } else { TDEFLFlush::None };
+        let mut stuck = 0u8;
+        loop {
+            let (status, used, made) = compress(&mut self.deflate, data, &mut self.out, flush);
+            data = data.get(used..).unwrap_or(&[]);
+            if made > 0 {
+                let mut piece = Vec::with_capacity(made + 12);
+                chunk(&mut piece, b"IDAT", self.out.get(..made).unwrap_or(&[]));
+                self.sink.write_all(&piece)?;
+            }
+            match status {
+                TDEFLStatus::Done => return Ok(()),
+                // (All given and the buffer not full: nothing more is waiting to come out, until the next rows or the end.)
+                TDEFLStatus::Okay if !last && data.is_empty() && made < self.out.len() => return Ok(()),
+                TDEFLStatus::Okay => {}
+                _ => return Err(std::io::Error::other("the compressor failed")),
+            }
+            stuck = if used == 0 && made == 0 { stuck + 1 } else { 0 };
+            if stuck > 2 {
+                return Err(std::io::Error::other("the compressor made no progress"));
+            }
         }
     }
-    assemble(width, height, 8, 2, &raw, 1)
+
+    /// The next rows of the page (`rgba`: 4 bytes a pixel, the fourth is not written; whole rows).
+    pub fn rows(&mut self, rgba: &[u8]) -> std::io::Result<()> {
+        let stride = (self.width * 4).max(1);
+        let mut raw = Vec::with_capacity((self.width * 3 + 1) * 64);
+        for band in rgba.chunks(stride * 64) {
+            raw.clear();
+            for row in band.chunks_exact(stride) {
+                if self.rows_left == 0 {
+                    break;
+                }
+                self.rows_left -= 1;
+                raw.push(1);
+                let mut left = [0u8; 3];
+                for &[r, g, b, _] in row.as_chunks::<4>().0 {
+                    let here = [r, g, b];
+                    raw.extend(here.iter().zip(&left).map(|(&v, &l)| v.wrapping_sub(l)));
+                    left = here;
+                }
+            }
+            self.push(&raw, false)?;
+        }
+        Ok(())
+    }
+
+    /// The end of the data and of the file; the sink is given back. Fewer rows than the header says were given: an error.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        if self.rows_left != 0 {
+            return Err(std::io::Error::other("the page was not all given"));
+        }
+        self.push(&[], true)?;
+        let mut end = Vec::with_capacity(12);
+        chunk(&mut end, b"IEND", &[]);
+        self.sink.write_all(&end)?;
+        Ok(self.sink)
+    }
+}
+
+/// The page `qingpdf render` draws (`rgba`: 4 bytes a pixel, the fourth is not written) as a PNG of RGB.
+pub(super) fn page(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    // (Into a vector nothing fails, but a bitmap that has fewer rows than it says, which a bitmap never has.)
+    PageWriter::new(Vec::new(), width, height).and_then(|mut w| w.rows(rgba).and_then(|()| w.finish())).unwrap_or_default()
 }
 
 /// The signature, the header, the data (`raw`: the rows with their filter bytes, compressed with zlib at `level`) and the end.
@@ -167,6 +249,32 @@ mod tests {
             let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| p.iter().take(3).copied()).collect();
             assert_eq!(back, rgb, "{w} x {h}");
         }
+    }
+
+    #[test]
+    fn a_page_written_in_bands_is_the_page_written_at_once() {
+        let (w, h) = (37usize, 211usize);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * 7 + i / 13 + (i / 5) % 3) % 251) as u8).collect();
+        let whole = page(w as u32, h as u32, &rgba);
+        // Bands of 1, 70 and 140 rows (the compressor takes them as they come); the picture is the same, and the data is cut into pieces.
+        let mut writer = PageWriter::new(Vec::new(), w as u32, h as u32).unwrap();
+        for band in [1usize, 70, 140] {
+            let from: usize = [0usize, 1, 71].iter().zip([1usize, 70, 140]).find(|(_, b)| *b == band).map(|(f, _)| *f).unwrap();
+            writer.rows(&rgba[from * w * 4..(from + band) * w * 4]).unwrap();
+        }
+        let banded = writer.finish().unwrap();
+        let rgb: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| p.iter().take(3).copied()).collect();
+        assert_eq!(decode(&whole).4, rgb);
+        assert_eq!(decode(&banded).4, rgb);
+        // A page that is not all given is an error, and so is one given with too many rows (they are left out).
+        let mut short = PageWriter::new(Vec::new(), 2, 3).unwrap();
+        short.rows(&[0; 8]).unwrap();
+        assert!(short.finish().is_err());
+        // A large noisy page comes out in more than one chunk of data.
+        let noise: Vec<u8> = (0..300 * 300 * 4u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        let big = page(300, 300, &noise);
+        assert!(big.windows(4).filter(|w| w == b"IDAT").count() > 1);
+        assert_eq!(decode(&big).4.len(), 300 * 300 * 3);
     }
 
     #[test]

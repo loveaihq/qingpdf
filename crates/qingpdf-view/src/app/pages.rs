@@ -106,7 +106,7 @@ impl App {
         if !self.rights.assemble {
             return Some(self.say(t(self.lang, Msg::NotePagesDenied).to_string()));
         }
-        if self.ocr.is_some() || self.print.is_some() {
+        if self.ocr.is_some() || self.print.is_some() || self.px.busy() {
             return Some(self.say(t(self.lang, Msg::NoteBusy).to_string()));
         }
         // It waits for the answer (a few milliseconds) by being ignored.

@@ -33,6 +33,8 @@ pub(super) struct MenuState {
     pub can_modify: bool,
     /// The bookmarks may be changed (Insert > Bookmark, Tools > Bookmarks from headings).
     pub can_bookmarks: bool,
+    /// Pages may be cropped (the Page menu).
+    pub can_crop: bool,
     pub wm: Watermarking,
     /// Text of scans can be recognized (a file is open and no recognition is going on).
     pub can_ocr: bool,
@@ -67,6 +69,7 @@ impl MenuState {
             text_size: 1,
             can_modify: false,
             can_bookmarks: false,
+            can_crop: false,
             wm: Watermarking { opacity: 1, angle: 0, tile: false, under: false, page_only: false },
             can_ocr: false,
             toolbar: true,
@@ -128,8 +131,11 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 item(CMD_SAVE_AS, Msg::SaveAs, st.has_doc),
                 item(CMD_EXPORT_DOCX, Msg::ExportWord, st.has_doc),
                 item(CMD_EXPORT_XLSX, Msg::ExportExcel, st.has_doc),
+                item(CMD_EXPORT_IMAGES, Msg::ExportImgMenu, st.has_doc),
+                item(CMD_EXTRACT_IMAGES, Msg::ExtractImgMenu, st.has_doc),
                 item(CMD_PROTECT, Msg::ProtectMenu, st.has_doc),
                 item(CMD_COMPRESS, Msg::CzMenu, st.has_doc),
+                item(CMD_PROPERTIES, Msg::PropsMenu, st.has_doc),
                 MenuEntry::Separator,
                 item(CMD_PRINT, Msg::Print, st.has_doc),
                 MenuEntry::Separator,
@@ -178,6 +184,14 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                         .map(|(id, m, c)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.lang_choice == c, enabled: true })
                         .collect(),
                 },
+            ],
+        },
+        Menu {
+            title: t(lang, Msg::PageMenu).to_string(),
+            entries: vec![
+                item(CMD_CROP, Msg::CropMenu, st.can_crop),
+                MenuEntry::Item { id: CMD_TOOL_CROP, label: t(lang, Msg::CropToolMenu).to_string(), checked: st.tool == CMD_TOOL_CROP, enabled: st.can_crop },
+                item(CMD_UNCROP, Msg::UncropMenu, st.can_crop),
             ],
         },
         Menu {
@@ -294,6 +308,7 @@ impl App {
             Tool::Shape(ShapeKind::Line) => CMD_TOOL_LINE,
             Tool::Shape(ShapeKind::Arrow) => CMD_TOOL_ARROW,
             Tool::Shape(ShapeKind::Redact) => CMD_TOOL_REDACT,
+            Tool::Crop => CMD_TOOL_CROP,
         }
     }
 
@@ -318,6 +333,7 @@ impl App {
             text_size: self.edit.forms.text_size,
             can_modify: self.doc.is_some() && self.rights.modify,
             can_bookmarks: self.bm_allowed(),
+            can_crop: self.can_crop(),
             wm: self.edit.forms.wm,
             can_ocr: self.doc.is_some() && self.ocr.is_none(),
             toolbar: self.toolbar_on,
@@ -354,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_nine_menus_and_every_command_is_in_one() {
+    fn there_are_ten_menus_and_every_command_is_in_one() {
         let st = MenuState {
             has_doc: true,
             recent: vec!["C:\\a.pdf".to_string(), "C:\\b&c.pdf".to_string()],
@@ -364,19 +380,20 @@ mod tests {
             has_picked: true,
             can_modify: true,
             can_bookmarks: true,
+            can_crop: true,
             can_ocr: true,
             ..MenuState::idle()
         };
         for lang in [Lang::En, Lang::Zh] {
             let menus = build_menus(lang, &st);
-            assert_eq!(menus.len(), 9);
+            assert_eq!(menus.len(), 10);
             let listed = all(&menus);
             let mut ids: Vec<u32> = listed.iter().map(|(id, ..)| *id).collect();
             ids.sort_unstable();
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_TOOL_REDACT, CMD_REDACT_SELECTION, CMD_REDACT_FIND, CMD_REDACT_APPLY, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_TOOL_REDACT, CMD_REDACT_SELECTION, CMD_REDACT_FIND, CMD_REDACT_APPLY, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA, CMD_CROP, CMD_TOOL_CROP, CMD_UNCROP, CMD_EXPORT_IMAGES, CMD_EXTRACT_IMAGES, CMD_PROPERTIES] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.
@@ -399,7 +416,7 @@ mod tests {
         for cmd in [CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_PRESENT, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }
-        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO] {
+        for cmd in [CMD_PRINT, CMD_ZOOM_IN, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_TOOL_HIGHLIGHT, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_TILE, CMD_AUTHOR, CMD_REMOVE, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_CROP, CMD_TOOL_CROP, CMD_UNCROP, CMD_EXPORT_IMAGES, CMD_EXTRACT_IMAGES, CMD_PROPERTIES] {
             assert_eq!(enabled(cmd), Some(false), "{cmd}");
         }
         assert!(listed.iter().any(|(id, label, e)| *id == 0 && label == "(none)" && !e));

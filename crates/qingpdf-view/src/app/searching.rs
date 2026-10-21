@@ -49,6 +49,9 @@ impl App {
         if let Some(actions) = self.cancel_compress() {
             return actions;
         }
+        if let Some(actions) = self.cancel_pictures().or_else(|| self.cancel_crop_look()) {
+            return actions;
+        }
         if let Some(actions) = self.stop_ocr() {
             return actions;
         }

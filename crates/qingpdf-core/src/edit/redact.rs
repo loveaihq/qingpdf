@@ -545,7 +545,7 @@ pub fn redact_document(doc: &Document, password: &str, spec: &RedactSpec, work: 
     if redactor.touched.iter().any(|f| matches!(doc.get(*f), Ok(Object::Dict(d)) if d.contains_key("ToUnicode"))) {
         warnings.push("The fonts that lost text still list the removed characters in their /ToUnicode tables: a short word can be read back as a set of characters.".to_string());
     }
-    let (files, scripts) = count_active(doc, &pages);
+    let (files, scripts, _) = count_active(doc, &pages, 2_000_000);
     if files + scripts > 0 {
         let what = format!("{files} attachment(s) and {scripts} script(s) (JavaScript)");
         if spec.remove_active {
@@ -629,7 +629,7 @@ fn places(doc: &Document, pages: &[Page]) -> Vec<(&'static str, Object)> {
         };
         out.push((name, v.clone()));
     }
-    out.extend(doc.trailer().get("Info").map(|i| ("the document information", i.clone())));
+    out.extend(doc.info_entry().map(|i| ("the document information", i)));
     for page in pages {
         out.extend(page.dict.get("AA").map(|a| ("actions", a.clone())));
         if let Some(Object::Array(items)) = page.dict.get("Annots").and_then(|a| doc.resolve(a).ok()) {
@@ -643,17 +643,18 @@ fn is_script(o: &Object) -> bool {
     matches!(o, Object::Dict(d) if d.get_name("S").is_some_and(|s| s == "JavaScript"))
 }
 
-/// How many attachments (file specifications that hold a file) and scripts (JavaScript actions) the file has.
-fn count_active(doc: &Document, pages: &[Page]) -> (usize, usize) {
+/// How many attachments (file specifications that hold a file) and scripts (JavaScript actions) the file has, looking at `budget` objects at the most
+/// (the third is whether all were looked at).
+pub(crate) fn count_active(doc: &Document, pages: &[Page], mut budget: usize) -> (usize, usize, bool) {
     let (mut files, mut scripts) = (0usize, 0usize);
-    let (mut seen, mut budget) = (IdSet::new(), 2_000_000usize);
+    let mut seen = IdSet::new();
     for (_, root) in places(doc, pages) {
         walk(doc, &root, &mut seen, &mut budget, &mut |o| {
             files += usize::from(matches!(o, Object::Dict(d) if d.contains_key("EF")));
             scripts += usize::from(is_script(o));
         });
     }
-    (files, scripts)
+    (files, scripts, budget > 0)
 }
 
 /// Does what `o` is (or leads to) have a script?

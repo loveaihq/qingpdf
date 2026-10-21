@@ -270,6 +270,19 @@ struct LocalTime {
     rest: [u16; 4],
 }
 
+/// BROWSEINFOW.
+#[repr(C)]
+struct BrowseInfo {
+    owner: isize,
+    root: *const c_void,
+    display_name: *mut u16,
+    title: *const u16,
+    flags: u32,
+    callback: *const c_void,
+    param: isize,
+    image: i32,
+}
+
 #[repr(C)]
 struct ProcessMemoryCounters {
     cb: u32,
@@ -540,6 +553,7 @@ unsafe extern "system" {
     fn CreateMutexW(attributes: *const c_void, owner: i32, name: *const u16) -> isize;
     fn GetLastError() -> u32;
     fn GetLocalTime(time: *mut LocalTime);
+    fn SystemTimeToTzSpecificLocalTime(zone: *const c_void, utc: *const LocalTime, local: *mut LocalTime) -> i32;
     fn AttachConsole(pid: u32) -> i32;
     fn GetStdHandle(which: u32) -> isize;
     fn SetStdHandle(which: u32, handle: isize) -> i32;
@@ -556,6 +570,7 @@ unsafe extern "system" {
 #[link(name = "ole32")]
 unsafe extern "system" {
     fn CoInitializeEx(reserved: *const c_void, flags: u32) -> i32;
+    fn CoTaskMemFree(memory: *mut c_void);
 }
 
 #[link(name = "shell32")]
@@ -564,6 +579,8 @@ unsafe extern "system" {
     fn DragQueryFileW(drop: isize, index: u32, buffer: *mut u16, len: u32) -> u32;
     fn DragFinish(drop: isize);
     fn ShellExecuteW(hwnd: isize, verb: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
+    fn SHBrowseForFolderW(info: *mut BrowseInfo) -> *mut c_void;
+    fn SHGetPathFromIDListW(list: *const c_void, path: *mut u16) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -670,6 +687,8 @@ const MB_ICONINFORMATION: u32 = 0x40;
 const MB_ICONERROR: u32 = 0x10;
 const MB_TASKMODAL: u32 = 0x2000;
 const ES_AUTOHSCROLL: u32 = 0x80;
+/// A label shows an ampersand as it is (a file name or a title is not a menu item).
+const SS_NOPREFIX: u32 = 0x80;
 const ES_PASSWORD: u32 = 0x20;
 const ES_MULTILINE: u32 = 0x4;
 const ES_AUTOVSCROLL: u32 = 0x40;
@@ -1005,6 +1024,18 @@ pub fn local_date() -> String {
     format!("{:04}-{:02}-{:02}", t.year, t.month, t.day)
 }
 
+/// A time (seconds since 1970, UTC) in the person's time zone, as `2026-10-15 14:03:09` (the dates in a file's properties).
+pub fn local_time(utc_secs: i64) -> String {
+    let (year, month, day, hour, minute, second) = qingpdf_core::props::civil(utc_secs);
+    let utc = LocalTime { year: year.clamp(1601, 30_827) as u16, month: month as u16, weekday: 0, day: day as u16, rest: [hour as u16, minute as u16, second as u16, 0] };
+    let mut local = LocalTime::default();
+    // SAFETY: both are live SYSTEMTIMEs of the size Windows expects; a null zone means the one Windows is set to; Windows fills in `local`
+    // and keeps no pointer. If it fails, `local` stays empty and the time is told as it came.
+    let ok = unsafe { SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) } != 0;
+    let l = if ok { local } else { utc };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", l.year, l.month, l.day, l.rest[0], l.rest[1], l.rest[2])
+}
+
 /// The most memory this process has had in use, in bytes (0 if Windows will not say).
 pub fn peak_working_set() -> u64 {
     let mut c = ProcessMemoryCounters {
@@ -1246,6 +1277,10 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
             Action::PickSavePath { title, filters, name } => {
                 let picked = file_dialog(hwnd, &title, &filters, Some(&name));
                 queue.extend(deliver(state, Event::SavePicked(picked)));
+            }
+            Action::PickFolder { title } => {
+                let picked = folder_dialog(hwnd, &title);
+                queue.extend(deliver(state, Event::FolderPicked(picked)));
             }
             Action::AskSave { tag, title, text } => {
                 let (t, c) = (wide(&text), wide(&title));
@@ -2605,6 +2640,28 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
     Some(PathBuf::from(OsString::from_wide(file.get(..len).unwrap_or(&[]))))
 }
 
+/// The box that picks a folder (the shell's tree of folders, with a button to make a new one).
+fn folder_dialog(owner: isize, title: &str) -> Option<PathBuf> {
+    /// BIF_RETURNONLYFSDIRS and BIF_NEWDIALOGSTYLE.
+    const FLAGS: u32 = 0x1 | 0x40;
+    let title = wide(title);
+    let mut name = [0u16; 260];
+    let mut info = BrowseInfo { owner, root: null(), display_name: name.as_mut_ptr(), title: title.as_ptr(), flags: FLAGS, callback: null(), param: 0, image: 0 };
+    // SAFETY: `info` is a live BROWSEINFOW whose pointers (`name`, which has the 260 units Windows writes at the most, and `title`) outlive the call; the box
+    // is modal and Windows keeps none of them. It returns a list of items to be freed with CoTaskMemFree, or null if it was cancelled.
+    let list = unsafe { SHBrowseForFolderW(&mut info) };
+    if list.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 260];
+    // SAFETY: `list` came from SHBrowseForFolderW and is freed once, after this; `path` has the 260 units MAX_PATH calls for.
+    let got = unsafe { SHGetPathFromIDListW(list, path.as_mut_ptr()) } != 0;
+    // SAFETY: `list` is the item list the shell allocated, not used again.
+    unsafe { CoTaskMemFree(list) };
+    let len = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+    got.then(|| PathBuf::from(OsString::from_wide(path.get(..len).unwrap_or(&[])))).filter(|p| !p.as_os_str().is_empty())
+}
+
 struct DialogState {
     done: Cell<bool>,
     accepted: Cell<bool>,
@@ -2740,11 +2797,21 @@ fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &
     let mut frame = WinRect { left: 0, top: 0, right: s(w), bottom: s(h) };
     // SAFETY: `frame` is a live RECT that is rewritten in place.
     unsafe { AdjustWindowRectExForDpi(&mut frame, style, 0, WS_EX_DLGMODALFRAME, dpi) };
-    let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
+    let (mut fw, mut fh) = (frame.right - frame.left, frame.bottom - frame.top);
+    // A box is never bigger than the work area of the screen it opens on, and it is moved in until all of it is there: its buttons are at its foot.
+    let work = monitor_work(owner);
+    if let Some(w) = &work {
+        fw = fw.min(w.right - w.left);
+        fh = fh.min(w.bottom - w.top);
+    }
     let mut at = WinRect::default();
     // SAFETY: `at` is a live RECT that Windows fills in.
     unsafe { GetWindowRect(owner, &mut at) };
-    let (x, y) = (at.left + ((at.right - at.left) - fw) / 2, at.top + ((at.bottom - at.top) - fh) / 3);
+    let (mut x, mut y) = (at.left + ((at.right - at.left) - fw) / 2, at.top + ((at.bottom - at.top) - fh) / 3);
+    if let Some(w) = &work {
+        x = x.clamp(w.left, (w.right - fw).max(w.left));
+        y = y.clamp(w.top, (w.bottom - fh).max(w.top));
+    }
     let title_w = wide(title);
     // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; `owner` is the main window; no
     // creation parameter is passed. A handle of 0 means failure and is checked.
@@ -2756,6 +2823,15 @@ fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &
     // (`end_modal`, which clears the slot), and the slot is only read on this thread.
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, std::ptr::from_ref(state) as isize) };
     Some((dialog, instance))
+}
+
+/// The height of the inside of a box made by `make_dialog`, in units of a 96th of an inch (less than it was asked for when the box was cut to the work
+/// area of the screen).
+fn client_units(dialog: isize, dpi: u32) -> i32 {
+    let mut r = WinRect::default();
+    // SAFETY: `r` is a live RECT that Windows fills in for a window that is alive.
+    let ok = unsafe { GetClientRect(dialog, &mut r) } != 0;
+    if ok && r.bottom > 0 { r.bottom * 96 / dpi.max(1) as i32 } else { i32::MAX }
 }
 
 /// A control inside a box made by `make_dialog`, at `(x, y, w, h)` units of a 96th of an inch, in the font of the program; 0 if it was not made.
@@ -2870,7 +2946,7 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
     let (mut buttons, mut focus) = (0usize, 0isize);
     for (k, item) in spec.items.iter().enumerate() {
         let (class, style, ex) = match item.kind {
-            FormKind::Label => ("STATIC", 0, 0),
+            FormKind::Label => ("STATIC", SS_NOPREFIX, 0),
             FormKind::Group => ("BUTTON", BS_GROUPBOX, 0),
             FormKind::Edit => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE),
             FormKind::Secret => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, WS_EX_CLIENTEDGE),
@@ -2918,7 +2994,8 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
             line: s(16),
         });
     }
-    let foot = spec.size.1 - 36;
+    // (The buttons are at the foot of the inside the box has, which is less than it was asked for when the box was cut to the screen.)
+    let foot = client_units(dialog, dpi).min(spec.size.1) - 36;
     child("BUTTON", &spec.ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (spec.size.0 - 202, foot, 90, 28), IDOK);
     child("BUTTON", &spec.cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (spec.size.0 - 104, foot, 90, 28), IDCANCEL);
     modal_loop(owner, dialog, &state, focus);
@@ -3629,6 +3706,14 @@ fn monitor_rect(hwnd: isize) -> Option<WinRect> {
     // SAFETY: `info` is a live struct of the size it declares, which Windows fills in; the handles are this window's and the monitor nearest it.
     let ok = unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) } != 0;
     ok.then_some(info.monitor)
+}
+
+/// The work area (the monitor less the taskbar) of the monitor the window is on (nearest it), if Windows says.
+fn monitor_work(hwnd: isize) -> Option<WinRect> {
+    let mut info = MonitorInfo { size: std::mem::size_of::<MonitorInfo>() as u32, monitor: WinRect::default(), work: WinRect::default(), flags: 0 };
+    // SAFETY: `info` is a live struct of the size it declares, which Windows fills in; the handles are this window's and the monitor nearest it.
+    let ok = unsafe { GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) } != 0;
+    ok.then_some(info.work)
 }
 
 /// The full-screen window is as big as its monitor (it was made so, and again when the monitor's dots per inch changed).

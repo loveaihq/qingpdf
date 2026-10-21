@@ -12,10 +12,11 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crate::idmap::IdMap;
+use crate::idmap::{IdMap, IdSet};
 use crate::document::{Document, Page};
 use crate::edit::{self, EditClass, signature::Policy};
 use crate::error::Error;
+use crate::export;
 use crate::object::Object;
 use crate::ops;
 use crate::render::work::{Work, cost};
@@ -28,7 +29,7 @@ use super::store::Store;
 use super::targets::{Names, page_index};
 use super::textcache::TextCache;
 use super::{
-    BACKGROUND_PRIORITY, CharBoxes, Command, Event, ListedAnnot, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
+    BACKGROUND_PRIORITY, CharBoxes, Command, Event, ImagesAsk, ListedAnnot, LOW_QUALITY_PRINT_DPI, OpenDoc, OpenFailure, Opened, PageInfo, PrintBand, PrintPage, PrintStatus, ProtectChange, ProtectJob, RenderRequest,
     MemoryPlan, RenderStatus, Rendered, Request, Rights, SearchHit, SearchStatus, Shared, TextStatus, annots, links, outline, page_info, reopen, search,
 };
 use crate::view::geometry::line_rects;
@@ -93,6 +94,32 @@ struct OcrImageJob {
     incomplete: String,
 }
 
+struct AutoCropJob {
+    id: u64,
+    pages: Vec<u32>,
+    /// The next page to draw (an index of `pages`), what was found, the pages that could not be drawn.
+    at: usize,
+    boxes: Vec<(u32, Option<[f32; 4]>)>,
+    failed: Vec<u32>,
+    announced: Instant,
+}
+
+struct ImagesJob {
+    id: u64,
+    ask: ImagesAsk,
+    /// The next page (an index of `ask.pages`), and for pictures how many this page has given so far.
+    at: usize,
+    n: usize,
+    checked: bool,
+    files: u32,
+    bytes: u64,
+    /// What went wrong, a line for each page.
+    failed: Vec<String>,
+    /// The pictures saved already.
+    seen: IdSet<u32>,
+    announced: Instant,
+}
+
 struct AnnotListJob {
     id: u64,
     /// The next page to read.
@@ -132,6 +159,9 @@ enum Job {
     Print(PrintJob),
     OcrScan(OcrScanJob),
     OcrImage(OcrImageJob),
+    Properties { id: u64 },
+    AutoCrop(AutoCropJob),
+    Images(Box<ImagesJob>),
 }
 
 impl Job {
@@ -144,12 +174,15 @@ impl Job {
             Job::Print(p) => p.id,
             Job::OcrScan(o) => o.id,
             Job::OcrImage(o) => o.id,
+            Job::Properties { id } => *id,
+            Job::AutoCrop(a) => a.id,
+            Job::Images(i) => i.id,
         }
     }
 
     /// A quick request that someone is waiting for.
     fn immediate(&self) -> bool {
-        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::AnnotText { .. } | Job::Fields { .. } | Job::Options { .. } | Job::TextLine { .. })
+        matches!(self, Job::Outline { .. } | Job::Links { .. } | Job::CharBoxes { .. } | Job::Annotations { .. } | Job::AnnotText { .. } | Job::Fields { .. } | Job::Options { .. } | Job::TextLine { .. } | Job::Properties { .. })
     }
 
     /// Has something to do now (a print job whose band is not used yet waits).
@@ -191,6 +224,9 @@ impl Job {
                 unreadable: 0,
                 truncated: false,
             }),
+            Request::Properties => Job::Properties { id },
+            Request::AutoCrop(list) => Job::AutoCrop(AutoCropJob { id, pages: edit::unique_pages(&list, pages), at: 0, boxes: Vec::new(), failed: Vec::new(), announced: Instant::now() }),
+            Request::Images(ask) => Job::Images(Box::new(ImagesJob { id, ask: *ask, at: 0, n: 0, checked: false, files: 0, bytes: 0, failed: Vec::new(), seen: IdSet::new(), announced: Instant::now() })),
             Request::OcrImage { page, max_side } => Job::OcrImage(OcrImageJob { id, page, max_side, size: None, y: 0, gray: Vec::new(), incomplete: String::new() }),
             Request::Print(mut list) => {
                 list.truncate(MAX_PRINT_PAGES);
@@ -638,6 +674,9 @@ impl Server<'_> {
             Job::Print(p) => self.step_print(p),
             Job::OcrScan(o) => self.step_ocr_scan(o),
             Job::OcrImage(o) => self.step_ocr_image(o),
+            Job::Properties { id } => self.properties(*id),
+            Job::AutoCrop(a) => self.step_auto_crop(a),
+            Job::Images(i) => self.step_images(i),
         };
         self.shared.current.store(0, Ordering::SeqCst);
         match step {
@@ -898,8 +937,9 @@ impl Server<'_> {
                     EditClass::Fill => (self.rights.fill_forms, DENIED_FILL),
                     EditClass::Content => (self.rights.modify, DENIED_MODIFY),
                     EditClass::Annotate => (self.rights.annotate, DENIED_ANNOTATE),
-                    EditClass::Assemble if matches!(edit, edit::Edit::Outline(_)) => (self.rights.assemble || self.rights.modify, DENIED_BOOKMARKS),
+                    EditClass::Assemble if matches!(edit, edit::Edit::Outline(_) | edit::Edit::Crop(_)) => (self.rights.assemble || self.rights.modify, DENIED_BOOKMARKS),
                     EditClass::Assemble => (self.rights.assemble, DENIED_ASSEMBLE),
+                    EditClass::Meta => (self.rights.modify, DENIED_MODIFY),
                 };
                 // Recognised text for a file that may not be changed is used in this window and not written (5c).
                 if let edit::Edit::OcrLayer(recognised) = &edit
@@ -983,10 +1023,13 @@ impl Server<'_> {
                 let changes = edit::commit(self.document, objects);
                 let signed = if policy == Policy::Warn && self.session.take_warning() { SIGNED_WARNING } else { "" };
                 let message = std::iter::once(signed.to_string()).chain(notes).filter(|m| !m.is_empty()).collect::<Vec<_>>().join(" ");
-                if let edit::Edit::Pages(op) = &edit {
+                if matches!(edit, edit::Edit::Pages(_) | edit::Edit::Crop(_)) {
                     // The list of pages: read again from the document, and only if it came out as the change meant is the step kept.
                     let before = self.pages.len();
-                    let expected = op.count_after(before);
+                    let expected = match &edit {
+                        edit::Edit::Pages(op) => op.count_after(before),
+                        _ => Some(before),
+                    };
                     let infos = match self.refresh_structure(|n| expected.map_or(n > before, |e| e == n)) {
                         Ok(infos) => infos,
                         Err(why) => {
@@ -1520,6 +1563,138 @@ impl Server<'_> {
         }
     }
 
+    // --- properties, cropping, pictures ---------------------------------------------------------------------------------
+
+    #[inline(never)]
+    fn properties(&mut self, id: u64) -> Step {
+        let props = crate::props::read(self.document, &self.pages, Some(crate::props::FontLimits::for_the_box()));
+        self.tell(Event::Properties { doc: self.doc_id, id, props: Box::new(props) });
+        Step::Done
+    }
+
+    /// Say how far a job of many pages is (every now and then, not for each page).
+    #[inline(never)]
+    fn progress(&self, id: u64, done: usize, total: usize, announced: &mut Instant) {
+        if announced.elapsed() >= PROGRESS_EVERY {
+            *announced = Instant::now();
+            self.tell(Event::CompressProgress { doc: self.doc_id, id, percent: u32::try_from(done * 100 / total.max(1)).unwrap_or(100) });
+        }
+    }
+
+    /// One page of finding the content of the pages: drawn small, looked at for what is not paper.
+    #[inline(never)]
+    fn step_auto_crop(&mut self, j: &mut AutoCropJob) -> Step {
+        let Some(&p) = j.pages.get(j.at) else {
+            self.tell(Event::AutoCrop { doc: self.doc_id, id: j.id, boxes: std::mem::take(&mut j.boxes), failed: std::mem::take(&mut j.failed) });
+            return Step::Done;
+        };
+        match self.pages.get(p as usize).map(|page| edit::auto_box(&mut self.renderer, page, edit::AUTO_PAD_MM * edit::PT_PER_MM)) {
+            Some(Ok(found)) => j.boxes.push((p, found.map(|r| r.map(|v| v as f32)))),
+            Some(Err(Error::Cancelled)) => return Step::Cancelled,
+            _ => j.failed.push(p),
+        }
+        let _ = self.renderer.take_warnings();
+        j.at += 1;
+        self.progress(j.id, j.at, j.pages.len(), &mut j.announced);
+        Step::More
+    }
+
+    /// One page of writing the pages as pictures, or of saving the pictures in the pages, as files in the folder.
+    fn step_images(&mut self, j: &mut ImagesJob) -> Step {
+        let (doc, id) = (self.doc_id, j.id);
+        let end = |this: &Self, j: &ImagesJob, status: SaveStatus, message: String| {
+            this.tell(Event::Exported { doc, id, status, message, pages: j.files, tables: 0, bytes: j.bytes });
+            Step::Done
+        };
+        if !j.checked {
+            j.checked = true;
+            let why = if !self.rights.copy {
+                Some(DENIED_EXTRACT)
+            } else if !std::path::Path::new(&j.ask.dir).is_dir() {
+                Some("the folder is not there")
+            } else if j.ask.pages.is_empty() || j.ask.pages.iter().any(|&p| p as usize >= self.pages.len()) {
+                Some("there is no such page")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return end(self, j, SaveStatus::Failed, why.to_string());
+            }
+            j.ask.pages = edit::unique_pages(&j.ask.pages, self.pages.len());
+        }
+        let Some(&p) = j.ask.pages.get(j.at) else {
+            let mut lines: Vec<String> = j.failed.iter().take(8).cloned().collect();
+            if j.failed.len() > 8 {
+                lines.push(format!("and {} more", j.failed.len() - 8));
+            }
+            let status = if j.files == 0 && !j.failed.is_empty() { SaveStatus::Failed } else { SaveStatus::Done };
+            return end(self, j, status, lines.join("; "));
+        };
+        let dir = std::path::Path::new(&j.ask.dir).to_path_buf();
+        let Some(page) = self.pages.get(p as usize) else { return end(self, j, SaveStatus::Failed, "there is no such page".to_string()) };
+        let mut failure: Option<Error> = None;
+        match j.ask.pages_as {
+            Some((dpi, format)) => {
+                let path = dir.join(export::page_file_name(&j.ask.stem, p as usize, format));
+                match export::write_page_file(&mut self.renderer, page, dpi, format, u64::from(self.max_tile_pixels).min(export::BAND_PIXELS), &path) {
+                    Ok(_) => {
+                        j.files += 1;
+                        j.bytes += std::fs::metadata(&path).map_or(0, |m| m.len());
+                    }
+                    Err(e) => failure = Some(e),
+                }
+                let _ = self.renderer.take_warnings();
+            }
+            None => {
+                let work = self.meter();
+                match export::page_pictures(&mut self.text, page, &work) {
+                    Err(e) => failure = Some(e),
+                    Ok(list) => {
+                        for obj in list {
+                            if j.seen.contains(&obj.num) {
+                                continue;
+                            }
+                            if j.files as usize >= export::MAX_PICTURES || j.bytes > export::MAX_PICTURE_BYTES {
+                                failure = Some(Error::Limit("there are more pictures than are saved in one go".to_string()));
+                                j.at = j.ask.pages.len();
+                                break;
+                            }
+                            // A picture that cannot be decoded, or is too much, is not tried again on another page. The pictures of a page are
+                            // numbered as they are met, so a name does not depend on what was saved; a file that is there already is never replaced.
+                            j.n += 1;
+                            let saved = match export::picture_of(self.document, obj, &work, export::READER_PICTURE_PIXELS) {
+                                Ok(Some(pic)) => {
+                                    export::write_new_file(&dir, &export::picture_file_stem(&j.ask.stem, p as usize, j.n), pic.ext, &pic.data).map(|_| pic.data.len() as u64)
+                                }
+                                Ok(None) => Err(Error::Invalid("a picture cannot be decoded".to_string())),
+                                Err(e) => Err(e),
+                            };
+                            match saved {
+                                Err(Error::Cancelled) => return Step::Cancelled,
+                                Ok(len) => {
+                                    j.files += 1;
+                                    j.bytes += len;
+                                }
+                                Err(e) => j.failed.push(format!("page {}: {e}", p + 1)),
+                            }
+                            j.seen.insert(obj.num);
+                        }
+                    }
+                }
+                let _ = self.text.take_warnings();
+            }
+        }
+        match failure {
+            Some(Error::Cancelled) => return Step::Cancelled,
+            Some(e) => j.failed.push(format!("page {}: {e}", p + 1)),
+            None => {}
+        }
+        j.at += 1;
+        j.n = 0;
+        self.progress(j.id, j.at, j.ask.pages.len(), &mut j.announced);
+        Step::More
+    }
+
     fn step_print(&mut self, p: &mut PrintJob) -> Step {
         let fail = |this: &Self, p: &PrintJob, message: &str| {
             this.tell(Event::PrintDone { doc: this.doc_id, id: p.id, status: PrintStatus::Failed, pages_done: p.printed, message: message.to_string() });
@@ -1593,7 +1768,7 @@ const DENIED_FILL: &str = "the file's author did not allow filling in form field
 
 const DENIED_ASSEMBLE: &str = "the file's author did not allow inserting, deleting, moving or turning pages, and the file was not opened with the owner password";
 
-const DENIED_BOOKMARKS: &str = "the file's author did not allow changing its bookmarks (permission bit 11 or 4), and the file was not opened with the owner password";
+const DENIED_BOOKMARKS: &str = "the file's author did not allow changing its bookmarks or cropping its pages (permission bit 11 or 4), and the file was not opened with the owner password";
 
 const DENIED_EXTRACT: &str = "the file's author did not allow copying or extracting, and the file was not opened with the owner password";
 

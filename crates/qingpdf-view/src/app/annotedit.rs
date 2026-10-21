@@ -22,9 +22,9 @@ pub(super) const NUDGE_MS: u32 = 400;
 /// A shape being dragged out: the page, where the pointer went down and where it is (points of the page), where it went down in the window
 /// (pixels) and whether Shift is held.
 pub(super) struct ShapeDraft {
-    page: u32,
-    from: [f32; 2],
-    to: [f32; 2],
+    pub(super) page: u32,
+    pub(super) from: [f32; 2],
+    pub(super) to: [f32; 2],
     px: (i64, i64),
     shift: bool,
 }
@@ -260,7 +260,7 @@ impl App {
 
     /// The pointer went down with a shape tool: the shape is begun.
     pub(super) fn shape_mouse_down(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
-        let Tool::Shape(_) = self.edit.tool else { return None };
+        let (Tool::Shape(_) | Tool::Crop) = self.edit.tool else { return None };
         let (page, ..) = self.page_at_point(x, y)?;
         let (xp, yp) = self.page_point(page as u32, x, y)?;
         self.edit.ae.draft = Some(ShapeDraft { page: page as u32, from: [xp, yp], to: [xp, yp], px: (x, y), shift: false });
@@ -315,9 +315,16 @@ impl App {
     /// The button came up: a shape is made, or what was held is moved or resized in the engine. `None`: nothing of this was going on.
     pub(super) fn annot_mouse_up(&mut self, x: i64, y: i64) -> Option<Vec<Action>> {
         if let Some(d) = self.edit.ae.draft.take() {
-            let Tool::Shape(kind) = self.edit.tool else { return Some(Vec::new()) };
+            let kind = match self.edit.tool {
+                Tool::Shape(kind) => kind,
+                Tool::Crop => ShapeKind::Rectangle,
+                _ => return Some(Vec::new()),
+            };
             if (x - d.px.0).abs().max((y - d.px.1).abs()) < self.px(SHAPE_AFTER) {
                 return Some(vec![Action::Invalidate]);
+            }
+            if self.edit.tool == Tool::Crop {
+                return Some(self.crop_dragged(d.page, d.from, d.to));
             }
             if !self.rights.annotate {
                 return Some(self.say(t(self.lang, Msg::NoteAnnotDenied).to_string()));
@@ -536,7 +543,12 @@ impl App {
             p.fill_rect(rect(x0, y0, thick, y1 - y0), self.frame_color());
             p.fill_rect(rect(x1 - thick, y0, thick, y1 - y0), self.frame_color());
         };
-        if let (Some(d), Tool::Shape(kind)) = (self.edit.ae.draft.as_ref().filter(|d| d.page as usize == page), self.edit.tool) {
+        let drag_kind = match self.edit.tool {
+            Tool::Shape(kind) => Some(kind),
+            Tool::Crop => Some(ShapeKind::Rectangle),
+            _ => None,
+        };
+        if let (Some(d), Some(kind)) = (self.edit.ae.draft.as_ref().filter(|d| d.page as usize == page), drag_kind) {
             let width = WIDTHS.get(self.edit.width).map_or(2.0, |w| w.1);
             let side = (f64::from(width) * self.doc.as_ref().map_or(1.0, |d| d.layout.scale())).round().max(1.0) as i64;
             let [r, g, b] = self.rgb();

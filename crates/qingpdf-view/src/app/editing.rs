@@ -44,6 +44,8 @@ pub(super) enum Tool {
     EditText,
     /// Drag out a rectangle, an ellipse, a line or an arrow (2026-10-17).
     Shape(ShapeKind),
+    /// Drag out the box of the page that is to be kept (2026-10-21).
+    Crop,
 }
 
 /// What is to be done once the changes are saved (or given up).
@@ -89,6 +91,10 @@ pub(super) enum Asked {
     Change,
     /// The bookmarks were changed (2026-10-20).
     Bookmarks,
+    /// Pages were cropped or uncropped, and the properties of the file were changed (2026-10-21).
+    Crop,
+    Uncrop,
+    Meta,
 }
 
 impl Asked {
@@ -99,6 +105,8 @@ impl Asked {
             Asked::Delete => Some(Msg::NotePagesDeleted),
             Asked::Move => Some(Msg::NotePagesMoved),
             Asked::Insert => Some(Msg::NotePagesInserted),
+            Asked::Crop => Some(Msg::NoteCropped),
+            Asked::Uncrop => Some(Msg::NoteUncropped),
             _ => None,
         }
     }
@@ -249,7 +257,10 @@ impl App {
         if tool != Tool::TextBox {
             self.edit.forms.content = tool == Tool::EditText;
         }
-        if tool != Tool::Select && !self.can_make() {
+        if tool == Tool::Crop && !self.can_crop() {
+            return self.say(t(self.lang, Msg::NotePagesDenied).to_string());
+        }
+        if tool != Tool::Select && tool != Tool::Crop && !self.can_make() {
             return self.say(t(self.lang, if self.edit.forms.content { Msg::NoteModifyDenied } else { Msg::NoteAnnotDenied }).to_string());
         }
         self.edit.ink = None;
@@ -273,6 +284,7 @@ impl App {
             Tool::TextBox => Some(Msg::NoteTextBoxHint),
             Tool::EditText => Some(Msg::NoteEditTextHint),
             Tool::Shape(ShapeKind::Redact) => Some(Msg::NoteRedactHint),
+            Tool::Crop => Some(Msg::NoteCropHint),
             Tool::Shape(_) => Some(Msg::NoteShapeHint),
         };
         match hint {
@@ -348,7 +360,7 @@ impl App {
         }
         match self.edit.tool {
             Tool::Select => self.annot_mouse_down(x, y, clicks),
-            Tool::Shape(_) => self.shape_mouse_down(x, y),
+            Tool::Shape(_) | Tool::Crop => self.shape_mouse_down(x, y),
             Tool::Ink => {
                 let (page, ..) = self.page_at_point(x, y)?;
                 let (xp, yp) = self.page_point(page as u32, x, y)?;
@@ -560,7 +572,7 @@ impl App {
     /// Is there an annotation under this place (so that the pointer can say so)?
     pub(super) fn annotation_cursor(&self) -> Option<Cursor> {
         match self.edit.tool {
-            Tool::Ink | Tool::Note | Tool::TextBox | Tool::Shape(_) => Some(Cursor::Cross),
+            Tool::Ink | Tool::Note | Tool::TextBox | Tool::Shape(_) | Tool::Crop => Some(Cursor::Cross),
             Tool::Markup(_) | Tool::EditText => Some(Cursor::Text),
             Tool::Select | Tool::Stamp => None,
         }
@@ -590,9 +602,17 @@ impl App {
 
     // --- undo, redo and the engine's answers ---------------------------------------------------------------------
 
+    /// An undo or a redo while pages are being written as pictures or looked at for their margins would change the pages under the work: said, not done.
+    fn history_not_now(&mut self) -> Option<Vec<Action>> {
+        (self.px.busy() || self.cr.busy()).then(|| self.say(t(self.lang, Msg::NoteBusy).to_string()))
+    }
+
     pub(super) fn undo(&mut self) -> Vec<Action> {
         if self.doc.is_none() {
             return Vec::new();
+        }
+        if let Some(said) = self.history_not_now() {
+            return said;
         }
         let id = self.new_id();
         self.engine.undo(self.doc_id, id);
@@ -603,6 +623,9 @@ impl App {
     pub(super) fn redo(&mut self) -> Vec<Action> {
         if self.doc.is_none() {
             return Vec::new();
+        }
+        if let Some(said) = self.history_not_now() {
+            return said;
         }
         let id = self.new_id();
         self.engine.redo(self.doc_id, id);
@@ -683,6 +706,10 @@ impl App {
                 } else if let Some(m) = what.pages_note() {
                     extra = r.message.clone();
                     Some(m)
+                } else if what == Asked::Meta {
+                    let xmp = if r.message.is_empty() { "" } else { t(lang, Msg::NotePropsXmp) };
+                    actions.extend(self.say(format!("{} {xmp}", t(lang, Msg::NoteProps)).trim_end().to_string()));
+                    None
                 } else if !r.message.is_empty() {
                     Some(Msg::NoteSigned)
                 } else if r.rewrote && !self.edit.rewrote {
@@ -696,7 +723,7 @@ impl App {
                         Asked::Remove => Some(Msg::NoteRemoved),
                         Asked::Pagenum => Some(Msg::NotePagenum),
                         Asked::Unpagenum => Some(Msg::NoteUnpagenum),
-                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Mark | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert | Asked::Bookmarks => None,
+                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Mark | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert | Asked::Bookmarks | Asked::Crop | Asked::Uncrop | Asked::Meta => None,
                     }
                 };
                 if let Some(m) = note {
@@ -710,6 +737,8 @@ impl App {
                     Msg::NotePagesDenied
                 } else if what == Asked::Bookmarks {
                     Msg::NoteBmDenied
+                } else if what == Asked::Meta {
+                    Msg::PropNoEdit
                 } else if what == Asked::Fill {
                     Msg::NoteFillDenied
                 } else {

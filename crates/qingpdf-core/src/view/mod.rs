@@ -31,6 +31,8 @@ mod store;
 mod targets;
 mod textcache;
 #[cfg(test)]
+mod page_tools_tests;
+#[cfg(test)]
 mod reader_tests;
 #[cfg(test)]
 mod tests;
@@ -51,6 +53,9 @@ pub use crate::edit::MAX_OPTION_BYTES;
 pub use crate::edit::{EditClass, FieldInfo, FieldKind, FillValue, MAX_FONT_SIZE, MAX_FREETEXT_CHARS, MAX_STAMP_FILE_BYTES, MAX_STAMP_PIXELS, MAX_VALUE_CHARS, MIN_FONT_SIZE};
 pub use crate::edit::{LineView, MAX_TEXT_CHARS};
 pub use crate::edit::{ALL_PAGES, NO_PAGE, MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Pagination, SLOTS, Watermark};
+pub use crate::edit::{CropOp, MAX_META_CHARS, Meta};
+pub use crate::export::{DEFAULT_QUALITY, DPI_CHOICES, ImageFormat};
+pub use crate::props::{Embedded, FontInfo, PdfDate, Properties};
 pub use crate::edit::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, order_after_move};
 pub use crate::edit::{MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, TARGET_DPI};
 pub use editing::{EditResult, EditStatus, MAX_UNDO_STEPS, SaveStatus};
@@ -398,8 +403,14 @@ pub enum Event {
     /// anything; `pages` how many pages were converted; `tables` how many tables are in the file: a Word table or an Excel sheet, and 0
     /// for an Excel file made of the text of the pages) or `Failed` (`message` says why; no file was written).
     Exported { doc: u64, id: u64, status: SaveStatus, message: String, pages: u32, tables: u32, bytes: u64 },
-    /// How far [`Engine::compress`] is, 0 to 100 (told every now and then while it runs).
+    /// How far [`Engine::compress`], [`Engine::export_images`], [`Engine::extract_images`] or [`Engine::auto_crop`] is, 0 to 100 (told every now and
+    /// then while it runs).
     CompressProgress { doc: u64, id: u64, percent: u32 },
+    /// The properties of the document, as it is with the edits not saved (the answer to [`Engine::properties`]).
+    Properties { doc: u64, id: u64, props: Box<Properties> },
+    /// Where the content of the pages is (the answer to [`Engine::auto_crop`]): for each page looked at, the rectangle `[left, top, right, bottom]` of the page as it
+    /// is shown that holds what it draws, with a little round it (`None`: the page draws nothing); `failed` are the pages that could not be drawn.
+    AutoCrop { doc: u64, id: u64, boxes: Vec<(u32, Option<[f32; 4]>)>, failed: Vec<u32> },
     /// The answer to [`Engine::compress`]: `Done` with the size of the file before and after (`after` is `before` and `kept` is true
     /// when the result would not have been smaller: no file was written), or `Failed` (`message` says why; no file was written).
     /// `message` also holds what the work warned of.
@@ -426,6 +437,18 @@ pub(crate) enum Request {
     TextLine { page: u32, at: [f32; 2] },
     OcrScan { only: Option<u32> },
     OcrImage { page: u32, max_side: u32 },
+    Properties,
+    AutoCrop(Vec<u32>),
+    Images(Box<ImagesAsk>),
+}
+
+/// What [`Engine::export_images`] and [`Engine::extract_images`] ask for.
+pub(crate) struct ImagesAsk {
+    pub dir: String,
+    pub stem: String,
+    pub pages: Vec<u32>,
+    /// `Some`: the pages are drawn at this resolution and written in this format; `None`: the pictures in the pages are saved.
+    pub pages_as: Option<(f64, ImageFormat)>,
 }
 
 pub(crate) enum Command {
@@ -773,6 +796,44 @@ impl Engine {
     /// Put pages (in their order) in front of page `to`, counted as the pages are now (the number of pages: after the last).
     pub fn move_pages(&self, doc: u64, id: u64, pages: Vec<u32>, to: u32) {
         self.page_op(doc, id, crate::edit::PageOp::Move { pages, to });
+    }
+
+    /// The properties of the document (version, pages, title, author, dates, protection, signatures, attachments, scripts, fonts), answered by
+    /// [`Event::Properties`]; a quick request, like the bookmarks.
+    pub fn properties(&self, doc: u64, id: u64) {
+        let _ = self.commands.send(Command::Request { doc, id, what: Request::Properties });
+    }
+
+    /// Change the title, author, subject or keywords (the ones that are `Some`, an empty text takes one away) in the information dictionary and the
+    /// XMP metadata. Needs [`Rights::modify`] and a file without signatures; answered by [`Event::Edited`] with `page` [`NO_PAGE`]; one step to undo.
+    pub fn set_properties(&self, doc: u64, id: u64, meta: Meta) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Meta(Box::new(meta)) });
+    }
+
+    /// Crop the pages, or give them their whole media box again. Needs [`Rights::assemble`] or [`Rights::modify`] and a file without signatures;
+    /// answered like the changes to the list of pages ([`Event::Edited`] with `pages`: the sizes have changed), one step to undo.
+    pub fn crop_pages(&self, doc: u64, id: u64, op: CropOp) {
+        let _ = self.commands.send(Command::Edit { doc, id, edit: crate::edit::Edit::Crop(Box::new(op)) });
+    }
+
+    /// Look for the content of the pages (from 0, each once) by drawing them small: answered by [`Event::AutoCrop`] after [`Event::CompressProgress`]s.
+    pub fn auto_crop(&self, doc: u64, id: u64, pages: Vec<u32>) {
+        let _ = self.commands.send(Command::Request { doc, id, what: Request::AutoCrop(pages) });
+    }
+
+    /// Write the pages (from 0) as pictures in the folder `dir`, drawn at `dpi` as `format` says, each as `<stem>-<page>.<png or jpg>`; files of that name
+    /// are replaced. Needs [`Rights::copy`]. Told by [`Event::CompressProgress`], ended by [`Event::Exported`] (`pages` is how many files were written,
+    /// `tables` is 0, `message` lists the pages that could not be drawn). Can be cancelled.
+    pub fn export_images(&self, doc: u64, id: u64, dir: &str, stem: &str, pages: Vec<u32>, (dpi, format): (f64, ImageFormat)) {
+        let ask = ImagesAsk { dir: dir.to_string(), stem: stem.to_string(), pages, pages_as: Some((dpi, format)) };
+        let _ = self.commands.send(Command::Request { doc, id, what: Request::Images(Box::new(ask)) });
+    }
+
+    /// Save the pictures that the pages (from 0) show in the folder `dir`, as `<stem>-p<page>-<n>.<ext>` (a JPEG or JPEG 2000 picture as it is in the
+    /// file, any other as a PNG); a picture on several pages is saved once. Answered like [`Engine::export_images`].
+    pub fn extract_images(&self, doc: u64, id: u64, dir: &str, stem: &str, pages: Vec<u32>) {
+        let ask = ImagesAsk { dir: dir.to_string(), stem: stem.to_string(), pages, pages_as: None };
+        let _ = self.commands.send(Command::Request { doc, id, what: Request::Images(Box::new(ask)) });
     }
 
     /// Put all the pages of the file at `path` in front of page `at` (the number of pages: after the last), with their annotations, form

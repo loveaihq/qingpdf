@@ -198,10 +198,15 @@ impl App {
             ev @ (EngineEvent::OcrPages { .. } | EngineEvent::OcrImage { .. }) => self.on_ocr_event(ev),
             EngineEvent::Saved { doc, id, status, message, .. } if doc == self.doc_id => self.on_saved(id, status, &message),
             EngineEvent::Protected { doc, id, status, message, .. } if doc == self.doc_id => self.on_protected(id, status, &message).unwrap_or_default(),
-            EngineEvent::CompressProgress { doc, id, percent } if doc == self.doc_id => self.on_compress_progress(id, percent),
+            EngineEvent::CompressProgress { doc, id, percent } if doc == self.doc_id => match self.on_pictures_progress(id, percent).or_else(|| self.on_crop_progress(id, percent)) {
+                Some(actions) => actions,
+                None => self.on_compress_progress(id, percent),
+            },
+            EngineEvent::Properties { doc, id, props } if doc == self.doc_id => self.on_properties(id, &props),
+            EngineEvent::AutoCrop { doc, id, boxes, failed } if doc == self.doc_id => self.on_auto_crop(id, boxes, &failed),
             EngineEvent::Compressed { doc, id, status, message, before, after, kept } if doc == self.doc_id => self.on_compressed(id, status, &message, before, after, kept),
             EngineEvent::Redacted { doc, id, status, message, pages, marks, .. } if doc == self.doc_id => self.on_redacted(id, status, &message, pages, marks),
-            EngineEvent::Exported { doc, id, status, message, pages, tables, .. } if doc == self.doc_id => match self.on_extracted(id, status, &message, pages) {
+            EngineEvent::Exported { doc, id, status, message, pages, tables, .. } if doc == self.doc_id => match self.on_pictures_done(id, status, &message, pages).or_else(|| self.on_extracted(id, status, &message, pages)) {
                 Some(actions) => actions,
                 None => self.on_exported(id, status, &message, tables),
             },

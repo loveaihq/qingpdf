@@ -123,6 +123,9 @@ pub struct Document {
     /// Objects made or changed in memory on top of the file (an edit, 4a): read before the file is, written out as one
     /// incremental update by `edit::incremental`.
     overlay: RefCell<Overlay>,
+    /// The object an edit made to be the information dictionary of a file that has none (or whose trailer holds it directly), 0 for none; it is
+    /// the dictionary while that object is in front of the file (`info_entry`), and the trailer of the update that writes it names it.
+    pending_info: Cell<u32>,
 }
 
 /// The objects that stand in front of the file's own: by number, in the form the reader sees (decrypted, not yet written).
@@ -648,6 +651,7 @@ impl Document {
             security: None,
             leading_junk: 0,
             overlay: RefCell::new(Overlay::default()),
+            pending_info: Cell::new(0),
         }
     }
 
@@ -833,16 +837,31 @@ impl Document {
     /// strings are encrypted in an encrypted file: [`Error::PasswordRequired`]
     /// while the file is locked.
     pub fn info(&self) -> Result<Option<Dict>> {
-        let Some(entry) = self.trailer.get("Info") else {
+        let Some(entry) = self.info_entry() else {
             return Ok(None);
         };
         if self.is_locked() {
             return Err(Error::PasswordRequired);
         }
-        match self.resolve(entry)? {
+        match self.resolve(&entry)? {
             Object::Dict(d) => Ok(Some(d)),
             _ => Ok(None),
         }
+    }
+
+    /// What the document's information dictionary is as the trailer says (a reference or the dictionary itself), or the object an edit has made for
+    /// it that is in front of the file.
+    pub fn info_entry(&self) -> Option<Object> {
+        let made = self.pending_info.get();
+        if made != 0 && self.overlay_has(made) {
+            return Some(Object::Ref(ObjRef::new(made, 0)));
+        }
+        self.trailer.get("Info").cloned()
+    }
+
+    /// Say that object `num` (an edit puts it in front of the file) is to be the information dictionary.
+    pub fn set_pending_info(&self, num: u32) {
+        self.pending_info.set(num);
     }
 
     /// Load an indirect object. An object that does not exist (not in the

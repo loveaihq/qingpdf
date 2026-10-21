@@ -10,7 +10,7 @@ use crate::text::font::Warnings;
 use super::func::Meter;
 use super::image::{self, Env, Loaded};
 use super::jbig2::GlobalsCache;
-pub use super::pngout::{crc32_update, png};
+pub use super::pngout::{PageWriter, crc32_update, png};
 use super::work::Work;
 
 /// The pixels of an image, top row first, without padding: 1 byte a pixel for grey, 3 for colour, 4 (R, G, B, A, not premultiplied)

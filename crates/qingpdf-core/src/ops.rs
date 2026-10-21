@@ -302,7 +302,7 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
     b.put(catalog_ref, &Object::Dict(catalog))?;
 
     // The information dictionary of the first file.
-    let info_ref = match base.doc.trailer().get("Info") {
+    let info_ref = match base.doc.info_entry().as_ref() {
         _ if no_metadata => None,
         Some(Object::Ref(r)) => b.import_ref(source_of(0)?, *r)?,
         Some(Object::Dict(d)) => {

@@ -393,6 +393,43 @@ fn blocks(r: &Raster<'_>, luma: &[f32; 64], chroma: &[f32; 64]) -> Vec<Coefs> {
     out
 }
 
+/// Everything of the file up to the entropy-coded data: the markers, the quantisation tables (two for a colour picture), the frame, the Huffman
+/// tables (one pair for each class: luminance, and chrominance for a colour picture) and the header of the scan.
+fn header(out: &mut Vec<u8>, (w, h): (usize, usize), comps: usize, (qy, qc): (&[u16; 64], &[u16; 64]), (dc_spec, ac_spec): (&[Spec], &[Spec])) {
+    let colour = comps == 3;
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    // JFIF 1.01, no units, 1 by 1 and no thumbnail: what tells the decoders that three components are YCbCr.
+    out.extend_from_slice(&[0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
+    dqt(out, 0, qy);
+    if colour {
+        dqt(out, 1, qc);
+    }
+    out.extend_from_slice(&[0xFF, 0xC0]);
+    push_u16(out, 8 + 3 * comps);
+    out.push(8);
+    push_u16(out, h);
+    push_u16(out, w);
+    out.push(comps as u8);
+    if colour {
+        out.extend_from_slice(&[1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    } else {
+        out.extend_from_slice(&[1, 0x11, 0]);
+    }
+    for (c, (d, a)) in dc_spec.iter().zip(ac_spec).enumerate() {
+        dht(out, c as u8, d);
+        dht(out, 0x10 | c as u8, a);
+    }
+    out.extend_from_slice(&[0xFF, 0xDA]);
+    push_u16(out, 6 + 2 * comps);
+    out.push(comps as u8);
+    if colour {
+        out.extend_from_slice(&[1, 0x00, 2, 0x11, 3, 0x11]);
+    } else {
+        out.extend_from_slice(&[1, 0x00]);
+    }
+    out.extend_from_slice(&[0, 63, 0]);
+}
+
 /// The picture as a baseline JPEG file, at `quality` (1 to 100: 75 is the usual one, 100 the best). `Err` for a picture with no pixels,
 /// one with more than [`MAX_SIDE`] on a side or [`MAX_PIXELS`] in all, or other than one or three samples to a pixel.
 pub fn encode(r: &Raster<'_>, quality: u8) -> Result<Vec<u8>> {
@@ -434,39 +471,7 @@ pub fn encode(r: &Raster<'_>, quality: u8) -> Result<Vec<u8>> {
 
     // The file.
     let mut out = Vec::with_capacity(all.len() * 24 + 700);
-    out.extend_from_slice(&[0xFF, 0xD8]);
-    // JFIF 1.01, no units, 1 by 1 and no thumbnail: what tells the decoders that three components are YCbCr.
-    out.extend_from_slice(&[0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0]);
-    dqt(&mut out, 0, &qy);
-    if colour {
-        dqt(&mut out, 1, &qc);
-    }
-    out.extend_from_slice(&[0xFF, 0xC0]);
-    push_u16(&mut out, 8 + 3 * r.comps);
-    out.push(8);
-    push_u16(&mut out, r.h);
-    push_u16(&mut out, r.w);
-    out.push(r.comps as u8);
-    if colour {
-        out.extend_from_slice(&[1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
-    } else {
-        out.extend_from_slice(&[1, 0x11, 0]);
-    }
-    for c in 0..nclass {
-        if let (Some(d), Some(a)) = (dc_spec.get(c), ac_spec.get(c)) {
-            dht(&mut out, c as u8, d);
-            dht(&mut out, 0x10 | c as u8, a);
-        }
-    }
-    out.extend_from_slice(&[0xFF, 0xDA]);
-    push_u16(&mut out, 6 + 2 * r.comps);
-    out.push(r.comps as u8);
-    if colour {
-        out.extend_from_slice(&[1, 0x00, 2, 0x11, 3, 0x11]);
-    } else {
-        out.extend_from_slice(&[1, 0x00]);
-    }
-    out.extend_from_slice(&[0, 63, 0]);
+    header(&mut out, (r.w, r.h), r.comps, (&qy, &qc), (&dc_spec, &ac_spec));
 
     // The second pass: the blocks, coded.
     let mut bits = Bits { out, acc: 0, n: 0 };
@@ -485,6 +490,115 @@ pub fn encode(r: &Raster<'_>, quality: u8) -> Result<Vec<u8>> {
     let mut out = bits.finish();
     out.extend_from_slice(&[0xFF, 0xD9]);
     Ok(out)
+}
+
+/// The tables of a picture that is coded a band at a time: the frequencies are not known before the whole picture is seen, so the codes are made for
+/// frequencies that fall away the way those of real pictures do (the end of a block, 0x00, most often, then the short runs of small values, the long
+/// runs of large ones last). The file comes out a few per cent bigger than the one the real frequencies give ([`encode`]).
+fn assumed(colour: bool) -> (Vec<Spec>, Vec<Spec>) {
+    let mut dc: Freq = [0; 257];
+    for (s, slot) in dc.iter_mut().enumerate().take(12) {
+        *slot = 1 + ((1u32 << 12) >> s.abs_diff(2).min(12));
+    }
+    let mut ac: Freq = [0; 257];
+    for (sym, slot) in ac.iter_mut().enumerate().take(256) {
+        let (run, size) = (sym >> 4, sym & 15);
+        // The symbols are the sizes 1 to 10 after each run of 0 to 15 zeros, and 0x00 and 0xF0.
+        if (1..=10).contains(&size) {
+            *slot = 1 + ((1u32 << 16) >> (size + run).min(16));
+        }
+    }
+    if let Some(end) = ac.get_mut(0x00) {
+        *end = 1 << 17;
+    }
+    if let Some(zeros) = ac.get_mut(0xF0) {
+        *zeros = 8;
+    }
+    let classes = if colour { 2 } else { 1 };
+    ((0..classes).map(|_| optimal(&dc)).collect(), (0..classes).map(|_| optimal(&ac)).collect())
+}
+
+/// A picture coded a band of rows at a time and written to `sink` as it goes, so that a picture of hundreds of megabytes is never held: only the
+/// quantised blocks of one band and the compressed bytes not yet written. The Huffman codes are the same all through ([`assumed`]).
+pub struct Banded<W: std::io::Write> {
+    sink: W,
+    w: usize,
+    rows_left: usize,
+    comps: usize,
+    luma: [f32; 64],
+    chroma: [f32; 64],
+    dc: Vec<Codes>,
+    ac: Vec<Codes>,
+    bits: Bits,
+    pred: [i16; 3],
+}
+
+impl<W: std::io::Write> Banded<W> {
+    /// Start a picture of `w` by `h` pixels (`comps` samples a pixel, 1 or 3) at `quality`; the header is written now. The limits are those of
+    /// [`encode`] on the sides (not on the pixels in all).
+    pub fn new(mut sink: W, (w, h): (usize, usize), comps: usize, quality: u8) -> Result<Banded<W>> {
+        if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE || !matches!(comps, 1 | 3) {
+            return Err(Error::Invalid("JPEG encoder: the picture has no pixels, is too wide or too high, or has other than one or three samples to a pixel".to_string()));
+        }
+        let (qy, qc) = (scaled(&LUMA, quality), scaled(&CHROMA, quality));
+        let (dc_spec, ac_spec) = assumed(comps == 3);
+        let mut head = Vec::with_capacity(700);
+        header(&mut head, (w, h), comps, (&qy, &qc), (&dc_spec, &ac_spec));
+        sink.write_all(&head)?;
+        Ok(Banded {
+            sink,
+            w,
+            rows_left: h,
+            comps,
+            luma: reciprocals(&qy),
+            chroma: reciprocals(&qc),
+            dc: dc_spec.iter().map(codes_of).collect(),
+            ac: ac_spec.iter().map(codes_of).collect(),
+            bits: Bits { out: Vec::new(), acc: 0, n: 0 },
+            pred: [0; 3],
+        })
+    }
+
+    /// The next rows of the picture: `data` is whole rows of `comps` samples a pixel. Every band but the last has a number of rows that is a
+    /// multiple of 16 (a colour picture) or of 8; anything else is an error.
+    pub fn band(&mut self, data: &[u8]) -> Result<()> {
+        let stride = self.w * self.comps;
+        let rows = data.len() / stride.max(1);
+        let unit = if self.comps == 3 { 16 } else { 8 };
+        if data.len() != rows * stride || rows == 0 || rows > self.rows_left || (rows < self.rows_left && !rows.is_multiple_of(unit)) {
+            return Err(Error::Invalid("JPEG encoder: a band is whole rows, a multiple of the block height unless it is the last".to_string()));
+        }
+        self.rows_left -= rows;
+        let all = blocks(&Raster { w: self.w, h: rows, comps: self.comps, data }, &self.luma, &self.chroma);
+        let per = if self.comps == 3 { 6 } else { 1 };
+        for (i, b) in all.iter().enumerate() {
+            let class = usize::from(self.comps == 3 && i % per >= 4);
+            let comp = if self.comps == 3 { [0usize, 0, 0, 0, 1, 2].get(i % 6).copied().unwrap_or(0) } else { 0 };
+            let (Some(dcc), Some(acc), Some(pr)) = (self.dc.get(class), self.ac.get(class), self.pred.get_mut(comp)) else { continue };
+            let bits = &mut self.bits;
+            symbols(b, pr, |is_ac, sym, extra, n| {
+                let t = if is_ac { acc } else { dcc };
+                bits.put(u32::from(t.code.get(usize::from(sym)).copied().unwrap_or(0)), u32::from(t.len.get(usize::from(sym)).copied().unwrap_or(0)));
+                if n > 0 {
+                    bits.put(extra, n);
+                }
+            });
+        }
+        self.sink.write_all(&self.bits.out)?;
+        self.bits.out.clear();
+        Ok(())
+    }
+
+    /// The end of the picture; the sink is given back. Rows missing: an error.
+    pub fn finish(mut self) -> Result<W> {
+        if self.rows_left != 0 {
+            return Err(Error::Invalid("JPEG encoder: the picture was not all given".to_string()));
+        }
+        let mut tail = self.bits.finish();
+        tail.extend_from_slice(&[0xFF, 0xD9]);
+        self.sink.write_all(&tail)?;
+        Ok(self.sink)
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +695,56 @@ mod tests {
             let (w, h, _) = decode(&jpeg, 1);
             assert_eq!((w, h), (64, 64));
         }
+    }
+
+    #[test]
+    fn a_picture_coded_in_bands_comes_back_close_and_not_much_bigger_than_the_best_coding() {
+        for (w, h, comps) in [(203usize, 157usize, 3usize), (320, 240, 1), (256, 200, 3), (33, 70, 1)] {
+            let data = photo(w, h, comps);
+            let best = encode(&Raster { w, h, comps, data: &data }, 85).unwrap();
+            // Bands of 16 rows (32 for the second), the last one whatever is left.
+            let unit = if comps == 3 { 16 } else { 8 };
+            let mut banded = Banded::new(Vec::new(), (w, h), comps, 85).unwrap();
+            let mut row = 0;
+            while row < h {
+                let rows = (unit * 2).min(h - row);
+                banded.band(&data[row * w * comps..(row + rows) * w * comps]).unwrap();
+                row += rows;
+            }
+            let jpeg = banded.finish().unwrap();
+            let (dw, dh, back) = decode(&jpeg, comps);
+            assert_eq!((dw, dh), (w, h));
+            let (p, p_best) = (psnr(&data, &back), psnr(&data, &decode(&best, comps).2));
+            assert!((p - p_best).abs() < 0.01, "{w}x{h}x{comps}: PSNR {p} against {p_best}");
+            assert!(jpeg.len() < if w * h > 10_000 { best.len() * 13 / 10 } else { best.len() * 2 }, "{w}x{h}x{comps}: {} bytes against {}", jpeg.len(), best.len());
+        }
+    }
+
+    #[test]
+    fn bands_that_are_not_whole_blocks_or_not_all_there_are_refused() {
+        let data = vec![9u8; 40 * 40 * 3];
+        let mut b = Banded::new(Vec::new(), (40, 40), 3, 75).unwrap();
+        assert!(b.band(&data[..40 * 3 * 10]).is_err(), "10 rows is not a multiple of 16");
+        assert!(b.band(&data[..40 * 3 * 3 + 1]).is_err(), "not whole rows");
+        assert!(b.band(&data[..0]).is_err());
+        assert!(b.band(&vec![0u8; 40 * 3 * 48]).is_err(), "more rows than there are");
+        b.band(&data[..40 * 3 * 16]).unwrap();
+        assert!(b.finish().is_err(), "24 rows are missing");
+        assert!(Banded::new(Vec::new(), (0, 5), 3, 75).is_err() && Banded::new(Vec::new(), (5, 5), 2, 75).is_err() && Banded::new(Vec::new(), (65_501, 5), 1, 75).is_err());
+    }
+
+    #[test]
+    fn the_assumed_tables_have_every_symbol_a_block_can_need() {
+        let (dc, ac) = assumed(true);
+        assert_eq!((dc.len(), ac.len()), (2, 2));
+        for spec in dc.iter().chain(&ac) {
+            let kraft: f64 = spec.counts.iter().enumerate().map(|(i, &c)| f64::from(c) / 2f64.powi(i as i32 + 1)).sum();
+            assert!(kraft < 1.0 && spec.counts.iter().map(|&c| usize::from(c)).sum::<usize>() == spec.symbols.len());
+        }
+        let has = |spec: &Spec, s: usize| spec.symbols.contains(&(s as u8));
+        assert!((0..=11).all(|s| has(&dc[0], s)));
+        assert!((0..16).all(|run| (1..=10).all(|size| has(&ac[0], run << 4 | size))) && has(&ac[0], 0) && has(&ac[0], 0xF0));
+        assert_eq!(assumed(false).0.len(), 1);
     }
 
     #[test]

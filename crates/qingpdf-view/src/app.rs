@@ -9,11 +9,14 @@
 
 #[cfg(test)]
 mod annot_tests;
+#[cfg(test)]
+mod page_tools_tests;
 mod annotedit;
 mod annotlist;
 mod bookmarks;
 mod chrome;
 mod compress;
+mod cropping;
 mod editing;
 mod forms;
 mod looks;
@@ -22,7 +25,9 @@ mod ocr;
 mod outline;
 mod pagenum;
 mod pages;
+mod pictures;
 mod printjob;
+mod props;
 mod protect;
 mod recents;
 mod redact;
@@ -135,6 +140,14 @@ pub const CMD_TOOL_REDACT: u32 = 180;
 pub const CMD_REDACT_SELECTION: u32 = 181;
 pub const CMD_REDACT_FIND: u32 = 182;
 pub const CMD_REDACT_APPLY: u32 = 183;
+/// The Page menu (2026-10-21): crop pages, the tool that drags out the box to keep, uncrop; and in the File menu: export as images, extract the
+/// pictures of the pages, the properties of the document.
+pub const CMD_CROP: u32 = 190;
+pub const CMD_TOOL_CROP: u32 = 191;
+pub const CMD_UNCROP: u32 = 192;
+pub const CMD_EXPORT_IMAGES: u32 = 193;
+pub const CMD_EXTRACT_IMAGES: u32 = 194;
+pub const CMD_PROPERTIES: u32 = 195;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
@@ -202,6 +215,12 @@ const TAG_NOTE_EDIT: u32 = 14;
 const TAG_BM_AUTO: u32 = 15;
 const TAG_REDACT_FIND: u32 = 16;
 const TAG_REDACT_APPLY: u32 = 17;
+const TAG_CROP: u32 = 18;
+const TAG_UNCROP: u32 = 19;
+const TAG_EXPORT_IMAGES: u32 = 20;
+const TAG_EXTRACT_IMAGES: u32 = 21;
+const TAG_PROPS: u32 = 22;
+const TAG_EXPORT_REPLACE: u32 = 23;
 
 // Timers.
 /// The view has stopped moving.
@@ -449,6 +468,8 @@ app_fields! {
         restore_page: Option<usize>,
         /// The speed test goes through the pages in the presentation (`--bench-present`).
         bench_present: bool,
+        /// How a time (seconds since 1970, UTC) is written in the person's time zone (the properties box).
+        local_time: fn(i64) -> String,
     }
     tab {
         doc_id: u64 = 0,
@@ -491,6 +512,11 @@ app_fields! {
         spread: Spread = Spread::Single,
         r2l: bool = false,
         cache_tint: Tint = Tint::Original,
+        // --- cropping, pictures, properties (2026-10-21) ---
+        /// The pages being looked at for their white margins; the pictures being written; the box of the properties.
+        cr: cropping::Cropping = cropping::Cropping::new(),
+        px: pictures::Pictures = pictures::Pictures::new(),
+        pp: props::PropsWork = props::PropsWork::new(),
     }
 }
 
@@ -595,6 +621,7 @@ impl App {
             present: None,
             restore_page: None,
             bench_present: false,
+            local_time: props::utc_time,
         };
         let mut app = App::assemble(globals);
         app.edit = EditState::new(author);
@@ -654,6 +681,10 @@ impl App {
         if let Some(id) = self.rd.reset() {
             self.engine.cancel(id);
         }
+        for id in [self.cr.reset(), self.px.reset()].into_iter().flatten() {
+            self.engine.cancel(id);
+        }
+        self.pp = props::PropsWork::new();
         let had_outline = !self.outline.is_empty();
         self.doc = None;
         self.outline.clear();
@@ -1180,6 +1211,12 @@ impl App {
             CMD_REDACT_SELECTION => self.redact_selection(),
             CMD_REDACT_FIND => self.ask_redact_find(),
             CMD_REDACT_APPLY => self.ask_redact_apply(),
+            CMD_CROP => self.ask_crop(),
+            CMD_TOOL_CROP => self.toggle_tool(Tool::Crop),
+            CMD_UNCROP => self.ask_uncrop(),
+            CMD_EXPORT_IMAGES => self.ask_export_images(),
+            CMD_EXTRACT_IMAGES => self.ask_extract_images(),
+            CMD_PROPERTIES => self.ask_properties(),
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
@@ -1292,6 +1329,7 @@ impl App {
                 vk::F => self.command(CMD_FIND),
                 vk::P => self.command(CMD_PRINT),
                 vk::C => self.command(CMD_COPY),
+                vk::D => self.command(CMD_PROPERTIES),
                 vk::A if self.thumb_focus && self.thumbs_shown() => {
                     self.pg.chosen.all(self.page_count());
                     vec![Action::Invalidate]
@@ -1705,6 +1743,11 @@ impl App {
             Event::Form { tag: TAG_COMPRESS, answer } => self.compress_answered(answer),
             Event::Form { tag: TAG_REDACT_FIND, answer } => self.redact_find_answered(answer),
             Event::Form { tag: TAG_REDACT_APPLY, answer } => self.redact_apply_answered(answer),
+            Event::Form { tag: TAG_CROP, answer } => self.crop_answered(answer),
+            Event::Form { tag: TAG_UNCROP, answer } => self.uncrop_answered(answer),
+            Event::Form { tag: TAG_EXPORT_IMAGES, answer } => self.export_images_answered(answer),
+            Event::Form { tag: TAG_EXTRACT_IMAGES, answer } => self.extract_images_answered(answer),
+            Event::Form { tag: TAG_PROPS, answer } => self.props_answered(answer),
             Event::Form { .. } => Vec::new(),
             Event::MouseDown { x, y, .. } if self.present.is_some() => self.present_click(i64::from(x), i64::from(y)),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),
@@ -1724,6 +1767,7 @@ impl App {
             Event::CloseRequested => self.quit_asked(),
             Event::Hover { .. } | Event::HoverEnd | Event::MiddleClick { .. } => Vec::new(),
             Event::SavePicked(path) => self.save_picked(path),
+            Event::FolderPicked(dir) => self.folder_picked(dir).unwrap_or_default(),
             Event::SaveChoice { tag: TAG_UNSAVED, choice } => self.unsaved_answered(choice),
             Event::SaveChoice { .. } => Vec::new(),
             Event::OutlineClick(i) => self.outline_click(i),
@@ -1736,6 +1780,7 @@ impl App {
             Event::Confirmed { tag: TAG_BM_AUTO, yes } => self.bm_auto_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_SAVE, yes } => self.compress_save_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_OPEN, yes } => self.compress_open_answered(yes),
+            Event::Confirmed { tag: TAG_EXPORT_REPLACE, yes } => self.export_replace_answered(yes),
             Event::Confirmed { .. } => Vec::new(),
             Event::Printer(setup) => self.printer_chosen(setup),
             Event::PrintStepDone => self.print_step_done(),

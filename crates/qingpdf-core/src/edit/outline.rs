@@ -25,7 +25,7 @@ fn odd(what: &str) -> Error {
 
 /// A title as a text string (7.9.2.2): PDFDocEncoding when every character is in it, otherwise UTF-16BE behind its byte order mark.
 /// Control characters (and so line ends) are spaces.
-fn title_string(title: &str) -> Object {
+pub(super) fn title_string(title: &str) -> Object {
     let clean: String = title.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     // The byte PDFDocEncoding has for a character (the bytes in the gaps of the table read as U+FFFD, which is no character to write).
     let doc_byte = |c: char| if c == '\u{FFFD}' { None } else { (0x18u8..=0x1F).chain(0x80..=0xFF).find(|&b| pdf_doc_char(b) == c) };
@@ -199,9 +199,9 @@ pub(super) fn apply(ctx: &mut Ctx<'_>, pages: &[Page], items: &[OutlineItem]) ->
 /// What the command line may spend on the objects of an edit.
 const CLI_ROOM: usize = 512 << 20;
 
-/// Why the bookmarks of a file may not be changed, if they may not: its permissions (bit 11, "assemble", or bit 4, unless it was opened
-/// with the owner password) and its signatures (the same as for the pages).
-pub fn check_outline_allowed(doc: &Document, password: &str) -> Result<()> {
+/// Why a file may not have its pages or bookmarks changed (`what` says which, for the words), if it may not: its permissions (bit 11, "assemble",
+/// or bit 4, unless it was opened with the owner password) and its signatures (the same as for the pages).
+pub(super) fn check_allowed(doc: &Document, password: &str, what: &str) -> Result<()> {
     if doc.is_locked() {
         return Err(Error::PasswordRequired);
     }
@@ -210,7 +210,7 @@ pub fn check_outline_allowed(doc: &Document, password: &str) -> Result<()> {
         && !encryption.permissions.modify
         && !crate::ops::has_owner_rights(doc, &encryption, password)
     {
-        return Err(odd("the file's author did not allow changing its bookmarks (permission bit 11 or 4); the owner password is needed (give it with --password)"));
+        return Err(odd(&format!("the file's author did not allow {what} (permission bit 11 or 4); the owner password is needed (give it with --password)")));
     }
     match signature::look(doc).policy(EditClass::Assemble) {
         Policy::Refuse(why) => Err(Error::Invalid(why.to_string())),
@@ -218,18 +218,29 @@ pub fn check_outline_allowed(doc: &Document, password: &str) -> Result<()> {
     }
 }
 
+/// Why the bookmarks of a file may not be changed, if they may not.
+pub fn check_outline_allowed(doc: &Document, password: &str) -> Result<()> {
+    check_allowed(doc, password, "changing its bookmarks")
+}
+
 /// The file with its bookmarks made `items` (one incremental update behind the whole original; a file with damaged structure data is
 /// written afresh first).
 pub fn set_outline(doc: &Document, password: &str, items: Vec<OutlineItem>) -> Result<Added> {
     check_outline_allowed(doc, password)?;
+    added_by(doc, password, |ctx, pages| apply(ctx, pages, &items))
+}
+
+/// The file with the change `make` works out appended to it as one incremental update (a file with damaged structure data is written afresh
+/// first, `rewritten`), without the document being changed. The caller has seen to the permissions. (Not through `apply_any`: that would bring the
+/// code of the page changes into the command line.)
+pub(super) fn added_by(doc: &Document, password: &str, make: impl FnOnce(&mut Ctx<'_>, &[Page]) -> Result<()>) -> Result<Added> {
     let rewritten = doc.was_repaired() || doc.leading_junk() > 0;
     let fresh = if rewritten { Some(Document::from_bytes_with_password(crate::ops::copy_all(doc)?.data, password)?) } else { None };
     let doc = fresh.as_ref().unwrap_or(doc);
     let pages = doc.pages()?;
-    // (Not through `apply_any`: that would bring the code of the page changes into the command line.)
     let work = Work::new();
     let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work: &work, room: CLI_ROOM, used: 0, notes: Vec::new() };
-    apply(&mut ctx, &pages, &items)?;
+    make(&mut ctx, &pages)?;
     let (objects, warnings) = (ctx.objects, ctx.notes);
     // The change is put in front of the document's objects to be written, and taken off again: the document is as it was.
     let changes = commit(doc, objects);

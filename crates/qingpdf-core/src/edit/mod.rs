@@ -12,6 +12,8 @@
 mod appearance;
 mod boxes;
 pub(crate) mod content;
+mod crop;
+mod meta;
 mod fill;
 pub(crate) mod fontsub;
 pub(crate) mod incremental;
@@ -41,6 +43,9 @@ use crate::layout::reals;
 use appearance::{Appearance, Quad};
 pub use retext::{LineView, MAX_REPLACE_HITS, MAX_TEXT_CHARS, Replaced, replace_text, text_line};
 pub use ocr::{has_layer as has_ocr_layer, MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_SCAN_TEXT_CHARS, MAX_WORDS_PER_PAGE, MAX_WORDS_PER_RUN, MIN_IMAGE_COVER, MIN_OCR_DPI, OcrLine, OcrPage, OcrWord, ScanState, TARGET_DPI, ocr_dpi, page_chars as ocr_page_chars, pages_with_words, scan_state, wants_text};
+pub(crate) use redact::count_active;
+pub use meta::{MAX_META_CHARS, Meta, check_meta_allowed, set_meta, update_xmp};
+pub use crop::{AUTO_PAD_MM, CropHow, CropOp, Cropped, PT_PER_MM, auto_box, crop_file, is_nearly_whole, margins_rect};
 pub use pages::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, PageOp, Password, order_after_move};
 pub(crate) use pages::unique as unique_pages;
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
@@ -149,6 +154,10 @@ pub enum Edit {
     Pages(Box<PageOp>),
     /// The bookmarks as they are to be (2026-10-20): the whole list, each item with the object it was read from (or 0 for a new one).
     Outline(Vec<OutlineItem>),
+    /// Pages cropped, or uncropped (2026-10-21): their crop boxes; nothing on the pages is touched.
+    Crop(Box<CropOp>),
+    /// The title, author, subject and keywords of the file (2026-10-21), in its information dictionary and its XMP.
+    Meta(Box<Meta>),
 }
 
 /// What kind of change an edit is, for the rights and the signatures that decide whether it may be made.
@@ -162,6 +171,8 @@ pub enum EditClass {
     Content,
     /// Pages are turned, taken out, moved or put in (permission bit 11, "assemble"; a signed file allows nothing of the kind).
     Assemble,
+    /// The properties of the file are changed (permission bit 4; a signed file allows nothing of the kind).
+    Meta,
 }
 
 impl Edit {
@@ -182,8 +193,8 @@ impl Edit {
             | Edit::AddText { page, .. }
             | Edit::AddImage { page, .. }
             | Edit::ReplaceLine { page, .. } => *page,
-            Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::RedactFind { .. } => ALL_PAGES,
-            Edit::Outline(_) => NO_PAGE,
+            Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::Crop(_) | Edit::RedactFind { .. } => ALL_PAGES,
+            Edit::Outline(_) | Edit::Meta(_) => NO_PAGE,
         }
     }
 
@@ -191,10 +202,16 @@ impl Edit {
         match self {
             Edit::Fill { .. } => EditClass::Fill,
             Edit::AddText { .. } | Edit::AddImage { .. } | Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::ReplaceLine { .. } | Edit::OcrLayer(_) => EditClass::Content,
-            Edit::Pages(_) | Edit::Outline(_) => EditClass::Assemble,
+            Edit::Pages(_) | Edit::Outline(_) | Edit::Crop(_) => EditClass::Assemble,
+            Edit::Meta(_) => EditClass::Meta,
             _ => EditClass::Annotate,
         }
     }
+}
+
+/// Does the file carry a signature or a certification?
+pub fn has_signature(doc: &Document) -> bool {
+    signature::look(doc).any()
 }
 
 /// Now, as a PDF date (7.9.4): `D:YYYYMMDDHHmmSSZ`, in UTC.
@@ -384,11 +401,13 @@ pub(crate) type Applied = (Vec<(u32, Object)>, Vec<String>);
 /// [`apply_noted`] for every kind of edit, those that turn, take out, move and put in pages too. (They are kept apart so that the command line,
 /// which makes the other edits through `apply_noted`, does not carry the code of the pages.)
 pub(crate) fn apply_any(doc: &Document, pages: &[Page], edit: &Edit, now: &str, work: &Work, room: usize) -> Result<Applied> {
-    if let Edit::Pages(_) | Edit::Outline(_) = edit {
+    if let Edit::Pages(_) | Edit::Outline(_) | Edit::Crop(_) | Edit::Meta(_) = edit {
         let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
         match edit {
             Edit::Pages(op) => pages::apply(&mut ctx, pages, op)?,
             Edit::Outline(items) => outline::apply(&mut ctx, pages, items)?,
+            Edit::Crop(op) => crop::apply(&mut ctx, pages, op)?,
+            Edit::Meta(meta) => meta::apply(&mut ctx, meta)?,
             _ => {}
         }
         return Ok((ctx.objects, ctx.notes));
@@ -457,7 +476,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::RedactFind { .. } | Edit::Pages(_) | Edit::Outline(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::RedactFind { .. } | Edit::Pages(_) | Edit::Outline(_) | Edit::Crop(_) | Edit::Meta(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));

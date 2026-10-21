@@ -70,8 +70,9 @@ pub(crate) fn section(doc: &Document, objects: &[(u32, Rc<Object>)]) -> Result<V
         return Err(Error::Invalid("the trailer has no /Root".to_string()));
     }
     for key in ["Info", "Encrypt"] {
-        if let Some(v) = doc.trailer().get(key) {
-            trailer.set(key, v.clone());
+        let entry = if key == "Info" { doc.info_entry() } else { doc.trailer().get(key).cloned() };
+        if let Some(v) = entry {
+            trailer.set(key, v);
         }
     }
     // An encrypted file's key (revisions 2 to 4) is made from the first string of `/ID`: it stays as it is, empty or not, and a

@@ -81,6 +81,7 @@ pub mod vk {
     pub const A: u32 = 0x41;
     pub const B: u32 = 0x42;
     pub const C: u32 = 0x43;
+    pub const D: u32 = 0x44;
     pub const F: u32 = 0x46;
     pub const G: u32 = 0x47;
     pub const O: u32 = 0x4F;
@@ -147,6 +148,8 @@ pub enum Event {
     CloseRequested,
     /// The answer to [`Action::PickSavePath`]: the file to write, or none if it was cancelled.
     SavePicked(Option<PathBuf>),
+    /// The answer to [`Action::PickFolder`]: the folder chosen, or none if it was cancelled.
+    FolderPicked(Option<PathBuf>),
     /// The answer to [`Action::AskSave`].
     SaveChoice { tag: u32, choice: SaveChoice },
     /// An item of the bookmarks was clicked (its number in the list given with [`Action::Outline`]).
@@ -196,6 +199,20 @@ pub struct FormItem {
     pub choices: Vec<String>,
     /// The entry a `Pick` starts with; for a `Check`, 1 when it starts ticked.
     pub selected: usize,
+}
+
+impl FormItem {
+    /// An item with nothing to pick from.
+    #[inline(never)]
+    pub fn new(kind: FormKind, text: &str, rect: (i32, i32, i32, i32)) -> FormItem {
+        FormItem { kind, text: text.to_string(), rect, choices: Vec::new(), selected: 0 }
+    }
+
+    /// A list of choices with the one at `selected` chosen.
+    #[inline(never)]
+    pub fn pick(choices: Vec<String>, selected: usize, rect: (i32, i32, i32, i32)) -> FormItem {
+        FormItem { kind: FormKind::Pick, text: String::new(), rect, choices, selected }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -369,6 +386,8 @@ pub enum Action {
     /// Show the save-as box (asking before it replaces a file); the answer comes as [`Event::SavePicked`]. `name` is the file name it
     /// starts with.
     PickSavePath { title: String, filters: Vec<(String, String)>, name: String },
+    /// Show the box that picks a folder; the answer comes as [`Event::FolderPicked`].
+    PickFolder { title: String },
     /// Ask "save the changes?" with Yes, No and Cancel; the answer is [`Event::SaveChoice`] with the same `tag` (Cancel unless the
     /// person says otherwise).
     AskSave { tag: u32, title: String, text: String },

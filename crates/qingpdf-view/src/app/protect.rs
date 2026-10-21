@@ -85,7 +85,7 @@ impl App {
     }
 
     /// The words for what the file's flags take away, in a list.
-    fn denied_list(&self, p: &Permissions) -> String {
+    pub(super) fn denied_list(&self, p: &Permissions) -> String {
         let lang = self.lang;
         let mut names: Vec<&str> = Vec::new();
         if !p.print {

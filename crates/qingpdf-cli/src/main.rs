@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use qingpdf_core::compress::{self, Preset};
-use qingpdf_core::edit::{self, ContentOp};
+use qingpdf_core::edit::{self, ContentOp, CropHow, Meta};
+use qingpdf_core::export::{self, ImageFormat};
 use qingpdf_core::image::PageMode;
 use qingpdf_core::info::{self, Report};
 use qingpdf_core::security::{Method, PasswordKind, Permissions, Protection};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
-use qingpdf_core::{Document, Error, Warning, docx, render, text, xlsx};
+use qingpdf_core::{Document, Error, Warning, docx, props, render, text, xlsx};
 
 use args::{BookmarkAction, Parsed, PrintLevel, Protect, RedactArgs, Request, UsageError};
 
@@ -78,7 +79,7 @@ fn say(text: &str) {
 
 fn run(request: Request) -> Result<(), Failure> {
     match request {
-        Request::Info { input, password } => info_command(&input, &password),
+        Request::Info { input, password, fonts } => info_command(&input, &password, fonts),
         Request::Merge { inputs, output, force, password } => merge_command(&inputs, &output, force, &password),
         Request::SplitPages { input, pages, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
@@ -121,9 +122,12 @@ fn run(request: Request) -> Result<(), Failure> {
         Request::Text { input, pages, output, force, password } => {
             text_command(&input, pages.as_deref(), output.as_deref(), force, &password)
         }
-        Request::Render { input, pages, dpi, annots, output, force, password } => {
-            render_command(&input, pages.as_deref(), dpi, annots, &output, force, &password)
+        Request::Render { input, pages, dpi, annots, format, output, force, password } => {
+            render_command(&input, pages.as_deref(), dpi, annots, format, &output, force, &password)
         }
+        Request::Crop { input, how, pages, output, force, password } => crop_command(&input, how, pages.as_deref(), &output, force, &password),
+        Request::Images { input, pages, output, force, password } => pictures_command(&input, pages.as_deref(), &output, force, &password),
+        Request::Meta { input, meta, output, force, password } => meta_command(&input, &meta, &output, force, &password),
         Request::Img2pdf { inputs, mode, output, force } => images_command(&inputs, mode, &output, force),
         Request::Watermark { input, text, image, opacity, angle, tile, under, pages, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
@@ -748,7 +752,8 @@ fn text_command(
     Ok(())
 }
 
-fn render_command(input: &Path, pages: Option<&str>, dpi: f64, annots: bool, template: &str, force: bool, password: &str) -> Result<(), Failure> {
+#[allow(clippy::too_many_arguments)]
+fn render_command(input: &Path, pages: Option<&str>, dpi: f64, annots: bool, format: ImageFormat, template: &str, force: bool, password: &str) -> Result<(), Failure> {
     let doc = open_unlocked(input, password)?;
     let wanted: Vec<usize> = match pages {
         Some(list) => page_list(&doc, input, list)?,
@@ -765,26 +770,141 @@ fn render_command(input: &Path, pages: Option<&str>, dpi: f64, annots: bool, tem
     let all = doc.pages().map_err(|e| op_error(input, &e))?;
     let mut renderer = render::Renderer::new(&doc, qingpdf_core::forms::painter());
     renderer.set_annotations(annots);
-    // Each page is reported as soon as it is done, so that if a later page fails the pages written are known.
+    // Each page is reported as soon as it is done, so that if a later page fails the pages written are known. A page is drawn a band of rows at
+    // a time and written as it goes (the same code as the reader's "export as pictures").
     for (&index, name) in wanted.iter().zip(&names) {
         let Some(page) = all.get(index) else { continue };
-        let drawn = renderer.render_page(page, dpi);
+        let drawn = export::write_page_file(&mut renderer, page, dpi, format, export::BAND_PIXELS, name);
         for w in renderer.take_warnings() {
             eprintln!("warning: page {}: {}", index + 1, clean(&w));
         }
-        let bitmap = drawn.map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
-        let png = bitmap.to_png().map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
-        write_file(name, &png)?;
-        say(&format!("wrote {} ({} x {} pixels)
-", name.display(), bitmap.width, bitmap.height));
-        if bitmap.boxed_characters > 0 {
-            let [no_font, no_char, not_in_font] = bitmap.boxed_causes;
+        let written = drawn.map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
+        say(&format!("wrote {} ({} x {} pixels)\n", name.display(), written.width, written.height));
+        if written.boxed > 0 {
+            let [no_font, no_char, not_in_font] = written.causes;
             eprintln!(
                 "warning: page {}: {} characters are drawn as outline boxes (no font for them: {no_font}; code with no character: {no_char}; character not in the font: {not_in_font})",
                 index + 1,
-                bitmap.boxed_characters
+                written.boxed
             );
         }
+    }
+    Ok(())
+}
+
+/// Crop the pages and write the file: the input as it was, with the change appended to it.
+fn crop_command(input: &Path, how: CropHow, pages: Option<&str>, output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    let wanted = match pages {
+        Some(list) => Some(page_list(&doc, input, list)?),
+        None => None,
+    };
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let done = edit::crop_file(&doc, password, how, wanted.as_deref()).map_err(|e| op_error(input, &e))?;
+    write_file(output, &done.added.data)?;
+    for warning in &done.added.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if done.added.rewritten {
+        eprintln!("warning: {} had damaged structure data, so it was written afresh as a whole; its original bytes are not kept", input.display());
+    }
+    if !done.blank.is_empty() {
+        let list: Vec<String> = done.blank.iter().map(|p| (p + 1).to_string()).collect();
+        eprintln!("warning: nothing is drawn on page{} {}; left as {}", plural(list.len()), list.join(", "), if list.len() == 1 { "it is" } else { "they are" });
+    }
+    if !done.whole.is_empty() {
+        let list: Vec<String> = done.whole.iter().map(|p| (p + 1).to_string()).collect();
+        eprintln!("warning: there is no white margin to cut on page{} {}; left as {}", plural(list.len()), list.join(", "), if list.len() == 1 { "it is" } else { "they are" });
+    }
+    let n = done.cropped.len();
+    say(&format!("wrote {} ({n} page{} cropped)\n", output.display(), plural(n)));
+    Ok(())
+}
+
+/// Change the title, author, subject and keywords and write the file: the input as it was, with the change appended to it.
+fn meta_command(input: &Path, meta: &Meta, output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    check_output(output, std::slice::from_ref(&input.to_path_buf()), force)?;
+    let added = edit::set_meta(&doc, password, meta).map_err(|e| op_error(input, &e))?;
+    write_file(output, &added.data)?;
+    for warning in &added.warnings {
+        eprintln!("warning: {warning}");
+    }
+    if added.rewritten {
+        eprintln!("warning: {} had damaged structure data, so it was written afresh as a whole; its original bytes are not kept", input.display());
+    }
+    say(&format!("wrote {}\n", output.display()));
+    Ok(())
+}
+
+/// Save the pictures the pages show as files in the folder `output`.
+fn pictures_command(input: &Path, pages: Option<&str>, output: &Path, force: bool, password: &str) -> Result<(), Failure> {
+    let doc = open_unlocked(input, password)?;
+    text::check_extraction_allowed(&doc, password).map_err(|e| op_error(input, &e))?;
+    let wanted: Vec<usize> = match pages {
+        Some(list) => page_list(&doc, input, list)?,
+        None => (0..doc.page_count().map_err(|e| op_error(input, &e))?).collect(),
+    };
+    if output.exists() && !output.is_dir() {
+        return Err(format!("{} is not a folder", output.display()));
+    }
+    fs::create_dir_all(output).map_err(|e| format!("cannot make the folder {}: {e}", output.display()))?;
+    let all = doc.pages().map_err(|e| op_error(input, &e))?;
+    let stem = export::file_stem(&input.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    let work = qingpdf_core::render::work::Work::new();
+    let mut extractor = text::TextExtractor::new(&doc);
+    // Work out every name and check it before saving anything (a picture on several pages is one; a page's pictures are numbered as they are met).
+    let mut seen: qingpdf_core::idmap::IdSet<u32> = qingpdf_core::idmap::IdSet::new();
+    let mut planned: Vec<(usize, qingpdf_core::object::ObjRef, PathBuf)> = Vec::new();
+    for &index in &wanted {
+        let Some(page) = all.get(index) else { continue };
+        let list = export::page_pictures(&mut extractor, page, &work).map_err(|e| format!("page {}: {}", index + 1, op_error(input, &e)))?;
+        let mut n = 0;
+        for obj in list {
+            if !seen.insert(obj.num) {
+                continue;
+            }
+            if planned.len() >= export::MAX_PICTURES {
+                return Err("there are more pictures than are saved in one go: use --pages".to_string());
+            }
+            n += 1;
+            planned.push((index, obj, output.join(export::picture_file_name(&stem, index, n, export::picture_ext(&doc, obj)))));
+        }
+        let _ = extractor.take_warnings();
+    }
+    for (_, _, name) in &planned {
+        check_output(name, std::slice::from_ref(&input.to_path_buf()), force)?;
+    }
+    let (mut files, mut bytes) = (0usize, 0u64);
+    for (index, obj, name) in &planned {
+        if bytes > export::MAX_PICTURE_BYTES {
+            return Err("there are more pictures than are saved in one go: use --pages".to_string());
+        }
+        let picture = match export::picture_of(&doc, *obj, &work, u64::MAX) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                eprintln!("warning: page {}: a picture cannot be decoded", index + 1);
+                continue;
+            }
+            Err(Error::Limit(why)) => {
+                eprintln!("warning: page {}: a picture is not saved: {}", index + 1, clean(&why));
+                continue;
+            }
+            Err(e) => return Err(format!("page {}: {}", index + 1, op_error(input, &e))),
+        };
+        export::write_file(name, |mut f| {
+            f.write_all(&picture.data)?;
+            Ok(f)
+        })
+        .map_err(|e| format!("cannot write {}: {e}", name.display()))?;
+        say(&format!("wrote {} ({} bytes)\n", name.display(), picture.data.len()));
+        files += 1;
+        bytes += picture.data.len() as u64;
+    }
+    if files == 0 {
+        say("no pictures were found\n");
+    } else {
+        say(&format!("{files} picture{} saved in {}\n", plural(files), output.display()));
     }
     Ok(())
 }
@@ -865,11 +985,69 @@ fn images_command(inputs: &[PathBuf], mode: PageMode, output: &Path, force: bool
 
 // --- info ---------------------------------------------------------------------------------------
 
-fn info_command(input: &Path, password: &str) -> Result<(), Failure> {
+fn info_command(input: &Path, password: &str, fonts: bool) -> Result<(), Failure> {
     let doc = open_pdf(input, password)?;
     let report = info::describe(&doc).map_err(|e| op_error(input, &e))?;
-    say(&render_info(input, &report));
+    let mut text = render_info(input, &report);
+    // What the file says about itself besides that (a locked file has pages and strings nobody can read).
+    if !doc.is_locked()
+        && let Ok(pages) = doc.pages()
+    {
+        let props = props::read(&doc, &pages, fonts.then(props::FontLimits::for_the_command_line));
+        text = insert_properties(&text, &props, fonts);
+    }
+    say(&text);
     Ok(())
+}
+
+/// The lines about what the file is (signed, tagged, linearized, attachments, scripts, XMP, dates) put in before the document information, and the fonts last.
+fn insert_properties(text: &str, p: &props::Properties, fonts: bool) -> String {
+    let mut lines = String::new();
+    let flag = |b: bool| if b { "yes" } else { "no" };
+    lines.push_str(&format!("Signed:              {}
+", flag(p.signed)));
+    lines.push_str(&format!("Tagged:              {}
+", flag(p.tagged)));
+    lines.push_str(&format!("Linearized:          {}
+", flag(p.linearized)));
+    let more = if p.counted_all { "" } else { " or more" };
+    lines.push_str(&format!("Attachments:         {}{more}
+", p.attachments));
+    lines.push_str(&format!("JavaScript:          {}{more}
+", if p.scripts > 0 { "yes" } else { "no" }));
+    lines.push_str(&format!("XMP metadata:        {}
+", flag(p.xmp)));
+    for (label, date) in [("Created:", p.created), ("Modified:", p.modified)] {
+        if let Some(d) = date {
+            lines.push_str(&format!("{label:<20} {}
+", d.text()));
+        }
+    }
+    let mut out = match text.find("
+Document info:
+") {
+        Some(at) => format!("{}{lines}{}", text.get(..at).unwrap_or(""), text.get(at..).unwrap_or("")),
+        None => format!("{text}{lines}"),
+    };
+    if fonts {
+        out.push_str(&format!("
+Fonts ({}{}):
+", p.fonts.len(), if p.fonts_cut { ", the list stops here" } else { "" }));
+        if p.fonts.is_empty() {
+            out.push_str("  (none)
+");
+        }
+        for f in &p.fonts {
+            let how = match f.embedded {
+                props::Embedded::No => "not embedded",
+                props::Embedded::Yes => "embedded",
+                props::Embedded::Subset => "embedded (subset)",
+            };
+            out.push_str(&format!("  {} [{}] {how}
+", if f.name.is_empty() { "(no name)" } else { &f.name }, f.kind));
+        }
+    }
+    out
 }
 
 /// A number with at most `decimals` decimals and no trailing zeros.
@@ -918,7 +1096,7 @@ fn render_info(path: &Path, r: &Report) -> String {
     for (i, page) in r.pages.iter().enumerate() {
         let size = match (page.size_pt, page.size_mm()) {
             (Some((w, h)), Some((mw, mh))) => {
-                format!("{} x {} pt ({} x {} mm)", trimmed(w, 2), trimmed(h, 2), trimmed(mw, 1), trimmed(mh, 1))
+                format!("{} x {} pt ({} x {} mm), {} x {} in", trimmed(w, 2), trimmed(h, 2), trimmed(mw, 1), trimmed(mh, 1), trimmed(w / 72.0, 2), trimmed(h / 72.0, 2))
             }
             _ => "size unknown".to_string(),
         };

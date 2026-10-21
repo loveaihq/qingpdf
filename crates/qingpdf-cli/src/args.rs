@@ -5,7 +5,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use qingpdf_core::compress::Preset;
-use qingpdf_core::edit::Preset as Kind;
+use qingpdf_core::edit::{CropHow, Meta, Preset as Kind};
+use qingpdf_core::export::ImageFormat;
 use qingpdf_core::image::PageMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +31,13 @@ pub enum Command {
     Xlsx,
     Bookmarks,
     Redact,
+    Crop,
+    Images,
+    Meta,
 }
 
 impl Command {
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 23] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -54,6 +58,9 @@ impl Command {
         Command::Xlsx,
         Command::Bookmarks,
         Command::Redact,
+        Command::Crop,
+        Command::Images,
+        Command::Meta,
     ];
 
     pub fn name(self) -> &'static str {
@@ -78,6 +85,9 @@ impl Command {
             Command::Xlsx => "xlsx",
             Command::Bookmarks => "bookmarks",
             Command::Redact => "redact",
+            Command::Crop => "crop",
+            Command::Images => "images",
+            Command::Meta => "meta",
         }
     }
 
@@ -89,7 +99,7 @@ impl Command {
 /// What the user asked for, checked for completeness.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
-    Info { input: PathBuf, password: String },
+    Info { input: PathBuf, password: String, fonts: bool },
     Merge { inputs: Vec<PathBuf>, output: PathBuf, force: bool, password: String },
     SplitPages { input: PathBuf, pages: String, output: PathBuf, force: bool, password: String },
     SplitEvery { input: PathBuf, every: usize, output: PathBuf, force: bool, password: String },
@@ -101,7 +111,7 @@ pub enum Request {
     /// Write a smaller copy; `lossless` leaves the pictures as they are.
     Compress { input: PathBuf, output: PathBuf, force: bool, password: String, preset: Preset, lossless: bool },
     Text { input: PathBuf, pages: Option<String>, output: Option<PathBuf>, force: bool, password: String },
-    Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, output: String, force: bool, password: String },
+    Render { input: PathBuf, pages: Option<String>, dpi: f64, annots: bool, format: ImageFormat, output: String, force: bool, password: String },
     Img2pdf { inputs: Vec<PathBuf>, mode: PageMode, output: PathBuf, force: bool },
     /// `text` and `image` are not both empty. `pages`: a page list (all pages when none).
     Watermark {
@@ -147,6 +157,12 @@ pub enum Request {
     Bookmarks { input: PathBuf, action: BookmarkAction, output: Option<PathBuf>, force: bool, password: String },
     /// Take what lies under the marks out of the file for real.
     Redact(Box<RedactArgs>),
+    /// Crop the pages (all of them when `pages` is none): by margins (points, from the top, right, bottom, left) or the white round the content.
+    Crop { input: PathBuf, how: CropHow, pages: Option<String>, output: PathBuf, force: bool, password: String },
+    /// Save the pictures of the pages (all of them when `pages` is none) as files in the folder `output`.
+    Images { input: PathBuf, pages: Option<String>, output: PathBuf, force: bool, password: String },
+    /// Change the title, author, subject and keywords.
+    Meta { input: PathBuf, meta: Meta, output: PathBuf, force: bool, password: String },
 }
 
 /// What `redact` was asked for. `areas`: the page (from 0) and `[x, y, width, height]` in points from the lower left of the page as shown.
@@ -262,6 +278,14 @@ struct Allowed {
     bookmarks: bool,
     /// The options of `redact`: `--find`, `--pattern`, `--area`, `--color`, `--label`, `--clear-metadata`.
     redact: bool,
+    /// `render`: `--format` and `--quality`.
+    format: bool,
+    /// `crop`: `--margins` and `--auto`.
+    crop: bool,
+    /// `meta`: `--title`, `--author`, `--subject`, `--keywords`.
+    meta: bool,
+    /// `info`: `--fonts`.
+    fonts: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
@@ -281,9 +305,13 @@ fn allowed(c: Command) -> Allowed {
         compress: false,
         bookmarks: false,
         redact: false,
+        format: false,
+        crop: false,
+        meta: false,
+        fonts: false,
     };
     match c {
-        Command::Info => Allowed { password: true, ..none },
+        Command::Info => Allowed { password: true, fonts: true, ..none },
         Command::Merge => Allowed { output: true, force: true, password: true, ..none },
         Command::Split => Allowed { output: true, force: true, pages: true, every: true, password: true, ..none },
         Command::Delete => Allowed { output: true, force: true, pages: true, password: true, ..none },
@@ -292,7 +320,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Encrypt => Allowed { output: true, force: true, password: true, protect: true, ..none },
         Command::Compress => Allowed { output: true, force: true, password: true, compress: true, ..none },
         Command::Text => Allowed { output: true, force: true, pages: true, password: true, ..none },
-        Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, ..none },
+        Command::Render => Allowed { output: true, force: true, pages: true, dpi: true, no_annots: true, password: true, format: true, ..none },
         Command::Img2pdf => Allowed { output: true, force: true, page: true, ..none },
         Command::Watermark => Allowed { output: true, force: true, pages: true, angle: true, password: true, mark: true, ..none },
         Command::Pagenum => Allowed { output: true, force: true, pages: true, password: true, mark: true, pagenum: true, ..none },
@@ -301,6 +329,9 @@ fn allowed(c: Command) -> Allowed {
         Command::Docx | Command::Xlsx => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Bookmarks => Allowed { output: true, force: true, password: true, bookmarks: true, ..none },
         Command::Redact => Allowed { output: true, force: true, password: true, redact: true, ..none },
+        Command::Crop => Allowed { output: true, force: true, pages: true, password: true, crop: true, ..none },
+        Command::Images => Allowed { output: true, force: true, pages: true, password: true, ..none },
+        Command::Meta => Allowed { output: true, force: true, password: true, meta: true, ..none },
     }
 }
 
@@ -354,6 +385,15 @@ struct Collected {
     label: Option<String>,
     clear_metadata: bool,
     remove_attachments: bool,
+    /// `render`: the picture format and the JPEG quality; `crop`: the margins; `meta`: the four properties; `info`: `--fonts`.
+    format: Option<String>,
+    quality: Option<String>,
+    margins: Option<String>,
+    title: Option<String>,
+    author: Option<String>,
+    subject: Option<String>,
+    keywords: Option<String>,
+    fonts: bool,
 }
 
 /// The switches of `encrypt` that take no value.
@@ -462,6 +502,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             }
             "--user-password" | "--owner-password" | "--password-file" | "--print" if ok.protect => {}
             "--preset" if ok.compress => {}
+            "--format" | "--quality" if ok.format => {}
+            "--margins" if ok.crop => {}
+            "--title" | "--author" | "--subject" | "--keywords" if ok.meta => {}
+            "--fonts" if ok.fonts => {
+                if inline.is_some() {
+                    return Err(usage(c, "--fonts does not take a value"));
+                }
+                got.fonts = true;
+                continue;
+            }
             "--export" | "--import" if ok.bookmarks => {}
             "--find" | "--pattern" | "--area" | "--label" | "--color" if ok.redact => {}
             "--clear-metadata" | "--remove-attachments" if ok.redact => {
@@ -475,7 +525,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
                 }
                 continue;
             }
-            "--auto" if ok.bookmarks => {
+            "--auto" if ok.bookmarks || ok.crop => {
                 if inline.is_some() {
                     return Err(usage(c, "--auto does not take a value"));
                 }
@@ -577,6 +627,20 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--preset" => {
                 if got.preset.replace(text(value, "--preset", command)?).is_some() {
                     return Err(slot_taken("--preset"));
+                }
+            }
+            "--format" | "--quality" | "--margins" | "--title" | "--author" | "--subject" | "--keywords" => {
+                let slot = match name.as_str() {
+                    "--format" => &mut got.format,
+                    "--quality" => &mut got.quality,
+                    "--margins" => &mut got.margins,
+                    "--title" => &mut got.title,
+                    "--author" => &mut got.author,
+                    "--subject" => &mut got.subject,
+                    _ => &mut got.keywords,
+                };
+                if slot.replace(text(value, &name, command)?).is_some() {
+                    return Err(slot_taken(&name));
                 }
             }
             "--export" => {
@@ -709,7 +773,7 @@ fn hex_color(v: &str) -> Option<[u8; 3]> {
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless, export, import, auto, finds, patterns, areas, label, clear_metadata, remove_attachments } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless, export, import, auto, finds, patterns, areas, label, clear_metadata, remove_attachments, format, quality, margins, title, author, subject, keywords, fonts } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -720,7 +784,7 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     };
     let need_output = |output: Option<PathBuf>| output.ok_or_else(|| usage(c, "-o <output file> is required"));
     match command {
-        Command::Info => Ok(Request::Info { input: one_input(&mut inputs)?, password }),
+        Command::Info => Ok(Request::Info { input: one_input(&mut inputs)?, password, fonts }),
         Command::Merge => {
             if inputs.len() < 2 {
                 return Err(usage(c, "merge needs at least two input files"));
@@ -827,7 +891,26 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                     .filter(|v| v.is_finite() && (qingpdf_core::render::MIN_DPI..=qingpdf_core::render::MAX_DPI).contains(v))
                     .ok_or_else(|| usage(c, format!("--dpi must be a number from 1 to 2400, not '{d}'")))?,
             };
-            Ok(Request::Render { input, pages, dpi, annots: !no_annots, output, force, password })
+            let wrote_jpeg = std::path::Path::new(&output).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
+            let want_jpeg = match format.as_deref() {
+                Some("png") => false,
+                Some("jpeg" | "jpg") => true,
+                Some(other) => return Err(usage(c, format!("--format must be png or jpeg, not '{other}'"))),
+                None => wrote_jpeg,
+            };
+            let format = if !want_jpeg {
+                if quality.is_some() {
+                    return Err(usage(c, "--quality goes with --format jpeg"));
+                }
+                ImageFormat::Png
+            } else {
+                let q = match quality.as_deref() {
+                    None => qingpdf_core::export::DEFAULT_QUALITY,
+                    Some(q) => q.trim().parse::<u8>().ok().filter(|v| (1..=100).contains(v)).ok_or_else(|| usage(c, format!("--quality needs a whole number from 1 to 100, not '{q}'")))?,
+                };
+                ImageFormat::Jpeg(q)
+            };
+            Ok(Request::Render { input, pages, dpi, annots: !no_annots, format, output, force, password })
         }
         Command::Watermark => {
             let input = one_input(&mut inputs)?;
@@ -900,6 +983,37 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 Some(v) => hex_color(v).ok_or_else(|| usage(c, format!("--color needs six hexadecimal digits like 000000, not '{v}'")))?,
             };
             Ok(Request::Redact(Box::new(RedactArgs { input, finds, patterns: kinds, areas, color, label: label.unwrap_or_default(), clear_metadata, remove_attachments, output, force, password })))
+        }
+        Command::Crop => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let how = match (margins.as_deref(), auto) {
+                (Some(_), true) => return Err(usage(c, "use either --margins or --auto, not both")),
+                (None, false) => return Err(usage(c, "crop needs --margins <top,right,bottom,left> (millimetres) or --auto")),
+                (None, true) => CropHow::Auto,
+                (Some(v), false) => {
+                    let bad = || usage(c, format!("--margins needs four numbers of millimetres like 10,15,10,15 (top, right, bottom, left), not '{v}'"));
+                    let numbers: Vec<f64> = v.split(',').map(|n| n.trim().parse::<f64>().ok().filter(|x| x.is_finite() && *x >= 0.0 && *x <= 5_000.0)).collect::<Option<_>>().ok_or_else(bad)?;
+                    match numbers.as_slice() {
+                        [t, r, b, l] => CropHow::Margins([*t, *r, *b, *l].map(|mm| mm * qingpdf_core::edit::PT_PER_MM)),
+                        _ => return Err(bad()),
+                    }
+                }
+            };
+            Ok(Request::Crop { input, how, pages, output, force, password })
+        }
+        Command::Images => {
+            let input = one_input(&mut inputs)?;
+            Ok(Request::Images { input, pages, output: need_output(output)?, force, password })
+        }
+        Command::Meta => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            let meta = Meta { title, author, subject, keywords };
+            if meta == Meta::default() {
+                return Err(usage(c, "meta needs --title, --author, --subject or --keywords (an empty text takes the property away)"));
+            }
+            Ok(Request::Meta { input, meta, output, force, password })
         }
         Command::Stamp => {
             let input = one_input(&mut inputs)?;
@@ -1009,7 +1123,7 @@ mod tests {
 
     #[test]
     fn every_command_in_its_documented_form() {
-        assert_eq!(run(&["info", "a.pdf"]), Request::Info { input: "a.pdf".into(), password: String::new() });
+        assert_eq!(run(&["info", "a.pdf"]), Request::Info { input: "a.pdf".into(), password: String::new(), fonts: false });
         assert_eq!(
             run(&["merge", "a.pdf", "b.pdf", "c.pdf", "-o", "out.pdf"]),
             Request::Merge {
@@ -1099,7 +1213,7 @@ mod tests {
         // `--` ends the options; `-` alone is a file name.
         assert_eq!(
             run(&["info", "--", "-weird.pdf"]),
-            Request::Info { input: "-weird.pdf".into(), password: String::new() }
+            Request::Info { input: "-weird.pdf".into(), password: String::new(), fonts: false }
         );
     }
 

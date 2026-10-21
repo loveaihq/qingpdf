@@ -18,7 +18,7 @@ Commands:
   encrypt   Write a copy with passwords and permissions (AES-256, or AES-128)
   compress  Write a smaller copy (merges what repeats, packs the file, shrinks pictures)
   text      Extract the text of a PDF, in reading order
-  render    Draw pages as PNG images (graphics and images; letters as boxes for now)
+  render    Draw pages as PNG or JPEG images
   img2pdf   Make a PDF from JPEG and PNG images, one image per page
   watermark Put a text or picture watermark on pages
   pagenum   Put page numbers, headers and footers on pages
@@ -29,6 +29,9 @@ Commands:
   xlsx      Make an Excel file (.xlsx) of the tables of a PDF, one sheet for each table
   bookmarks Write the bookmarks to a text file, or make them from a text file or the headings
   redact    Take text, pictures and shapes out of the pages for real and cover the places
+  crop      Cut the margins off pages, or the white round their content
+  images    Save the pictures that pages show as files, as they are in the PDF
+  meta      Change the title, author, subject and keywords
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -72,7 +75,15 @@ AES-128, AES-256), whether a password is needed to open it and which one
 opened it, and what its author allows: printing, copying, modifying and so on.
 Without the password only the encryption can be shown, not the document info.
 
+The properties of the file are listed too: whether it is signed, tagged
+(accessible structure) or linearized (made for fast web view), how many files
+are attached, whether it has JavaScript, whether it has XMP metadata, and when
+it was made and last changed (in the time zone the file wrote).
+
 Options:
+  --fonts                Also list the fonts the pages use: name, kind, and
+                         whether the font is in the file (a subset has only the
+                         characters of the file)
   --password <password>  The password of an encrypted file
 ";
 
@@ -261,11 +272,13 @@ Options:
 ";
 
 const RENDER: &str = "Usage:
-  qingpdf render <file.pdf> [--pages <list>] [--dpi <N>] [--no-annots] -o <page_%d.png> [--force] [--password <password>]
+  qingpdf render <file.pdf> [--pages <list>] [--dpi <N>] [--format png|jpeg] [--quality <N>] [--no-annots] -o <page_%d.png> [--force] [--password <password>]
 
-Draw pages as PNG images. The page is its crop box, turned by its /Rotate; one
+Draw pages as PNG or JPEG images. The page is its crop box, turned by its /Rotate; one
 file is written per page, and the output name must contain %d (which becomes the
-page number) unless a single page is drawn.
+page number) unless a single page is drawn. A page is drawn and written a band of
+rows at a time, so a big page at a high resolution does not need the memory of
+the whole picture.
 
 What is drawn: paths (fill, stroke, dashes, clipping), colours (device, ICC
 and Cal spaces as the device space, Indexed, Separation, DeviceN, Lab), images
@@ -284,7 +297,10 @@ without an appearance stream is skipped with a warning.
 Options:
   --pages <list>        The pages to draw (default: all)
   --dpi <N>             Resolution, 1 to 2400 (default 150); a page may have
-                        at most 16 million pixels
+                        at most 250 million pixels
+  --format <kind>       png (the default) or jpeg; a name that ends in .jpg or
+                        .jpeg makes it jpeg
+  --quality <N>         The quality of a JPEG, 1 to 100 (default 90)
   --no-annots           Do not draw the annotations
   -o, --output <file>   The file name pattern to write (required)
   --force               Overwrite output files that exist
@@ -587,6 +603,82 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const CROP: &str = "\
+Usage:
+  qingpdf crop <file.pdf> --margins <top,right,bottom,left> [--pages <list>] -o <output.pdf> [--force] [--password <password>]
+  qingpdf crop <file.pdf> --auto [--pages <list>] -o <output.pdf> [--force] [--password <password>]
+
+Show less of the pages: their crop box (/CropBox) is set. Nothing on the pages is
+touched, so the content, the annotations and the links keep their places; the
+media box stays, and 'uncrop' in the reader gives it back. The margins are
+millimetres cut off the page as it is shown (the top is the top of a page that is
+turned). With --auto the paper round what the page draws is cut off, leaving
+3 millimetres (the page is drawn small to find where its content is; the paper is
+the colour most of the page has, white or grey, give or take a little; a page with
+nothing on it, or with something on it from edge to edge, is left as it is, with
+a warning).
+
+The output is the input with the change appended (the input's bytes are kept as
+they are; a file with damaged structure data is written afresh). It is refused
+for a file that is signed, and for an encrypted file whose author did not allow
+assembling or changing it (permission bit 11 or 4) unless the owner password is
+given.
+
+Options:
+  --margins <t,r,b,l>   Four numbers of millimetres: top, right, bottom, left
+  --auto                Cut the white margins
+  --pages <list>        The pages to crop (default: all)
+  -o, --output <file>   The PDF to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
+const IMAGES: &str = "\
+Usage:
+  qingpdf images <file.pdf> [--pages <list>] -o <folder> [--force] [--password <password>]
+
+Save the pictures that the pages show as files in the folder (made if it is not
+there), named <name>-p<page>-<n>.<extension>: the page where the picture is met
+first, and n counting the pictures saved from that page. A picture that is one
+JPEG is saved as it is in the file (.jpg, the same bytes), one that is JPEG 2000
+as .jp2 (or .j2k for a bare code stream); any other picture is decoded and saved
+as a PNG, with its soft mask as the transparency. A picture used on several pages
+is saved once. Pictures drawn in the page's content as inline images are not
+saved. A file whose author did not allow copying is refused unless the owner
+password is given.
+
+Options:
+  --pages <list>        The pages to look at (default: all)
+  -o, --output <folder> The folder to write into (required)
+  --force               Overwrite files that exist
+  --password <password> The password of an encrypted file
+";
+
+const META: &str = "\
+Usage:
+  qingpdf meta <file.pdf> [--title <text>] [--author <text>] [--subject <text>] [--keywords <text>] -o <output.pdf> [--force] [--password <password>]
+
+Change the title, author, subject or keywords of the file, in its document
+information and in its XMP metadata if it has some (so that the two agree; if the
+XMP cannot be put right it is left as it is, with a warning). A property that is
+not named stays as it is, and so do the dates; an empty text takes the property
+away. A file that has no document information gets some.
+
+The output is the input with the change appended (the input's bytes are kept as
+they are). It is refused for a file that is signed, and for an encrypted file
+whose author did not allow changing it (permission bit 4) unless the owner
+password is given.
+
+Options:
+  --title <text>        The title
+  --author <text>       The author
+  --subject <text>      The subject
+  --keywords <text>     The keywords
+  -o, --output <file>   The PDF to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 /// The help text for the tool or for one command.
 pub fn text(command: Option<Command>) -> String {
     match command {
@@ -611,5 +703,8 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Xlsx) => format!("{XLSX}{PAGE_LIST}"),
         Some(Command::Bookmarks) => BOOKMARKS.to_string(),
         Some(Command::Redact) => REDACT.to_string(),
+        Some(Command::Crop) => format!("{CROP}{PAGE_LIST}"),
+        Some(Command::Images) => format!("{IMAGES}{PAGE_LIST}"),
+        Some(Command::Meta) => META.to_string(),
     }
 }

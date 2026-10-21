@@ -30,7 +30,7 @@ impl App {
     /// Something is going on in the shown tab that is answered to the tab, or that is left half done if the tab is left: a file being opened,
     /// a save, an export, an edit not yet answered, a compression, a change of protection, a print, a run of text recognition, pages being put in.
     pub(super) fn tab_busy(&self) -> bool {
-        self.opening || self.print.is_some() || self.ocr.is_some() || self.cz.busy() || self.rd.busy() || self.pt.is_busy() || self.pg.busy() || self.edit.busy()
+        self.opening || self.print.is_some() || self.ocr.is_some() || self.cz.busy() || self.rd.busy() || self.cr.busy() || self.px.busy() || self.pt.is_busy() || self.pg.busy() || self.edit.busy()
     }
 
     /// Make `incoming` the state of the file that is shown and give back the state that was shown. What belongs to the person and not to the file

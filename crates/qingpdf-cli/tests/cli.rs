@@ -790,10 +790,6 @@ fn render_writes_one_png_per_page() {
     let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--pages".as_ref(), "3".as_ref(), "--force".as_ref()]);
     assert_eq!(code(&out), 1, "a page that does not exist is an error");
 
-    // A page that would be too big is an error naming the way out; usage errors; the help.
-    let out = run([OsStr::new("render"), two.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--dpi".as_ref(), "2400".as_ref(), "--force".as_ref()]);
-    assert_eq!(code(&out), 1);
-    assert!(stderr(&out).contains("--dpi"), "{}", stderr(&out));
     // When a later page fails, the pages before it were written and are reported (and page 2 is named).
     let half = dir.join("half.pdf");
     std::fs::write(
@@ -811,6 +807,10 @@ fn render_writes_one_png_per_page() {
     assert_eq!(code(&out), 1);
     assert!(stdout(&out).contains("page_1.png") && !stdout(&out).contains("page_2.png"), "{}", stdout(&out));
     assert!(stderr(&out).contains("page 2"), "{}", stderr(&out));
+    // A page that would be too big is an error naming the way out (a page may have 250 million pixels at the most); usage errors; the help.
+    let out = run([OsStr::new("render"), half.as_os_str(), "-o".as_ref(), pattern.as_os_str(), "--pages".as_ref(), "2".as_ref(), "--force".as_ref()]);
+    assert_eq!(code(&out), 1);
+    assert!(stderr(&out).contains("--dpi"), "{}", stderr(&out));
     assert_eq!(code(&run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "0".as_ref(), "-o".as_ref(), pattern.as_os_str()])), 2);
     assert_eq!(code(&run([OsStr::new("render"), two.as_os_str(), "--dpi".as_ref(), "abc".as_ref(), "-o".as_ref(), pattern.as_os_str()])), 2);
     assert_eq!(code(&run([OsStr::new("render"), two.as_os_str()])), 2);

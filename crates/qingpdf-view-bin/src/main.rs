@@ -144,6 +144,7 @@ fn main() {
         app.apply_settings(&kept);
         app.set_system_dark(win32::system_uses_dark());
         app.set_clock(win32::local_date);
+        app.set_local_time(win32::local_time);
         app.set_random(win32::random_bytes);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));

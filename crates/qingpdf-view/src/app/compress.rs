@@ -37,7 +37,7 @@ impl Squeeze {
 }
 
 /// "5.2 MB", "340 KB": a size in bytes for a person.
-fn size_text(bytes: u64) -> String {
+pub(super) fn size_text(bytes: u64) -> String {
     if bytes >= 1_000_000 { format!("{:.1} MB", bytes as f64 / 1_000_000.0) } else { format!("{} KB", bytes.div_ceil(1000)) }
 }
 
