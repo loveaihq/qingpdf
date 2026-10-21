@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "qingpdf-base"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "aes",
  "md-5",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "qingpdf-cli"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "png",
  "qingpdf-core",
@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "qingpdf-core"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "aes",
  "md-5",
@@ -245,14 +245,14 @@ dependencies = [
 
 [[package]]
 name = "qingpdf-view"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "qingpdf-core",
 ]
 
 [[package]]
 name = "qingpdf-view-bin"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "qingpdf-core",
  "qingpdf-view",
