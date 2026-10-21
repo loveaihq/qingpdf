@@ -121,6 +121,8 @@ pub(crate) struct Tune<'t> {
     pub tidy: crate::writer::Tidy<'t>,
     /// Pack the objects into object streams and write a cross-reference stream (PDF 1.5); not for a file that says it is PDF/A-1.
     pub pack: bool,
+    /// Leave out the information dictionary and the catalog's metadata stream (redaction).
+    pub no_metadata: bool,
 }
 
 /// One page of the output: page `page` of document `doc`, turned a further
@@ -192,6 +194,7 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
         picks.iter().filter(|p| p.doc == 0).filter_map(|p| base.pages.get(p.page)).map(|p| p.obj_ref.num).collect();
     let subset = kept.len() < base.page_nums.len();
 
+    let no_metadata = tune.as_ref().is_some_and(|t| t.no_metadata);
     let mut b = Builder::with_capacity(version, base.size_hint.get());
     // A file that is written afresh under another encryption (or none) loses every signature it had.
     let rewriting = matches!(encrypt, Encrypt::New(_) | Encrypt::Clear) || tune.is_some();
@@ -200,7 +203,7 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
     }
     let sources: Vec<usize> = docs.iter().map(|d| b.add_source(d.doc, &d.page_nums)).collect();
     let source_of = |i: usize| sources.get(i).copied().ok_or_else(|| internal("unknown document"));
-    if let Some(Tune { merged, replaced, tidy, pack }) = tune {
+    if let Some(Tune { merged, replaced, tidy, pack, .. }) = tune {
         if pack {
             b.pack_objects();
         }
@@ -226,6 +229,9 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
     let mut warnings = Vec::new();
     let mut catalog = base.doc.catalog()?;
     catalog.remove("Pages");
+    if no_metadata {
+        catalog.remove("Metadata");
+    }
     // `/EncryptMetadata false` leaves this stream, and only this one, unencrypted.
     if let Some(Object::Ref(metadata)) = catalog.get("Metadata") {
         b.mark_root_metadata(source_of(0)?, metadata.num);
@@ -297,6 +303,7 @@ pub(crate) fn build(docs: &[Loaded<'_>], picks: &[Pick], encrypt: Encrypt, tune:
 
     // The information dictionary of the first file.
     let info_ref = match base.doc.trailer().get("Info") {
+        _ if no_metadata => None,
         Some(Object::Ref(r)) => b.import_ref(source_of(0)?, *r)?,
         Some(Object::Dict(d)) => {
             let Object::Dict(d) = b.import(source_of(0)?, Object::Dict(d.clone()))? else {
@@ -417,6 +424,16 @@ pub fn copy_all(doc: &Document) -> Result<Output> {
     let d = load(doc)?;
     let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
     build(&[d], &picks, Encrypt::Keep, None)
+}
+
+/// [`copy_all`] for a file whose pages were redacted (the document with the redaction in front of its objects): written afresh with only
+/// what the catalog reaches, the thumbnails and private data taken out (`drop_junk`), and with `no_metadata` the information dictionary
+/// and the metadata stream too.
+pub(crate) fn rewrite_redacted(doc: &Document, no_metadata: bool) -> Result<Output> {
+    let d = load(doc)?;
+    let picks: Vec<Pick> = all_picks(0, d.pages.len()).collect();
+    let tune = Tune { merged: IdMap::new(), replaced: IdMap::new(), tidy: Box::new(|_, _| Ok(())), pack: false, no_metadata };
+    build(&[d], &picks, Encrypt::Keep, Some(tune))
 }
 
 /// A new file with just the pages `pages` (0-based indices, as returned by

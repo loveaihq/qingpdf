@@ -73,6 +73,8 @@ pub(super) enum Asked {
     Redo,
     /// A line of the page's text was changed (5a).
     Line,
+    /// Marks for redaction were made by a find (2026-10-20): the engine says how many.
+    Mark,
     /// The text layer of a run of text recognition was written (5c): the run says how it went.
     Ocr,
     /// Pages were turned, taken out, moved, or put in from a file (2026-10-15).
@@ -270,6 +272,7 @@ impl App {
             Tool::Note => Some(Msg::NoteNoteHint),
             Tool::TextBox => Some(Msg::NoteTextBoxHint),
             Tool::EditText => Some(Msg::NoteEditTextHint),
+            Tool::Shape(ShapeKind::Redact) => Some(Msg::NoteRedactHint),
             Tool::Shape(_) => Some(Msg::NoteShapeHint),
         };
         match hint {
@@ -664,7 +667,15 @@ impl App {
                 self.annots_stale();
                 // The engine tells once, with a message, that the file is signed and the signature will show it as changed.
                 let mut extra = String::new();
-                let note = if what == Asked::Line {
+                let note = if what == Asked::Mark {
+                    // (The engine's message is what it has to say, and the number of places last.)
+                    let (said, n) = r.message.rsplit_once(' ').unwrap_or(("", &r.message));
+                    actions.extend(self.say(t(lang, Msg::NoteMarked).replace("{n}", n)));
+                    if !said.is_empty() {
+                        actions.push(Action::Message { title: t(lang, Msg::RdFindTitle).to_string(), text: said.to_string() });
+                    }
+                    None
+                } else if what == Asked::Line {
                     extra = r.message.clone();
                     Some(Msg::NoteLineChanged)
                 } else if what == Asked::Ocr {
@@ -685,7 +696,7 @@ impl App {
                         Asked::Remove => Some(Msg::NoteRemoved),
                         Asked::Pagenum => Some(Msg::NotePagenum),
                         Asked::Unpagenum => Some(Msg::NoteUnpagenum),
-                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert | Asked::Bookmarks => None,
+                        Asked::Undo | Asked::Redo | Asked::Line | Asked::Mark | Asked::Ocr | Asked::Rotate | Asked::Delete | Asked::Move | Asked::Insert | Asked::Bookmarks => None,
                     }
                 };
                 if let Some(m) = note {
@@ -799,6 +810,9 @@ impl App {
             return actions;
         }
         if let Some(actions) = self.compress_picked(path.clone()) {
+            return actions;
+        }
+        if let Some(actions) = self.redact_picked(path.clone()) {
             return actions;
         }
         if let Some(actions) = self.extract_picked(path.clone()) {

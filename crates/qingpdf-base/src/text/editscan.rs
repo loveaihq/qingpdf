@@ -110,6 +110,9 @@ pub struct Source {
     pub content: Rc<Vec<u8>>,
     /// How many times the page draws it.
     pub uses: u32,
+    /// Other places that draw it by another name or from another stream: (the stream, the name). Empty when every draw is the one
+    /// `parent` and `name` say.
+    pub also: Vec<(u32, Vec<u8>)>,
     /// For the page: where each of its streams is in `content` (start, end) and which object it is (`None`: not a reference).
     pub streams: Vec<StreamSpan>,
     /// For the page: for each of `streams`, whether its object is in the page's list more than once.
@@ -139,6 +142,29 @@ pub struct ActualSpan {
     pub parent: u32,
 }
 
+/// What the page draws other than text, for taking it out (redaction): where the statement is, and the matrix the drawing is under.
+#[derive(Clone, Debug)]
+pub struct Draw {
+    /// The content stream it is in ([`Scan::sources`]) and the bytes of the statement there, operands included.
+    pub src: u32,
+    pub start: u32,
+    pub end: u32,
+    /// The current transformation matrix of default user space when it is drawn.
+    pub ctm: [f64; 6],
+    pub kind: DrawKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum DrawKind {
+    /// `Do` of an image XObject.
+    Image(ObjRef),
+    /// `BI ... ID ... EI`: the statement holds the image.
+    Inline,
+    /// A path painted by `S`, `f`, `B` or one of their kin (a path that is a clip is not one): its bounds in default user space, the
+    /// width of the stroke included.
+    Path([f64; 4]),
+}
+
 /// What reading the page for editing finds.
 pub struct Scan {
     pub sources: Vec<Source>,
@@ -154,6 +180,13 @@ pub struct Scan {
     /// The marked-content sequences with an `/ActualText`, by `BDC` order; and from which glyph on which of them is the innermost
     /// one the glyphs are in (`u32::MAX`: none).
     pub spans: Vec<ActualSpan>,
+    /// The images and paths drawn (only when the page is read for redaction), in the order they are drawn.
+    pub draws: Vec<Draw>,
+    /// Text that was shown with no font (not read); the patterns chosen as a colour (the stream, the name); and what is painted with them: (the pattern as an
+    /// index of those, the path drawn as an index of `draws`; `u32::MAX`: something else, text or a picture).
+    pub unreadable: usize,
+    pub pat_names: Vec<(u32, Vec<u8>)>,
+    pub pat_uses: Vec<(u32, u32)>,
     runs: Vec<(u32, u32)>,
 }
 
@@ -185,6 +218,11 @@ pub struct Recorder {
     /// sequence with one.
     pub(super) open: Vec<u32>,
     pub(super) runs: Vec<(u32, u32)>,
+    /// The images and paths drawn, kept only when `graphics` is set.
+    pub draws: Vec<Draw>,
+    pub(super) graphics: bool,
+    pub(super) pat_names: Vec<(u32, Vec<u8>)>,
+    pub(super) pat_uses: Vec<(u32, u32)>,
 }
 
 impl Recorder {
@@ -202,7 +240,18 @@ impl Recorder {
             spans: Vec::new(),
             open: Vec::new(),
             runs: Vec::new(),
+            draws: Vec::new(),
+            graphics: false,
+            pat_names: Vec::new(),
+            pat_uses: Vec::new(),
         }
+    }
+
+    /// A drawing is kept (when the page is read for redaction); an error when the page has too many.
+    pub(super) fn add_draw(&mut self, draw: Draw) -> Result<()> {
+        self.add_pieces(1)?;
+        self.draws.push(draw);
+        Ok(())
     }
 
     /// `n` more pieces are kept; an error when the page has too many.
@@ -224,6 +273,9 @@ impl Recorder {
         if let Some(&(_, i)) = self.form_index.get(at).filter(|e| e.0 == r) {
             if let Some(s) = self.sources.get_mut(i as usize) {
                 s.uses = s.uses.saturating_add(1);
+                if (s.parent != parent || s.name != name) && s.also.len() < 64 && !s.also.iter().any(|(p, n)| *p == parent && n == name) {
+                    s.also.push((parent, name.to_vec()));
+                }
             }
             return i;
         }
@@ -238,6 +290,7 @@ impl Recorder {
             dict: dict.cloned().unwrap_or_default(),
             content: Rc::clone(content),
             uses: 1,
+            also: Vec::new(),
             streams: Vec::new(),
             repeated: Vec::new(),
         });
@@ -266,11 +319,19 @@ impl Recorder {
 pub struct EditScanner<'a> {
     doc: &'a Document,
     shared: Shared,
+    /// Read for redaction: all the text (that of watermarks and page numbers too), and the images and paths drawn.
+    redaction: bool,
 }
 
 impl<'a> EditScanner<'a> {
     pub fn new(doc: &'a Document) -> EditScanner<'a> {
-        EditScanner { doc, shared: Shared::default() }
+        EditScanner { doc, shared: Shared::default(), redaction: false }
+    }
+
+    /// A scanner for taking things off the pages: it also reads the text of watermarks and page numbers, and notes down the images
+    /// and paths that are drawn.
+    pub fn for_redaction(doc: &'a Document) -> EditScanner<'a> {
+        EditScanner { redaction: true, ..EditScanner::new(doc) }
     }
 
     /// Read `page`; everything it costs is charged to `work` (`Error::Limit` or `Error::Cancelled` when that is spent).
@@ -293,13 +354,17 @@ impl<'a> EditScanner<'a> {
             }
         }
         let repeated = streams.iter().map(|s| s.2.is_some_and(|r| twice.contains(&r))).collect();
-        let source = Source { form: None, parent: 0, name: Vec::new(), dict: Dict::new(), content: Rc::clone(&content), uses: 1, streams, repeated };
+        let source = Source { form: None, parent: 0, name: Vec::new(), dict: Dict::new(), content: Rc::clone(&content), uses: 1, also: Vec::new(), streams, repeated };
         let scope = Rc::new(Scope::new(self.doc, page.resources()));
         let mut interp = Interp::new(self.doc, &mut self.shared).with_work(work);
-        interp.rec = Some(Box::new(Recorder::new(source)));
+        let mut recorder = Recorder::new(source);
+        recorder.graphics = self.redaction;
+        interp.keep_artifacts = self.redaction;
+        interp.rec = Some(Box::new(recorder));
         interp.run(&content, &scope, 0)?;
         let glyphs = std::mem::take(&mut interp.glyphs);
         let rec = interp.rec.take();
+        let unreadable = interp.unreadable;
         drop(interp);
         if !work.charge(glyphs.len() as f64 * cost::TEXT_LAYOUT) {
             return Err(spent(work));
@@ -312,7 +377,7 @@ impl<'a> EditScanner<'a> {
         for s in &mut rec.spans {
             s.last = s.last.min(end);
         }
-        Ok(Scan { sources: rec.sources, shows: rec.shows, parts: rec.parts, glyphs, chars: rec.chars, fonts: rec.fonts, text, marks, spans: rec.spans, runs: rec.runs })
+        Ok(Scan { sources: rec.sources, shows: rec.shows, parts: rec.parts, glyphs, chars: rec.chars, fonts: rec.fonts, text, marks, spans: rec.spans, draws: rec.draws, unreadable, pat_names: rec.pat_names, pat_uses: rec.pat_uses, runs: rec.runs })
     }
 
     /// What went wrong without stopping the reading, and forget it.

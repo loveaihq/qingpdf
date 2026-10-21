@@ -2195,68 +2195,74 @@ impl<'a> Interp<'a> {
 
     /// `BI` (8.9.7): the dictionary up to `ID`, the data up to `EI`.
     fn inline_image(&mut self, sc: &mut Scanner<'_>, ops: &mut Vec<Operand>, res: &Rc<Resources>) -> Result<()> {
-        let mut dict = Dict::new();
-        // The key/value pairs arrive as the operands of `ID`, `true`, `false` and `null` (which the
-        // scanner calls operators) among them.
-        let mut flat: Vec<Object> = Vec::new();
-        let mut found_id = false;
-        for _ in 0..64 {
-            let keyword = match sc.next(ops) {
-                Item::Operator(k) => k,
-                Item::End => return Ok(()),
-            };
-            push_operands(ops, sc, &mut flat);
-            match keyword {
-                b"ID" => {
-                    found_id = true;
-                    break;
-                }
-                b"true" => flat.push(Object::Bool(true)),
-                b"false" => flat.push(Object::Bool(false)),
-                b"null" => flat.push(Object::Null),
-                _ => {}
-            }
-        }
-        if !found_id {
-            return Ok(());
-        }
-        for pair in flat.chunks_exact(2) {
-            if let [Object::Name(k), v] = pair {
-                dict.set(k.clone(), v.clone());
-            }
-        }
-        let dict = image::expand_inline(&dict);
-        let w = dict.get("Width").and_then(Object::as_int).unwrap_or(0).max(0) as usize;
-        let h = dict.get("Height").and_then(Object::as_int).unwrap_or(0).max(0) as usize;
-        // Without a filter the data has a known length.
-        let known = if dict.contains_key("Filter") {
-            None
-        } else {
-            let bpc = if matches!(dict.get("ImageMask"), Some(Object::Bool(true))) { 1 } else { dict.get("BitsPerComponent").and_then(Object::as_int).unwrap_or(8).max(1) as usize };
-            let comps = if matches!(dict.get("ImageMask"), Some(Object::Bool(true))) {
-                1
-            } else {
-                match dict.get("ColorSpace") {
-                    Some(Object::Name(n)) => match n.as_bytes() {
-                        b"DeviceGray" | b"CalGray" => 1,
-                        b"DeviceCMYK" => 4,
-                        b"DeviceRGB" | b"CalRGB" => 3,
-                        _ => 0,
-                    },
-                    Some(Object::Array(_)) => 1,
-                    _ => 0,
-                }
-            };
-            // (the numbers come from the file: no overflow may panic or wrap)
-            w.checked_mul(comps).and_then(|n| n.checked_mul(bpc)).filter(|_| comps > 0).map(|bits| bits.div_ceil(8).saturating_mul(h))
-        };
-        let data = sc.inline_image_data(known).to_vec();
+        let Some(stream) = read_inline_image(sc, ops) else { return Ok(()) };
         if self.gs.clip.is_empty() {
             return Ok(());
         }
-        let stream = Stream { dict, data };
         self.draw_image(&stream, None, res)
     }
+}
+
+/// The inline image whose `BI` has just been read from `sc`: its dictionary (the keys spelled out) up to `ID`, and its data up to `EI`. `None`
+/// for one that has no `ID`.
+pub(crate) fn read_inline_image(sc: &mut Scanner<'_>, ops: &mut Vec<Operand>) -> Option<Stream> {
+    let mut dict = Dict::new();
+    // The key/value pairs arrive as the operands of `ID`, `true`, `false` and `null` (which the
+    // scanner calls operators) among them.
+    let mut flat: Vec<Object> = Vec::new();
+    let mut found_id = false;
+    for _ in 0..64 {
+        let keyword = match sc.next(ops) {
+            Item::Operator(k) => k,
+            Item::End => return None,
+        };
+        push_operands(ops, sc, &mut flat);
+        match keyword {
+            b"ID" => {
+                found_id = true;
+                break;
+            }
+            b"true" => flat.push(Object::Bool(true)),
+            b"false" => flat.push(Object::Bool(false)),
+            b"null" => flat.push(Object::Null),
+            _ => {}
+        }
+    }
+    if !found_id {
+        return None;
+    }
+    for pair in flat.chunks_exact(2) {
+        if let [Object::Name(k), v] = pair {
+            dict.set(k.clone(), v.clone());
+        }
+    }
+    let dict = image::expand_inline(&dict);
+    let w = dict.get("Width").and_then(Object::as_int).unwrap_or(0).max(0) as usize;
+    let h = dict.get("Height").and_then(Object::as_int).unwrap_or(0).max(0) as usize;
+    // Without a filter the data has a known length.
+    let known = if dict.contains_key("Filter") {
+        None
+    } else {
+        let bpc = if matches!(dict.get("ImageMask"), Some(Object::Bool(true))) { 1 } else { dict.get("BitsPerComponent").and_then(Object::as_int).unwrap_or(8).max(1) as usize };
+        let comps = if matches!(dict.get("ImageMask"), Some(Object::Bool(true))) {
+            1
+        } else {
+            match dict.get("ColorSpace") {
+                Some(Object::Name(n)) => match n.as_bytes() {
+                    b"DeviceGray" | b"CalGray" => 1,
+                    b"DeviceCMYK" => 4,
+                    b"DeviceRGB" | b"CalRGB" => 3,
+                    _ => 0,
+                },
+                Some(Object::Array(_)) => 1,
+                _ => 0,
+            }
+        };
+        // (the numbers come from the file: no overflow may panic or wrap)
+        w.checked_mul(comps).and_then(|n| n.checked_mul(bpc)).filter(|_| comps > 0).map(|bits| bits.div_ceil(8).saturating_mul(h))
+    };
+    let data = sc.inline_image_data(known).to_vec();
+    Some(Stream { dict, data })
 }
 
 /// A character that is white space draws no box (an unknown one does).

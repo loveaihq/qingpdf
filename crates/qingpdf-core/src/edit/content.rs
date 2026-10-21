@@ -53,7 +53,7 @@ const BYTE_COST: f64 = 8.0;
 const MARK_COST: f64 = 2_500.0;
 const SCAN_COST: f64 = 10.0;
 /// The most `q` made up for in front of a page's content (for its stray `Q`) or `Q` after it (for the `q` it leaves open).
-const MAX_BALANCE: u32 = 1_024;
+pub(super) const MAX_BALANCE: u32 = 1_024;
 /// The most bytes of one content stream that are decoded to be scanned.
 const MAX_SCANNED: usize = 256 << 20;
 /// Opens the marked content a watermark is drawn in (ISO 32000-1 14.8.2.2, Table 330); `EMC` closes it.
@@ -152,11 +152,11 @@ pub(super) struct Shared {
 /// What a content stream (or several in a row) leaves behind: `Q` that close nothing in it, `q` still open, and whether a text
 /// object or a path is open at the end (`None`: it has no word on that).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Balance {
-    underflow: u32,
-    depth: u32,
-    text: Option<bool>,
-    path: Option<bool>,
+pub(super) struct Balance {
+    pub(super) underflow: u32,
+    pub(super) depth: u32,
+    pub(super) text: Option<bool>,
+    pub(super) path: Option<bool>,
 }
 
 impl Balance {
@@ -174,7 +174,7 @@ impl Balance {
 
 /// Count the `q` and `Q` (8.4.2) of a content stream, and see whether it ends inside a text object (9.4.1) or a path (8.5.2).
 /// Inline images are skipped, and what they hold is not read as operators.
-fn scan_balance(data: &[u8]) -> Balance {
+pub(super) fn scan_balance(data: &[u8]) -> Balance {
     let mut scanner = Scanner::new(data);
     let mut ops = Vec::new();
     let mut b = Balance::default();

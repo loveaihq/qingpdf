@@ -28,6 +28,7 @@ Commands:
   docx      Make a Word file (.docx) of a PDF: text, headings, lists, tables, pictures
   xlsx      Make an Excel file (.xlsx) of the tables of a PDF, one sheet for each table
   bookmarks Write the bookmarks to a text file, or make them from a text file or the headings
+  redact    Take text, pictures and shapes out of the pages for real and cover the places
 
 Options:
   -h, --help       Show this help (also: qingpdf <command> --help)
@@ -475,6 +476,41 @@ Options:
   --password <password> The password of an encrypted file
 ";
 
+const REDACT: &str = "Usage:
+  qingpdf redact <file.pdf> [--find <text>]... [--pattern idcard|phone|bankcard]... [--area <page:x,y,width,height>]...
+                 [--color <rrggbb>] [--label <text>] [--clear-metadata] [--remove-attachments] -o <output.pdf> [--force] [--password <password>]
+
+Take what is under the places out of the file, and draw a box over each place. Nothing is only covered:
+the text (every letter whose box meets a place, the invisible text of scans, the text of forms and
+Type 3 letters too) is cut out of the page's drawing instructions, the pixels of pictures are painted
+over in the picture and the picture is coded again (JPEG pictures as JPEG at high quality, the rest
+Flate), the shapes drawn wholly inside a place are not drawn, the annotations and form fields that
+lie in a place are taken off, and the places that other programs or the reader marked in the file with
+Redact annotations are done too. A shape that is only partly in a place stays whole (it is shown cut
+by the box). What stays on a line keeps its place. The output is written afresh as a whole with only
+what is reachable (the old bytes are not in it); an encrypted file stays encrypted; a signed file is
+refused; changing the content of the pages needs permission bit 4 or the owner password.
+
+The places are: every spot of the text where --find text is found (case does not matter, wide and
+narrow forms are the same), every number of the kind --pattern names (idcard: 18 characters, the
+last a digit or X; phone: 11 digits starting 13 to 19; bankcard: 16 to 19 digits, in groups
+with a space or a hyphen), and each --area (page from 1; x and y are the lower left corner, in points
+of the page as shown, to the right and up). Each of the three can be given again and again.
+Prints what was taken from each page. Exit status 1 when no place was found at all.
+
+Options:
+  --find <text>         Text to find (case and wide/narrow forms ignored)
+  --pattern <kind>      idcard, phone or bankcard
+  --area <p:x,y,w,h>    A rectangle: page, lower left corner, width and height in points
+  --color <rrggbb>      The colour of the boxes (default 000000)
+  --label <text>        Words on the boxes (for example 已涂黑); the Redact annotations of the file may have their own
+  --clear-metadata      Leave the document information and the metadata out of the new file
+  --remove-attachments  Take the attached files and the scripts (JavaScript) out of the new file too
+  -o, --output <file>   The file to write (required)
+  --force               Overwrite the output file if it exists
+  --password <password> The password of an encrypted file
+";
+
 const XLSX: &str = "Usage:
   qingpdf xlsx <file.pdf> [--pages <list>] -o <output.xlsx> [--force] [--password <password>]
 
@@ -574,5 +610,6 @@ pub fn text(command: Option<Command>) -> String {
         Some(Command::Docx) => format!("{DOCX}{PAGE_LIST}"),
         Some(Command::Xlsx) => format!("{XLSX}{PAGE_LIST}"),
         Some(Command::Bookmarks) => BOOKMARKS.to_string(),
+        Some(Command::Redact) => REDACT.to_string(),
     }
 }

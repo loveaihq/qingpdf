@@ -61,3 +61,15 @@ pub fn decode_image(doc: &Document, stream: &Stream, work: &Work, target: (usize
     }
     Ok(Some(Pixels { width, height, channels, data }))
 }
+
+/// The inline image (8.9.7) of the statement `BI ... ID ... EI` as a stream: the dictionary's keys spelled out, the data as it is in the content.
+/// `None` for a statement that is not one.
+pub fn inline_image(statement: &[u8]) -> Option<Stream> {
+    use crate::text::scan::{Item, Scanner};
+    let mut scanner = Scanner::new(statement);
+    let mut ops = Vec::new();
+    match scanner.next(&mut ops) {
+        Item::Operator(b"BI") => super::interp::read_inline_image(&mut scanner, &mut ops),
+        _ => None,
+    }
+}

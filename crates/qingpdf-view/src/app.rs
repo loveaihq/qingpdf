@@ -25,6 +25,7 @@ mod pages;
 mod printjob;
 mod protect;
 mod recents;
+mod redact;
 mod screen;
 mod searching;
 mod selecting;
@@ -129,6 +130,11 @@ pub const CMD_TOOL_ELLIPSE: u32 = 131;
 pub const CMD_TOOL_LINE: u32 = 132;
 pub const CMD_TOOL_ARROW: u32 = 133;
 pub const CMD_FILL: u32 = 134;
+/// The Redact menu (2026-10-20): the tool that drags out a box, the selected text, find and mark, apply.
+pub const CMD_TOOL_REDACT: u32 = 180;
+pub const CMD_REDACT_SELECTION: u32 = 181;
+pub const CMD_REDACT_FIND: u32 = 182;
+pub const CMD_REDACT_APPLY: u32 = 183;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
@@ -194,6 +200,8 @@ const TAG_COMPRESS_SAVE: u32 = 12;
 const TAG_COMPRESS_OPEN: u32 = 13;
 const TAG_NOTE_EDIT: u32 = 14;
 const TAG_BM_AUTO: u32 = 15;
+const TAG_REDACT_FIND: u32 = 16;
+const TAG_REDACT_APPLY: u32 = 17;
 
 // Timers.
 /// The view has stopped moving.
@@ -424,6 +432,8 @@ app_fields! {
         thumb_target: Option<usize>,
         thumb_nav: bool,
         cz: compress::Squeeze,
+        /// Redaction (2026-10-20): the box that asks where to write is answered, the engine is making the file.
+        rd: redact::Redacting,
         /// The look of the window (2026-10-20): what the person chose in View > Interface, whether Windows is set to dark apps, the colours in use, and
         /// whether the window is to be told them (`Action::Theme`) with the next answer.
         theme_choice: ThemeChoice,
@@ -574,6 +584,7 @@ impl App {
             thumb_target: None,
             thumb_nav: false,
             cz: compress::Squeeze::new(),
+            rd: redact::Redacting::new(),
             theme_choice: ThemeChoice::System,
             system_dark: false,
             pal: &theme::LIGHT,
@@ -638,6 +649,9 @@ impl App {
         self.edit.reset();
         self.pt.reset();
         if let Some(id) = self.cz.reset() {
+            self.engine.cancel(id);
+        }
+        if let Some(id) = self.rd.reset() {
             self.engine.cancel(id);
         }
         let had_outline = !self.outline.is_empty();
@@ -1162,6 +1176,10 @@ impl App {
             CMD_INS_PAGENUM => self.ask_pagenum(),
             CMD_PROTECT => self.ask_protect(),
             CMD_COMPRESS => self.ask_compress(),
+            CMD_TOOL_REDACT => self.toggle_tool(Tool::Shape(ShapeKind::Redact)),
+            CMD_REDACT_SELECTION => self.redact_selection(),
+            CMD_REDACT_FIND => self.ask_redact_find(),
+            CMD_REDACT_APPLY => self.ask_redact_apply(),
             CMD_WM_OPACITY_BASE..=CMD_WM_PAGE => self.set_watermark_option(cmd),
             c if (CMD_SIZE_BASE..CMD_SIZE_BASE + 4).contains(&c) => self.set_text_size((c - CMD_SIZE_BASE) as usize),
             CMD_TOOL_SELECT => self.set_tool(Tool::Select),
@@ -1685,6 +1703,8 @@ impl App {
             Event::Form { tag: TAG_PAGENUM, answer } => self.pagenum_answered(answer),
             Event::Form { tag: TAG_PROTECT, answer } => self.protect_answered(answer),
             Event::Form { tag: TAG_COMPRESS, answer } => self.compress_answered(answer),
+            Event::Form { tag: TAG_REDACT_FIND, answer } => self.redact_find_answered(answer),
+            Event::Form { tag: TAG_REDACT_APPLY, answer } => self.redact_apply_answered(answer),
             Event::Form { .. } => Vec::new(),
             Event::MouseDown { x, y, .. } if self.present.is_some() => self.present_click(i64::from(x), i64::from(y)),
             Event::MouseDown { x, y, ctrl, shift, clicks } => self.mouse_down(i64::from(x), i64::from(y), ctrl, shift, clicks),

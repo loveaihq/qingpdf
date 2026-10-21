@@ -25,7 +25,7 @@ mod geometry;
 mod links;
 mod outline;
 mod plan;
-mod search;
+pub(crate) mod search;
 mod server;
 mod store;
 mod targets;
@@ -59,11 +59,14 @@ pub use links::{Link, LinkKind, MAX_LINKS, MAX_URI_BYTES, safe_uri};
 pub use outline::{MAX_OUTLINE_DEPTH, MAX_OUTLINE_ITEMS, MAX_TITLE_CHARS, OutlineItem, read_bookmarks};
 pub(crate) use outline::walk as walk_outline;
 pub use crate::edit::{MAX_AUTHOR_CHARS, MAX_INK_POINTS, MAX_INK_STROKES, MAX_INK_WIDTH, MAX_NOTE_CHARS, MAX_QUADS, MIN_INK_WIDTH, MarkupKind, ShapeKind, keep_on_page};
+pub use crate::edit::{FindSpec, Preset, REDACT_COLOR};
 pub use plan::{ACTIVE_FLOOR, MAX_FILE_BYTES, MemoryPlan, THUMB_CACHE_BYTES, TOTAL_BYTES, plan};
 
 /// The biggest file the reader compresses: the file, the new file and the new pictures are held at once, with the pictures being
 /// worked on (`docs/decisions.md`, compressing); a bigger one is for `qingpdf compress`.
 pub const MAX_COMPRESS_FILE: u64 = 30_000_000;
+/// The biggest file the reader redacts (the same reasons; a bigger one is for `qingpdf redact`).
+pub const MAX_REDACT_FILE: u64 = 40_000_000;
 pub use search::MAX_QUERY_CHARS;
 pub use server::{MAX_COPY_CHARS, MAX_COPY_PAGES, MAX_HITS_PER_PAGE, MAX_PRINT_DPI, MAX_PRINT_PAGES, MAX_SEARCH_HITS};
 
@@ -401,6 +404,9 @@ pub enum Event {
     /// when the result would not have been smaller: no file was written), or `Failed` (`message` says why; no file was written).
     /// `message` also holds what the work warned of.
     Compressed { doc: u64, id: u64, status: SaveStatus, message: String, before: u64, after: u64, kept: bool },
+    /// The answer to [`Engine::redact`]: `Done` (the file at the path was written, `bytes` long; `pages` pages had something taken out, for
+    /// `marks` marks; `message` is what the work warned of) or `Failed` (`message` says why; no file was written).
+    Redacted { doc: u64, id: u64, status: SaveStatus, message: String, bytes: u64, pages: u32, marks: u32 },
 }
 
 /// What can be asked of the open document besides drawing.
@@ -436,6 +442,7 @@ pub(crate) enum Command {
     Extract { doc: u64, id: u64, pages: Vec<u32>, path: String },
     Protect { doc: u64, id: u64, path: String, job: Box<ProtectJob> },
     Compress { doc: u64, id: u64, path: String, how: CompressHow },
+    Redact { doc: u64, id: u64, path: String, how: RedactHow },
     /// Inside the serving loop only: the document is to be replaced by an edited one.
     Swap,
     PrintNext(u64),
@@ -451,6 +458,17 @@ pub struct CompressHow {
     pub preset: crate::compress::Preset,
     /// Only what loses nothing: the pictures are not changed.
     pub lossless_only: bool,
+}
+
+/// What [`Engine::redact`] asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RedactHow {
+    /// The words on the boxes that have none of their own (empty: none).
+    pub label: String,
+    /// Leave the information dictionary and the metadata out of the new file.
+    pub clear_metadata: bool,
+    /// Take the attached files and the scripts out of the new file.
+    pub remove_active: bool,
 }
 
 /// What [`Engine::protect`] asks for, and the seed of the random bytes it needs.
@@ -799,6 +817,23 @@ impl Engine {
         let _ = self.commands.send(Command::Compress { doc, id, path: path.to_string(), how });
     }
 
+    /// Apply the marks of the document (its `Redact` annotations, with the edits not saved yet): what lies under them is taken out of the pages for real
+    /// (`edit::redact_document`) and the file is written afresh as a whole at `path` (into a file of its own that replaces `path` only when it is
+    /// whole; `path` may be the open file), the document's encryption kept. The open file is not touched. Answered by [`Event::Redacted`]; a file that is
+    /// signed, or whose author did not allow changing its content and that was not opened with the owner password, answers `Failed`, and so does one
+    /// bigger than [`MAX_REDACT_FILE`]. Done in the order of the edits.
+    pub fn redact(&self, doc: u64, id: u64, path: &str, how: RedactHow) {
+        let _ = self.commands.send(Command::Redact { doc, id, path: path.to_string(), how });
+    }
+
+    /// (A mark for redaction over text or a box is [`Engine::add_markup`] of [`MarkupKind::Redact`], or [`Engine::add_shape`] of [`ShapeKind::Redact`].)
+    /// Mark every place the words and kinds of number of `spec` are found, on every page, one mark for each place: answered by one [`Event::Edited`] with
+    /// `page` [`ALL_PAGES`] whose `message` is the number of places (or `Failed`: nothing found, or too many places).
+    pub fn redact_find(&self, doc: u64, id: u64, spec: FindSpec, author: &str) {
+        let edit = crate::edit::Edit::RedactFind { spec: Box::new(spec), author: author.to_string() };
+        let _ = self.commands.send(Command::Edit { doc, id, edit });
+    }
+
     /// Draw a shape: a rectangle, an ellipse, a line or an arrow, with its line `width` points wide (between [`MIN_INK_WIDTH`] and [`MAX_INK_WIDTH`]) in
     /// `color`; `fill` fills a rectangle or an ellipse with the colour lightened. `from` and `to` are the points of [`CharBoxes`] the person dragged
     /// from and to (opposite corners, or the ends of the line). Answered by [`Event::Edited`].
@@ -993,6 +1028,7 @@ fn run(commands: &Receiver<Command>, events: &Sender<Event>, notify: &(dyn Fn() 
             | Command::Extract { .. }
             | Command::Protect { .. }
             | Command::Compress { .. }
+            | Command::Redact { .. }
             | Command::Swap
             | Command::PrintNext(_)
             | Command::Cancel(_) => None,

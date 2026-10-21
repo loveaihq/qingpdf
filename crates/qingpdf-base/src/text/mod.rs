@@ -34,7 +34,7 @@ use crate::security::has_owner_rights;
 use crate::render::work::{Work, cost};
 
 pub use chars::{MAX_PAGE_CHARS, PageChars};
-pub use editscan::{ActualSpan, CharRec, EditScanner, FontRec, Part, Scan, Show, ShowItem, ShowOp, Source, StreamSpan};
+pub use editscan::{ActualSpan, CharRec, Draw, DrawKind, EditScanner, FontRec, Part, Scan, Show, ShowItem, ShowOp, Source, StreamSpan};
 pub use interp::Glyph;
 pub use layout::Mark;
 pub use chars::Shown;

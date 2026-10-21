@@ -25,6 +25,8 @@ pub enum ShapeKind {
     Line = 2,
     /// A `Line` whose end has an open arrow head (`/LE [/None /OpenArrow]`, `/IT /LineArrow`).
     Arrow = 3,
+    /// Not a shape: a mark for redaction (a `Redact` annotation, `edit::redact`) over the rectangle that is dragged out.
+    Redact = 4,
 }
 
 /// How a line ends (12.5.6.7, `/LE`): nothing, an open arrow head (two barbs) or a closed one (a triangle, filled).
@@ -197,10 +199,14 @@ pub(super) fn shape(ctx: &mut Ctx<'_>, shown: &Shown, kind: ShapeKind, from: [f3
     let place = |p: [f32; 2]| -> Result<(f64, f64)> { Ok((finite_place(p[0])?.clamp(0.0, page_w), finite_place(p[1])?.clamp(0.0, page_h))) };
     let (a, b) = (place(from)?, place(to)?);
     let (side_x, side_y) = ((a.0 - b.0).abs(), (a.1 - b.1).abs());
-    let boxed_shape = matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse);
+    let boxed_shape = matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse | ShapeKind::Redact);
     let too_small = if boxed_shape { side_x < MIN_SHAPE || side_y < MIN_SHAPE } else { side_x.hypot(side_y) < MIN_SHAPE };
     if too_small {
         return Err(bad("the shape is too small"));
+    }
+    if kind == ShapeKind::Redact {
+        // (Not a shape: a mark for redaction, which is a markup over the box.)
+        return super::markup(ctx, shown, super::MarkupKind::Redact, &[[a.0.min(b.0) as f32, a.1.min(b.1) as f32, a.0.max(b.0) as f32, a.1.max(b.1) as f32]], rgb, author, now);
     }
     let (ua, ub) = (shown.unmap(a.0, a.1), shown.unmap(b.0, b.1));
     let look = Look { rgb, width, fill: (fill && boxed_shape).then(|| lighten(rgb)) };
@@ -228,7 +234,7 @@ pub(super) fn shape(ctx: &mut Ctx<'_>, shown: &Shown, kind: ShapeKind, from: [f3
         ShapeKind::Rectangle => "Rectangle",
         ShapeKind::Ellipse => "Oval",
         ShapeKind::Line => "Line",
-        ShapeKind::Arrow => "Arrow",
+        ShapeKind::Arrow | ShapeKind::Redact => "Arrow",
     };
     d.set("Subj", text_string(subject));
     let form = ctx.form(&ap)?;

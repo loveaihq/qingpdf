@@ -62,18 +62,24 @@ const MAX_WAVES_IN_ALL: usize = 20_000;
 pub(crate) fn markup(kind: MarkupKind, quads: &[Quad], rgb: [f64; 3]) -> Appearance {
     let mut c = String::new();
     match kind {
-        MarkupKind::Highlight => {
+        MarkupKind::Highlight | MarkupKind::Redact => {
             c.push_str("/GS0 gs\n");
-            color(&mut c, rgb, "rg");
+            // A mark for redaction is outlined, and tinted so that the text under it can be read; a highlight is the colour.
+            let redact = kind == MarkupKind::Redact;
+            color(&mut c, if redact { rgb.map(|v| 1.0 - (1.0 - v) * 0.15) } else { rgb }, "rg");
+            if redact {
+                color(&mut c, rgb, "RG");
+                c.push_str("1 w\n");
+            }
             for q in quads {
                 let [ul, ur, ll, lr] = *q;
                 point(&mut c, ul, "m");
                 point(&mut c, ur, "l");
                 point(&mut c, lr, "l");
                 point(&mut c, ll, "l");
-                c.push_str("h f\n");
+                c.push_str(if redact { "h B\n" } else { "h f\n" });
             }
-            Appearance { bbox: quad_bounds(quads, 0.0), content: c, multiply: true }
+            Appearance { bbox: quad_bounds(quads, if redact { 1.0 } else { 0.0 }), content: c, multiply: true }
         }
         MarkupKind::Underline | MarkupKind::StrikeOut => {
             let k = if kind == MarkupKind::Underline { 0.1 } else { 0.45 };

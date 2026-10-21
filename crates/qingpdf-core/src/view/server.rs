@@ -492,7 +492,7 @@ impl Server<'_> {
                 }
                 None
             }
-            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. } | Command::Protect { .. } | Command::Compress { .. }) => {
+            c @ (Command::Edit { .. } | Command::Undo { .. } | Command::Redo { .. } | Command::Save { .. } | Command::Export { .. } | Command::Extract { .. } | Command::Protect { .. } | Command::Compress { .. } | Command::Redact { .. }) => {
                 let doc = match &c {
                     Command::Edit { doc, .. }
                     | Command::Undo { doc, .. }
@@ -501,7 +501,8 @@ impl Server<'_> {
                     | Command::Export { doc, .. }
                     | Command::Extract { doc, .. }
                     | Command::Protect { doc, .. }
-                    | Command::Compress { doc, .. } => *doc,
+                    | Command::Compress { doc, .. }
+                    | Command::Redact { doc, .. } => *doc,
                     _ => 0,
                 };
                 if doc == self.doc_id {
@@ -1190,6 +1191,47 @@ impl Server<'_> {
                         }
                     }
                     Err(e) => reply(self, SaveStatus::Failed, e.to_string(), 0, 0, false),
+                }
+                None
+            }
+            Command::Redact { doc, id, path, how } => {
+                let reply = |this: &Self, status: SaveStatus, message: String, bytes: u64, pages: u32, marks: u32| this.tell(Event::Redacted { doc, id, status, message, bytes, pages, marks });
+                let fail = |this: &Self, why: &str| reply(this, SaveStatus::Failed, why.to_string(), 0, 0, 0);
+                if printing {
+                    fail(self, BUSY);
+                    return None;
+                }
+                if !self.rights.modify {
+                    fail(self, DENIED_MODIFY);
+                    return None;
+                }
+                if let Policy::Refuse(why) = self.session.policy(self.document, EditClass::Content) {
+                    fail(self, why);
+                    return None;
+                }
+                if self.document.data().len() as u64 > super::MAX_REDACT_FILE {
+                    fail(self, &format!("the file is bigger than {} MB, the most this reader redacts; use the command line: qingpdf redact", super::MAX_REDACT_FILE / 1_000_000));
+                    return None;
+                }
+                let Some(room) = self.plan.compress_room(self.document.overlay_bytes() as u64) else {
+                    fail(self, "the window and the file leave this reader too little memory to redact it; use the command line: qingpdf redact");
+                    return None;
+                };
+                // What the drawing keeps (fonts, pictures, forms, the text of the pages) is let go of: the memory is for the redaction.
+                self.renderer = Renderer::new(self.document, crate::forms::painter());
+                self.renderer.set_memory_limits(self.limits);
+                self.renderer.set_cancel(Some(self.shared.stop.clone()));
+                self.text = TextExtractor::new(self.document);
+                self.chars = TextCache::new(self.text_budget);
+                let spec = edit::RedactSpec { color: edit::REDACT_COLOR, label: how.label, use_marks: true, clear_metadata: how.clear_metadata, remove_active: how.remove_active, ..edit::RedactSpec::default() };
+                let work = Work::with_allowance(edit::REDACT_ALLOWANCE);
+                // The document as it is, with the edits not saved yet.
+                match edit::redact_document(self.document, self.session.password(), &spec, &work, usize::try_from(room).unwrap_or(usize::MAX)) {
+                    Ok(done) => match write_atomic(&path, &done.data) {
+                        Ok(()) => reply(self, SaveStatus::Done, done.warnings.join("\n"), done.data.len() as u64, u32::try_from(done.pages.len()).unwrap_or(u32::MAX), u32::try_from(done.marks).unwrap_or(u32::MAX)),
+                        Err(e) => fail(self, &e.to_string()),
+                    },
+                    Err(e) => fail(self, &e.to_string()),
                 }
                 None
             }

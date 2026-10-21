@@ -98,7 +98,7 @@ impl AnnotEdit {
 
 /// Is this a mark on text (picked by clicking, but dragged over is for selecting the text under it)?
 fn is_text_markup(a: &AnnotInfo) -> bool {
-    matches!(a.subtype.as_str(), "Highlight" | "Underline" | "StrikeOut" | "Squiggly")
+    matches!(a.subtype.as_str(), "Highlight" | "Underline" | "StrikeOut" | "Squiggly" | "Redact")
 }
 
 /// The distance from the point to the segment.
@@ -125,7 +125,7 @@ fn constrained(kind: ShapeKind, from: [f32; 2], to: [f32; 2], shift: bool) -> [f
     }
     let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
     match kind {
-        ShapeKind::Rectangle | ShapeKind::Ellipse => {
+        ShapeKind::Rectangle | ShapeKind::Ellipse | ShapeKind::Redact => {
             let s = dx.abs().max(dy.abs());
             [from[0] + s * if dx < 0.0 { -1.0 } else { 1.0 }, from[1] + s * if dy < 0.0 { -1.0 } else { 1.0 }]
         }
@@ -141,7 +141,7 @@ fn constrained(kind: ShapeKind, from: [f32; 2], to: [f32; 2], shift: bool) -> [f
 /// The lines a shape is previewed with, as points of the page.
 fn preview(kind: ShapeKind, a: [f32; 2], b: [f32; 2]) -> Vec<Vec<[f32; 2]>> {
     match kind {
-        ShapeKind::Rectangle => vec![vec![a, [b[0], a[1]], b, [a[0], b[1]], a]],
+        ShapeKind::Rectangle | ShapeKind::Redact => vec![vec![a, [b[0], a[1]], b, [a[0], b[1]], a]],
         ShapeKind::Ellipse => {
             let (cx, cy, rx, ry) = ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0, (b[0] - a[0]) / 2.0, (b[1] - a[1]) / 2.0);
             vec![(0..=64).map(|i| {
@@ -543,7 +543,7 @@ impl App {
             let color = (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b);
             let to = constrained(kind, d.from, d.to, d.shift);
             let (a, c) = ([d.from[0].min(to[0]), d.from[1].min(to[1])], [d.from[0].max(to[0]), d.from[1].max(to[1])]);
-            let corners = if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse) { (a, c) } else { (d.from, to) };
+            let corners = if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse | ShapeKind::Redact) { (a, c) } else { (d.from, to) };
             for line in preview(kind, corners.0, corners.1) {
                 let points: Vec<(f64, f64)> = line.iter().map(|q| map.to_px(f64::from(q[0]), f64::from(q[1]))).collect();
                 self.draw_dots(p, &points, left, top, side, color);

@@ -1068,7 +1068,7 @@ pub fn compress(doc: &Document, password: &str, how: &Options, ctl: &Control<'_>
     }
     let picks: Vec<ops::Pick> = ops::all_picks(0, loaded.pages.len()).collect();
     loaded.size_hint.set(doc.data().len());
-    let out = ops::build(&[loaded], &picks, Encrypt::Keep, Some(Tune { merged: found.merged, replaced, tidy: Box::new(tidy), pack }))?;
+    let out = ops::build(&[loaded], &picks, Encrypt::Keep, Some(Tune { merged: found.merged, replaced, tidy: Box::new(tidy), pack, no_metadata: false }))?;
     (ctl.progress)(100);
     warnings.extend(out.warnings);
     let before = doc.data().len() as u64;

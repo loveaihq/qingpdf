@@ -20,6 +20,7 @@ mod ocr;
 pub(crate) mod outline;
 mod pagenum;
 mod pages;
+mod redact;
 mod retext;
 mod shapes;
 pub(crate) mod signature;
@@ -43,6 +44,7 @@ pub use ocr::{has_layer as has_ocr_layer, MAX_IMAGE_PIXELS, MAX_OCR_PAGES, MAX_S
 pub use pages::{MAX_INSERT_FILE_BYTES, MAX_INSERT_PAGES, MAX_PAGES_AFTER, PageOp, Password, order_after_move};
 pub(crate) use pages::unique as unique_pages;
 pub use content::{ALL_PAGES, ContentOp, MAX_WATERMARK_CHARS, MAX_WATERMARK_PAGES, Watermark, add_content};
+pub use redact::{ALLOWANCE as REDACT_ALLOWANCE, Area, Counts as RedactCounts, DEFAULT_COLOR as REDACT_COLOR, FindSpec, MAX_AREAS, MAX_FIND_MARKS, MAX_FIND_WORDS, MAX_RECTS as MAX_REDACT_RECTS, Preset, RedactSpec, Redacted, redact_document, redact_file};
 pub use pagenum::{MAX_MARGIN_MM, MAX_PAGINATION_PAGES, MAX_START, MAX_TEMPLATE_CHARS, Pagination, SLOTS};
 pub use modify::keep_on_page;
 pub use shapes::ShapeKind;
@@ -80,6 +82,8 @@ pub enum MarkupKind {
     Underline = 1,
     StrikeOut = 2,
     Squiggly = 3,
+    /// A mark for redaction (a `Redact` annotation, 12.5.6.23; `edit::redact`): the places are outlined in the colour, the box that will cover them is black.
+    Redact = 4,
 }
 
 impl MarkupKind {
@@ -89,6 +93,7 @@ impl MarkupKind {
             MarkupKind::Underline => "Underline",
             MarkupKind::StrikeOut => "StrikeOut",
             MarkupKind::Squiggly => "Squiggly",
+            MarkupKind::Redact => "Redact",
         }
     }
 }
@@ -133,6 +138,8 @@ pub enum Edit {
     Pagination(Box<Pagination>),
     /// Take away the page numbers, headers and footers that a `Pagination` wrote (on every page).
     Unpaginate,
+    /// A mark over each place a word or a kind of number is found, on every page.
+    RedactFind { spec: Box<FindSpec>, author: String },
     /// Change the line of text at `at` (points of the page as shown; it reads `old`) into `text` (5a, the page's own content).
     ReplaceLine { page: u32, at: [f32; 2], old: String, text: String },
     /// An invisible text layer over scanned pages, from the words a recogniser found (5c, the pages' own content): one font for all
@@ -175,7 +182,7 @@ impl Edit {
             | Edit::AddText { page, .. }
             | Edit::AddImage { page, .. }
             | Edit::ReplaceLine { page, .. } => *page,
-            Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) => ALL_PAGES,
+            Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::RedactFind { .. } => ALL_PAGES,
             Edit::Outline(_) => NO_PAGE,
         }
     }
@@ -426,6 +433,11 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
         ocr::layer(&mut ctx, pages, recognised)?;
         return Ok((ctx.objects, ctx.notes));
     }
+    if let Edit::RedactFind { spec, author } = edit {
+        let mut ctx = Ctx { doc, next: doc.next_free_number(), objects: Vec::new(), work, room, used: 0, notes: Vec::new() };
+        redact::mark_found(&mut ctx, pages, spec, author, now)?;
+        return Ok((ctx.objects, ctx.notes));
+    }
     let page_index = usize::try_from(edit.page()).unwrap_or(usize::MAX);
     let page = pages.get(page_index).ok_or_else(|| Error::Invalid("there is no such page".to_string()))?;
     let shown = Shown::of(page);
@@ -445,7 +457,7 @@ pub(crate) fn apply_noted(doc: &Document, pages: &[Page], edit: &Edit, now: &str
             content::add_image(&mut ctx, page, *rect, image)?;
             return Ok((ctx.objects, ctx.notes));
         }
-        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::Pages(_) | Edit::Outline(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
+        Edit::Watermark(_) | Edit::Pagination(_) | Edit::Unpaginate | Edit::OcrLayer(_) | Edit::RedactFind { .. } | Edit::Pages(_) | Edit::Outline(_) | Edit::Shape { .. } | Edit::Move { .. } | Edit::Resize { .. } | Edit::Restyle { .. } | Edit::SetText { .. } => return Err(Error::Invalid("this change is not made for one page".to_string())),
         Edit::ReplaceLine { at, old, text, .. } => {
             retext::replace_line(&mut ctx, page, *at, old, text)?;
             return Ok((ctx.objects, ctx.notes));
@@ -498,6 +510,10 @@ fn markup(ctx: &mut Ctx<'_>, shown: &Shown, kind: MarkupKind, rects: &[[f32; 4]]
     let mut d = annotation(kind.subtype(), ap.bbox, color, author, now);
     let points: Vec<f64> = quads.iter().flat_map(|q| q.iter().flat_map(|&(x, y)| [x, y])).collect();
     d.set("QuadPoints", reals(&points));
+    if kind == MarkupKind::Redact {
+        // (The box that covers: black.)
+        d.set("IC", reals(&[0.0, 0.0, 0.0]));
+    }
     d.set("Border", Object::Array(vec![Object::Integer(0), Object::Integer(0), Object::Integer(0)]));
     with_appearance(&mut d, form);
     ctx.objects.push((annot_ref.num, Object::Dict(d)));
@@ -866,6 +882,8 @@ mod forms_tests;
 mod modify_tests;
 #[cfg(test)]
 mod pages_tests;
+#[cfg(test)]
+mod redact_tests;
 #[cfg(test)]
 mod retext_tests;
 

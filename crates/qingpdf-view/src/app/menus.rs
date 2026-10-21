@@ -244,6 +244,16 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             },
         },
         Menu {
+            title: t(lang, Msg::RdMenu).to_string(),
+            entries: vec![
+                MenuEntry::Item { id: CMD_TOOL_REDACT, label: t(lang, Msg::RdToolArea).to_string(), checked: st.tool == CMD_TOOL_REDACT, enabled: st.can_edit },
+                item(CMD_REDACT_SELECTION, Msg::RdSelection, st.can_edit),
+                item(CMD_REDACT_FIND, Msg::RdFind, st.can_edit),
+                MenuEntry::Separator,
+                item(CMD_REDACT_APPLY, Msg::RdApply, st.can_modify),
+            ],
+        },
+        Menu {
             title: t(lang, Msg::ToolsMenu).to_string(),
             entries: vec![
                 item(CMD_OCR_ALL, Msg::OcrAll, st.can_ocr),
@@ -273,7 +283,7 @@ impl App {
             Tool::Markup(MarkupKind::Highlight) => CMD_TOOL_HIGHLIGHT,
             Tool::Markup(MarkupKind::Underline) => CMD_TOOL_UNDERLINE,
             Tool::Markup(MarkupKind::StrikeOut) => CMD_TOOL_STRIKE,
-            Tool::Markup(MarkupKind::Squiggly) => CMD_TOOL_SQUIGGLY,
+            Tool::Markup(MarkupKind::Squiggly | MarkupKind::Redact) => CMD_TOOL_SQUIGGLY,
             Tool::Ink => CMD_TOOL_INK,
             Tool::Note => CMD_TOOL_NOTE,
             Tool::TextBox => CMD_TOOL_TEXTBOX,
@@ -283,6 +293,7 @@ impl App {
             Tool::Shape(ShapeKind::Ellipse) => CMD_TOOL_ELLIPSE,
             Tool::Shape(ShapeKind::Line) => CMD_TOOL_LINE,
             Tool::Shape(ShapeKind::Arrow) => CMD_TOOL_ARROW,
+            Tool::Shape(ShapeKind::Redact) => CMD_TOOL_REDACT,
         }
     }
 
@@ -343,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn there_are_eight_menus_and_every_command_is_in_one() {
+    fn there_are_nine_menus_and_every_command_is_in_one() {
         let st = MenuState {
             has_doc: true,
             recent: vec!["C:\\a.pdf".to_string(), "C:\\b&c.pdf".to_string()],
@@ -358,14 +369,14 @@ mod tests {
         };
         for lang in [Lang::En, Lang::Zh] {
             let menus = build_menus(lang, &st);
-            assert_eq!(menus.len(), 8);
+            assert_eq!(menus.len(), 9);
             let listed = all(&menus);
             let mut ids: Vec<u32> = listed.iter().map(|(id, ..)| *id).collect();
             ids.sort_unstable();
             let n = ids.len();
             ids.dedup();
             assert_eq!(ids.len(), n, "a command is listed twice");
-            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
+            for cmd in [CMD_OPEN, CMD_PRINT, CMD_EXIT, CMD_ZOOM_IN, CMD_ZOOM_OUT, CMD_FIT_WIDTH, CMD_FIT_PAGE, CMD_ACTUAL, CMD_ROTATE, CMD_BOOKMARKS, CMD_GOTO, CMD_COPY, CMD_FIND, CMD_FIND_NEXT, CMD_FIND_PREV, CMD_ABOUT, CMD_CLEAR_RECENT, CMD_RECENT_BASE, CMD_RECENT_BASE + 1, CMD_SAVE, CMD_SAVE_AS, CMD_EXPORT_DOCX, CMD_EXPORT_XLSX, CMD_PROTECT, CMD_COMPRESS, CMD_UNDO, CMD_REDO, CMD_REMOVE, CMD_AUTHOR, CMD_TOOL_SELECT, CMD_TOOL_HIGHLIGHT, CMD_TOOL_UNDERLINE, CMD_TOOL_STRIKE, CMD_TOOL_SQUIGGLY, CMD_TOOL_INK, CMD_TOOL_NOTE, CMD_TOOL_TEXTBOX, CMD_TOOL_EDITTEXT, CMD_STAMP, CMD_SIZE_BASE, CMD_SIZE_BASE + 3, CMD_COLOR_BASE, CMD_COLOR_BASE + 5, CMD_WIDTH_BASE, CMD_WIDTH_BASE + 3, CMD_INS_TEXT, CMD_INS_IMAGE, CMD_INS_WM, CMD_WM_OPACITY_BASE, CMD_WM_OPACITY_BASE + 2, CMD_WM_ANGLE_BASE, CMD_WM_ANGLE_BASE + 2, CMD_WM_TILE, CMD_WM_UNDER, CMD_WM_PAGE, CMD_OCR_ALL, CMD_OCR_PAGE, CMD_BM_ADD, CMD_BM_AUTO, CMD_TOOL_REDACT, CMD_REDACT_SELECTION, CMD_REDACT_FIND, CMD_REDACT_APPLY, CMD_PREV_PAGE, CMD_NEXT_PAGE, CMD_TOOLBAR, CMD_LANG_SYSTEM, CMD_LANG_ZH, CMD_LANG_EN, CMD_LAYOUT_SINGLE, CMD_LAYOUT_SPREAD, CMD_LAYOUT_COVER, CMD_FULLSCREEN, CMD_PRESENT, CMD_THEME_SYSTEM, CMD_THEME_LIGHT, CMD_THEME_DARK, CMD_TINT_ORIGINAL, CMD_TINT_NIGHT, CMD_TINT_SEPIA] {
                 assert!(ids.contains(&cmd), "{cmd} is in no menu");
             }
             // An & in a path is doubled, so that it does not make a shortcut letter.

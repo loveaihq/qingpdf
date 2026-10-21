@@ -18,7 +18,7 @@ use qingpdf_core::security::{Method, PasswordKind, Permissions, Protection};
 use qingpdf_core::ops::{self, Input, LoadedImage, Output};
 use qingpdf_core::{Document, Error, Warning, docx, render, text, xlsx};
 
-use args::{BookmarkAction, Parsed, PrintLevel, Protect, Request, UsageError};
+use args::{BookmarkAction, Parsed, PrintLevel, Protect, RedactArgs, Request, UsageError};
 
 /// An error message for the user; the exit code is 1.
 type Failure = String;
@@ -175,6 +175,7 @@ fn run(request: Request) -> Result<(), Failure> {
         Request::Xlsx { input, pages, output, force, password } => xlsx_command(&input, pages.as_deref(), &output, force, &password),
         Request::Bookmarks { input, action, output, force, password } => bookmarks_command(&input, &action, output.as_deref(), force, &password),
         Request::Replace { input, find, with, pages, output, force, password } => replace_command(&input, &find, &with, pages.as_deref(), &output, force, &password),
+        Request::Redact(args) => redact_command(&args),
         Request::Addtext { input, page, at, size, text, output, force, password } => {
             let doc = open_unlocked(&input, &password)?;
             check_output(&output, std::slice::from_ref(&input), force)?;
@@ -463,6 +464,72 @@ fn replace_command(input: &Path, find: &str, with: &str, pages: Option<&str>, ou
     }
     say(&format!("replaced {} place{} on {} page{}; wrote {}
 ", found.count, plural(found.count), found.pages, plural(found.pages), output.display()));
+    Ok(())
+}
+
+/// Take what lies under the places out of the file and write it afresh as a whole.
+fn redact_command(args: &RedactArgs) -> Result<(), Failure> {
+    let input = args.input.as_path();
+    let doc = open_unlocked(input, &args.password)?;
+    check_output(&args.output, std::slice::from_ref(&args.input), args.force)?;
+    let pages = doc.pages().map_err(|e| op_error(input, &e))?;
+    let mut areas = Vec::with_capacity(args.areas.len());
+    for &(page, [x, y, w, h]) in &args.areas {
+        let Some(p) = pages.get(page) else { return Err(format!("{}: there is no page {} (the file has {})", input.display(), page + 1, pages.len())) };
+        // From the lower left, y up, to the top left, y down.
+        let (_, height) = text::Shown::of(p).size();
+        areas.push(edit::Area { page, rect: [x as f32, (height - y - h) as f32, (x + w) as f32, (height - y) as f32] });
+    }
+    let spec = edit::RedactSpec {
+        find: edit::FindSpec { words: args.finds.clone(), presets: args.patterns.clone() },
+        areas,
+        color: args.color,
+        label: args.label.clone(),
+        use_marks: true,
+        clear_metadata: args.clear_metadata,
+        remove_active: args.remove_attachments,
+    };
+    let done = edit::redact_file(&doc, &args.password, &spec).map_err(|e| op_error(input, &e))?;
+    for warning in &done.warnings {
+        eprintln!("warning: {warning}");
+    }
+    for what in &done.unfound {
+        eprintln!("warning: '{what}' was not found");
+    }
+    write_file(&args.output, &done.data)?;
+    let (mut glyphs, mut pictures, mut paths, mut annots) = (0, 0, 0, 0);
+    for (page, c) in &done.pages {
+        say(&format!(
+            "page {}: {} character{}, {} picture{}, {} shape{}, {} annotation{} taken out
+",
+            page + 1,
+            c.glyphs,
+            plural(c.glyphs),
+            c.images,
+            plural(c.images),
+            c.paths,
+            plural(c.paths),
+            c.annots,
+            plural(c.annots)
+        ));
+        glyphs += c.glyphs;
+        pictures += c.images;
+        paths += c.paths;
+        annots += c.annots;
+    }
+    say(&format!(
+        "redacted {} place{} on {} page{} ({glyphs} character{}, {pictures} picture{}, {paths} shape{}, {annots} annotation{}); wrote {}
+",
+        done.marks,
+        plural(done.marks),
+        done.pages.len(),
+        plural(done.pages.len()),
+        plural(glyphs),
+        plural(pictures),
+        plural(paths),
+        plural(annots),
+        args.output.display()
+    ));
     Ok(())
 }
 

@@ -288,6 +288,7 @@ impl App {
             "Square" => Msg::ToolRect,
             "Circle" => Msg::ToolEllipse,
             "Line" => Msg::ToolLine,
+            "Redact" => Msg::RdKind,
             other => return other.to_string(),
         };
         plain_label(t(self.lang, m)).0

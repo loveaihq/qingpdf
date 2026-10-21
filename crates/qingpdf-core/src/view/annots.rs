@@ -151,7 +151,7 @@ pub(super) fn read(doc: &Document, page: &Page, work: &Work) -> (Vec<AnnotInfo>,
         }
         let to32 = |b: [f64; 4]| [b[0] as f32, b[1] as f32, b[2] as f32, b[3] as f32];
         let mut parts: Vec<[f32; 4]> = Vec::new();
-        if matches!(subtype.as_bytes(), b"Highlight" | b"Underline" | b"StrikeOut" | b"Squiggly")
+        if matches!(subtype.as_bytes(), b"Highlight" | b"Underline" | b"StrikeOut" | b"Squiggly" | b"Redact")
             && let Some(q) = d.get("QuadPoints").and_then(|q| work.read(doc, q))
             && let Some(values) = q.as_array()
         {

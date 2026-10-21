@@ -257,6 +257,19 @@
 
 命令行用 `qingpdf_core::edit::set_outline(doc, 密码, items)`（返回追加了改动的整份文件的字节）、`check_outline_allowed`、`view::read_bookmarks(doc)`、`docx::headings(doc, 密码, only, cancel)`。
 
+## 涂黑的请求和结果（2026-10-20）
+
+给“涂黑”菜单用。**标记**是 `Redact` 批注（12.5.6.23），加、列、选、删、撤销都和别的批注一样；**应用**是把标记范围里的内容真正从页面里删掉、整份重写成新文件。
+
+| 调用 | 作用 |
+|---|---|
+| `add_markup(doc, id, page, MarkupKind::Redact, rects, color, author)` | 在 `rects`（每行字一个 `[左, 上, 右, 下]`，页面显示后的点，和高亮同一套）上做一个标记：批注有 `/QuadPoints`、`/IC [0 0 0]`（应用后盖住的框的颜色）、外观（`color` 描边，里面淡淡地染一层，用 `/BM /Multiply`，下面的字看得清）。答 `Edited`。需要 `Rights.annotate`。 |
+| `add_shape(doc, id, page, ShapeKind::Redact, from, to, color, width, fill, author)` | 拖出一个方框做的标记（形状工具的第五种；不是形状，做出来和上一项一样；`width`、`fill` 不用）。边长不到 2 点答 `Failed`。答 `Edited`。 |
+| `redact_find(doc, id, FindSpec { words, presets }, author)` | 每个词、每种号码（`Preset::{IdCard, Phone, BankCard}`）在**每一页**找到的**每一处**做一个标记。词照查找的规矩比（大小写、全角半角、汉字旁的空格），号码按形状认（身份证 18 位末位可为 X；手机号 `1[3-9]` 加 9 位；银行卡 16 到 19 位，可以用一个空格或连字符分组；都不认一个更长的数字里面的一段）。答一个 `Edited`（`page` 是 `ALL_PAGES`，一步撤销），`message` 的最后一个词是找到几处（十进制数；它前面可能有一段话，说哪些页没有找全，界面应当让人看到）；一处也没有答 `Failed`；超过 `MAX_FIND_MARKS`（5000）处答 `Failed`；词和种类加起来最多 `MAX_FIND_WORDS`（64）。需要 `Rights.annotate`。 |
+| `redact(doc, id, 路径, RedactHow { label, clear_metadata, remove_active })` | **应用**：把文档（连没保存的改动、没应用的标记一起）里每个 `Redact` 标记范围内的文字、图片像素、完全在里面的图形、范围内的批注和表单控件都删掉，在原处画一个框（颜色是标记的 `/IC`，默认黑；`label` 是没有自己 `/OverlayText` 的框上的字，空是不写），去掉标记，整份重写（只留够得着的对象，对象重新编号，缩略图和私有数据不要；`clear_metadata` 时文档信息和 XMP 也不要；`remove_active` 时附件和脚本也不要）写到路径（先写同目录的临时文件、再改名替换，路径可以就是打开的文件，出错原文件不动），加密的保持原来的加密。**不碰打开的文件，也不换掉引擎里的文档**；界面做完后自己决定怎么打开新文件。答 `Redacted { doc, id, status, message, bytes, pages, marks }`：`Done` 时 `bytes` 是新文件的字节数、`pages` 是有东西被删的页数、`marks` 是应用了几个标记、`message` 是做的提醒（没有就空；每条一行，用换行隔开：文档里的附件和脚本有几个、被删的字还留在哪些地方、有页读不全、字体没有字宽、字体表没剪……，界面应当让人看到）；`Failed` 时 `message` 说原因，没写文件。 |
+
+规矩（不合规矩答 `Failed`，没写文件）：要 `Rights.modify`（权限位 4，所有者密码解除，和加水印、压缩同一条）；有签名的文件（任何签名、任何级别的认证）拒绝；文件超过 `view::MAX_REDACT_FILE`（40 MB）拒绝，消息里让用命令行；文档里**一个标记也没有**时答 `Failed`（"nothing to redact"）；有标记但标记范围里没有东西可删时照样做（只画框）；内存按 `MemoryPlan::compress_room` 算（和压缩同一个算法），借给新对象；正在打印时答 `Failed`。一个内容流读不了（不认识的过滤器）、一个语句跨两个内容流、一个页把同一个内容流列了两次而里面有要改的地方、一个表单用两个名字或从两处画而里面有要改的地方，整个应用答 `Failed`，消息里有页码：宁可不做，也不交出一份没做完的页。做的时候引擎线程不画页（和压缩一样）；不能取消。数字和理由见 `docs/decisions.md` 的"涂黑（2026-10-20）"。
+
 ## 对接别的语言
 
 接口里只有整数、浮点、字符串、字节数组和没有数据的枚举，没有 Rust 特有的东西（借用、闭包、泛型）。包成 C 接口：每个调用一个函数（`add_markup`、`add_ink`、`add_note`、`delete_annotation` 各是一个函数，不是一个带数据的 `Edit` 枚举），事件取出来摊平成一个结构（`kind` 加上各字段）、位图用"指针加长度"交出去并配一个释放函数，`notify` 换成"函数指针加一个 `void*`"。鸿蒙的 NAPI 同理：`poll` 的结果转成 JS 对象，`notify` 用线程安全函数回到主线程。**这两个包装 3d-1、3d-2、4a 都没有写。**

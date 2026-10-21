@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use qingpdf_core::compress::Preset;
+use qingpdf_core::edit::Preset as Kind;
 use qingpdf_core::image::PageMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +29,11 @@ pub enum Command {
     Docx,
     Xlsx,
     Bookmarks,
+    Redact,
 }
 
 impl Command {
-    pub const ALL: [Command; 19] = [
+    pub const ALL: [Command; 20] = [
         Command::Info,
         Command::Merge,
         Command::Split,
@@ -51,6 +53,7 @@ impl Command {
         Command::Docx,
         Command::Xlsx,
         Command::Bookmarks,
+        Command::Redact,
     ];
 
     pub fn name(self) -> &'static str {
@@ -74,6 +77,7 @@ impl Command {
             Command::Docx => "docx",
             Command::Xlsx => "xlsx",
             Command::Bookmarks => "bookmarks",
+            Command::Redact => "redact",
         }
     }
 
@@ -141,6 +145,24 @@ pub enum Request {
     /// Write the bookmarks to a text file, or replace them (from a text file, or from the headings): `output` is the PDF written by the second
     /// and the third.
     Bookmarks { input: PathBuf, action: BookmarkAction, output: Option<PathBuf>, force: bool, password: String },
+    /// Take what lies under the marks out of the file for real.
+    Redact(Box<RedactArgs>),
+}
+
+/// What `redact` was asked for. `areas`: the page (from 0) and `[x, y, width, height]` in points from the lower left of the page as shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedactArgs {
+    pub input: PathBuf,
+    pub finds: Vec<String>,
+    pub patterns: Vec<Kind>,
+    pub areas: Vec<(usize, [f64; 4])>,
+    pub color: [u8; 3],
+    pub label: String,
+    pub clear_metadata: bool,
+    pub remove_attachments: bool,
+    pub output: PathBuf,
+    pub force: bool,
+    pub password: String,
 }
 
 /// What `bookmarks` is to do.
@@ -238,6 +260,8 @@ struct Allowed {
     compress: bool,
     /// The options of `bookmarks`: `--export`, `--import` and `--auto`.
     bookmarks: bool,
+    /// The options of `redact`: `--find`, `--pattern`, `--area`, `--color`, `--label`, `--clear-metadata`.
+    redact: bool,
 }
 
 fn allowed(c: Command) -> Allowed {
@@ -256,6 +280,7 @@ fn allowed(c: Command) -> Allowed {
         protect: false,
         compress: false,
         bookmarks: false,
+        redact: false,
     };
     match c {
         Command::Info => Allowed { password: true, ..none },
@@ -275,6 +300,7 @@ fn allowed(c: Command) -> Allowed {
         Command::Replace => Allowed { output: true, force: true, pages: true, password: true, mark: true, ..none },
         Command::Docx | Command::Xlsx => Allowed { output: true, force: true, pages: true, password: true, ..none },
         Command::Bookmarks => Allowed { output: true, force: true, password: true, bookmarks: true, ..none },
+        Command::Redact => Allowed { output: true, force: true, password: true, redact: true, ..none },
     }
 }
 
@@ -321,6 +347,13 @@ struct Collected {
     export: Option<PathBuf>,
     import: Option<PathBuf>,
     auto: bool,
+    /// `redact`: the words, kinds of number and areas to take out, the words on the boxes, and the switch for the metadata.
+    finds: Vec<String>,
+    patterns: Vec<String>,
+    areas: Vec<String>,
+    label: Option<String>,
+    clear_metadata: bool,
+    remove_attachments: bool,
 }
 
 /// The switches of `encrypt` that take no value.
@@ -430,6 +463,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
             "--user-password" | "--owner-password" | "--password-file" | "--print" if ok.protect => {}
             "--preset" if ok.compress => {}
             "--export" | "--import" if ok.bookmarks => {}
+            "--find" | "--pattern" | "--area" | "--label" | "--color" if ok.redact => {}
+            "--clear-metadata" | "--remove-attachments" if ok.redact => {
+                if inline.is_some() {
+                    return Err(usage(c, format!("{name} does not take a value")));
+                }
+                if name == "--clear-metadata" {
+                    got.clear_metadata = true;
+                } else {
+                    got.remove_attachments = true;
+                }
+                continue;
+            }
             "--auto" if ok.bookmarks => {
                 if inline.is_some() {
                     return Err(usage(c, "--auto does not take a value"));
@@ -481,6 +526,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, UsageEr
         };
         let slot_taken = |what: &str| usage(c, format!("{what} given more than once"));
         match name.as_str() {
+            "--find" if ok.redact => got.finds.push(text(value, "--find", command)?),
+            "--pattern" if ok.redact => got.patterns.push(text(value, "--pattern", command)?),
+            "--area" if ok.redact => got.areas.push(text(value, "--area", command)?),
+            "--label" if ok.redact => {
+                if got.label.replace(text(value, "--label", command)?).is_some() {
+                    return Err(slot_taken("--label"));
+                }
+            }
             "-o" | "--output" => {
                 if got.output.replace(PathBuf::from(value)).is_some() {
                     return Err(slot_taken("the output file"));
@@ -632,6 +685,18 @@ fn place(c: Option<Command>, value: Option<&str>) -> Result<[f64; 2], UsageError
     Ok(parsed)
 }
 
+/// `--area PAGE:X,Y,WIDTH,HEIGHT`: the page from 1, the lower left corner and the size in points of the page as shown.
+fn area(c: Option<Command>, v: &str) -> Result<(usize, [f64; 4]), UsageError> {
+    let bad = || usage(c, format!("--area needs a page, a colon and four numbers like 1:72,600,200,40, not '{v}'"));
+    let (page, rest) = v.split_once(':').ok_or_else(bad)?;
+    let page = page.trim().parse::<usize>().ok().filter(|&p| p >= 1).ok_or_else(bad)?;
+    let numbers: Vec<f64> = rest.split(',').map(|n| n.trim().parse::<f64>().ok().filter(|x| x.is_finite() && x.abs() <= MAX_PLACE)).collect::<Option<_>>().ok_or_else(bad)?;
+    match numbers.as_slice() {
+        [x, y, w, h] if *w > 0.0 && *h > 0.0 => Ok((page - 1, [*x, *y, *w, *h])),
+        _ => Err(bad()),
+    }
+}
+
 /// `rrggbb` (with or without a `#`) as a colour.
 fn hex_color(v: &str) -> Option<[u8; 3]> {
     let v = v.trim().trim_start_matches('#');
@@ -644,7 +709,7 @@ fn hex_color(v: &str) -> Option<[u8; 3]> {
 
 fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
     let c = Some(command);
-    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless, export, import, auto } = got;
+    let Collected { mut inputs, output, force, no_annots, pages, every, angle, page, dpi, password, text, image, opacity, at, width, size, find, replace, tile, under, slots, color, margin, start, mirror, skip_first, user_password, owner_password, password_file, print, switches, preset, lossless, export, import, auto, finds, patterns, areas, label, clear_metadata, remove_attachments } = got;
     let password = password.unwrap_or_default();
     let one_input = |inputs: &mut Vec<PathBuf>| -> Result<PathBuf, UsageError> {
         match inputs.len() {
@@ -815,6 +880,26 @@ fn finish(command: Command, got: Collected) -> Result<Request, UsageError> {
                 return Err(usage(c, "pagenum needs some text for at least one of the six places"));
             }
             Ok(Request::Pagenum { input, slots: Box::new(slots), size, color, margin, pages, start, mirror, skip_first, output, force, password })
+        }
+        Command::Redact => {
+            let input = one_input(&mut inputs)?;
+            let output = need_output(output)?;
+            if finds.is_empty() && patterns.is_empty() && areas.is_empty() {
+                return Err(usage(c, "redact needs --find <text>, --pattern <kind> or --area <page:x,y,width,height> (or marks made in the reader)"));
+            }
+            if finds.iter().any(|f| f.trim().is_empty()) {
+                return Err(usage(c, "--find needs some text"));
+            }
+            let kinds = patterns
+                .iter()
+                .map(|n| Kind::parse(n).ok_or_else(|| usage(c, format!("--pattern needs idcard, phone or bankcard, not '{n}'"))))
+                .collect::<Result<Vec<_>, _>>()?;
+            let areas = areas.iter().map(|a| area(c, a)).collect::<Result<Vec<_>, _>>()?;
+            let color = match color.as_deref() {
+                None => [0, 0, 0],
+                Some(v) => hex_color(v).ok_or_else(|| usage(c, format!("--color needs six hexadecimal digits like 000000, not '{v}'")))?,
+            };
+            Ok(Request::Redact(Box::new(RedactArgs { input, finds, patterns: kinds, areas, color, label: label.unwrap_or_default(), clear_metadata, remove_attachments, output, force, password })))
         }
         Command::Stamp => {
             let input = one_input(&mut inputs)?;

@@ -23,6 +23,9 @@
 //!
 //! One line at a time: the characters of a hit are on one line of the page's text, and nothing is moved to make room.
 
+mod pixels;
+pub(super) mod redact;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -375,7 +378,20 @@ struct PageEdits {
     hits: usize,
     /// About how many bytes `inserted` takes.
     bytes: usize,
+    /// Redaction: statements to write again that are not text (a picture drawn, a path painted), and the pictures made for the page:
+    /// (content stream, name, object) to be listed in the `/XObject` resources of the stream's form (or the page's).
+    extra: Vec<Change>,
+    xobjects: Vec<(u32, Vec<u8>, ObjRef)>,
+    /// Redaction: entries of the `/Properties` and `/Pattern` resources of a stream to put (the name, the object) or, with the object number 0, to take
+    /// out: (content stream, kind, name, object).
+    others: Vec<Other>,
+    /// Redaction: what the page's content draws after its own (balanced), the annotations it keeps (`None`: as they are).
+    overlay: Vec<u8>,
+    annots: Option<Vec<Object>>,
 }
+
+/// An entry of the resources of a stream to put or take out (redaction): (content stream, kind, name, object).
+type Other = (u32, &'static str, Vec<u8>, ObjRef);
 
 /// A statement to write again: (content stream, start, end, bytes).
 type Change = (u32, usize, usize, Vec<u8>);
@@ -419,6 +435,8 @@ impl PageEdits {
         self.shows.dedup();
         crate::order::sort_by(&mut self.fallbacks, |a, b| a.cmp(b));
         self.fallbacks.dedup();
+        crate::order::sort_by_key(&mut self.xobjects, |e| u64::from(e.0));
+        crate::order::sort_by_key(&mut self.others, |e| u64::from(e.0));
         crate::order::sort_by_key(&mut self.spans, |e| u64::from(e.0));
         let mut merged: Vec<(u32, Option<String>)> = Vec::with_capacity(self.spans.len());
         for e in std::mem::take(&mut self.spans) {
@@ -886,10 +904,14 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         }
         for (id, text) in &edits.spans {
             if let Some(sequence) = scan.spans.get(*id as usize) {
-                let bytes = render_span(scan, sequence, text.as_deref())?;
+                let bytes = render_span(scan, sequence, text.as_deref(), !edits.overlay.is_empty())?;
                 hold(ctx, bytes.len())?;
                 changes.push((sequence.src, sequence.start as usize, sequence.end as usize, bytes));
             }
+        }
+        for c in &edits.extra {
+            hold(ctx, c.3.len())?;
+            changes.push(c.clone());
         }
         if MANY {
             order_many(&mut changes);
@@ -928,8 +950,8 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         // the resources of what draws it that points at the copy.
         let n = scan.sources.len();
         let mut dirty = vec![false; n];
-        for c in &changes {
-            if let Some(d) = dirty.get_mut(c.0 as usize) {
+        for c in changes.iter().map(|c| c.0).chain(edits.others.iter().map(|o| o.0)) {
+            if let Some(d) = dirty.get_mut(c as usize) {
                 *d = true;
             }
         }
@@ -944,7 +966,8 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         let drawn_by = |copies: &[Option<ObjRef>], i: usize| -> Vec<(Vec<u8>, ObjRef)> {
             (i + 1..n)
                 .filter(|&j| scan.sources.get(j).is_some_and(|c| c.parent as usize == i))
-                .filter_map(|j| Some((scan.sources.get(j)?.name.clone(), copies.get(j).copied().flatten()?)))
+                .filter_map(|j| Some((scan.sources.get(j)?.name.clone(), copies.get(j).copied().flatten()?, scan.sources.get(j)?.form)))
+                .flat_map(|(name, copy, old)| old.map(|o| (Vec::new(), o)).into_iter().chain([(name, copy)]))
                 .collect()
         };
         for i in (1..n).rev() {
@@ -955,7 +978,9 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
                 dict.remove(k);
             }
             // Its resources get the substitute fonts it uses and the copies of the forms it draws.
-            let (fonts, forms) = (fonts_of(self, i as u32), drawn_by(&copies, i));
+            let (fonts, mut forms) = (fonts_of(self, i as u32), drawn_by(&copies, i));
+            forms.extend(span(&edits.xobjects, i as u32, |e| e.0).iter().map(|e| (e.1.clone(), e.2)));
+            let others = span(&edits.others, i as u32, |e| e.0);
             // A copy that does not depend on the page (the form has resources of its own, or gets none) is the same for every page
             // that makes it the same: made once.
             let key = src.form.filter(|_| MANY && (src.dict.get("Resources").is_some() || (fonts.is_empty() && forms.is_empty()))).map(|form| {
@@ -974,11 +999,12 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
                 }
                 continue;
             }
-            if !fonts.is_empty() || !forms.is_empty() {
+            if !fonts.is_empty() || !forms.is_empty() || !others.is_empty() {
                 let mut res = effective_resources(ctx.doc, page, scan, i);
                 charge(ctx, BYTE_COST * res.approx_size() as f64)?;
                 add_entries(ctx.doc, &mut res, "Font", &fonts)?;
                 add_entries(ctx.doc, &mut res, "XObject", &forms)?;
+                add_others(ctx.doc, &mut res, others)?;
                 dict.set("Resources", Object::Dict(res));
             }
             let packed = compress(ctx, &mut dict, &data)?;
@@ -997,9 +1023,20 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         let Object::Dict(mut pdict) = ctx.doc.get(page.obj_ref)? else { return Err(Error::Invalid("the page is not a dictionary".to_string())) };
         charge(ctx, BYTE_COST * pdict.approx_size() as f64)?;
         let mut replaced: Vec<(ObjRef, ObjRef)> = Vec::new();
+        let mut joined: Option<ObjRef> = None;
         if let Some(src) = scan.sources.first() {
             let own = span(&changes, 0, |c| c.0);
-            for &(from, to, old) in &src.streams {
+            if !edits.overlay.is_empty() {
+                // Redaction makes a new file whole: the page's streams are written as the one they are read as (the streams one after the other, a
+                // line feed between), so a statement that runs from one into the next is written as it is.
+                let data = splice(ctx, &src.content, 0, src.content.len(), own)?;
+                let mut dict = Dict::new();
+                let packed = compress(ctx, &mut dict, &data)?;
+                let r = ctx.alloc()?;
+                ctx.objects.push((r.num, Object::Stream(Stream { dict, data: packed })));
+                joined = Some(r);
+            }
+            for &(from, to, old) in src.streams.iter().filter(|_| joined.is_none()) {
                 let Some(old) = old else { continue };
                 let list = own.get(own.partition_point(|c| c.1 < from)..own.partition_point(|c| c.1 < to)).unwrap_or(&[]);
                 if list.is_empty() {
@@ -1013,13 +1050,17 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
                 replaced.insert(replaced.partition_point(|e| e.0 < old), (old, r));
             }
         }
-        let list: Vec<Object> = contents_list(ctx.doc, pdict.get("Contents"))
-            .into_iter()
-            .map(|o| match o.as_obj_ref().and_then(|r| replaced.get(replaced.partition_point(|e| e.0 < r)).filter(|e| e.0 == r)) {
-                Some(&(_, new)) => Object::Ref(new),
-                None => o,
-            })
-            .collect();
+        let list: Vec<Object> = match joined {
+            Some(r) => vec![Object::Ref(r)],
+            None => contents_list(ctx.doc, pdict.get("Contents"))
+                .into_iter()
+                .map(|o| match o.as_obj_ref().and_then(|r| replaced.get(replaced.partition_point(|e| e.0 < r)).filter(|e| e.0 == r)) {
+                    Some(&(_, new)) => Object::Ref(new),
+                    None => o,
+                })
+                .collect(),
+        };
+        let list = self.with_overlay(ctx, scan, &edits.overlay, list)?;
         let single = matches!(pdict.get("Contents"), Some(Object::Ref(r)) if ctx.doc.is_stream(*r));
         match (single, list.as_slice()) {
             (true, [one]) => pdict.set("Contents", one.clone()),
@@ -1027,8 +1068,18 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         }
 
         // The page's resources: the substitute fonts it uses itself and the copies of the forms it draws.
-        let (fonts, forms) = (fonts_of(self, 0), drawn_by(&copies, 0));
-        self.page_resources(ctx, page, &mut pdict, &fonts, &forms)?;
+        let (fonts, mut forms) = (fonts_of(self, 0), drawn_by(&copies, 0));
+        forms.extend(span(&edits.xobjects, 0, |e| e.0).iter().map(|e| (e.1.clone(), e.2)));
+        self.page_resources(ctx, page, &mut pdict, &fonts, &forms, span(&edits.others, 0, |e| e.0))?;
+        if let Some(annots) = &edits.annots {
+            // (Redaction: the page's small picture shows what was taken out.)
+            if annots.is_empty() {
+                pdict.remove("Annots");
+            } else {
+                pdict.set("Annots", Object::Array(annots.clone()));
+            }
+            pdict.remove("Thumb");
+        }
         ctx.spend(pdict.approx_size() + 48)?;
         ctx.objects.push((page.obj_ref.num, Object::Dict(pdict)));
         Ok(())
@@ -1037,20 +1088,21 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
     /// Add the fonts and form copies to the page's resources. A dictionary of the page's own is changed where it is; one that is an
     /// object, or that the page tree gives the page, is not (other pages use it): the page gets a copy, one for all the pages that
     /// need only fonts added to the same resources.
-    fn page_resources(&mut self, ctx: &mut Ctx<'_>, page: &Page, pdict: &mut Dict, fonts: &[(Vec<u8>, ObjRef)], forms: &[(Vec<u8>, ObjRef)]) -> Result<()> {
-        if fonts.is_empty() && forms.is_empty() {
+    fn page_resources(&mut self, ctx: &mut Ctx<'_>, page: &Page, pdict: &mut Dict, fonts: &[(Vec<u8>, ObjRef)], forms: &[(Vec<u8>, ObjRef)], others: &[Other]) -> Result<()> {
+        if fonts.is_empty() && forms.is_empty() && others.is_empty() {
             return Ok(());
         }
         if let Some(Object::Dict(res)) = pdict.get_mut("Resources") {
             add_entries(ctx.doc, res, "Font", fonts)?;
-            return add_entries(ctx.doc, res, "XObject", forms);
+            add_entries(ctx.doc, res, "XObject", forms)?;
+            return add_others(ctx.doc, res, others);
         }
         let key = match pdict.get("Resources") {
             Some(Object::Ref(r)) => Some((false, r.num as usize)),
             Some(_) => None,
             None => page.inherited("Resources").map(|a| (true, a.id)),
         };
-        let shareable = (MANY && forms.is_empty()).then_some(key).flatten();
+        let shareable = (MANY && forms.is_empty() && others.is_empty()).then_some(key).flatten();
         if let Some(k) = shareable
             && let Some(&(_, copy)) = self.res_copies.iter().find(|(have, _)| *have == k)
         {
@@ -1067,6 +1119,7 @@ impl<'a, const MANY: bool> Run<'a, MANY> {
         charge(ctx, BYTE_COST * res.approx_size() as f64)?;
         add_entries(ctx.doc, &mut res, "Font", fonts)?;
         add_entries(ctx.doc, &mut res, "XObject", forms)?;
+        add_others(ctx.doc, &mut res, others)?;
         ctx.spend(res.approx_size() + 48)?;
         match shareable {
             Some(k) => {
@@ -1180,12 +1233,18 @@ fn span_changes(scan: &Scan, hit: &Hit, text: &str) -> std::result::Result<Vec<(
 
 /// The `BDC` statement of a sequence once its `/ActualText` is `text` (`None`: taken out; a sequence left with no properties is
 /// a `BMC`).
-fn render_span(scan: &Scan, sequence: &ActualSpan, text: Option<&str>) -> Result<Vec<u8>> {
+fn render_span(scan: &Scan, sequence: &ActualSpan, text: Option<&str>, redacting: bool) -> Result<Vec<u8>> {
     let old = scan.sources.get(sequence.src as usize).and_then(|s| s.content.get(sequence.start as usize..sequence.end as usize)).unwrap_or_default();
     let mut parser = crate::parser::Parser::new(old, 0);
     let (Ok(Object::Name(tag)), Ok(Object::Dict(mut props))) = (parser.parse_object(), parser.parse_object()) else { return Ok(old.to_vec()) };
-    // (Not the sequence that was thought: one that has no /ActualText stays as it is.)
-    if props.remove("ActualText").is_none() {
+    // (Not the sequence that was thought: one that has no /ActualText stays as it is. Redacting, the /Alt and /E go with it: all three are read out as
+    // the page's words.)
+    let mut found = props.remove("ActualText").is_some();
+    if redacting {
+        found |= props.remove("Alt").is_some();
+        found |= props.remove("E").is_some();
+    }
+    if !found {
         return Ok(old.to_vec());
     }
     if let Some(t) = text {
@@ -1239,7 +1298,7 @@ fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
-fn resolve_dict(doc: &Document, o: &Object) -> Dict {
+pub(in crate::edit) fn resolve_dict(doc: &Document, o: &Object) -> Dict {
     match doc.resolve(o) {
         Ok(Object::Dict(d)) => d,
         _ => Dict::new(),
@@ -1273,6 +1332,16 @@ fn add_entries(doc: &Document, res: &mut Dict, category: &str, entries: &[(Vec<u
         None => Dict::new(),
     };
     for (name, r) in entries {
+        if name.is_empty() {
+            // (Redaction: what the page drew with this object is not drawn any more; the entries that name it go, so that the old picture or form
+            // is not kept in the file by a name that nothing uses.)
+            sub = Dict::from_pairs(sub.into_pairs().into_iter().filter(|(_, v)| *v != Object::Ref(*r)).collect());
+            continue;
+        }
+        if r.num == 0 {
+            sub = Dict::from_pairs(sub.into_pairs().into_iter().filter(|(k, _)| k.0 != *name).collect());
+            continue;
+        }
         if let Some(have) = sub.iter().find(|(k, _)| k.0 == *name).map(|(_, v)| v)
             && *have != Object::Ref(*r)
             && category == "Font"
@@ -1282,6 +1351,15 @@ fn add_entries(doc: &Document, res: &mut Dict, category: &str, entries: &[(Vec<u
         sub.set(Name(name.clone()), Object::Ref(*r));
     }
     res.set(category, Object::Dict(sub));
+    Ok(())
+}
+
+/// [`add_entries`] for the `/Properties` and `/Pattern` resources (redaction).
+fn add_others(doc: &Document, res: &mut Dict, others: &[Other]) -> Result<()> {
+    for kind in ["Properties", "Pattern"] {
+        let entries: Vec<(Vec<u8>, ObjRef)> = others.iter().filter(|o| o.1 == kind).map(|o| (o.2.clone(), o.3)).collect();
+        add_entries(doc, res, kind, &entries)?;
+    }
     Ok(())
 }
 

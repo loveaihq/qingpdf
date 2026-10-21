@@ -18,7 +18,7 @@ use crate::render::work::{Work, cost};
 
 use super::cmap::{CMap, Uni};
 use super::font::{Font, Warnings};
-use super::editscan::{ActualSpan, CharRec, Part, Recorder, Show, ShowItem, ShowOp};
+use super::editscan::{ActualSpan, CharRec, Draw, DrawKind, Part, Recorder, Show, ShowItem, ShowOp};
 use super::page::Gfx;
 use super::scan::{Item, Operand, Scanner};
 
@@ -223,7 +223,32 @@ struct GState {
     rise: f64,
     /// The text rendering mode (9.3.6, `Tr`): 0 to 7.
     render: u8,
+    /// The line width (`w`), for the extent of a stroked path when the page is read for redaction.
+    lw: f64,
+    /// Read for redaction: the pattern that is the fill colour and the one that is the stroke colour (the stream it was chosen in, its name).
+    fill_pat: u32,
+    stroke_pat: u32,
 }
+
+/// A path being built, when the page is read for redaction: the bounds of its points in default user space, where its first
+/// statement starts, and whether it is to be a clip.
+struct PathAcc {
+    bounds: [f64; 4],
+    start: u32,
+    clip: bool,
+}
+
+impl PathAcc {
+    fn add(&mut self, ctm: &Matrix, x: f64, y: f64) {
+        let (px, py) = (ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]);
+        if px.is_finite() && py.is_finite() {
+            self.bounds = [self.bounds[0].min(px), self.bounds[1].min(py), self.bounds[2].max(px), self.bounds[3].max(py)];
+        }
+    }
+}
+
+/// Most images and paths one page may be read for redaction with (they are kept, each takes some 100 bytes).
+const MAX_DRAWS: usize = 400_000;
 
 /// What the matrices give for every character of a string: the linear part of the text
 /// matrix times the CTM, the lengths of its columns, the two writing directions and
@@ -306,6 +331,13 @@ pub(crate) struct Interp<'a> {
     stmt: (u32, u32),
     /// The images and the ruled lines of the page, when the page is read for a word processor (`page.rs`).
     pub(super) gfx: Option<Box<Gfx>>,
+    /// Read for redaction: the text of artifacts is kept, and the path being built is followed.
+    pub(super) keep_artifacts: bool,
+    path: Option<PathAcc>,
+    /// Text shown with no font (the name is not in the resources, or no font was chosen): it is not read.
+    pub(super) unreadable: usize,
+    /// The resources of the streams that run the one being run (the page's first): a form with no fonts of its own takes the fonts of what draws it.
+    outer: Vec<Rc<Scope>>,
 }
 
 impl<'a> Interp<'a> {
@@ -316,7 +348,7 @@ impl<'a> Interp<'a> {
             glyphs: Vec::new(),
             ops_left: MAX_OPERATORS,
             in_progress: Vec::new(),
-            gs: GState { ctm: IDENTITY, font: None, rec_font: u32::MAX, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0, render: 0 },
+            gs: GState { ctm: IDENTITY, font: None, rec_font: u32::MAX, size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0, render: 0, lw: 1.0, fill_pat: u32::MAX, stroke_pat: u32::MAX },
             stack: Vec::new(),
             tm: IDENTITY,
             tlm: IDENTITY,
@@ -330,6 +362,10 @@ impl<'a> Interp<'a> {
             cur_src: 0,
             stmt: (0, 0),
             gfx: None,
+            keep_artifacts: false,
+            path: None,
+            unreadable: 0,
+            outer: Vec::new(),
         }
     }
 
@@ -362,10 +398,16 @@ impl<'a> Interp<'a> {
             self.charge(cost::TEXT_OP)?;
             if op == b"BI" {
                 // 8.9.7: the image's dictionary entries, `ID`, binary data, `EI`: nothing for text.
+                let start = sc.statement_start();
                 for _ in 0..4096 {
                     match sc.next(&mut ops) {
                         Item::Operator(b"ID") => {
                             sc.skip_inline_image_data();
+                            if let Some(rec) = self.rec.as_mut().filter(|r| r.graphics) {
+                                let (start, end) = (u32::try_from(start).unwrap_or(u32::MAX), u32::try_from(sc.pos()).unwrap_or(u32::MAX));
+                                rec.add_draw(Draw { src: self.cur_src, start, end, ctm: self.gs.ctm, kind: DrawKind::Inline })?;
+                                self.pattern_paint(u32::MAX, true, false);
+                            }
                             break;
                         }
                         Item::Operator(_) => {}
@@ -471,9 +513,11 @@ impl<'a> Interp<'a> {
             OP_TF => {
                 if let [.., Operand::Name(name), Operand::Num(size)] = ops {
                     self.gs.size = *size;
-                    self.gs.font = self.font(sc.bytes(*name), scope);
+                    // (A form whose resources have no fonts takes those of what draws it, as PDFium does.)
+                    let scope = Rc::clone(if scope.fonts.is_empty() { self.outer.iter().rev().find(|o| !o.fonts.is_empty()).unwrap_or(scope) } else { scope });
+                    self.gs.font = self.font(sc.bytes(*name), &scope);
                     if self.rec.is_some() {
-                        self.gs.rec_font = self.record_font(sc.bytes(*name), scope);
+                        self.gs.rec_font = self.record_font(sc.bytes(*name), &scope);
                     }
                 }
             }
@@ -527,9 +571,114 @@ impl<'a> Interp<'a> {
                 if let Some(g) = self.gfx.as_mut() {
                     g.operator(op, ops, &self.gs.ctm);
                 }
+                if self.rec.as_ref().is_some_and(|r| r.graphics) {
+                    self.follow_path(op, ops, sc)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Redaction: follow the path being built (8.5) and note down the one that is painted. A path that is also a clip (`W`) is not
+    /// noted: it hides, it does not draw.
+    fn follow_path(&mut self, op: &[u8], ops: &[Operand], sc: &Scanner<'_>) -> Result<()> {
+        let ctm = self.gs.ctm;
+        let start = self.stmt.0;
+        let fresh = || PathAcc { bounds: [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], start, clip: false };
+        match op {
+            b"w" => {
+                if let Some([v]) = numbers::<1>(ops) {
+                    self.gs.lw = v.abs();
+                }
+            }
+            // The colours: a name given to `scn` is a pattern; any other choice of colour is not.
+            b"cs" | b"CS" | b"scn" | b"SCN" => {
+                let mut chosen = u32::MAX;
+                if let Some(Operand::Name(n)) = ops.last().filter(|_| op == b"scn" || op == b"SCN")
+                    && let Some(rec) = self.rec.as_mut()
+                {
+                    // (The patterns by name: the table is kept short; one that is not in it is never taken out of the resources.)
+                    let key = (self.cur_src, sc.bytes(*n).to_vec());
+                    match rec.pat_names.iter().rposition(|p| *p == key) {
+                        Some(i) => chosen = u32::try_from(i).unwrap_or(u32::MAX),
+                        None if rec.pat_names.len() < 5_000 => {
+                            rec.pat_names.push(key);
+                            chosen = u32::try_from(rec.pat_names.len() - 1).unwrap_or(u32::MAX);
+                        }
+                        None => {}
+                    }
+                }
+                if op.first().is_some_and(|c| c.is_ascii_uppercase()) {
+                    self.gs.stroke_pat = chosen;
+                } else {
+                    self.gs.fill_pat = chosen;
+                }
+            }
+            // A point, or the points of a curve (its control points too: the curve is inside their hull).
+            b"m" | b"l" | b"c" | b"v" | b"y" => {
+                let acc = self.path.get_or_insert_with(fresh);
+                for pair in ops.as_chunks::<2>().0 {
+                    if let [Operand::Num(x), Operand::Num(y)] = pair {
+                        acc.add(&ctm, *x, *y);
+                    }
+                }
+            }
+            b"re" => {
+                if let Some([x, y, w, h]) = numbers::<4>(ops) {
+                    let acc = self.path.get_or_insert_with(fresh);
+                    for (px, py) in [(x, y), (x + w, y), (x + w, y + h), (x, y + h)] {
+                        acc.add(&ctm, px, py);
+                    }
+                }
+            }
+            b"W" | b"W*" => {
+                if let Some(acc) = self.path.as_mut() {
+                    acc.clip = true;
+                }
+            }
+            b"S" | b"s" | b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*" | b"n" => {
+                let Some(acc) = self.path.take() else { return Ok(()) };
+                let (fill, stroke) = (!matches!(op, b"n" | b"S" | b"s"), !matches!(op, b"n" | b"f" | b"F" | b"f*"));
+                if op == b"n" || acc.clip || !acc.bounds.iter().all(|v| v.is_finite()) {
+                    // (What a clip is, or a path that has no bounds, may still be painted with a pattern: it is kept.)
+                    if op != b"n" && !acc.clip {
+                        self.pattern_paint(u32::MAX, fill, stroke);
+                    }
+                    return Ok(());
+                }
+                let mut bounds = acc.bounds;
+                if matches!(op, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*") {
+                    // A line is drawn as wide as `lw` times the scale of the matrix, on both sides of the path (a miter or a square
+                    // cap reaches further than half of it; the whole width is left on each side).
+                    let scale = (ctm[0] * ctm[3] - ctm[1] * ctm[2]).abs().sqrt();
+                    let margin = (self.gs.lw * scale).max(0.5);
+                    bounds = [bounds[0] - margin, bounds[1] - margin, bounds[2] + margin, bounds[3] + margin];
+                }
+                if let Some(rec) = self.rec.as_mut() {
+                    if rec.draws.len() >= MAX_DRAWS {
+                        return Err(Error::Limit(format!("more than {MAX_DRAWS} drawings on one page")));
+                    }
+                    rec.add_draw(Draw { src: self.cur_src, start: acc.start, end: self.stmt.1, ctm, kind: DrawKind::Path(bounds) })?;
+                    let at = u32::try_from(rec.draws.len() - 1).unwrap_or(u32::MAX);
+                    self.pattern_paint(at, fill, stroke);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Redaction: something is painted with the pattern that is the fill or the stroke colour; `draw` is the path drawn (`u32::MAX`: something else, text
+    /// or a picture, which the page keeps whatever is taken out).
+    fn pattern_paint(&mut self, draw: u32, fill: bool, stroke: bool) {
+        let used = [if fill { self.gs.fill_pat } else { u32::MAX }, if stroke { self.gs.stroke_pat } else { u32::MAX }];
+        if let Some(rec) = self.rec.as_mut() {
+            for p in used.into_iter().filter(|&p| p != u32::MAX) {
+                if rec.pat_uses.len() < 100_000 {
+                    rec.pat_uses.push((p, draw));
+                }
+            }
+        }
     }
 
     // --- reading a page for editing (`editscan`) -----------------------------------------------------------------------
@@ -579,8 +728,10 @@ impl<'a> Interp<'a> {
     /// resources, `/Properties`, is not looked at.)
     fn actual_text(&self, ops: &[Operand], sc: &Scanner<'_>) -> Option<ActualSpan> {
         let [.., Operand::Name(_), Operand::Dict(d)] = ops else { return None };
-        // (The word may be in a string: whoever changes the statement reads the list.)
-        sc.bytes(*d).windows(10).any(|w| w == b"ActualText").then_some(ActualSpan { src: self.cur_src, start: self.stmt.0, end: self.stmt.1, first: 0, last: u32::MAX, parent: u32::MAX })
+        // (The word may be in a string: whoever changes the statement reads the list. Read for redaction, a list with an /Alt or an /E is kept too: the
+        // words in them are read out as the page's.)
+        let bytes = sc.bytes(*d);
+        (bytes.windows(10).any(|w| w == b"ActualText") || (self.keep_artifacts && bytes.windows(2).any(|w| w == b"/A" || w == b"/E"))).then_some(ActualSpan { src: self.cur_src, start: self.stmt.0, end: self.stmt.1, first: 0, last: u32::MAX, parent: u32::MAX })
     }
 
     fn record_font(&mut self, name: &[u8], scope: &Rc<Scope>) -> u32 {
@@ -597,6 +748,8 @@ impl<'a> Interp<'a> {
             self.marks_past += 1;
             return Ok(());
         }
+        // (Read for redaction, the text of an artifact is text like the rest.)
+        let watermark = watermark && !self.keep_artifacts;
         self.marks.push(watermark);
         self.hidden += usize::from(watermark);
         let at = u32::try_from(self.glyphs.len()).unwrap_or(u32::MAX);
@@ -710,7 +863,13 @@ impl<'a> Interp<'a> {
     // --- showing text ------------------------------------------------------------------------
 
     fn show(&mut self, s: &[u8]) -> Result<()> {
-        let Some(font) = self.gs.font.clone() else { return Ok(()) };
+        let Some(font) = self.gs.font.clone() else {
+            self.unreadable += usize::from(!s.is_empty());
+            return Ok(());
+        };
+        if self.keep_artifacts && (self.gs.fill_pat != u32::MAX || self.gs.stroke_pat != u32::MAX) {
+            self.pattern_paint(u32::MAX, true, true);
+        }
         let (size, tc, tw, th, rise) = (self.gs.size, self.gs.tc, self.gs.tw, self.gs.th, self.gs.rise);
         let ctm = self.gs.ctm;
         let mut tm = self.tm;
@@ -816,14 +975,14 @@ impl<'a> Interp<'a> {
         let Some(Object::Ref(r)) = scope.xobjects.get(name) else { return Ok(()) };
         let r = *r;
         if self.shared.not_forms.contains(&r) {
-            self.place_image(r);
+            self.place_image(r)?;
             return Ok(());
         }
         let form = match self.shared.forms.get(&r) {
             Some(f) => f.clone(),
             None => {
                 let Some(form) = self.load_form(r)? else {
-                    self.place_image(r);
+                    self.place_image(r)?;
                     return Ok(());
                 };
                 let form = Rc::new(form);
@@ -857,7 +1016,9 @@ impl<'a> Interp<'a> {
         }
         self.in_progress.push(r);
         let inner = form.scope.clone().unwrap_or_else(|| scope.clone());
+        self.outer.push(scope.clone());
         let result = self.run(&form.content, &inner, depth + 1);
+        self.outer.pop();
         self.in_progress.pop();
         self.cur_src = saved_src;
         self.stack.truncate(saved_depth);
@@ -869,13 +1030,18 @@ impl<'a> Interp<'a> {
     }
 
     /// An XObject that is not a form was drawn: when it is an image, the page remembers where.
-    fn place_image(&mut self, r: ObjRef) {
-        if self.hidden == 0
-            && self.shared.image_refs.contains(&r)
-            && let Some(g) = self.gfx.as_mut()
-        {
-            g.image(r, self.gs.ctm);
+    fn place_image(&mut self, r: ObjRef) -> Result<()> {
+        if self.hidden == 0 && self.shared.image_refs.contains(&r) {
+            if let Some(g) = self.gfx.as_mut() {
+                g.image(r, self.gs.ctm);
+            }
+            if let Some(rec) = self.rec.as_mut().filter(|r| r.graphics) {
+                let ctm = self.gs.ctm;
+                rec.add_draw(Draw { src: self.cur_src, start: self.stmt.0, end: self.stmt.1, ctm, kind: DrawKind::Image(r) })?;
+                self.pattern_paint(u32::MAX, true, false);
+            }
         }
+        Ok(())
     }
 
     /// Read a form XObject; `None` (and remembered) when it is not a form or cannot be read.
