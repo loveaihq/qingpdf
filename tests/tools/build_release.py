@@ -51,7 +51,7 @@ def main():
         check(exe)
     name = f"qingpdf-{ver}-windows-x64"
     out = os.path.join(DIST, name + ".zip")
-    docs = ["README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", os.path.join("docs", "使用说明.md")]
+    docs = ["README.md", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES.md", os.path.join("docs", "使用说明.md"), os.path.join("docs", "USER-GUIDE.md")]
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for exe in exes:
             z.write(exe, f"{name}/{os.path.basename(exe)}")

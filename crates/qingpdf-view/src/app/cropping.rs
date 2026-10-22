@@ -167,7 +167,7 @@ impl App {
             let id = self.new_id();
             self.engine.auto_crop(self.doc_id, id, pages);
             self.cr.looking = Some(id);
-            return self.say(fill(t(self.lang, Msg::NoteCropLooking), &[("n", "0")]));
+            return self.say_job(sticky::Job::Crop, fill(t(self.lang, Msg::NoteCropLooking), &[("n", "0")]));
         }
         let mut cut = [0.0f64; 4];
         for (slot, v) in cut.iter_mut().zip(&values) {
@@ -245,7 +245,7 @@ impl App {
     /// How far the looking is.
     #[inline(never)]
     pub(super) fn on_crop_progress(&mut self, id: u64, percent: u32) -> Option<Vec<Action>> {
-        (self.cr.looking == Some(id)).then(|| self.say(fill(t(self.lang, Msg::NoteCropLooking), &[("n", &percent.to_string())])))
+        (self.cr.looking == Some(id)).then(|| self.say_job(sticky::Job::Crop, fill(t(self.lang, Msg::NoteCropLooking), &[("n", &percent.to_string())])))
     }
 
     // --- the pointer: a box dragged out on a page ------------------------------------------------------------------

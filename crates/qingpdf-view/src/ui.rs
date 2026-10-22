@@ -61,6 +61,47 @@ pub trait Painter {
     }
 }
 
+/// `s` cut short with an ellipsis so that it is at most `room` pixels wide (it is kept whole when it fits).
+pub fn fit_text(p: &mut dyn Painter, s: &str, room: i32) -> String {
+    if p.text_width(s) <= room {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let cut: String = chars.iter().take(mid).chain(std::iter::once(&'\u{2026}')).collect();
+        if p.text_width(&cut) <= room { lo = mid } else { hi = mid - 1 }
+    }
+    chars.iter().take(lo).chain(std::iter::once(&'\u{2026}')).collect()
+}
+
+/// `v` held between `lo` and `hi`, and never a panic: `Ord::clamp` panics when `lo` is more than `hi` (a card wider than the window it is to stand in), and
+/// here `lo` wins then.
+pub fn clamp_to<T: Ord + Copy>(v: T, lo: T, hi: T) -> T {
+    v.max(lo).min(hi.max(lo))
+}
+
+/// `s` cut short in the middle with an ellipsis so that it is at most `room` pixels wide, keeping the start and the end (a path keeps its drive and its file
+/// name); kept whole when it fits.
+pub fn fit_middle(p: &mut dyn Painter, s: &str, room: i32) -> String {
+    if p.text_width(s) <= room {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    // The most characters that fit with the ellipsis, shared between the two ends (the end gets the larger share).
+    let (mut lo, mut hi) = (0usize, chars.len());
+    let cut = |keep: usize| -> String {
+        let (head, tail) = (keep / 3, keep - keep / 3);
+        chars.iter().take(head).chain(std::iter::once(&'\u{2026}')).chain(chars.iter().skip(chars.len().saturating_sub(tail))).collect()
+    };
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if p.text_width(&cut(mid)) <= room { lo = mid } else { hi = mid - 1 }
+    }
+    cut(lo)
+}
+
 /// Virtual-key codes the reader uses (winuser.h).
 pub mod vk {
     pub const BACK: u32 = 0x08;
@@ -197,6 +238,8 @@ pub enum Event {
     Frame { custom: bool, caption: i32 },
     /// Alt or F10 alone was pressed: the menus are asked for, to be used by the keyboard.
     MenuKey,
+    /// Windows is set to show animations (`true`) or not, at the start and when that changes: the window moves things only when it is.
+    Motion(bool),
 }
 
 /// One thing in a form box ([`Action::AskForm`]): what it is, what it says, and where it is in the box (`x, y, w, h` in units of a 96th of
@@ -388,6 +431,8 @@ pub enum Cursor {
 pub enum Action {
     /// Draw the window again.
     Invalidate,
+    /// Draw this part of the window again (in the window's coordinates); the rest is left as it is. What fades or grows asks for the room it is in.
+    InvalidateRect(Rect),
     SetTitle(String),
     SetTimer { id: u32, ms: u32 },
     KillTimer(u32),
@@ -468,6 +513,26 @@ pub struct ThemeSpec {
     pub field_bg: Rgb,
     pub tree_bg: Rgb,
     pub tree_line: Rgb,
+    /// The colours of the menus and of the boxes the reader opens, which it draws itself.
+    pub skin: Skin,
+}
+
+/// The colours that menus and boxes are drawn in: the ground, the ink and its paler partners (for a key, for what is off), the hairline, the ground of a box
+/// that is typed in, the accent with its four partners, and the ink laid over the ground to show the pointer on a button.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skin {
+    pub surface: Rgb,
+    pub text: Rgb,
+    pub dim: Rgb,
+    pub off: Rgb,
+    pub line: Rgb,
+    pub field: Rgb,
+    pub accent: Rgb,
+    pub accent_hover: Rgb,
+    pub tint: Rgb,
+    pub on_tint: Rgb,
+    pub on_accent: Rgb,
+    pub hover: Rgb,
 }
 
 /// The search box of the command bar: where it is, what it says while it is empty, and whether it can be used.
@@ -480,7 +545,8 @@ pub struct SearchBox {
 
 #[derive(Debug)]
 pub enum MenuEntry {
-    Item { id: u32, label: String, checked: bool, enabled: bool },
+    /// An item; `radio`: it is one of a list of which one is chosen (shown with a dot, not a tick).
+    Item { id: u32, label: String, checked: bool, radio: bool, enabled: bool },
     Submenu { title: String, entries: Vec<MenuEntry> },
     Separator,
 }
@@ -504,6 +570,12 @@ pub trait Handler {
     /// Draw the window. The answer says whether the picture is to be put on the screen: it always is, except in the
     /// speed test, which does not present the pictures that are not the one it waits for (see `bench.rs`).
     fn paint(&mut self, painter: &mut dyn Painter) -> bool;
+    /// Draw only the part of the window whose top left corner is at (`x`, `y`): `painter` is a picture of that part alone (its corner is its origin). Gives
+    /// what `paint` gives.
+    fn paint_part(&mut self, painter: &mut dyn Painter, x: i32, y: i32) -> bool {
+        let _ = (painter, x, y);
+        true
+    }
     /// The shape of the pointer over this place of the client area.
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor;
     /// What this place of the client area is to the frame: part of the title bar (the window is dragged there, and a double click makes it big or small) or
@@ -515,5 +587,51 @@ pub trait Handler {
     /// the person; `None` when it may end. The window then holds the shutdown up and asks, as it does when it is closed.
     fn unsaved_reason(&self) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Ruler;
+
+    impl Painter for Ruler {
+        fn fill_rect(&mut self, _r: Rect, _c: Rgb) {}
+        fn fill_rect_alpha(&mut self, _r: Rect, _c: Rgb, _a: u8) {}
+        fn draw_bgra(&mut self, _d: Rect, _w: i32, _h: i32, _b: &[u8]) {}
+        fn text(&mut self, _x: i32, _y: i32, _s: &str, _c: Rgb) {}
+        fn text_width(&mut self, s: &str) -> i32 {
+            7 * s.chars().count() as i32
+        }
+        fn line_height(&self) -> i32 {
+            16
+        }
+    }
+
+    #[test]
+    fn a_clamp_that_has_no_room_gives_the_low_end_and_never_panics() {
+        assert_eq!(clamp_to(50, 4, 100), 50);
+        assert_eq!(clamp_to(-5, 4, 100), 4);
+        assert_eq!(clamp_to(500, 4, 100), 100);
+        // The window is narrower than the card: the card stands at the low end.
+        assert_eq!(clamp_to(50, 4, -20), 4);
+        assert_eq!(clamp_to(50, 4, 3), 4);
+        assert_eq!(clamp_to(7i64, 7, 7), 7);
+    }
+
+    #[test]
+    fn words_are_cut_with_an_ellipsis_at_the_end_or_in_the_middle_and_kept_whole_when_they_fit() {
+        let mut p = Ruler;
+        assert_eq!(fit_text(&mut p, "short", 100), "short");
+        assert_eq!(fit_middle(&mut p, "short", 100), "short");
+        let long = "C:\\one\\two\\three\\four\\five\\six\\seven\\file.pdf";
+        let end = fit_text(&mut p, long, 140);
+        assert!(end.ends_with('\u{2026}') && p.text_width(&end) <= 140, "{end}");
+        let mid = fit_middle(&mut p, long, 140);
+        assert!(p.text_width(&mid) <= 140 && mid.contains('\u{2026}') && mid.ends_with("file.pdf") && mid.starts_with("C:"), "{mid}");
+        // No room at all: nothing that is too wide comes back.
+        let (none_mid, none_end) = (fit_middle(&mut p, long, 0), fit_text(&mut p, long, 0));
+        assert!(p.text_width(&none_mid) <= 7 && p.text_width(&none_end) <= 7, "{none_mid} {none_end}");
     }
 }

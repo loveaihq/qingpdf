@@ -376,10 +376,11 @@ fn the_third_tab_lists_the_annotations_by_page_and_a_click_goes_to_the_annotatio
     assert_eq!(app.al.loaded_rows(), 10);
     let mut rec = sidebar::tests::Rec::default();
     app.paint(&mut rec);
-    for want in ["Page 1", "Page 2", "Note - Bob", "Rectangle - Ann"] {
+    // A row is a picture of the kind, the title (the words, or the kind when there are none) and who made it and when.
+    for want in ["Page 1", "Page 2", "Bob \u{b7} 2026-10-02", "Ann \u{b7} 2026-10-01", "hello note", "a square", "Line"] {
         assert!(rec.texts.iter().any(|(_, _, s)| s == want), "{want} is not drawn: {:?}", rec.texts);
     }
-    assert!(rec.texts.iter().any(|(_, _, s)| s == "2026-10-02") && rec.texts.iter().any(|(_, _, s)| s == "hello note"));
+    assert!(rec.texts.iter().any(|(_, _, s)| s == "\u{e70b}"), "the picture of a note");
     // Click the row of the second page's note: the page is shown and the note is picked.
     let row_y = |app: &App, key: (u32, u32)| {
         let r = app.al.row_of(key).expect("a row");
@@ -415,6 +416,29 @@ fn the_third_tab_lists_the_annotations_by_page_and_a_click_goes_to_the_annotatio
     let mut rec = sidebar::tests::Rec::default();
     empty.paint(&mut rec);
     assert!(rec.texts.iter().any(|(_, _, s)| s == "There are no annotations in this file."), "{:?}", rec.texts);
+}
+
+#[test]
+fn the_row_the_pointer_is_over_in_the_list_of_annotations_has_the_pale_fill_and_a_heading_has_none() {
+    let mut app = open("hover");
+    app.event(Event::Key { vk: vk::F4, ctrl: false, shift: false });
+    let third = (app.list_w() - 10) as i32;
+    click(&mut app, (third, 10));
+    pump(&mut app, "the list", |a| a.al.loaded_rows() > 0);
+    let row = app.al.row_of((0, NOTE as u32)).expect("a row");
+    let y = (app.tabs_h() + app.row_top(row) - app.al.scroll + 4) as i32;
+    assert!(app.event(Event::Hover { x: 60, y }).iter().any(|a| matches!(a, Action::Invalidate)));
+    assert_eq!(app.side_hot, Some(row));
+    let mut rec = sidebar::tests::Rec::default();
+    app.paint(&mut rec);
+    assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.status_fg), "the row under the pointer is filled");
+    // The same row again changes nothing; the heading of the page and the pointer leaving the window take the fill away.
+    assert!(app.event(Event::Hover { x: 60, y: y + 1 }).is_empty());
+    app.event(Event::Hover { x: 60, y: (app.tabs_h() + 2) as i32 });
+    assert_eq!(app.side_hot, None);
+    app.event(Event::Hover { x: 60, y });
+    app.event(Event::HoverEnd);
+    assert_eq!(app.side_hot, None);
 }
 
 #[test]

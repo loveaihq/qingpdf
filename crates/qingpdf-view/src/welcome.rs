@@ -122,7 +122,7 @@ pub fn layout(area: Rect, dpi: u32, entries: usize, title_h: i32, line_h: i32) -
     let list_head = s(32) + line_h + s(8);
     let pad = s(CARD_PAD);
     let room = (area.h - 2 * margin - head - list_head - 2 * pad).max(0);
-    let rows = if row > 0 { (room / row).clamp(0, i32::try_from(entries.max(1)).unwrap_or(1)) } else { 0 };
+    let rows = if row > 0 { crate::ui::clamp_to(room / row, 0, i32::try_from(entries.max(1)).unwrap_or(1)) } else { 0 };
     // Without the room for even one row the list is left out.
     let (list, rows) = if rows >= 1 { (list_head + rows * row + 2 * pad, rows) } else { (0, 0) };
     let total = head + list;

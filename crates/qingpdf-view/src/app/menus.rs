@@ -98,14 +98,14 @@ fn shorten(path: &str, most: usize) -> String {
 
 /// A submenu of choices of one kind, the one made ticked.
 fn choices<T: PartialEq + Copy>(lang: Lang, title: Msg, enabled: bool, chosen: T, list: &[(u32, Msg, T)]) -> MenuEntry {
-    let entries = list.iter().map(|&(id, m, v)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: chosen == v, enabled }).collect();
+    let entries = list.iter().map(|&(id, m, v)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: chosen == v, radio: true, enabled }).collect();
     MenuEntry::Submenu { title: t(lang, title).to_string(), entries }
 }
 
 pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
-    let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: false, enabled };
+    let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: false, radio: false, enabled };
     let recent: Vec<MenuEntry> = if st.recent.is_empty() {
-        vec![MenuEntry::Item { id: 0, label: t(lang, Msg::NoRecent).to_string(), checked: false, enabled: false }]
+        vec![MenuEntry::Item { id: 0, label: t(lang, Msg::NoRecent).to_string(), checked: false, radio: false, enabled: false }]
     } else {
         let mut entries: Vec<MenuEntry> = st
             .recent
@@ -114,7 +114,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             .map(|(i, path)| {
                 // The first nine have a number to press.
                 let label = if i < 9 { format!("&{} {}", i + 1, shorten(path, 60)) } else { shorten(path, 60) };
-                MenuEntry::Item { id: CMD_RECENT_BASE + i as u32, label, checked: false, enabled: true }
+                MenuEntry::Item { id: CMD_RECENT_BASE + i as u32, label, checked: false, radio: false, enabled: true }
             })
             .collect();
         entries.push(MenuEntry::Separator);
@@ -169,20 +169,20 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 item(CMD_ROTATE, Msg::Rotate, st.has_doc),
                 MenuEntry::Separator,
                 choices(lang, Msg::LayoutMenu, st.has_doc, st.spread, &[(CMD_LAYOUT_SINGLE, Msg::LayoutSingle, Spread::Single), (CMD_LAYOUT_SPREAD, Msg::LayoutSpread, Spread::Pair), (CMD_LAYOUT_COVER, Msg::LayoutCover, Spread::Cover)]),
-                MenuEntry::Item { id: CMD_FULLSCREEN, label: t(lang, Msg::FullScreen).to_string(), checked: st.full, enabled: true },
+                MenuEntry::Item { id: CMD_FULLSCREEN, label: t(lang, Msg::FullScreen).to_string(), checked: st.full, radio: false, enabled: true },
                 item(CMD_PRESENT, Msg::Present, st.has_doc),
                 MenuEntry::Separator,
                 choices(lang, Msg::ThemeMenu, true, st.theme, &[(CMD_THEME_SYSTEM, Msg::LangSystem, ThemeChoice::System), (CMD_THEME_LIGHT, Msg::ThemeLight, ThemeChoice::Light), (CMD_THEME_DARK, Msg::ThemeDark, ThemeChoice::Dark)]),
                 choices(lang, Msg::PageColorMenu, st.has_doc, st.tint, &[(CMD_TINT_ORIGINAL, Msg::PcOriginal, Tint::Original), (CMD_TINT_NIGHT, Msg::PcNight, Tint::Night), (CMD_TINT_SEPIA, Msg::PcSepia, Tint::Sepia)]),
                 MenuEntry::Separator,
-                MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowSidebar).to_string(), checked: st.show_sidebar, enabled: st.has_doc },
-                MenuEntry::Item { id: CMD_TOOLBAR, label: t(lang, Msg::ShowToolbar).to_string(), checked: st.toolbar, enabled: true },
+                MenuEntry::Item { id: CMD_BOOKMARKS, label: t(lang, Msg::ShowSidebar).to_string(), checked: st.show_sidebar, radio: false, enabled: st.has_doc },
+                MenuEntry::Item { id: CMD_TOOLBAR, label: t(lang, Msg::ShowToolbar).to_string(), checked: st.toolbar, radio: false, enabled: true },
                 MenuEntry::Separator,
                 MenuEntry::Submenu {
                     title: t(lang, Msg::LanguageMenu).to_string(),
                     entries: [(CMD_LANG_SYSTEM, Msg::LangSystem, LangChoice::System), (CMD_LANG_ZH, Msg::LangChinese, LangChoice::Zh), (CMD_LANG_EN, Msg::LangEnglish, LangChoice::En)]
                         .into_iter()
-                        .map(|(id, m, c)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.lang_choice == c, enabled: true })
+                        .map(|(id, m, c)| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.lang_choice == c, radio: true, enabled: true })
                         .collect(),
                 },
             ],
@@ -191,17 +191,17 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
             title: t(lang, Msg::PageMenu).to_string(),
             entries: vec![
                 item(CMD_CROP, Msg::CropMenu, st.can_crop),
-                MenuEntry::Item { id: CMD_TOOL_CROP, label: t(lang, Msg::CropToolMenu).to_string(), checked: st.tool == CMD_TOOL_CROP, enabled: st.can_crop },
+                MenuEntry::Item { id: CMD_TOOL_CROP, label: t(lang, Msg::CropToolMenu).to_string(), checked: st.tool == CMD_TOOL_CROP, radio: true, enabled: st.can_crop },
                 item(CMD_UNCROP, Msg::UncropMenu, st.can_crop),
             ],
         },
         Menu {
             title: t(lang, Msg::CommentMenu).to_string(),
             entries: {
-                let tool = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.tool == id, enabled: id == CMD_TOOL_SELECT && st.has_doc || st.can_edit };
-                let colors: Vec<MenuEntry> = COLORS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_COLOR_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.color == i, enabled: st.can_edit && st.color_ok }).collect();
-                let sizes: Vec<MenuEntry> = TEXT_SIZES.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_SIZE_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.text_size == i, enabled: st.can_edit }).collect();
-                let widths: Vec<MenuEntry> = WIDTHS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_WIDTH_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.width == i, enabled: st.can_edit && st.width_ok }).collect();
+                let tool = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: st.tool == id, radio: true, enabled: id == CMD_TOOL_SELECT && st.has_doc || st.can_edit };
+                let colors: Vec<MenuEntry> = COLORS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_COLOR_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.color == i, radio: true, enabled: st.can_edit && st.color_ok }).collect();
+                let sizes: Vec<MenuEntry> = TEXT_SIZES.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_SIZE_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.text_size == i, radio: true, enabled: st.can_edit }).collect();
+                let widths: Vec<MenuEntry> = WIDTHS.iter().enumerate().map(|(i, (m, _))| MenuEntry::Item { id: CMD_WIDTH_BASE + i as u32, label: t(lang, *m).to_string(), checked: st.width == i, radio: true, enabled: st.can_edit && st.width_ok }).collect();
                 vec![
                     tool(CMD_TOOL_SELECT, Msg::ToolSelect),
                     MenuEntry::Separator,
@@ -214,7 +214,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     tool(CMD_TOOL_ELLIPSE, Msg::ToolEllipse),
                     tool(CMD_TOOL_LINE, Msg::ToolLine),
                     tool(CMD_TOOL_ARROW, Msg::ToolArrow),
-                    MenuEntry::Item { id: CMD_FILL, label: t(lang, Msg::FillShapes).to_string(), checked: st.fill, enabled: st.can_edit && st.fill_ok },
+                    MenuEntry::Item { id: CMD_FILL, label: t(lang, Msg::FillShapes).to_string(), checked: st.fill, radio: false, enabled: st.can_edit && st.fill_ok },
                     tool(CMD_TOOL_NOTE, Msg::ToolNote),
                     tool(CMD_TOOL_TEXTBOX, Msg::ToolTextBox),
                     tool(CMD_STAMP, Msg::ToolStamp),
@@ -231,16 +231,16 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
         Menu {
             title: t(lang, Msg::InsertMenu).to_string(),
             entries: {
-                let item = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: false, enabled: st.can_modify };
-                let switch = |id: u32, m: Msg, on: bool| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: on, enabled: st.can_modify };
+                let item = |id: u32, m: Msg| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: false, radio: false, enabled: st.can_modify };
+                let switch = |id: u32, m: Msg, on: bool| MenuEntry::Item { id, label: t(lang, m).to_string(), checked: on, radio: false, enabled: st.can_modify };
                 // The choices of a list are named by their numbers.
                 let choices = |base: u32, names: Vec<String>, chosen: usize| {
-                    names.into_iter().enumerate().map(|(i, label)| MenuEntry::Item { id: base + i as u32, label, checked: chosen == i, enabled: st.can_modify }).collect::<Vec<_>>()
+                    names.into_iter().enumerate().map(|(i, label)| MenuEntry::Item { id: base + i as u32, label, checked: chosen == i, radio: true, enabled: st.can_modify }).collect::<Vec<_>>()
                 };
                 let percents = WM_OPACITY.iter().map(|p| format!("{p}%")).collect();
                 let degrees = WM_ANGLE.iter().map(|a| format!("{a}°")).collect();
                 vec![
-                    MenuEntry::Item { id: CMD_TOOL_EDITTEXT, label: t(lang, Msg::ToolEditText).to_string(), checked: st.tool == CMD_TOOL_EDITTEXT, enabled: st.can_modify },
+                    MenuEntry::Item { id: CMD_TOOL_EDITTEXT, label: t(lang, Msg::ToolEditText).to_string(), checked: st.tool == CMD_TOOL_EDITTEXT, radio: true, enabled: st.can_modify },
                     MenuEntry::Separator,
                     item(CMD_INS_TEXT, Msg::InsertText),
                     item(CMD_INS_IMAGE, Msg::InsertImage),
@@ -254,14 +254,14 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                     MenuEntry::Separator,
                     item(CMD_INS_PAGENUM, Msg::InsertPagenum),
                     MenuEntry::Separator,
-                    MenuEntry::Item { id: CMD_BM_ADD, label: t(lang, Msg::BmAdd).to_string(), checked: false, enabled: st.can_bookmarks },
+                    MenuEntry::Item { id: CMD_BM_ADD, label: t(lang, Msg::BmAdd).to_string(), checked: false, radio: false, enabled: st.can_bookmarks },
                 ]
             },
         },
         Menu {
             title: t(lang, Msg::RdMenu).to_string(),
             entries: vec![
-                MenuEntry::Item { id: CMD_TOOL_REDACT, label: t(lang, Msg::RdToolArea).to_string(), checked: st.tool == CMD_TOOL_REDACT, enabled: st.can_edit },
+                MenuEntry::Item { id: CMD_TOOL_REDACT, label: t(lang, Msg::RdToolArea).to_string(), checked: st.tool == CMD_TOOL_REDACT, radio: true, enabled: st.can_edit },
                 item(CMD_REDACT_SELECTION, Msg::RdSelection, st.can_edit),
                 item(CMD_REDACT_FIND, Msg::RdFind, st.can_edit),
                 MenuEntry::Separator,
@@ -274,7 +274,7 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
                 item(CMD_OCR_ALL, Msg::OcrAll, st.can_ocr),
                 item(CMD_OCR_PAGE, Msg::OcrPageOnly, st.can_ocr),
                 MenuEntry::Separator,
-                MenuEntry::Item { id: CMD_BM_AUTO, label: t(lang, Msg::BmAuto).to_string(), checked: false, enabled: st.can_bookmarks },
+                MenuEntry::Item { id: CMD_BM_AUTO, label: t(lang, Msg::BmAuto).to_string(), checked: false, radio: false, enabled: st.can_bookmarks },
             ],
         },
         Menu {

@@ -182,7 +182,7 @@ impl App {
         }
         self.ctx_at = over;
         let has_selection = self.selection.is_some();
-        let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, enabled };
+        let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, radio: false, enabled };
         let entries = vec![
             item(CMD_COPY, Msg::Copy, has_selection && self.rights.copy),
             item(CMD_CTX_HIGHLIGHT, Msg::CtxHighlight, has_selection && self.rights.annotate),

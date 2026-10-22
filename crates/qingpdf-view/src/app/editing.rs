@@ -276,21 +276,13 @@ impl App {
             return self.apply_markup(kind);
         }
         self.edit.tool = tool;
-        let hint = match tool {
-            Tool::Select | Tool::Stamp => None,
-            Tool::Markup(_) => Some(Msg::NoteMarkHint),
-            Tool::Ink => Some(Msg::NoteInkHint),
-            Tool::Note => Some(Msg::NoteNoteHint),
-            Tool::TextBox => Some(Msg::NoteTextBoxHint),
-            Tool::EditText => Some(Msg::NoteEditTextHint),
-            Tool::Shape(ShapeKind::Redact) => Some(Msg::NoteRedactHint),
-            Tool::Crop => Some(Msg::NoteCropHint),
-            Tool::Shape(_) => Some(Msg::NoteShapeHint),
-        };
-        match hint {
-            Some(m) => self.say(t(self.lang, m).to_string()),
-            None => vec![Action::Invalidate],
+        // The hint of the tool stays over the pages for as long as the tool is in use (`sticky.rs`).
+        if let Some(m) = self.mode_hint() {
+            self.note = Some(t(self.lang, m).to_string());
         }
+        let mut actions = self.sync_sticky();
+        actions.push(Action::Invalidate);
+        actions
     }
 
     pub(super) fn set_color(&mut self, index: usize) -> Vec<Action> {
@@ -517,7 +509,13 @@ impl App {
         self.selection = None;
         let mut actions = vec![Action::Invalidate];
         if !sent {
-            actions.extend(self.say(t(self.lang, Msg::NoteMarkHint).to_string()));
+            // Nothing in what was selected to mark: the marking tool is in use now (what its hint says), and the hint stays until Esc ends it.
+            if self.edit.tool == Tool::Select {
+                self.edit.tool = Tool::Markup(kind);
+                self.menus_dirty = true;
+            }
+            self.note = Some(t(self.lang, Msg::NoteMarkHint).to_string());
+            actions.extend(self.sync_sticky());
         }
         actions
     }
@@ -755,7 +753,7 @@ impl App {
                 let mb = (qingpdf_core::view::MAX_INSERT_FILE_BYTES >> 20).to_string();
                 actions.extend(self.say(t(lang, Msg::NoteInsertTooBig).replace("{n}", &mb)));
             }
-            EditStatus::Failed => actions.extend(self.say(format!("{} {}", t(lang, Msg::NoteEditFailed), r.message))),
+            EditStatus::Failed => actions.extend(self.fail(format!("{} {}", t(lang, Msg::NoteEditFailed), r.message))),
             EditStatus::Nothing => {
                 let m = if what == Asked::Redo { Msg::NoteNothingRedo } else { Msg::NoteNothingUndo };
                 actions.extend(self.say(t(lang, m).to_string()));
@@ -810,7 +808,7 @@ impl App {
         }
         self.edit.exporting = Some(id);
         self.edit.export_excel = excel;
-        self.say(t(self.lang, Msg::NoteExporting).to_string())
+        self.say_job(sticky::Job::Export, t(self.lang, Msg::NoteExporting).to_string())
     }
 
     /// Esc while the export is going: the engine is told to stop at the next page (it answers nothing), the temporary file goes,

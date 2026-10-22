@@ -72,9 +72,25 @@ pub fn restore(saved: Placement, work_areas: &[Rect]) -> Option<Placement> {
     Some(Placement { x, y, w, h, maximized: saved.maximized })
 }
 
+/// The client area of a maximized window, `[left, top, right, bottom]`, with one pixel left at each edge that has a task bar which hides itself (`edges`: left,
+/// top, right, bottom): a window that covers the whole screen up to its edge leaves the pointer no way to bring the task bar up.
+pub fn leave_edge(client: [i32; 4], edges: [bool; 4]) -> [i32; 4] {
+    let [l, t, r, b] = client;
+    [l + i32::from(edges[0]), t + i32::from(edges[1]), r - i32::from(edges[2]), b - i32::from(edges[3])]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_maximized_window_leaves_a_pixel_at_the_edge_where_the_task_bar_hides() {
+        let screen = [0, 0, 1920, 1080];
+        assert_eq!(leave_edge(screen, [false; 4]), screen);
+        assert_eq!(leave_edge(screen, [false, false, false, true]), [0, 0, 1920, 1079]);
+        assert_eq!(leave_edge(screen, [true, true, false, false]), [1, 1, 1920, 1080]);
+        assert_eq!(leave_edge(screen, [false, false, true, false]), [0, 0, 1919, 1080]);
+    }
 
     const MAIN: Rect = Rect { x: 0, y: 0, w: 1920, h: 1040 };
     const RIGHT: Rect = Rect { x: 1920, y: 0, w: 2560, h: 1400 };

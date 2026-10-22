@@ -22,9 +22,9 @@ pub fn thumb(track: i64, content: i64, view: i64, pos: i64, min_len: i64) -> Opt
     if track <= 0 || view <= 0 || content <= view {
         return None;
     }
-    let len = (track as i128 * view as i128 / content as i128).clamp(i128::from(min_len.min(track)), i128::from(track)) as i64;
+    let len = crate::ui::clamp_to(track as i128 * view as i128 / content as i128, i128::from(min_len.min(track)), i128::from(track)) as i64;
     let range = content - view;
-    let start = (i128::from(track - len) * i128::from(pos.clamp(0, range)) / i128::from(range)) as i64;
+    let start = (i128::from(track - len) * i128::from(crate::ui::clamp_to(pos, 0, range)) / i128::from(range)) as i64;
     Some((start, len))
 }
 
@@ -34,7 +34,7 @@ pub fn pos_at(track: i64, content: i64, view: i64, len: i64, start: i64) -> i64 
     if room <= 0 || range <= 0 {
         return 0;
     }
-    (i128::from(start.clamp(0, room)) * i128::from(range) / i128::from(room)) as i64
+    (i128::from(crate::ui::clamp_to(start, 0, room)) * i128::from(range) / i128::from(room)) as i64
 }
 
 /// What a click on the track does: above the thumb is a page back (-1), below it a page on (1), on it nothing (0).
@@ -102,7 +102,27 @@ impl Vis {
         thin + ((i64::from(wide - thin) * level) / 256) as i32
     }
 
-    /// Is something about the bar changing at `now` (so that the clock must go on)?
+    /// Does the picture of the bar change as time passes at `now` (it widens, narrows or fades), so that the clock must run at its fast pace?
+    pub fn changing(&self, now: u64) -> bool {
+        // (A bar that has never been touched has `changed` at 0: it is not narrowing.)
+        if self.changed > 0 && now.saturating_sub(self.changed) < GROW_MS {
+            return true;
+        }
+        if self.hover || self.drag {
+            return false;
+        }
+        self.woken.is_some_and(|t| (IDLE_MS..IDLE_MS + FADE_MS).contains(&now.saturating_sub(t)))
+    }
+
+    /// How long (milliseconds) until a bar that stands still, in full, begins to fade (none: it is not waiting for that).
+    pub fn hold_left(&self, now: u64) -> Option<u64> {
+        if self.hover || self.drag || self.changing(now) {
+            return None;
+        }
+        self.woken.map(|t| now.saturating_sub(t)).filter(|&age| age < IDLE_MS).map(|age| IDLE_MS - age)
+    }
+
+    /// Is something about the bar changing at `now`, or about to (so that the clock must go on)?
     pub fn moving(&self, now: u64) -> bool {
         if self.hover || self.drag {
             return now.saturating_sub(self.changed) < GROW_MS;

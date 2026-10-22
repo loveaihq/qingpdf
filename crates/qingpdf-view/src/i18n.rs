@@ -1138,7 +1138,7 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::ExportExcel => ("Export to &Excel...", "导出为 Excel(&E)..."),
         Msg::ExportExcelTitle => ("Export to Excel", "导出为 Excel"),
         Msg::FilterXlsx => ("Excel workbooks", "Excel 工作簿"),
-        Msg::NoteExporting => ("Exporting...", "正在导出……"),
+        Msg::NoteExporting => ("Exporting... (Esc cancels)", "正在导出……（按 Esc 取消）"),
         Msg::NoteExported => ("Exported to Word.", "已导出为 Word。"),
         Msg::NoteExportedExcel => ("Exported to Excel.", "已导出为 Excel。"),
         Msg::NoteExportedNoTables => ("Exported to Excel: no table was found, so the sheet has the text of the pages.", "已导出为 Excel：没有找到表格，工作表里是各页的文字。"),

@@ -1,10 +1,12 @@
-//! The mark of qingpdf (2026-10-21): the character 轻 in white on a rounded teal square, drawn by us as a few bold strokes with round
-//! ends (a simple, geometric build of 车 on the left and 圣, a 又 over a 土, on the right), so that no outline is taken from any font. The
-//! same strokes are drawn in the title strip, on the welcome page and, by `tests/tools/make_icon.py` (which reads this file), into the
-//! frames of the program's icon. All numbers are in a square of 100 by 100 units, y down.
+//! The mark of qingpdf (2026-10-21, drawn again 2026-10-22): the character 轻 in white on a rounded teal square, drawn by us as a few bold strokes so that no
+//! outline is taken from any font. On the left is 车, in the four strokes it is written in: 横 (the short bar at the top), 撇折 (down to the left and then across),
+//! 竖 (the stem through all of it) and 提 (the last bar, rising to the right). On the right is 又 (a 横撇 and a 捺) over 工 (a short bar, the stem between the two bars, which does not stick out above the
+//! short one, and the long bar under it, which is as wide as the 又 above). All the strokes are as thick as each other and end in the same round cap. The same strokes are drawn in the title
+//! strip, on the welcome page and, by `tests/tools/make_icon.py` (which reads this file), into the frames of the program's icon (48 and 256 pixels).
 //!
-//! Below 25 pixels the build is simplified (`SMALL`: thicker strokes, three flat bars for 车, fewer in 圣); at 16 pixels and less (`TINY`) the strokes also stand on
-//! the middles of the pixels of a 16 by 16 square, so that they come out sharp, and so that it reads at 16.
+//! At 16, 24 and 32 pixels the mark is not drawn from the strokes but from a bitmap made by hand (`P16`, `P24`, `P32`: `#` is a pixel of the character, whole
+//! pixels, one pixel thick at 16 and two at 24 and 32, simplified where the room is short), so that the bars and the stems come out sharp where the strokes would
+//! be smeared over two pixels. All numbers of the strokes are in a square of 100 by 100 units, y down.
 
 /// One stroke: a line through these points with round caps and joins, `width` thick.
 pub struct Stroke {
@@ -15,51 +17,113 @@ pub struct Stroke {
 /// The corner radius of the rounded square.
 pub const RADIUS: f32 = 22.0;
 
-/// The full build, for 25 pixels and more.
+/// The strokes, for the sizes that have no bitmap (48 pixels and more, and the sizes between the bitmaps').
 pub const FULL: &[Stroke] = &[
-    Stroke { pts: &[(19.0, 27.0), (41.0, 27.0)], width: 7.5 },
-    Stroke { pts: &[(37.0, 38.0), (20.0, 51.0), (45.0, 51.0)], width: 7.5 },
-    Stroke { pts: &[(13.0, 67.0), (47.0, 67.0)], width: 7.5 },
-    Stroke { pts: &[(31.0, 14.0), (31.0, 88.0)], width: 7.5 },
-    Stroke { pts: &[(55.0, 25.0), (85.0, 25.0), (63.0, 46.0)], width: 7.5 },
-    Stroke { pts: &[(66.0, 33.0), (87.0, 47.0)], width: 7.5 },
-    Stroke { pts: &[(62.0, 60.0), (82.0, 60.0)], width: 7.5 },
-    Stroke { pts: &[(72.0, 60.0), (72.0, 86.0)], width: 7.5 },
-    Stroke { pts: &[(56.0, 86.0), (88.0, 86.0)], width: 7.5 },
+    Stroke { pts: &[(15.0, 27.0), (40.0, 27.0)], width: 7.2 },
+    Stroke { pts: &[(39.0, 37.5), (19.5, 50.5), (45.0, 50.5)], width: 7.2 },
+    Stroke { pts: &[(31.0, 13.0), (31.0, 88.0)], width: 7.2 },
+    Stroke { pts: &[(13.5, 72.0), (46.5, 62.5)], width: 7.2 },
+    Stroke { pts: &[(55.0, 24.0), (86.0, 24.0), (63.0, 43.0)], width: 7.2 },
+    Stroke { pts: &[(67.0, 31.0), (88.0, 45.0)], width: 7.2 },
+    Stroke { pts: &[(64.0, 61.0), (82.0, 61.0)], width: 7.2 },
+    Stroke { pts: &[(73.0, 61.0), (73.0, 86.0)], width: 7.2 },
+    Stroke { pts: &[(56.0, 86.0), (90.0, 86.0)], width: 7.2 },
 ];
 
-/// The simplified build, for up to 24 pixels.
-pub const SMALL: &[Stroke] = &[
-    Stroke { pts: &[(18.0, 30.0), (44.0, 30.0)], width: 9.5 },
-    Stroke { pts: &[(13.0, 54.0), (48.0, 54.0)], width: 9.5 },
-    Stroke { pts: &[(13.0, 78.0), (48.0, 78.0)], width: 9.5 },
-    Stroke { pts: &[(31.0, 14.0), (31.0, 90.0)], width: 9.5 },
-    Stroke { pts: &[(56.0, 28.0), (86.0, 28.0), (60.0, 52.0)], width: 9.5 },
-    Stroke { pts: &[(68.0, 36.0), (88.0, 52.0)], width: 9.5 },
-    Stroke { pts: &[(72.0, 62.0), (72.0, 90.0)], width: 9.5 },
-    Stroke { pts: &[(58.0, 90.0), (90.0, 90.0)], width: 9.5 },
+/// The strokes to draw the mark with when it is `px` pixels wide and has no bitmap.
+pub fn strokes(_px: i32) -> &'static [Stroke] {
+    FULL
+}
+
+/// The bitmaps made by hand, for 16, 24 and 32 pixels (`#` is a pixel of the character).
+pub const P16: &[&str] = &[
+    "................",
+    "................",
+    ".....#..........",
+    "...####..#####..",
+    ".....#.#.....#..",
+    ".....##...#.#...",
+    "....##.....#....",
+    "...#####..#.#...",
+    ".....#...#...#..",
+    ".....###........",
+    "....##....###...",
+    "..##.#.....#....",
+    ".....#.....#....",
+    ".....#...#####..",
+    "................",
+    "................",
 ];
 
-/// The build for 16 pixels and less: the strokes are 1.3 pixels thick (1.6 on the right) and their middles are on the middles of pixels of a 16 by 16 square.
-pub const TINY: &[Stroke] = &[
-    Stroke { pts: &[(34.375, 15.625), (34.375, 84.375)], width: 8.125 },
-    Stroke { pts: &[(21.875, 28.125), (46.875, 28.125)], width: 8.125 },
-    Stroke { pts: &[(15.625, 46.875), (53.125, 46.875)], width: 8.125 },
-    Stroke { pts: &[(15.625, 65.625), (53.125, 65.625)], width: 8.125 },
-    Stroke { pts: &[(59.375, 28.125), (84.375, 28.125), (63.75, 45.625)], width: 10.0 },
-    Stroke { pts: &[(71.875, 53.125), (71.875, 84.375)], width: 10.0 },
-    Stroke { pts: &[(59.375, 84.375), (84.375, 84.375)], width: 10.0 },
-    Stroke { pts: &[(62.5, 65.625), (81.25, 65.625)], width: 10.0 },
+pub const P24: &[&str] = &[
+    "........................",
+    "........................",
+    "........................",
+    ".......##...............",
+    ".......##...............",
+    ".......##...............",
+    "....#######..########...",
+    "....#######..########...",
+    ".......##......##..##...",
+    ".......##..##...####....",
+    ".......##.##....###.....",
+    ".......####....##.##....",
+    ".......##.....##...##...",
+    "......###...............",
+    "....########....####....",
+    "....########....####....",
+    ".......##.##.....##.....",
+    ".......#####.....##.....",
+    ".....#####.......##.....",
+    "...######........##.....",
+    "...##..##.....########..",
+    "..............########..",
+    "........................",
+    "........................",
 ];
 
-/// The strokes to draw the mark with when it is `px` pixels wide.
-pub fn strokes(px: i32) -> &'static [Stroke] {
-    if px <= 16 {
-        TINY
-    } else if px <= 24 {
-        SMALL
-    } else {
-        FULL
+pub const P32: &[&str] = &[
+    "................................",
+    "................................",
+    "................................",
+    "................................",
+    ".........##.....................",
+    ".........##.....................",
+    ".........##.....................",
+    ".........##.....................",
+    ".....##########...##########....",
+    ".....##########...##########....",
+    ".........##..............###....",
+    ".........##...###....######.....",
+    ".........##..###......####......",
+    ".........##.###.......####......",
+    ".........#####.......######.....",
+    ".........###........###..###....",
+    "........###.....................",
+    "......##########................",
+    "......##########................",
+    ".........##...........#####.....",
+    ".........##...........#####.....",
+    ".........##.............##......",
+    ".........##....##.......##......",
+    ".........##.#####.......##......",
+    ".........######.........##......",
+    "......######............##......",
+    "....#######.............##......",
+    "....##...##........##########...",
+    ".........##........##########...",
+    "................................",
+    "................................",
+    "................................",
+];
+
+/// The bitmap for a mark that is exactly `px` pixels wide, if there is one.
+pub fn bitmap(px: i32) -> Option<&'static [&'static str]> {
+    match px {
+        16 => Some(P16),
+        24 => Some(P24),
+        32 => Some(P32),
+        _ => None,
     }
 }
 
@@ -69,55 +133,70 @@ mod tests {
 
     #[test]
     fn every_stroke_is_inside_the_square_with_its_width_and_has_two_points_or_more() {
-        for set in [FULL, SMALL, TINY] {
-            for s in set {
-                assert!(s.pts.len() >= 2 && s.width > 0.0);
-                for &(x, y) in s.pts {
-                    let half = s.width / 2.0;
-                    assert!(x - half >= 0.0 && x + half <= 100.0 && y - half >= 0.0 && y + half <= 100.0, "({x}, {y}) is too near the edge");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn the_glyph_is_in_the_middle_of_the_square() {
-        for set in [FULL, SMALL, TINY] {
-            let (mut x0, mut x1, mut y0, mut y1) = (100.0f32, 0.0f32, 100.0f32, 0.0f32);
-            for s in set {
-                for &(x, y) in s.pts {
-                    (x0, x1, y0, y1) = (x0.min(x - s.width / 2.0), x1.max(x + s.width / 2.0), y0.min(y - s.width / 2.0), y1.max(y + s.width / 2.0));
-                }
-            }
-            assert!(((x0 + x1) / 2.0 - 50.0).abs() <= 3.0 && ((y0 + y1) / 2.0 - 50.0).abs() <= 3.0, "{x0} {x1} {y0} {y1}");
-        }
-    }
-
-    #[test]
-    fn small_sizes_get_the_simple_builds_and_the_thicker_strokes() {
-        let build = |px: i32| (strokes(px).len(), strokes(px).first().map(|s| s.width));
-        assert!(build(16) == (TINY.len(), Some(TINY[0].width)) && build(10) == build(16));
-        assert!(build(17) == (SMALL.len(), Some(SMALL[0].width)) && build(24) == build(17));
-        assert!(build(25) == (FULL.len(), Some(FULL[0].width)) && build(256) == build(25));
-        assert!(SMALL.len() <= FULL.len() && TINY.len() <= FULL.len());
-        let thinnest = |set: &[Stroke]| set.iter().map(|s| s.width).fold(f32::MAX, f32::min);
-        assert!(thinnest(SMALL) > thinnest(FULL) && thinnest(TINY) > thinnest(FULL));
-    }
-
-    #[test]
-    fn the_tiny_build_stands_on_the_middles_of_the_pixels_of_a_16_pixel_square() {
-        // A unit is a 6.25th of a pixel at 16 pixels: the places of the strokes' points are halves of pixels.
-        for s in TINY {
+        for s in FULL {
+            assert!(s.pts.len() >= 2 && s.width > 0.0);
             for &(x, y) in s.pts {
-                for v in [x, y] {
-                    let px = v / 6.25;
-                    let near_half = (px - (px - 0.5).round() - 0.5).abs() < 0.25;
-                    assert!(near_half || (px - px.round()).abs() < 0.5, "{px}");
-                }
+                let half = s.width / 2.0;
+                assert!(x - half >= 0.0 && x + half <= 100.0 && y - half >= 0.0 && y + half <= 100.0, "({x}, {y}) is too near the edge");
             }
         }
-        // The vertical of 车 and of 土 are on the middle of a pixel exactly.
-        assert_eq!((TINY[0].pts[0].0 / 6.25).fract(), 0.5);
-        assert_eq!((TINY[5].pts[0].0 / 6.25).fract(), 0.5);
+    }
+
+    #[test]
+    fn the_strokes_are_as_thick_as_each_other_and_the_glyph_is_in_the_middle_of_the_square() {
+        assert!(FULL.windows(2).all(|w| w[0].width == w[1].width), "one thickness for all the strokes");
+        let (mut x0, mut x1, mut y0, mut y1) = (100.0f32, 0.0f32, 100.0f32, 0.0f32);
+        for s in FULL {
+            for &(x, y) in s.pts {
+                (x0, x1, y0, y1) = (x0.min(x - s.width / 2.0), x1.max(x + s.width / 2.0), y0.min(y - s.width / 2.0), y1.max(y + s.width / 2.0));
+            }
+        }
+        assert!(((x0 + x1) / 2.0 - 50.0).abs() <= 2.0 && ((y0 + y1) / 2.0 - 50.0).abs() <= 2.0, "{x0} {x1} {y0} {y1}");
+        // 车 is on the left of 圣, and the long bar under 圣 is as wide as the 又 above it.
+        let reach = |from: usize, to: usize| {
+            let (mut lo, mut hi) = (100.0f32, 0.0f32);
+            for s in &FULL[from..to] {
+                for &(x, _) in s.pts {
+                    (lo, hi) = (lo.min(x), hi.max(x));
+                }
+            }
+            (lo, hi)
+        };
+        let (left, right, top, bottom) = (reach(0, 4), reach(4, 9), reach(4, 6), reach(8, 9));
+        assert!(left.1 < right.0 + 8.0 && left.0 < right.0);
+        assert!(((top.1 - top.0) - (bottom.1 - bottom.0)).abs() <= 4.0, "{top:?} {bottom:?}");
+        // 工: the short bar is clearly shorter than the long one, and the stem is between the two, in the middle of both, and does not stick out above the short bar.
+        let (upper, stem, lower) = (&FULL[6], &FULL[7], &FULL[8]);
+        let length = |s: &Stroke| (s.pts[1].0 - s.pts[0].0).abs();
+        assert!(length(upper) <= 0.6 * length(lower), "{} {}", length(upper), length(lower));
+        assert!(stem.pts[0].1 >= upper.pts[0].1 && stem.pts[1].1 <= lower.pts[0].1 + 0.1, "the stem is between the bars");
+        let middle = |s: &Stroke| (s.pts[0].0 + s.pts[1].0) / 2.0;
+        assert!((stem.pts[0].0 - middle(upper)).abs() <= 1.0 && (stem.pts[0].0 - middle(lower)).abs() <= 1.0);
+    }
+
+    #[test]
+    fn a_mark_of_16_24_or_32_pixels_has_its_bitmap_and_other_sizes_are_drawn_from_the_strokes() {
+        for (px, bm) in [(16, P16), (24, P24), (32, P32)] {
+            assert_eq!(bitmap(px).map(|b| b.len()), Some(px as usize));
+            assert!(bm.iter().all(|row| row.len() == px as usize && row.bytes().all(|c| c == b'#' || c == b'.')), "{px}");
+        }
+        assert!(bitmap(20).is_none() && bitmap(48).is_none() && bitmap(256).is_none());
+    }
+
+    #[test]
+    fn each_bitmap_has_the_character_in_the_middle_of_its_square_and_stems_that_are_whole_pixels() {
+        for (px, bm) in [(16usize, P16), (24, P24), (32, P32)] {
+            let on: Vec<(usize, usize)> = bm.iter().enumerate().flat_map(|(y, row)| row.bytes().enumerate().filter(|(_, c)| *c == b'#').map(move |(x, _)| (x, y))).collect();
+            let (x0, x1) = (on.iter().map(|p| p.0).min().unwrap_or(0), on.iter().map(|p| p.0).max().unwrap_or(0));
+            let (y0, y1) = (on.iter().map(|p| p.1).min().unwrap_or(0), on.iter().map(|p| p.1).max().unwrap_or(0));
+            // The room on a side differs from the room on the other by at most a pixel.
+            assert!((x0 as i32 - (px as i32 - 1 - x1 as i32)).abs() <= 1 && (y0 as i32 - (px as i32 - 1 - y1 as i32)).abs() <= 1, "{px}: {x0}..{x1}, {y0}..{y1}");
+            // The glyph does not touch the edge of the square (the corners are round).
+            assert!(x0 >= px / 10 && y0 >= px / 10 && x1 + px / 10 < px && y1 + px / 10 < px, "{px}");
+            // The stem of 车 is the columns that are as tall as the character (nine tenths): one pixel wide at 16, two at 24 and 32.
+            let (thick, tall) = (if px == 16 { 1 } else { 2 }, y1 - y0 + 1);
+            let stem = (0..px).filter(|&x| bm.iter().filter(|row| row.as_bytes()[x] == b'#').count() * 10 >= tall * 9).count();
+            assert_eq!(stem, thick, "{px}: the stem is {stem} wide");
+        }
     }
 }

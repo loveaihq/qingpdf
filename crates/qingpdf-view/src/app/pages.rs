@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use qingpdf_core::view::{Engine, PageInfo, SaveStatus};
 
 use super::editing::Asked;
-use super::sidebar::TAB_H;
 use super::*;
 use crate::layout::Layout;
 use crate::thumbs::{self, Chosen};
@@ -293,8 +292,7 @@ impl App {
         if x < 0 || x >= self.list_w() {
             return None;
         }
-        let tabs = self.px(TAB_H);
-        Some(thumbs::gap_at(&self.thumbs.strip, self.thumbs.scroll + (y - tabs).max(0).min((self.view_h - tabs).max(0))))
+        Some(thumbs::gap_at(&self.thumbs.strip, self.thumbs.scroll + (y - self.tabs_h()).max(0).min(self.list_h())))
     }
 
     /// The pointer moved with the button down on a thumbnail. `None`: no such press.
@@ -320,7 +318,7 @@ impl App {
         if !self.pg.drag.as_ref().is_some_and(|d| d.moved) {
             return vec![Action::KillTimer(TIMER_THUMB_DRAG)];
         }
-        let (tabs, list_h) = (self.px(TAB_H), self.view_h - self.px(TAB_H));
+        let (tabs, list_h) = (self.tabs_h(), self.list_h());
         let delta = thumbs::edge_scroll(self.mouse.1, tabs, tabs + list_h, self.px(EDGE), self.px(EDGE_SPEED));
         if delta == 0 {
             return Vec::new();
@@ -359,7 +357,7 @@ impl App {
 
     /// The right button on the list of thumbnails: the page under it joins the chosen ones if it was not among them, and the menu opens.
     pub(super) fn thumb_menu(&mut self, x: i64, y: i64) -> Vec<Action> {
-        let at = self.thumbs.scroll + y - self.px(TAB_H);
+        let at = self.thumbs.scroll + y - self.tabs_h();
         let Some(row) = self.thumbs.strip.row_at(at) else { return Vec::new() };
         if !self.pg.chosen.contains(row) {
             self.pg.chosen.only(row);
@@ -367,7 +365,7 @@ impl App {
         self.thumb_focus = true;
         let (pages, count) = (self.pg.chosen.len(), self.page_count());
         let assemble = self.rights.assemble;
-        let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, enabled };
+        let item = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, radio: false, enabled };
         let entries = vec![
             item(CMD_PG_LEFT, Msg::PgLeft, assemble),
             item(CMD_PG_RIGHT, Msg::PgRight, assemble),
@@ -473,7 +471,7 @@ impl App {
         }
         let y = tabs + thumbs::gap_top(&self.thumbs.strip, *gap) - self.thumbs.scroll;
         let h = self.px(DROP_H);
-        let rect = Rect { x: clamp32(self.px(4)), y: clamp32(y - h / 2), w: clamp32((width - self.px(8)).max(1)), h: clamp32(h) };
+        let rect = Rect { x: clamp32(self.px(6)), y: clamp32(y - h / 2), w: clamp32((width - self.px(12)).max(1)), h: clamp32(h) };
         p.fill_rect(rect, DROP_COLOR);
     }
 }
@@ -482,6 +480,7 @@ impl App {
 mod tests {
     use std::time::Duration;
 
+    use super::super::sidebar::TAB_H;
     use super::super::sidebar::tests::{Rec, app, letter, open_pages, pages_pdf, pump};
     use super::*;
     use crate::ui::vk;
@@ -565,12 +564,13 @@ mod tests {
         let in_view = app.thumbs.strip.rows_in(app.thumbs.scroll, app.thumbs.scroll + list_h).len();
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), in_view);
+        // (The tab that is shown is on the same tint.)
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.accent_tint).count(), in_view + 1);
         // Nothing chosen: the page in view has the mark, as it always had.
         app.pg.chosen.clear();
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), 1);
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.accent_tint).count(), 1 + 1);
         // One page chosen follows the page in view when the pages are moved some other way.
         click_row(&mut app, 1, false, false);
         app.event(Event::Wheel { delta: -120, ctrl: false, shift: false, x: 600, y: 300 });

@@ -516,7 +516,7 @@ impl App {
 
     /// A picture was chosen: its frame is put in the middle of the window, to be moved and resized.
     pub(super) fn stamp_picked(&mut self, path: &Path) -> Vec<Action> {
-        let bad = |this: &mut Self, why: String| this.say(format!("{} {why}", t(this.lang, Msg::NoteStampBad)));
+        let bad = |this: &mut Self, why: String| this.fail(format!("{} {why}", t(this.lang, Msg::NoteStampBad)));
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         if size > MAX_STAMP_FILE_BYTES as u64 {
             return bad(self, format!("> {} MB", MAX_STAMP_FILE_BYTES >> 20));
@@ -547,7 +547,9 @@ impl App {
         self.edit.picked = None;
         self.edit.tool = Tool::Stamp;
         self.menus_dirty = true;
-        let mut actions = self.say(t(self.lang, Msg::NoteStampHint).to_string());
+        // (The hint of the picture's frame stays over the pages until the picture is placed or Esc cancels it: `sticky.rs`.)
+        self.note = Some(t(self.lang, Msg::NoteStampHint).to_string());
+        let mut actions = self.sync_sticky();
         actions.push(Action::Invalidate);
         actions
     }

@@ -25,6 +25,7 @@ mod editing;
 mod forms;
 mod looks;
 mod menus;
+mod motion;
 mod ocr;
 mod outline;
 mod overlay;
@@ -40,6 +41,7 @@ mod screen;
 mod searching;
 mod selecting;
 mod sidebar;
+mod sticky;
 mod tabbar;
 mod tabset;
 mod welcomeui;
@@ -69,7 +71,7 @@ use crate::tiles;
 use crate::accent::{self, AccentChoice};
 use crate::overbar::Vis;
 use crate::toast::Toasts;
-use crate::ui::{Action, Cursor, Event, Font, Handler, Menu, Painter, Rect, Rgb, SearchBox, vk};
+use crate::ui::{Action, Cursor, Event, Font, Handler, Menu, Painter, Rect, Rgb, SearchBox, clamp_to, vk};
 use qingpdf_core::view::{MarkupKind, ShapeKind};
 use crate::zoom::{self, ZoomMode};
 
@@ -257,7 +259,7 @@ const TIMER_TIP: u32 = 8;
 const GAP: i64 = 10;
 const MARGIN: i64 = 12;
 /// The strip between the sidebar and the pages that can be dragged to change the sidebar's width (at 96 dpi; the usual width is `sidebar::DEFAULT_WIDTH`).
-const SPLIT_GAP: i64 = 6;
+const SPLIT_GAP: i64 = 8;
 const WHEEL_STEP: i64 = 96;
 const LINE_STEP: i64 = 48;
 /// The find box: the edit box, the room for the count to its left, the gap to the top and right edges.
@@ -417,12 +419,20 @@ app_fields! {
         pill_edit: Option<overlay::PillField>,
         last_pos: (i64, i64, i64),
         anim_on: bool,
+        /// The row of the list in the sidebar the pointer is over.
+        side_hot: Option<usize>,
+        /// The short movements of the window (2026-10-22): hover fades, the sidebar's slide, the tabs after one is closed, and whether Windows allows them.
+        fx: motion::Fx,
         /// The width of a digit, the height of a line of text and of the big name, and the width of the message shown, in the font the window draws in (found when
         /// it draws): what the pill, the welcome page and the messages are laid out by.
         digit_w: i32,
         line_h: i32,
         title_font_h: i32,
-        toast_w: i32,
+        /// Where the card of the message that shows was drawn (in the pages' area), for a click on it; what the clock drew again at the tick before; and what a job
+        /// that is running said last (the message that stays, with the job it belongs to).
+        toast_rect: Option<Rect>,
+        anim_prev: overlay::Dirty,
+        job_note: Option<(sticky::Job, String)>,
         /// The row of the welcome page the keyboard is on.
         welcome_focus: Option<usize>,
         /// The window has nothing round the pages (no title strip, command bar, bars, pill or messages), as the speed test's has not: what the tests of the pages
@@ -623,10 +633,14 @@ impl App {
             pill_edit: None,
             last_pos: (0, 0, 0),
             anim_on: false,
+            side_hot: None,
+            fx: motion::Fx::new(),
             digit_w: 8,
             line_h: 16,
             title_font_h: 36,
-            toast_w: 0,
+            toast_rect: None,
+            anim_prev: overlay::Dirty::default(),
+            job_note: None,
             welcome_focus: None,
             bare: cfg!(test),
             frame_custom: true,
@@ -1583,6 +1597,8 @@ impl App {
             actions.push(Action::SetMenus(self.menus()));
         }
         actions.extend(self.chrome_updates());
+        // What a job says and the hint of the tool stay over the pages for as long as they are true.
+        actions.extend(self.sync_sticky());
         if let Some(mut bench) = self.bench.take() {
             actions.extend(bench.step(self));
             self.bench = Some(bench);
@@ -1623,7 +1639,7 @@ impl Handler for App {
         self.title_font_h = p.line_height();
         p.set_font(Font::Body);
         let dy = clamp32(self.bar_h());
-        let drawn = if dy == 0 { self.paint_pages(p) } else { self.paint_pages(&mut tabbar::Shifted { inner: &mut *p, dy }) };
+        let drawn = if dy == 0 { self.paint_pages(p) } else { self.paint_pages(&mut tabbar::Shifted { inner: &mut *p, dx: 0, dy }) };
         self.draw_overlays(p);
         if dy > 0 {
             // (The command bar first: the tab that is shown is a little taller than the strip, and flows into it.)
@@ -1632,6 +1648,11 @@ impl Handler for App {
         }
         self.draw_tooltip(p);
         drawn
+    }
+
+    fn paint_part(&mut self, p: &mut dyn Painter, x: i32, y: i32) -> bool {
+        // (The part of the window that starts at (x, y) is drawn on a picture of its own: everything is drawn that much up and to the left.)
+        self.paint(&mut tabbar::Shifted { inner: p, dx: -x, dy: -y })
     }
 
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
@@ -1804,6 +1825,7 @@ impl App {
             Event::SystemAccent(rgb) => self.set_system_accent(rgb),
             Event::HighContrast(colors) => self.set_contrast(colors),
             Event::MenuKey => self.open_menu(true),
+            Event::Motion(on) => self.set_motion(on),
             Event::MouseMove { x, y, .. } if self.present.is_some() => self.present_pointer(i64::from(x), i64::from(y)),
             Event::MouseUp { .. } if self.present.is_some() => Vec::new(),
             Event::MouseMove { x, y, shift } => self.mouse_move(i64::from(x), i64::from(y), shift),
@@ -1839,12 +1861,15 @@ impl App {
     fn paint_pages(&mut self, p: &mut dyn Painter) -> bool {
         let (full_w, full_h) = (clamp32(self.client_w.max(self.view_x + self.view_w)), clamp32(self.view_h));
         p.fill_rect(Rect { x: 0, y: 0, w: full_w, h: full_h }, self.page_background());
-        if self.view_x > 0 {
+        if self.view_x > 0 && self.card_m() == 0 {
             // The edge of the bookmarks, which can be dragged: a thin line in the middle of its strip.
             let line = clamp32(self.px(1).max(1));
             p.fill_rect(Rect { x: clamp32(self.view_x - self.px(SPLIT_GAP) / 2), y: 0, w: line, h: full_h }, self.pal.split);
         }
-        self.draw_sidebar(p);
+        // (A sidebar that is sliding out is drawn over the pages, which are laid out for no sidebar by then.)
+        if self.fx.ghost == 0 {
+            self.draw_sidebar(p);
+        }
         let mut drew = false;
         match &self.doc {
             Some(doc) => {
@@ -1858,6 +1883,9 @@ impl App {
                 let w = p.text_width(s);
                 p.text(clamp32(self.view_x) + (clamp32(self.view_w) - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, self.pal.hint_fg);
             }
+        }
+        if self.fx.ghost > 0 {
+            self.draw_sidebar(p);
         }
         self.draw_find_panel(p);
         let now = Instant::now();

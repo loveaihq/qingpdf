@@ -7,14 +7,14 @@
 use qingpdf_core::view::ListedAnnot;
 
 use super::editing::Asked;
-use super::sidebar::TAB_H;
+use super::sidebar::fit;
 use super::*;
 use crate::thumbs::{self, ListKey};
 use crate::cmdbar::plain_label;
 
 // Sizes at 96 dpi.
-const HEAD_H: i64 = 22;
-const ITEM_H: i64 = 58;
+const HEAD_H: i64 = 26;
+const ITEM_H: i64 = 52;
 const PAD: i64 = 8;
 const BAR_W: i64 = 6;
 const BAR_EDGE: i64 = 3;
@@ -162,6 +162,13 @@ impl App {
 
     // --- the pointer and the keys ----------------------------------------------------------------------------------------
 
+    /// The row of an annotation (not a page's heading) at this height of the pages' area.
+    pub(super) fn annot_row_at(&self, y: i64) -> Option<usize> {
+        let at = self.al.scroll + y - self.tabs_h();
+        let row = self.rows_between(at, at + 1).start;
+        (at >= 0 && at < self.annots_total() && matches!(self.al.rows.get(row), Some(Row::Item(_)))).then_some(row)
+    }
+
     pub(super) fn over_annots(&self, x: i64, y: i64) -> bool {
         self.annots_shown() && x >= 0 && x < self.list_w() && y >= 0 && y < self.view_h
     }
@@ -180,7 +187,7 @@ impl App {
             self.al.dragging = true;
             return self.annots_drag_to(y);
         }
-        let at = self.al.scroll + y - self.px(TAB_H);
+        let at = self.al.scroll + y - self.tabs_h();
         let row = self.rows_between(at, at + 1).start;
         match self.al.rows.get(row) {
             Some(Row::Item(i)) if at >= 0 && at < self.annots_total() => self.select_listed(*i as usize),
@@ -190,7 +197,7 @@ impl App {
 
     /// The bar at the side of the list is dragged, the pointer now at `y`.
     pub(super) fn annots_drag_to(&mut self, y: i64) -> Vec<Action> {
-        self.al.scroll = thumbs::scroll_at_bar(y - self.px(TAB_H), self.list_h(), self.annots_total());
+        self.al.scroll = thumbs::scroll_at_bar(y - self.tabs_h(), self.list_h(), self.annots_total());
         self.clamp_annots_scroll();
         vec![Action::Invalidate]
     }
@@ -294,61 +301,74 @@ impl App {
         plain_label(t(self.lang, m)).0
     }
 
-    pub(super) fn draw_annot_list(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
+    /// The picture (a letter of the icon font) of a kind of annotation.
+    fn kind_glyph(subtype: &str) -> char {
+        match subtype {
+            "Highlight" => '\u{E7E6}',
+            "Underline" => '\u{E8DC}',
+            "StrikeOut" => '\u{EDE0}',
+            "Squiggly" => '\u{EDC6}',
+            "Ink" => '\u{EE56}',
+            "Text" => '\u{E70B}',
+            "FreeText" => '\u{E8AC}',
+            "Stamp" => '\u{E8EC}',
+            "Square" => '\u{E739}',
+            "Circle" => '\u{EA3A}',
+            "Line" => '\u{E72A}',
+            "Redact" => '\u{E8A8}',
+            _ => '\u{E90A}',
+        }
+    }
+
+    /// The list: a small picture of the kind, the title (the words of the annotation, or its kind when it has none), and under it who made it and when, in the
+    /// pale ink. A row chosen is on a tint of the accent, with round corners; so is the one under the pointer, faintly.
+    pub(super) fn draw_annot_list(&self, p: &mut dyn Painter, width: i64, tabs: i64, bg: Rgb) {
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
         let list_h = self.list_h();
-        p.fill_rect(rect(0, tabs, width, list_h), self.pal.list_bg);
+        p.fill_rect(rect(0, tabs, width, list_h), bg);
         if self.al.rows.is_empty() {
             if self.al.loaded {
                 let s = t(self.lang, Msg::AnnotsEmpty);
                 let w = i64::from(p.text_width(s));
-                p.text(clamp32((width - w) / 2), clamp32(tabs + self.px(40)), s, self.pal.disabled_fg);
+                p.text(clamp32((width - w).max(self.px(8)) / 2), clamp32(tabs + self.px(40)), s, self.pal.disabled_fg);
             }
             return;
         }
         let picked = self.edit.picked.and_then(|(page, _)| self.edit.picked_info().map(|a| (page, a.index, a.num)));
-        let pad = self.px(PAD);
+        let (pad, inset, radius) = (self.px(PAD), self.px(6), clamp32(self.px(8)));
         let line = i64::from(p.line_height());
-        let fit = |p: &mut dyn Painter, s: &str, room: i64| -> String {
-            if i64::from(p.text_width(s)) <= room {
-                return s.to_string();
-            }
-            let chars: Vec<char> = s.chars().collect();
-            let (mut lo, mut hi) = (0usize, chars.len());
-            while lo < hi {
-                let mid = (lo + hi).div_ceil(2);
-                let cut: String = chars.iter().take(mid).chain(std::iter::once(&'\u{2026}')).collect();
-                if i64::from(p.text_width(&cut)) <= room { lo = mid } else { hi = mid - 1 }
-            }
-            chars.iter().take(lo).chain(std::iter::once(&'\u{2026}')).collect()
-        };
         for r in self.rows_between(self.al.scroll, self.al.scroll + list_h) {
             let (top, h) = (tabs + self.row_top(r) - self.al.scroll, self.row_h(r));
             match self.al.rows.get(r).copied() {
                 Some(Row::Page(page)) => {
-                    p.fill_rect(rect(0, top, width, h), self.pal.header_bg);
                     let s = t(self.lang, Msg::ListPage).replace("{n}", &(page + 1).to_string());
-                    p.text(clamp32(pad), clamp32(top + (h - line) / 2), &s, self.pal.number_fg);
+                    p.text(clamp32(inset + pad), clamp32(top + (h - line) / 2), &s, self.pal.dim_fg);
                 }
                 Some(Row::Item(i)) => {
                     let Some(l) = self.al.items.get(i as usize) else { continue };
                     let key = (l.page, l.info.index, l.info.num);
                     let chosen = self.al.selected == Some(key) || picked == Some(key);
+                    let frame = rect(inset, top + self.px(2), width - 2 * inset, h - self.px(4));
                     if chosen {
-                        let edge = self.px(2);
-                        p.fill_rect(rect(self.px(4), top + 1, width - 2 * self.px(4), h - 2), self.pal.selected_border);
-                        p.fill_rect(rect(self.px(4) + edge, top + 1 + edge, width - 2 * (self.px(4) + edge), h - 2 - 2 * edge), self.pal.selected_bg);
+                        p.fill_shape(frame, [radius; 4], self.pal.accent_tint, 255);
+                    } else if self.side_hot == Some(r) {
+                        p.fill_shape(frame, [radius; 4], self.pal.status_fg, self.pal.hover_alpha);
                     }
-                    let room = width - 2 * pad - self.px(BAR_W + BAR_EDGE);
-                    // The kind and the author on the first line, the text under it, the date under that.
-                    let head = if l.info.author.is_empty() { self.kind_name(&l.info.subtype) } else { format!("{} - {}", self.kind_name(&l.info.subtype), l.info.author) };
-                    let color = if chosen { self.pal.selected_fg } else if l.info.locked() { self.pal.dim_fg } else { self.pal.number_fg };
-                    let y = top + self.px(4);
-                    // (A line with nothing in it is left out.)
-                    let lines = [(head.as_str(), color), (l.info.contents.as_str(), self.pal.dim_fg), (l.info.modified.as_str(), self.pal.dim_fg)];
-                    for (n, (s, c)) in lines.into_iter().filter(|(s, _)| !s.is_empty()).enumerate() {
-                        let s = fit(p, s, room);
-                        p.text(clamp32(pad), clamp32(y + n as i64 * (line + self.px(1))), &s, c);
+                    let kind = self.kind_name(&l.info.subtype);
+                    let ink = if chosen { self.pal.accent_on_tint } else { self.pal.dim_fg };
+                    let icon = rect(inset + pad, top, self.px(24), h);
+                    p.glyph(icon, Self::kind_glyph(&l.info.subtype), if l.info.locked() { self.pal.disabled_fg } else if chosen { self.pal.accent_on_tint } else { self.pal.accent });
+                    let (tx, room) = (inset + pad + self.px(32), width - inset - pad - self.px(32) - self.px(BAR_W + BAR_EDGE) - pad);
+                    // (A kind with no words is its own title; who and when is left out where there is nothing to say.)
+                    let title = if l.info.contents.is_empty() { kind.clone() } else { l.info.contents.clone() };
+                    let by: Vec<&str> = [l.info.author.as_str(), l.info.modified.as_str()].into_iter().filter(|s| !s.is_empty()).collect();
+                    let second = if by.is_empty() { if l.info.contents.is_empty() { String::new() } else { kind } } else { by.join(" \u{B7} ") };
+                    let title = fit(p, &title, room);
+                    let ty = if second.is_empty() { top + (h - line) / 2 } else { top + (h - 2 * line - self.px(2)) / 2 };
+                    p.text(clamp32(tx), clamp32(ty), &title, if chosen { self.pal.accent_on_tint } else if l.info.locked() { self.pal.dim_fg } else { self.pal.number_fg });
+                    if !second.is_empty() {
+                        let second = fit(p, &second, room);
+                        p.text(clamp32(tx), clamp32(ty + line + self.px(2)), &second, ink);
                     }
                 }
                 None => {}

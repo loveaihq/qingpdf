@@ -488,7 +488,7 @@ impl App {
         let Some((_, page, index, num)) = self.edit.ae.text_ask.take_if(|a| a.0 == id) else { return Vec::new() };
         let Some(a) = self.edit.annots.get(&page).and_then(|l| l.iter().find(|a| a.index == index && a.num == num)).cloned() else { return Vec::new() };
         if !found {
-            return self.say(t(self.lang, Msg::NoteEditFailed).to_string());
+            return self.fail(t(self.lang, Msg::NoteEditFailed).to_string());
         }
         // A text box is typed over in place; so is a note that has line breaks (the box for notes has one line, and would lose them).
         if a.subtype == "FreeText" || text.contains('\n') {

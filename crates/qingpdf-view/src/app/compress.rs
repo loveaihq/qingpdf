@@ -123,7 +123,7 @@ impl App {
 
     fn say_working(&mut self, percent: u32) -> Vec<Action> {
         let text = t(self.lang, Msg::CzWorking).replace("{n}", &percent.to_string());
-        self.say(text)
+        self.say_job(sticky::Job::Compress, text)
     }
 
     pub(super) fn on_compress_progress(&mut self, id: u64, percent: u32) -> Vec<Action> {

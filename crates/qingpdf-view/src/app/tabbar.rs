@@ -11,12 +11,13 @@ use crate::ui::{Font, Rgb};
 /// The painter of the pages when something is above them: everything is drawn `dy` lower.
 pub(super) struct Shifted<'a> {
     pub(super) inner: &'a mut dyn Painter,
+    pub(super) dx: i32,
     pub(super) dy: i32,
 }
 
 impl Shifted<'_> {
     fn down(&self, r: Rect) -> Rect {
-        Rect { y: r.y.saturating_add(self.dy), ..r }
+        Rect { x: r.x.saturating_add(self.dx), y: r.y.saturating_add(self.dy), ..r }
     }
 }
 
@@ -37,7 +38,7 @@ impl Painter for Shifted<'_> {
     }
 
     fn text(&mut self, x: i32, y: i32, s: &str, color: Rgb) {
-        let y = y.saturating_add(self.dy);
+        let (x, y) = (x.saturating_add(self.dx), y.saturating_add(self.dy));
         self.inner.text(x, y, s, color);
     }
 
@@ -64,8 +65,8 @@ impl Painter for Shifted<'_> {
     }
 
     fn polyline(&mut self, points: &[(f32, f32)], width: f32, color: Rgb, alpha: u8) {
-        let dy = self.dy as f32;
-        let moved: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x, y + dy)).collect();
+        let (dx, dy) = (self.dx as f32, self.dy as f32);
+        let moved: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x + dx, y + dy)).collect();
         self.inner.polyline(&moved, width, color, alpha);
     }
 
@@ -146,17 +147,18 @@ impl App {
         let (pad, dot) = (self.px(10), self.px(12));
         let radii = self.tab_radii();
         for (i, tab) in self.tabs.iter().enumerate() {
-            let x = strip.xs.get(i).copied().unwrap_or(0);
+            let x = strip.xs.get(i).copied().unwrap_or(0) + self.tab_offset(i);
             let shown = self.tabs.active() == Some(i);
             let hot = matches!(self.hot, Some(Hot::Tab(n) | Hot::Close(n)) if n == i);
+            let hover = self.hover_level(Hot::Tab(i)).max(self.hover_level(Hot::Close(i)));
             // The shown tab is the surface of the command bar, a little taller than the strip so that it flows into it, with the accent on its top edge.
             if shown {
                 let body = rc(x, strip.top, strip.width, strip.height + 1);
                 p.fill_shape(body, radii, pal.accent, 255);
                 p.fill_shape(rc(x, strip.top + self.px(2), strip.width, strip.height + 1 - self.px(2)), radii, pal.tab_on, 255);
-            } else if hot {
+            } else if hover > 0 {
                 let body = rc(x, strip.top + self.px(2), strip.width, strip.height - self.px(4));
-                self.hover_fill(p, body, clamp32(self.px(8)), false, 255);
+                self.hover_fill(p, body, clamp32(self.px(8)), false, hover);
             }
             let close = self.shows_close(i);
             let mut left = x + pad;
@@ -172,8 +174,9 @@ impl App {
             if close && let Some((cl, ct, side)) = strip.close_box(i) {
                 let r = rc(cl, ct, side, side);
                 let on = self.hot == Some(Hot::Close(i));
-                if on || self.pressed == Some(Hot::Close(i)) {
-                    self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Close(i)) && on, 255);
+                let level = self.hover_level(Hot::Close(i));
+                if level > 0 || self.pressed == Some(Hot::Close(i)) {
+                    self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Close(i)) && on, level);
                 }
                 let (cx, cy, a) = (cl as f32 + side as f32 / 2.0, ct as f32 + side as f32 / 2.0, side as f32 * 0.23);
                 let w = (1.4 * self.dpi as f32 / 96.0).max(1.0);
@@ -185,8 +188,9 @@ impl App {
         if let Some((l, t, side)) = strip.plus {
             let r = rc(l, t, side, side);
             let on = self.hot == Some(Hot::Plus);
-            if on || self.pressed == Some(Hot::Plus) {
-                self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Plus) && on, 255);
+            let level = self.hover_level(Hot::Plus);
+            if level > 0 || self.pressed == Some(Hot::Plus) {
+                self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Plus) && on, level);
             }
             let (cx, cy, a) = (l as f32 + side as f32 / 2.0, t as f32 + side as f32 / 2.0, side as f32 * 0.21);
             let w = (1.5 * self.dpi as f32 / 96.0).max(1.0);
@@ -205,7 +209,7 @@ mod tests {
     fn the_shifted_painter_moves_everything_down() {
         let mut rec = Rec::default();
         {
-            let mut s = Shifted { inner: &mut rec, dy: 30 };
+            let mut s = Shifted { inner: &mut rec, dx: 0, dy: 30 };
             s.fill_rect(Rect { x: 1, y: 2, w: 3, h: 4 }, 5);
             s.fill_shape(Rect { x: 1, y: 2, w: 3, h: 4 }, [1; 4], 6, 255);
             s.text(7, 8, "x", 9);

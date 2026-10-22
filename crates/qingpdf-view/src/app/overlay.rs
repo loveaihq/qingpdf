@@ -11,6 +11,7 @@ use crate::accent;
 use crate::overbar;
 use crate::pill::{self, Part};
 use crate::tabs;
+use crate::toast;
 use crate::ui::Font;
 
 /// The time between two pictures of something fading or growing, in milliseconds, and how long the pointer rests on a button before its tooltip comes.
@@ -40,6 +41,20 @@ pub(super) enum PillField {
     Zoom,
 }
 
+/// What the clock draws again at a tick: the rooms of the things that change (in the window's coordinates), or all of the window (when something moves the pages
+/// or the strip).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Dirty {
+    Parts(Vec<Rect>),
+    Full,
+}
+
+impl Default for Dirty {
+    fn default() -> Dirty {
+        Dirty::Parts(Vec::new())
+    }
+}
+
 /// A scroll bar being dragged: which, and how far down its thumb (in pixels) the pointer took hold.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BarDrag {
@@ -51,11 +66,26 @@ pub(super) fn rc(x: i64, y: i64, w: i64, h: i64) -> Rect {
     Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) }
 }
 
-/// The mark: the character 轻 in white on a rounded teal square, in the rectangle `r` (square).
+/// The mark: the character 轻 in white on a rounded teal square, in the rectangle `r` (square). At 16, 24 and 32 pixels it is the bitmap made by hand (whole pixels);
+/// at any other size, the strokes.
 pub(super) fn draw_logo(p: &mut dyn Painter, r: Rect) {
     let k = r.w as f32 / 100.0;
     let radius = (crate::logo::RADIUS * k).round() as i32;
     p.fill_shape(r, [radius; 4], accent::QING_LIGHT.base, 255);
+    if let Some(bitmap) = crate::logo::bitmap(r.w).filter(|_| r.w == r.h) {
+        for (y, row) in bitmap.iter().enumerate() {
+            // A run of pixels in a row is one rectangle.
+            let mut x = 0;
+            while x < row.len() {
+                let run = row.bytes().skip(x).take_while(|&c| c == b'#').count();
+                if run > 0 {
+                    p.fill_rect(Rect { x: r.x + x as i32, y: r.y + y as i32, w: run as i32, h: 1 }, 0xFFFFFF);
+                }
+                x += run.max(1);
+            }
+        }
+        return;
+    }
     for s in crate::logo::strokes(r.w) {
         let points: Vec<(f32, f32)> = s.pts.iter().map(|&(x, y)| (r.x as f32 + x * k, r.y as f32 + y * k)).collect();
         p.polyline(&points, s.width * k, 0xFFFFFF, 255);
@@ -93,29 +123,107 @@ impl App {
 
     // --- the clock ----------------------------------------------------------------------------------------------
 
-    /// Is anything fading, growing or waiting for its turn at `now`?
+    /// Does the picture of anything change as time passes at `now` (something fades, grows or slides), so that the clock must run at its fast pace? What only
+    /// stands (a message that is held, a bar that waits to begin to fade) does not count: [`App::next_wake`] says when that changes.
     fn animating(&self, now: u64) -> bool {
-        self.toasts.busy() || self.vis_v.moving(now) || self.vis_h.moving(now) || pill::moving(now, self.pill_scrolled)
+        self.toasts.moving(now) || self.vis_v.changing(now) || self.vis_h.changing(now) || pill::changing(now, self.pill_scrolled) || self.motion_busy(now)
     }
 
-    /// The timer for the pictures of something that fades is set (once).
+    /// How long (milliseconds) the clock may sleep when nothing changes now: until the message that is held ends, or the bar that stands begins to fade.
+    fn next_wake(&self, now: u64) -> Option<u64> {
+        [self.toasts.next_change(now), self.vis_v.hold_left(now), self.vis_h.hold_left(now), pill::hold_left(now, self.pill_scrolled)].into_iter().flatten().min()
+    }
+
+    /// The timer for the pictures of something that fades is set (once, at its fast pace).
     pub(super) fn start_anim(&mut self) -> Vec<Action> {
         if std::mem::replace(&mut self.anim_on, true) { Vec::new() } else { vec![Action::SetTimer { id: TIMER_ANIM, ms: ANIM_MS }] }
     }
 
-    /// The timer: the next picture, and the end of the timer when nothing moves any more.
+    /// The timer: the next picture of what changes (only the room of it is drawn again), then the end of the timer when nothing moves any more, or a slow one
+    /// that wakes the clock when something that stands is to change.
     pub(super) fn anim_tick(&mut self) -> Vec<Action> {
         let now = self.now_ms();
         self.toasts.advance(now);
-        let mut actions = vec![Action::Invalidate];
-        if !self.animating(now) {
+        let mut actions = self.motion_tick(now);
+        actions.extend(self.clock_repaint(now));
+        if self.animating(now) {
+            // (A tick of the slow clock that finds something changing puts it back to its fast pace.)
+            if !std::mem::replace(&mut self.anim_on, true) {
+                actions.push(Action::SetTimer { id: TIMER_ANIM, ms: ANIM_MS });
+            }
+        } else {
             self.anim_on = false;
-            actions.push(Action::KillTimer(TIMER_ANIM));
+            actions.push(match self.next_wake(now) {
+                Some(ms) => Action::SetTimer { id: TIMER_ANIM, ms: u32::try_from(ms.clamp(10, 60_000)).unwrap_or(1000) + 2 },
+                None => Action::KillTimer(TIMER_ANIM),
+            });
         }
         actions
     }
 
+    /// What a tick draws again: the room of each thing that changes now, and of each that changed at the tick before (so that the last picture of a fade is
+    /// drawn); all of the window when something moves the pages or the strip.
+    fn clock_repaint(&mut self, now: u64) -> Vec<Action> {
+        let cur = self.changing_parts(now);
+        match (cur.clone(), std::mem::replace(&mut self.anim_prev, cur)) {
+            (Dirty::Parts(mut parts), Dirty::Parts(before)) => {
+                for r in before {
+                    if !parts.contains(&r) {
+                        parts.push(r);
+                    }
+                }
+                parts.into_iter().map(Action::InvalidateRect).collect()
+            }
+            _ => vec![Action::Invalidate],
+        }
+    }
+
+    /// The rooms (in the window's coordinates) of what changes as time passes at `now`.
+    fn changing_parts(&self, now: u64) -> Dirty {
+        if self.fx.side.moving(now) || self.fx.slides.moving(now) || self.fx.ghost > 0 {
+            return Dirty::Full;
+        }
+        let (grow, top) = (clamp32(self.px(2)), clamp32(self.bar_h()));
+        let mut parts = Vec::new();
+        for key in self.fx.hover.active(now) {
+            match self.hot_rect(key) {
+                Some(r) => parts.push(Rect { x: r.x - grow, y: r.y - grow, w: r.w + 2 * grow, h: r.h + 2 * grow }),
+                None => return Dirty::Full,
+            }
+        }
+        if self.toasts.moving(now) {
+            parts.push(self.toast_zone());
+        }
+        for (vertical, vis) in [(true, &self.vis_v), (false, &self.vis_h)] {
+            if vis.changing(now) && self.bar_geometry(vertical).is_some() {
+                let z = self.bar_zone(vertical);
+                parts.push(Rect { y: z.y + top, ..z });
+            }
+        }
+        if pill::changing(now, self.pill_scrolled) && self.pill_visible() {
+            let card = self.pill_layout().card;
+            let m = clamp32(self.px(6));
+            parts.push(Rect { x: card.x - m, y: card.y + top - m, w: card.w + 2 * m, h: card.h + 2 * m });
+        }
+        Dirty::Parts(parts)
+    }
+
     // --- the little messages -------------------------------------------------------------------------------------
+
+    /// The room the messages can take, in the window's coordinates: as wide as a message may be, as high as two lines, above the pill; with the room for the shadow
+    /// and for the rise of a message that fades in. The part of the window that is drawn again when a message comes, changes, fades or goes.
+    fn toast_zone(&self) -> Rect {
+        let m = self.px(4);
+        let (lh, lift) = (i64::from(self.line_h.max(16)), self.px(i64::from(toast::LIFT)));
+        let (w, card_h) = ((self.view_w * 7 / 10).max(self.px(120)), 2 * lh + self.px(2) + 2 * self.px(10));
+        let bottom = if self.pill_visible() { i64::from(self.pill_layout().card.y) - self.px(12) } else { self.view_h - self.px(24) };
+        rc(self.view_x + (self.view_w - w) / 2 - m, bottom - card_h - m + self.bar_h(), w + 2 * m, card_h + lift + 2 * m)
+    }
+
+    /// Draw the room of the messages again.
+    pub(super) fn toast_invalid(&self) -> Action {
+        Action::InvalidateRect(self.toast_zone())
+    }
 
     /// Say something over the pages for a few seconds.
     pub(super) fn say(&mut self, text: String) -> Vec<Action> {
@@ -123,41 +231,64 @@ impl App {
         self.note = Some(text.clone());
         self.toasts.push(text, now);
         let mut actions = self.start_anim();
-        actions.push(Action::Invalidate);
+        actions.push(self.toast_invalid());
         actions
     }
 
-    /// Esc closes the message that shows. `None` when none does.
+    /// Esc closes the ordinary message that shows (one that stays is for its job or its tool to end). `None` when none does.
     pub(super) fn dismiss_toast(&mut self) -> Option<Vec<Action>> {
         let now = self.now_ms();
         if !self.toasts.dismiss(now) {
             return None;
         }
         let mut actions = self.start_anim();
-        actions.push(Action::Invalidate);
+        actions.push(self.toast_invalid());
         Some(actions)
     }
 
-    /// Where the card of the message that shows is, in the pages' area: in the middle, above the pill.
-    fn toast_card(&self, text_w: i64, line_h: i64) -> Rect {
-        let (w, h) = (text_w + 2 * self.px(16), line_h + 2 * self.px(10));
+    /// A click on the message that shows closes it, a message that stays too (it is not shown again until it says something else).
+    fn close_toast(&mut self) -> Vec<Action> {
+        let now = self.now_ms();
+        if !self.toasts.close(now) {
+            return Vec::new();
+        }
+        let mut actions = self.start_anim();
+        actions.push(self.toast_invalid());
+        actions
+    }
+
+    /// Where the card of the message that shows is, in the pages' area: in the middle, above the pill. The message is `lines` lines of `line_h`, the widest `text_w`.
+    fn toast_card(&self, text_w: i64, lines: usize, line_h: i64) -> Rect {
+        let n = lines.max(1) as i64;
+        let (w, h) = (text_w + 2 * self.px(16), n * line_h + (n - 1) * self.px(2) + 2 * self.px(10));
         let bottom = if self.pill_visible() { i64::from(self.pill_layout().card.y) - self.px(12) } else { self.view_h - self.px(24) };
         rc(self.view_x + (self.view_w - w) / 2, bottom - h, w, h)
     }
 
-    fn draw_toast(&self, p: &mut dyn Painter, now: u64) {
-        let Some(view) = self.toasts.view(now) else { return };
+    /// The lines a message is laid in: at most two, as wide as the card may be (a long message is broken after a word, and only if it is still too long the
+    /// middle of the second line is left out, so that the end of it stays: "Esc ends", "Ctrl+Enter").
+    fn toast_lines(&self, p: &mut dyn Painter, text: &str) -> Vec<String> {
         p.set_font(Font::Body);
         let most = (self.view_w * 7 / 10).max(self.px(120)) - 2 * self.px(16);
-        let text = tabs::shorten_to(view.text, |s| i64::from(p.text_width(s)) <= most);
-        let (tw, lh) = (i64::from(p.text_width(&text)), i64::from(p.line_height()));
-        let mut card = self.toast_card(tw, lh);
+        toast::wrap(text, clamp32(most.max(0)), 2, &mut |s| p.text_width(s))
+    }
+
+    fn draw_toast(&self, p: &mut dyn Painter, now: u64, lines: &[String]) {
+        let Some(view) = self.toasts.view(now) else { return };
+        if lines.is_empty() {
+            return;
+        }
+        p.set_font(Font::Body);
+        let (tw, lh) = (lines.iter().map(|l| i64::from(p.text_width(l))).max().unwrap_or(0), i64::from(p.line_height()));
+        let mut card = self.toast_card(tw, lines.len(), lh);
         card.y += clamp32(self.px(i64::from(view.lift)));
         let a = u32::from(view.alpha);
         p.fill_shape(Rect { x: card.x - 1, y: card.y - 1, w: card.w + 2, h: card.h + 2 }, [clamp32(self.px(11)); 4], 0x000000, (u32::from(self.pal.shadow_alpha) * a / 255) as u8);
         p.fill_shape(card, [clamp32(self.px(10)); 4], self.pal.toast_bg, view.alpha);
         let ink = accent::mix(self.pal.toast_bg, self.pal.toast_fg, a + (a >> 7));
-        p.text(card.x + clamp32(self.px(16)), card.y + (card.h - clamp32(lh)) / 2, &text, ink);
+        for (i, line) in lines.iter().enumerate() {
+            p.text(card.x + clamp32(self.px(16)), card.y + clamp32(self.px(10) + i as i64 * (lh + self.px(2))), line, ink);
+        }
     }
 
     // --- the page pill -------------------------------------------------------------------------------------------
@@ -334,9 +465,26 @@ impl App {
         if vertical { rc(self.view_x + self.view_w - z, 0, z, self.view_h) } else { rc(self.view_x, self.view_h - z, self.view_w, z) }
     }
 
+    /// Is (`x`, `y`) of the pages' area in the strip that wakes the bar (the pointer there makes the bar widen)?
     fn in_zone(&self, vertical: bool, x: i64, y: i64) -> bool {
         let z = self.bar_zone(vertical);
         self.bar_geometry(vertical).is_some() && x >= i64::from(z.x) && y >= i64::from(z.y) && x < i64::from(z.x) + i64::from(z.w) && y < i64::from(z.y) + i64::from(z.h)
+    }
+
+    /// Does the bar take a mouse-down at (`x`, `y`) of the pages' area? Only where it is: on its thumb while it shows, or anywhere in its strip while the pointer
+    /// has been on it (it is wide then, and a click on its track pages) or it is dragged. A click in the strip of a bar that is not shown, or away from the thumb
+    /// of one that is, is the page's (a link, a field, the start of a selection at the edge of the window).
+    fn bar_takes(&self, vertical: bool, x: i64, y: i64, now: u64) -> bool {
+        if !self.in_zone(vertical, x, y) {
+            return false;
+        }
+        let vis = if vertical { &self.vis_v } else { &self.vis_h };
+        if vis.hover || vis.drag {
+            return true;
+        }
+        let Some(((start, _), (t0, len))) = self.bar_geometry(vertical) else { return false };
+        let at = (if vertical { y } else { x - self.view_x }) - start;
+        vis.alpha(now) > 0 && (t0..t0 + len).contains(&at)
     }
 
     /// The thumb as a rectangle in the pages' area, as wide as the bar is now.
@@ -465,7 +613,9 @@ impl App {
             Hot::More => Some(down(self.cmd_layout().more, title)),
             Hot::Search => self.cmd_layout().search.map(|r| down(r, title)),
             Hot::Pill(part) => self.pill_layout().parts.iter().find(|(p, _)| *p == part).map(|(_, r)| down(*r, top)),
-            Hot::Open | Hot::Row(_) | Hot::BarV | Hot::BarH => None,
+            Hot::BarV => Some(down(self.bar_zone(true), top)),
+            Hot::BarH => Some(down(self.bar_zone(false), top)),
+            Hot::Open | Hot::Row(_) => None,
         }
     }
 
@@ -506,6 +656,7 @@ impl App {
         let was = std::mem::replace(&mut self.hot, hot);
         self.tip_on = false;
         let mut actions = vec![Action::Invalidate];
+        actions.extend(self.hover_moved(was, hot));
         for (bar, vertical) in [(Hot::BarV, true), (Hot::BarH, false)] {
             if was == Some(bar) || hot == Some(bar) {
                 let on = hot == Some(bar);
@@ -530,9 +681,11 @@ impl App {
         let Some(hot) = self.hot.filter(|_| self.tip_on) else { return };
         let (Some(text), Some(r)) = (self.tip_text(hot), self.hot_rect(hot)) else { return };
         p.set_font(Font::Body);
-        let (pad, lh) = (clamp32(self.px(8)), p.line_height());
+        let (pad, lh, edge) = (clamp32(self.px(8)), p.line_height(), clamp32(self.px(4)));
+        // (A path is longer than a narrow window: it is cut in the middle, so that it keeps its drive and the name of its file, to what the window has room for.)
+        let text = crate::ui::fit_middle(p, &text, (clamp32(self.client_w) - 2 * (pad + edge)).max(0));
         let (w, h) = (p.text_width(&text) + 2 * pad, lh + clamp32(self.px(10)));
-        let x = (r.x + (r.w - w) / 2).clamp(clamp32(self.px(4)), clamp32(self.client_w).saturating_sub(w + clamp32(self.px(4))).max(0));
+        let x = clamp_to(r.x + (r.w - w) / 2, edge, clamp32(self.client_w).saturating_sub(w + edge));
         let y = if i64::from(r.y) + i64::from(r.h) + self.px(8) + i64::from(h) > self.client_h { r.y - h - clamp32(self.px(6)) } else { r.y + r.h + clamp32(self.px(6)) };
         let card = Rect { x, y, w, h };
         let radius = clamp32(self.px(6));
@@ -547,7 +700,13 @@ impl App {
     /// The pointer moved with no button down, at (`x`, `y`) of the window (`None`: it left the window).
     pub(super) fn hover_at(&mut self, at: Option<(i64, i64)>) -> Vec<Action> {
         let hot = at.and_then(|(x, y)| self.hot_at(x, y));
-        self.set_hot(hot)
+        let top = self.bar_h();
+        let row = self.side_hover(at.map(|(x, y)| (x, y - top)));
+        let mut actions = self.set_hot(hot);
+        if row && actions.is_empty() {
+            actions.push(Action::Invalidate);
+        }
+        actions
     }
 
     /// The left button went down at (`x`, `y`) of the window: `Some` when what is there is the reader's own chrome or overlay (a title strip, a button, the pill,
@@ -560,20 +719,22 @@ impl App {
         if y >= top {
             let py = y - top;
             // A message goes at a click on it.
-            if self.toasts.is_showing(now) {
-                let (lh, tw) = (i64::from(self.line_h), i64::from(self.toast_w));
-                let c = self.toast_card(tw, lh);
-                if x >= i64::from(c.x) && y - top >= i64::from(c.y) && x < i64::from(c.x) + i64::from(c.w) && py < i64::from(c.y) + i64::from(c.h) {
-                    actions.extend(self.dismiss_toast().unwrap_or_default());
-                    return Some(actions);
-                }
+            if self.toasts.is_showing(now)
+                && let Some(c) = self.toast_rect
+                && x >= i64::from(c.x)
+                && py >= i64::from(c.y)
+                && x < i64::from(c.x) + i64::from(c.w)
+                && py < i64::from(c.y) + i64::from(c.h)
+            {
+                actions.extend(self.close_toast());
+                return Some(actions);
             }
             match self.hot_at(x, y) {
-                Some(Hot::BarV) => {
+                Some(Hot::BarV) if self.bar_takes(true, x, py, now) => {
                     actions.extend(self.bar_down(true, x, py));
                     return Some(actions);
                 }
-                Some(Hot::BarH) => {
+                Some(Hot::BarH) if self.bar_takes(false, x, py, now) => {
                     actions.extend(self.bar_down(false, x, py));
                     return Some(actions);
                 }
@@ -677,19 +838,21 @@ impl App {
         }
         let now = self.now_ms();
         let dy = clamp32(self.bar_h());
-        let mut shifted = Shifted { inner: p, dy };
+        let mut shifted = Shifted { inner: p, dx: 0, dy };
         let p = &mut shifted;
         p.set_font(Font::Body);
-        if let Some(v) = self.toasts.view(now) {
-            self.toast_w = p.text_width(v.text).min(clamp32(self.view_w));
-        }
+        let lines = match self.toasts.view(now) {
+            Some(v) if self.present.is_none() => self.toast_lines(p, v.text),
+            _ => Vec::new(),
+        };
+        let (tw, lh) = (lines.iter().map(|l| i64::from(p.text_width(l))).max().unwrap_or(0), i64::from(p.line_height()));
+        // (Where the card is, for a click on it.)
+        self.toast_rect = (!lines.is_empty()).then(|| self.toast_card(tw, lines.len(), lh));
         if !self.welcome_shown() {
             self.draw_bars(p, now);
             self.draw_pill(p, now);
         }
-        if self.present.is_none() {
-            self.draw_toast(p, now);
-        }
+        self.draw_toast(p, now, &lines);
     }
 
     /// Draw the tooltip last, over everything (it hangs from a button that may be in the title strip).
@@ -877,5 +1040,169 @@ mod tests {
         let mut rec = Rec::default();
         app.paint(&mut rec);
         assert!(!rec.texts.iter().any(|(_, _, s)| s == "Print (Ctrl+P)"));
+    }
+
+    /// The lines of the message on the card: what the painter was told to write that is part of `text` (the pages say nothing like it).
+    fn card_lines(app: &mut App, text: &str) -> Vec<String> {
+        let mut rec = Rec::default();
+        app.paint(&mut rec);
+        let key = &text[..20.min(text.len())];
+        let tail: String = text.chars().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect();
+        rec.texts.into_iter().map(|(_, _, s)| s).filter(|s| s.len() > 12 && (text.contains(s.as_str()) || s.starts_with(key) || s.ends_with(&tail))).collect()
+    }
+
+    #[test]
+    fn a_long_message_is_laid_in_two_lines_and_the_end_of_it_stays_even_when_it_is_cut() {
+        let mut app = app_with_pages("toast2", 3);
+        // (A card is at most 70 % of the pages' width, less its margins; a character is 7 pixels wide in the tests.)
+        let most = usize::try_from(app.view_w * 7 / 10 - 32).unwrap();
+        let hint = "Drag a box for the text, type, then click outside it or press Ctrl+Enter. Esc ends.".to_string();
+        app.say(hint.clone());
+        let lines = card_lines(&mut app, &hint);
+        assert_eq!(lines.len(), 1, "it fits one line: {lines:?}");
+        let long = format!("{hint} {hint} Esc ends it.");
+        app.toasts.clear();
+        app.say(long.clone());
+        let lines = card_lines(&mut app, &long);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines.iter().all(|l| 7 * l.chars().count() <= most), "{lines:?}");
+        assert!(lines[1].ends_with("Esc ends it."), "the end stays: {lines:?}");
+        // Too long even for two lines: the middle of the second is left out, the end is not.
+        let longer = format!("{long} {long} {long} Ctrl+Enter places it, Esc ends it.");
+        app.toasts.clear();
+        app.say(longer.clone());
+        let lines = card_lines(&mut app, &longer);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains('\u{2026}') && lines[1].ends_with("Esc ends it."), "{lines:?}");
+        // Its card is as high as two lines, and a click on it closes it.
+        let card = app.toast_rect.expect("the card");
+        assert!(card.h > 2 * 16, "{card:?}");
+        let (x, y) = (card.x + card.w / 2, card.y + card.h / 2 + app.bar_h() as i32);
+        let before = app.toasts.is_showing(app.now_ms());
+        app.event(Event::MouseDown { x, y, ctrl: false, shift: false, clicks: 1 });
+        assert!(before && !app.toasts.is_showing(app.now_ms()));
+    }
+
+    #[test]
+    fn a_message_that_fades_asks_for_its_own_room_only_and_the_pages_are_not_asked_to_be_drawn_again() {
+        let mut app = app_with_pages("fade-rect", 3);
+        // (What the opening of the file woke is let go, so that only the message moves.)
+        app.vis_v = Vis::default();
+        app.vis_h = Vis::default();
+        app.pill_scrolled = None;
+        app.toasts.clear();
+        app.anim_prev = Dirty::default();
+        app.say("Copied 12 characters".to_string());
+        let (zone, client) = (app.toast_zone(), (app.client_w, app.client_h));
+        assert!(i64::from(zone.w) * i64::from(zone.h) * 8 < client.0 * client.1, "the room of a message is a small part of the window: {zone:?}");
+        let tick = app.event(Event::Timer(TIMER_ANIM));
+        assert!(!tick.iter().any(|a| matches!(a, Action::Invalidate)), "{tick:?}");
+        let rects: Vec<Rect> = tick.iter().filter_map(|a| if let Action::InvalidateRect(r) = a { Some(*r) } else { None }).collect();
+        assert!(!rects.is_empty() && rects.iter().all(|r| *r == zone), "{rects:?} {zone:?}");
+        // The middle of the pages and the strip above them are not in it.
+        let (mx, my) = (i32::try_from(app.client_w / 2).unwrap(), i32::try_from(app.client_h / 2).unwrap());
+        assert!(rects.iter().all(|r| !(r.x <= mx && mx < r.x + r.w && r.y <= my && my < r.y + r.h)) && rects.iter().all(|r| i64::from(r.y) > app.bar_h()));
+        // The same room is asked for while the message goes (so that the last picture of it is drawn, too).
+        std::thread::sleep(std::time::Duration::from_millis(toast::FADE_IN + 40));
+        let held = app.event(Event::Timer(TIMER_ANIM));
+        assert!(held.iter().all(|a| !matches!(a, Action::Invalidate)), "{held:?}");
+    }
+
+    #[test]
+    fn a_message_that_is_held_lets_the_clock_sleep_until_it_ends_and_a_message_that_stays_lets_it_stop() {
+        let mut app = app_with_pages("hold-clock", 3);
+        app.vis_v = Vis::default();
+        app.vis_h = Vis::default();
+        app.pill_scrolled = None;
+        app.toasts.clear();
+        app.say("Saved.".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(toast::FADE_IN + 60));
+        let tick = app.event(Event::Timer(TIMER_ANIM));
+        // It stands in full: no fast clock, and one slow timer set for about when it will begin to go (seconds, not 16 milliseconds).
+        let slow: Vec<u32> = tick.iter().filter_map(|a| if let Action::SetTimer { id: TIMER_ANIM, ms } = a { Some(*ms) } else { None }).collect();
+        assert!(!app.anim_on && slow.len() == 1 && slow[0] > 3_000 && slow[0] <= 6_000, "{slow:?} {tick:?}");
+        // A message that stays asks for no timer at all once it has faded in.
+        let mut app = app_with_pages("stay-clock", 3);
+        app.vis_v = Vis::default();
+        app.vis_h = Vis::default();
+        app.pill_scrolled = None;
+        app.event(Event::Command(CMD_TOOL_INK));
+        std::thread::sleep(std::time::Duration::from_millis(toast::FADE_IN + 60));
+        let tick = app.event(Event::Timer(TIMER_ANIM));
+        assert!(!app.anim_on && tick.iter().any(|a| matches!(a, Action::KillTimer(TIMER_ANIM))) && !tick.iter().any(|a| matches!(a, Action::SetTimer { id: TIMER_ANIM, .. })), "{tick:?}");
+    }
+
+    #[test]
+    fn a_bar_that_fades_asks_for_the_strip_it_is_in_and_no_more() {
+        let mut app = app_with_pages("bar-rect", 8);
+        app.toasts.clear();
+        app.pill_scrolled = None;
+        app.vis_h = Vis::default();
+        // The bar was woken a second ago: it begins to fade.
+        let now = app.now_ms().max(1100);
+        app.vis_v = Vis { woken: Some(now - 1100), hover: false, drag: false, changed: 0 };
+        app.anim_prev = Dirty::default();
+        let strip = app.bar_zone(true);
+        let tick = app.clock_repaint(now);
+        let rects: Vec<Rect> = tick.iter().filter_map(|a| if let Action::InvalidateRect(r) = a { Some(*r) } else { None }).collect();
+        assert!(!tick.iter().any(|a| matches!(a, Action::Invalidate)) && !rects.is_empty(), "{tick:?}");
+        assert!(rects.iter().all(|r| r.x == strip.x && r.w == strip.w), "{rects:?} {strip:?}");
+    }
+
+    #[test]
+    fn a_click_in_the_strip_of_a_bar_that_is_not_shown_goes_to_the_page_and_a_click_on_the_thumb_takes_hold_of_it() {
+        let mut app = app_with_pages("bar-click", 8);
+        let ((start, track), (t0, len)) = app.bar_geometry(true).expect("a bar");
+        let x = i32::try_from(app.view_x + app.view_w - app.px(5)).unwrap();
+        let top = app.bar_h();
+        let down = |app: &mut App, y: i64| app.event(Event::MouseDown { x, y: i32::try_from(y + top).unwrap(), ctrl: false, shift: false, clicks: 1 });
+        // The bar is not shown (it was woken long ago): the page gets the click, wherever in the strip it is.
+        app.vis_v = Vis::default();
+        down(&mut app, start + t0 + len / 2);
+        assert!(app.bar_drag.is_none() && !app.chrome_press, "the page has it");
+        app.event(Event::MouseUp { x, y: 0 });
+        // The bar is shown (just scrolled): a click on its thumb takes hold of it, a click on the track away from the thumb is the page's still (the pointer has
+        // not been on the bar).
+        let now = app.now_ms();
+        app.vis_v.wake(now);
+        let away = start + (t0 + len + 40).min(track - 2);
+        assert!(away > start + t0 + len);
+        down(&mut app, away);
+        assert!(app.bar_drag.is_none() && !app.chrome_press);
+        app.event(Event::MouseUp { x, y: 0 });
+        down(&mut app, start + t0 + len / 2);
+        assert!(app.bar_drag.is_some(), "the thumb is taken hold of");
+        app.event(Event::MouseUp { x, y: 0 });
+        // Once the pointer has been on the bar (it is wide) a click on its track pages, as a bar does.
+        app.event(Event::Hover { x, y: i32::try_from(away + top).unwrap() });
+        assert!(app.vis_v.hover);
+        let before = app.scroll_y;
+        down(&mut app, away);
+        assert!(app.scroll_y > before, "{before} -> {}", app.scroll_y);
+    }
+
+    #[test]
+    fn the_tip_of_a_tab_with_a_long_path_is_cut_to_the_window_and_never_panics_however_narrow_it_is() {
+        let mut app = app_with_pages("longtip", 3);
+        let long = format!("C:\\{}file.pdf", "a-very-long-name-of-a-folder\\".repeat(20));
+        assert!(long.len() > 500);
+        app.path = Some(std::path::PathBuf::from(&long));
+        app.sync_tab();
+        assert_eq!(app.tabs.get(0).map(|t| t.path.to_string_lossy().into_owned()), Some(long.clone()));
+        // (The tooltip is the full path; at every width of the window, from a wide one to a sliver, it is drawn and fits the window.)
+        for w in [1400i32, 700, 420, 160, 60, 12, 1] {
+            app.event(Event::Size { w, h: 900 });
+            app.hot = Some(Hot::Tab(0));
+            app.tip_on = true;
+            let mut rec = Rec::default();
+            app.paint(&mut rec);
+            let tip = rec.texts.iter().find(|(_, _, s)| s.starts_with("C:")).cloned();
+            if w >= 160 {
+                let (x, _, text) = tip.unwrap_or_else(|| panic!("the tip of a tab is drawn at {w}: {:?}", rec.texts));
+                assert!(x >= 0 && x + 7 * text.chars().count() as i32 <= w, "{w}: {x} {text}");
+                // The file's name is what is kept at the end.
+                assert!(w < 300 || text.ends_with("file.pdf"), "{text}");
+            }
+        }
     }
 }

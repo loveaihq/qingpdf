@@ -154,7 +154,7 @@ impl<S> Tabs<S> {
 /// between tabs, the button that opens another file ("+"), the button that closes a tab and the room to its right, and the least of the strip that is left
 /// for dragging the window (to the left of the buttons of the frame).
 pub const TITLE_H: i64 = 40;
-pub const MARK: i64 = 20;
+pub const MARK: i64 = 24;
 pub const MARK_X: i64 = 14;
 pub const TAB_TOP: i64 = 6;
 pub const MIN_TAB_W: i64 = 44;
@@ -193,7 +193,7 @@ impl Strip {
         let n = i64::try_from(count).unwrap_or(0);
         let reserved = if n > 0 { s(PLUS + PLUS_GAP) } else { 0 };
         let room = (right - first - reserved - (n - 1).max(0) * s(TAB_GAP)).max(0);
-        let width = if n > 0 { (room / n).clamp(s(MIN_TAB_W), s(MAX_TAB_W)) } else { s(MAX_TAB_W) };
+        let width = if n > 0 { crate::ui::clamp_to(room / n, s(MIN_TAB_W), s(MAX_TAB_W)) } else { s(MAX_TAB_W) };
         let xs: Vec<i64> = (0..n).map(|i| first + i * (width + s(TAB_GAP))).collect();
         let top = s(TAB_TOP);
         let height = s(TITLE_H) - top;
@@ -420,8 +420,8 @@ mod tests {
         assert_eq!(Strip::new(2, 96, right).width, MAX_TAB_W);
         // Five tabs: what is left after the mark, the "+" and the gaps, shared.
         let five = Strip::new(5, 96, right);
-        assert_eq!(five.width, (right - 44 - (PLUS + PLUS_GAP) - 4 * TAB_GAP) / 5);
-        assert_eq!(five.xs, (0..5).map(|i| 44 + i * (five.width + TAB_GAP)).collect::<Vec<_>>());
+        assert_eq!(five.width, (right - (MARK_X + MARK + 10) - (PLUS + PLUS_GAP) - 4 * TAB_GAP) / 5);
+        assert_eq!(five.xs, (0..5).map(|i| MARK_X + MARK + 10 + i * (five.width + TAB_GAP)).collect::<Vec<_>>());
         assert!(Strip::new(16, 96, right).width >= MIN_TAB_W && Strip::new(16, 96, right).width < 60);
         assert_eq!(Strip::new(16, 96, 400).width, MIN_TAB_W);
         assert_eq!(Strip::new(0, 96, right).width, MAX_TAB_W);

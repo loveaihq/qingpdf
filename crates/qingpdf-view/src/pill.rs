@@ -114,7 +114,7 @@ pub fn parse_zoom(text: &str, least: u32, most: u32) -> Option<u32> {
         return None;
     }
     let percent: f64 = digits.parse().ok()?;
-    (percent > 0.0).then(|| ((percent * 10.0).round().min(f64::from(u32::MAX)) as u32).clamp(least, most))
+    (percent > 0.0).then(|| crate::ui::clamp_to((percent * 10.0).round().min(f64::from(u32::MAX)) as u32, least, most))
 }
 
 /// How opaque the pill is, 0 to 255: faint from a scroll until `FADE_HOLD` later, then back to full over `FADE_BACK`; full when the pointer is on it. (`scrolled`
@@ -142,6 +142,16 @@ pub fn usable(alpha: u8) -> bool {
 /// Does the pill change by itself at `now` (a timer is needed)?
 pub fn moving(now: u64, scrolled: Option<u64>) -> bool {
     scrolled.is_some_and(|t| now.saturating_sub(t) < FADE_HOLD + FADE_BACK)
+}
+
+/// Does the picture of the pill change as time passes at `now` (it comes back from faint), so that the clock must run at its fast pace?
+pub fn changing(now: u64, scrolled: Option<u64>) -> bool {
+    scrolled.is_some_and(|t| (FADE_HOLD..FADE_HOLD + FADE_BACK).contains(&now.saturating_sub(t)))
+}
+
+/// How long (milliseconds) until a pill that is faint begins to come back (none: it is not waiting for that).
+pub fn hold_left(now: u64, scrolled: Option<u64>) -> Option<u64> {
+    scrolled.map(|t| now.saturating_sub(t)).filter(|&since| since < FADE_HOLD).map(|since| FADE_HOLD - since)
 }
 
 #[cfg(test)]

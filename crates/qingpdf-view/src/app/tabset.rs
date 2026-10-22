@@ -183,7 +183,7 @@ impl App {
         let changed = self.stamp.zip(crate::places::stamp_of(&path)).is_some_and(|(then, now)| then != now);
         let mut actions = self.begin_open("");
         if changed {
-            actions.extend(self.say(t(self.lang, Msg::TabFileChanged).to_string()));
+            actions.extend(self.fail(t(self.lang, Msg::TabFileChanged).to_string()));
         }
         actions
     }
@@ -431,7 +431,9 @@ impl App {
 
     /// Close a tab that is not shown (it has nothing unsaved).
     fn close_hidden(&mut self, index: usize) -> Vec<Action> {
+        let before = self.strip().xs;
         let Some(closed) = self.tabs.close(index) else { return Vec::new() };
+        let slid = self.slide_tabs(&before, index);
         if let Some(mut kept) = closed.tab.kept {
             if closed.tab.at == Where::Waiting {
                 self.engine.close_doc(kept.doc_id);
@@ -440,6 +442,7 @@ impl App {
         }
         self.menus_dirty = true;
         let mut actions = self.bar_changed();
+        actions.extend(slid);
         actions.push(Action::Invalidate);
         actions
     }
@@ -455,7 +458,9 @@ impl App {
             self.engine.close_doc(old);
         }
         (self.path, self.stamp, self.restore, self.doc_id, self.opening, self.activating) = (None, None, None, 0, false, false);
+        let before = self.strip().xs;
         let next = self.tabs.close(shown).and_then(|c| c.show);
+        actions.extend(self.slide_tabs(&before, shown));
         if let Some(i) = next {
             actions.extend(self.bring(i));
         }
@@ -839,6 +844,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn the_tabs_after_a_closed_one_slide_into_its_place_and_stay_where_they_are_when_windows_shows_no_animations() {
+        let dir = folder("slide");
+        let (a, b, c) = (file(&dir, "a.pdf", 1), file(&dir, "b.pdf", 1), file(&dir, "c.pdf", 1));
+        let mut app = app();
+        for f in [&a, &b, &c] {
+            open(&mut app, f);
+        }
+        let before = app.strip().xs;
+        // Close the middle one (it is not shown, and has nothing unsaved): the last one starts where it was and goes to the middle one's place; the first stays.
+        app.close_tab(1);
+        assert_eq!(app.tabs.len(), 2);
+        let after = app.strip().xs;
+        let (far, near) = (before[2] - after[1], app.tab_offset(1));
+        assert!(app.tab_offset(0) == 0 && near > 0 && near <= far, "{near} of {far}");
+        assert!(app.motion_busy(app.now_ms()));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!((app.tab_offset(0), app.tab_offset(1)), (0, 0));
+        // With no animations the next one is in its place at once.
+        app.event(Event::Motion(false));
+        open(&mut app, &b);
+        let before = app.strip().xs;
+        app.close_tab(0);
+        assert_eq!((app.tab_offset(0), app.tab_offset(1)), (0, 0), "{before:?}");
+    }
 
     #[test]
     fn closing_a_tab_with_changes_asks_and_ctrl_w_closes_the_shown_one() {

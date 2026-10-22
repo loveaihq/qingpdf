@@ -177,13 +177,13 @@ impl App {
             Job::Extract { pages } => self.engine.extract_images(self.doc_id, id, &dir, &stem, pages),
         }
         self.px.running = Some((id, dir));
-        self.say(fill(t(self.lang, Msg::NotePictures), &[("n", "0")]))
+        self.say_job(sticky::Job::Pictures, fill(t(self.lang, Msg::NotePictures), &[("n", "0")]))
     }
 
     /// How far the engine is. `None`: that request is not the pictures.
     #[inline(never)]
     pub(super) fn on_pictures_progress(&mut self, id: u64, percent: u32) -> Option<Vec<Action>> {
-        (self.px.running.as_ref().is_some_and(|r| r.0 == id)).then(|| self.say(fill(t(self.lang, Msg::NotePictures), &[("n", &percent.to_string())])))
+        (self.px.running.as_ref().is_some_and(|r| r.0 == id)).then(|| self.say_job(sticky::Job::Pictures, fill(t(self.lang, Msg::NotePictures), &[("n", &percent.to_string())])))
     }
 
     /// Esc while the files are being written. `None`: they are not.

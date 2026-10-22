@@ -10,7 +10,13 @@ use super::*;
 use crate::thumbs::{Built, ListKey, Metrics, Strip, Thumb, tab_at};
 
 // Sizes at 96 dpi.
-pub(super) const TAB_H: i64 = 28;
+/// The header of the sidebar: the control that chooses the list (`SEG_H` high), with `SEG_PAD` of room round it.
+pub(super) const TAB_H: i64 = 44;
+const SEG_H: i64 = 28;
+const SEG_PAD: i64 = 8;
+/// The sidebar is a card that floats `CARD_M` from the edges of the window and from the command bar, with corners of `CARD_R`.
+pub(super) const CARD_M: i64 = 8;
+const CARD_R: i64 = 12;
 /// The width of a thumbnail, however wide the sidebar is; it is shrunk only when the sidebar is narrower than that and `THUMB_MARGIN` on each side.
 const THUMB_W: i64 = 130;
 const THUMB_MARGIN: i64 = 18;
@@ -22,9 +28,14 @@ const THUMB_AFTER: i64 = 6;
 const BAR_W: i64 = 6;
 const BAR_EDGE: i64 = 3;
 /// The width of the sidebar when none was kept: a thumbnail with room on each side for the bar at the edge and the margin.
-pub(super) const DEFAULT_WIDTH: i64 = THUMB_W + 2 * (THUMB_MARGIN + BAR_W + BAR_EDGE);
+pub(super) const DEFAULT_WIDTH: i64 = THUMB_W + 2 * (THUMB_MARGIN + BAR_W + BAR_EDGE) + 48;
 
 /// The key of the list a key of the keyboard is, if it is one.
+/// `s` cut short with an ellipsis so that it is at most `room` pixels wide.
+pub(super) fn fit(p: &mut dyn Painter, s: &str, room: i64) -> String {
+    crate::ui::fit_text(p, s, clamp32(room))
+}
+
 pub(super) fn list_key(key: u32) -> Option<ListKey> {
     match key {
         vk::UP => Some(ListKey::Up),
@@ -47,20 +58,39 @@ impl App {
     pub(super) fn sidebar_width(&self) -> i64 {
         let wanted = self.show_sidebar && (!self.outline.is_empty() || self.thumbs_alone);
         if self.doc.is_some() && wanted && !self.full && (self.bench.is_none() || self.bench_sidebar) {
-            (self.px(self.sidebar_pref) + self.px(SPLIT_GAP)).min(self.client_w / 2)
+            (self.px(self.sidebar_pref) + self.card_m() + self.px(SPLIT_GAP)).min(self.client_w / 2)
         } else {
             0
         }
     }
 
-    /// The width of what is in the sidebar (without the strip at its edge).
-    pub(super) fn list_w(&self) -> i64 {
-        (self.view_x - self.px(SPLIT_GAP)).max(0)
+    /// The room round the card of the sidebar (none in a window that is bare: the tests of the pages and the speed test).
+    pub(super) fn card_m(&self) -> i64 {
+        if self.bare || self.bench.is_some() { 0 } else { self.px(CARD_M) }
     }
 
-    /// The height of the list under the tabs.
+    /// The width the sidebar has (also while it slides out after it was hidden: the pages are laid out for none by then, but it is still drawn).
+    pub(super) fn side_x(&self) -> i64 {
+        self.view_x.max(self.fx.ghost)
+    }
+
+    /// The width of the sidebar with the room at its left, without the strip at its edge that is dragged.
+    pub(super) fn list_w(&self) -> i64 {
+        (self.side_x() - self.px(SPLIT_GAP)).max(0)
+    }
+
+    /// The width of the card (what is in it).
+    pub(super) fn card_w(&self) -> i64 {
+        (self.list_w() - self.card_m()).max(0)
+    }
+
+    /// Where the list under the header begins (from the top of the pages' area), and how high it is.
+    pub(super) fn tabs_h(&self) -> i64 {
+        self.px(TAB_H) + self.card_m()
+    }
+
     pub(super) fn list_h(&self) -> i64 {
-        (self.view_h - self.px(TAB_H)).max(0)
+        (self.view_h - self.tabs_h() - self.card_m()).max(0)
     }
 
     /// The tab that shows: the person's, but the thumbnails when they chose the bookmarks and there are none.
@@ -70,15 +100,17 @@ impl App {
 
     /// Are the thumbnails on the screen?
     pub(super) fn thumbs_shown(&self) -> bool {
-        self.view_x > 0 && self.doc.is_some() && self.active_tab() == Tab::Pages
+        self.side_x() > 0 && self.doc.is_some() && self.active_tab() == Tab::Pages
     }
 
     /// Where the tree of bookmarks (under the tabs, when they are the tab shown) and the find box go in the window now.
     pub(super) fn chrome(&self) -> Vec<Action> {
-        // The tree stops short of the pages by the strip that is dragged to change the sidebar's width.
-        let tabs = self.px(TAB_H);
-        let (w, h) = (clamp32(self.list_w()), clamp32((self.view_h - tabs).max(0)));
-        let side = if self.view_x > 0 && self.active_tab() == Tab::Bookmarks { Rect { x: 0, y: clamp32(tabs), w, h } } else { Rect { x: 0, y: 0, w: 0, h: 0 } };
+        // The tree stands in the card, in from its sides and short of its foot (the corners are round), and goes with it while it slides.
+        let (m, pad) = (self.card_m(), self.px(SEG_PAD));
+        let (inset, foot) = if m > 0 { (pad, pad) } else { (self.px(4), 0) };
+        let (w, h) = (clamp32((self.card_w() - 2 * inset).max(0)), clamp32((self.list_h() - foot).max(0)));
+        let at = Rect { x: clamp32(m + inset + self.side_dx()), y: clamp32(self.tabs_h()), w, h };
+        let side = if self.side_x() > 0 && self.active_tab() == Tab::Bookmarks { at } else { Rect { x: 0, y: 0, w: 0, h: 0 } };
         let find = self.find_open.then(|| self.find_rect());
         vec![Action::Sidebar(side), Action::Find(find)]
     }
@@ -111,6 +143,7 @@ impl App {
         if self.doc.is_none() {
             return Vec::new();
         }
+        let was = self.view_x;
         if self.sidebar_width() > 0 {
             self.show_sidebar = false;
         } else {
@@ -121,7 +154,12 @@ impl App {
             }
         }
         self.thumb_focus = false;
-        self.apply_sidebar()
+        self.side_slide(was);
+        let mut actions = self.apply_sidebar();
+        if self.fx.side.moving(self.now_ms()) {
+            actions.extend(self.start_anim());
+        }
+        actions
     }
 
     /// A tab was clicked: it is the one shown, and the one kept for the next time.
@@ -148,7 +186,7 @@ impl App {
     /// The room for a picture: a fixed width (centred in the list when the rows are drawn), so the rows do not change when the sidebar is
     /// made wider or narrower, until it is too narrow for them.
     fn thumb_metrics(&self) -> Metrics {
-        let avail_w = thumbs::picture_width(self.px(THUMB_W), self.list_w(), self.px(THUMB_MARGIN), self.px(32));
+        let avail_w = thumbs::picture_width(self.px(THUMB_W), self.card_w(), self.px(THUMB_MARGIN), self.px(32));
         Metrics::new(avail_w, self.px(THUMB_ABOVE), self.px(THUMB_GAP + THUMB_LABEL_H + THUMB_AFTER))
     }
 
@@ -277,15 +315,35 @@ impl App {
         actions
     }
 
+    /// The pointer is at (`x`, `y`) of the pages' area with no button down (none: it left the window): the row of the list under it has the pale fill. `true` when
+    /// that is another row than it was.
+    pub(super) fn side_hover(&mut self, at: Option<(i64, i64)>) -> bool {
+        let tabs = self.tabs_h();
+        let row = at.filter(|&(x, y)| y >= tabs && y < tabs + self.list_h() && x >= self.card_m()).and_then(|(x, y)| {
+            if self.thumbs_shown() && self.over_thumbs(x, y) {
+                self.thumbs.strip.row_at(self.thumbs.scroll + y - tabs)
+            } else if self.annots_shown() && self.over_annots(x, y) {
+                self.annot_row_at(y)
+            } else {
+                None
+            }
+        });
+        std::mem::replace(&mut self.side_hot, row) != row
+    }
+
     /// A press in the sidebar: on a tab, on the bar at the side of the list, or on a row. `None`: it is not in the sidebar.
     pub(super) fn sidebar_mouse_down(&mut self, x: i64, y: i64, ctrl: bool, shift: bool) -> Option<Vec<Action>> {
         let width = self.list_w();
         if self.view_x <= 0 || x < 0 || x >= width || y < 0 || y >= self.view_h {
             return None;
         }
-        let tabs = self.px(TAB_H);
+        let (m, tabs) = (self.card_m(), self.tabs_h());
         if y < tabs {
-            return Some(self.choose_tab(tab_at(x, width)));
+            if x < m || y < m {
+                return Some(Vec::new());
+            }
+            let seg = self.seg_rect();
+            return Some(self.choose_tab(tab_at(x - m - i64::from(seg.x), i64::from(seg.w))));
         }
         if self.annots_shown() {
             return Some(self.annots_press(x, y));
@@ -300,7 +358,7 @@ impl App {
             return Some(self.thumb_drag_to(y));
         }
         let at = self.thumbs.scroll + y - tabs;
-        Some(match self.thumbs.strip.row_at(at) {
+        Some(match self.thumbs.strip.row_at(at).filter(|_| x >= m) {
             Some(page) => self.thumb_press(page, ctrl, shift, x, y),
             None => Vec::new(),
         })
@@ -309,7 +367,7 @@ impl App {
     /// The bar at the side of the list is dragged, the pointer now at `y`.
     pub(super) fn thumb_drag_to(&mut self, y: i64) -> Vec<Action> {
         let list_h = self.list_h();
-        self.thumbs.scroll = thumbs::scroll_at_bar(y - self.px(TAB_H), list_h, self.thumbs.strip.total());
+        self.thumbs.scroll = thumbs::scroll_at_bar(y - self.tabs_h(), list_h, self.thumbs.strip.total());
         self.thumbs.clamp(list_h);
         // Nothing new is asked for while the bar is held, but the requests for the rows it left are taken back.
         self.schedule_thumbs();
@@ -334,62 +392,90 @@ impl App {
 
     // --- drawing -----------------------------------------------------------------------------------------------
 
-    pub(super) fn draw_sidebar(&self, p: &mut dyn Painter) {
-        if self.view_x <= 0 {
-            return;
-        }
-        let (width, tabs) = (self.list_w(), self.px(TAB_H));
-        if self.thumbs_shown() {
-            self.draw_thumbs(p, width, tabs);
-        } else if self.annots_shown() {
-            self.draw_annot_list(p, width, tabs);
-        }
-        // The tabs come last: a row scrolled up under them is hidden by them.
-        self.draw_tabs(p, width, tabs);
+    /// The control that chooses the list, as a place in the card (x from the card's left edge, y from the top of the pages' area).
+    fn seg_rect(&self) -> Rect {
+        let (pad, m) = (self.px(SEG_PAD), self.card_m());
+        rect(pad, m + pad, (self.card_w() - 2 * pad).max(0), self.px(SEG_H))
     }
 
-    fn draw_tabs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
-        p.fill_rect(rect(0, 0, width, tabs), self.pal.header_bg);
+    /// Draw the sidebar: a card (rounded, with a hairline round it) that holds the control that chooses the list and the list. While the sidebar slides in or
+    /// out the card is `side_dx` to the left of its place.
+    pub(super) fn draw_sidebar(&self, p: &mut dyn Painter) {
+        if self.side_x() <= 0 {
+            return;
+        }
+        let (m, width, tabs) = (self.card_m(), self.card_w(), self.tabs_h());
+        let dx = clamp32(m + self.side_dx());
+        let bg = if m > 0 { self.pal.surface } else { self.pal.list_bg };
+        let card = Rect { x: dx, y: clamp32(m), w: clamp32(width), h: clamp32((self.view_h - 2 * m).max(0)) };
+        let radius = clamp32(self.px(CARD_R));
+        if m > 0 {
+            p.fill_shape(card, [radius; 4], bg, 255);
+        }
+        {
+            let mut inner = tabbar::Shifted { inner: &mut *p, dx, dy: 0 };
+            let p = &mut inner;
+            if self.thumbs_shown() {
+                self.draw_thumbs(p, width, tabs, bg);
+            } else if self.annots_shown() {
+                self.draw_annot_list(p, width, tabs, bg);
+            }
+            // The header comes last: a row scrolled up under it is hidden by it.
+            p.fill_rect(rect(0, 0, width, tabs), bg);
+            self.draw_tabs(p);
+        }
+        if m > 0 {
+            // What the rows of the list put outside the card (at its foot and in its round corners) is taken back with the ground, in a ring of the room's width.
+            let ring = clamp32(m);
+            p.stroke_round(Rect { x: card.x - ring, y: card.y - ring, w: card.w + 2 * ring, h: card.h + 2 * ring }, radius + ring, ring, self.page_background(), 255);
+            p.stroke_round(card, radius, clamp32(self.px(1).max(1)), self.pal.hairline, 255);
+        }
+    }
+
+    /// The control that chooses the list: a track with the three names, the one shown on a tint of the accent.
+    fn draw_tabs(&self, p: &mut dyn Painter) {
+        let seg = self.seg_rect();
+        let (x, w) = (i64::from(seg.x), i64::from(seg.w));
+        p.fill_shape(seg, [clamp32(self.px(8)); 4], self.pal.field_bg, 255);
         let active = self.active_tab();
-        let (third, two_thirds) = (width / 3, width * 2 / 3);
-        for (tab, x0, x1, msg) in [(Tab::Bookmarks, 0, third, Msg::TabBookmarks), (Tab::Pages, third, two_thirds, Msg::TabPages), (Tab::Annots, two_thirds, width, Msg::TabAnnots)] {
+        let inset = self.px(2);
+        for (k, (tab, msg)) in [(Tab::Bookmarks, Msg::TabBookmarks), (Tab::Pages, Msg::TabPages), (Tab::Annots, Msg::TabAnnots)].into_iter().enumerate() {
+            let (x0, x1) = (x + w * k as i64 / 3, x + w * (k as i64 + 1) / 3);
             let on = tab == active;
             let enabled = tab != Tab::Bookmarks || !self.outline.is_empty();
             if on {
-                p.fill_rect(rect(x0, 0, x1 - x0, tabs), self.pal.tab_on_bg);
-                p.fill_rect(rect(x0, tabs - self.px(3), x1 - x0, self.px(3)), self.pal.accent);
+                p.fill_shape(rect(x0 + inset, i64::from(seg.y) + inset, x1 - x0 - 2 * inset, i64::from(seg.h) - 2 * inset), [clamp32(self.px(6)); 4], self.pal.accent_tint, 255);
             }
-            let s = t(self.lang, msg);
-            let w = i64::from(p.text_width(s));
-            let color = if !enabled { self.pal.disabled_fg } else if on { self.pal.selected_fg } else { self.pal.number_fg };
-            p.text(clamp32(x0 + (x1 - x0 - w) / 2), clamp32((tabs - i64::from(p.line_height())) / 2 - self.px(1)), s, color);
+            let s = fit(p, t(self.lang, msg), x1 - x0 - self.px(6));
+            let tw = i64::from(p.text_width(&s));
+            let color = if !enabled { self.pal.disabled_fg } else if on { self.pal.accent_on_tint } else { self.pal.dim_fg };
+            p.text(clamp32(x0 + (x1 - x0 - tw) / 2), seg.y + (seg.h - p.line_height()) / 2, &s, color);
         }
-        p.fill_rect(rect(0, tabs - self.px(1).max(1), width, self.px(1).max(1)), self.pal.header_edge);
-        p.fill_rect(rect(third, 0, self.px(1).max(1), tabs), self.pal.header_edge);
-        p.fill_rect(rect(two_thirds, 0, self.px(1).max(1), tabs), self.pal.header_edge);
     }
 
-    fn draw_thumbs(&self, p: &mut dyn Painter, width: i64, tabs: i64) {
+    fn draw_thumbs(&self, p: &mut dyn Painter, width: i64, tabs: i64, bg: Rgb) {
         let (strip, scroll, list_h) = (&self.thumbs.strip, self.thumbs.scroll, self.list_h());
-        p.fill_rect(rect(0, tabs, width, list_h), self.pal.list_bg);
+        p.fill_rect(rect(0, tabs, width, list_h), bg);
         let current = self.thumb_current();
         // (In a spread both pages of the row in view are the page in view.)
         let shown = self.doc.as_ref().map_or(current..current + 1, |d| d.layout.pages_in_row(current));
         let chosen = &self.pg.chosen;
-        let (above, inset, edge) = (self.px(THUMB_ABOVE), self.px(4), self.px(2));
-        let label_top = self.px(THUMB_GAP);
+        let (above, inset, edge) = (self.px(THUMB_ABOVE), self.px(6), self.px(2));
+        let (label_top, radius) = (self.px(THUMB_GAP), clamp32(self.px(8)));
         let label_h = self.px(THUMB_LABEL_H);
         for i in strip.rows_in(scroll, scroll + list_h) {
             let Some(row) = strip.row(i) else { continue };
             let top = tabs + row.top - scroll;
-            // The chosen rows are marked; with none chosen the page in view is (as it always was), and when others are chosen it has a frame.
+            // The chosen rows are tinted (with none chosen the page in view is), the page in view has a ring of the accent, and the row under the pointer a pale fill.
             let picked = chosen.contains(i) || (chosen.is_empty() && shown.contains(&i));
+            let frame = rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge);
             if picked {
-                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), self.pal.selected_border);
-                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), self.pal.selected_bg);
-            } else if shown.contains(&i) {
-                p.fill_rect(rect(inset, top + edge, width - 2 * inset, row.height - 2 * edge), self.pal.current_frame);
-                p.fill_rect(rect(inset + edge, top + 2 * edge, width - 2 * (inset + edge), row.height - 4 * edge), self.pal.list_bg);
+                p.fill_shape(frame, [radius; 4], self.pal.accent_tint, 255);
+            } else if self.side_hot == Some(i) {
+                p.fill_shape(frame, [radius; 4], self.pal.status_fg, self.pal.hover_alpha);
+            }
+            if shown.contains(&i) {
+                p.stroke_round(frame, radius, clamp32(edge), self.pal.accent, 255);
             }
             let (x, y) = ((width - row.img_w) / 2, top + above);
             p.fill_rect(rect(x - 1, y - 1, row.img_w + 2, row.img_h + 2), self.pal.thumb_border);
@@ -400,9 +486,13 @@ impl App {
                 None => p.fill_rect(rect(x, y, row.img_w, row.img_h), if self.thumbs.failed.contains(&(i as u32)) { self.pal.damaged } else { self.pal.placeholder }),
             }
             let number = (i + 1).to_string();
+            // The number of the page in view is in the accent (and bold).
+            let now = shown.contains(&i);
+            p.set_font(if now { Font::Bold } else { Font::Body });
             let w = i64::from(p.text_width(&number));
             let ty = y + row.img_h + label_top + (label_h - i64::from(p.line_height())) / 2;
-            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if picked { self.pal.selected_fg } else { self.pal.number_fg });
+            p.text(clamp32((width - w) / 2), clamp32(ty), &number, if now { self.pal.accent } else if picked { self.pal.accent_on_tint } else { self.pal.number_fg });
+            p.set_font(Font::Body);
         }
         self.draw_drop_mark(p, width, tabs);
         if let Some((bar_top, bar_len)) = thumbs::bar(scroll, list_h, strip.total()) {
@@ -559,6 +649,58 @@ pub(super) mod tests {
         let menus = app.menus();
         let view = menus.iter().find(|m| m.title.contains("View")).expect("a View menu");
         assert!(view.entries.iter().any(|e| matches!(e, crate::ui::MenuEntry::Item { id, checked: true, enabled: true, .. } if *id == CMD_BOOKMARKS)));
+    }
+
+    #[test]
+    fn the_thumbnail_the_pointer_is_over_has_the_pale_fill_the_page_in_view_a_ring_and_its_number_the_accent() {
+        let mut app = open_pages("hot", &letter(6), true);
+        pump(&mut app, "a picture", |a| a.thumbs.cache.get(1).is_some());
+        let row = app.thumbs.strip.row(1).copied().expect("a row");
+        let y = (app.tabs_h() + row.top + row.height / 2) as i32;
+        app.event(Event::Hover { x: 80, y });
+        assert_eq!(app.side_hot, Some(1));
+        let mut rec = Rec::default();
+        app.paint(&mut rec);
+        assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.status_fg), "the row under the pointer is filled");
+        // The page in view has its number in the accent; the others do not.
+        let mut hit = Rec::default();
+        app.paint(&mut hit);
+        assert_eq!(hit.texts.iter().filter(|(_, _, s)| s == "1").count(), 1);
+        // Out of the list, or out of the window, the fill goes.
+        app.event(Event::Hover { x: 600, y });
+        assert_eq!(app.side_hot, None);
+        app.event(Event::Hover { x: 80, y });
+        app.event(Event::HoverEnd);
+        assert_eq!(app.side_hot, None);
+    }
+
+    #[test]
+    fn the_sidebar_is_a_card_inside_the_window_8_pixels_from_the_edges_and_the_command_bar_and_presses_in_its_margins_are_nobodys() {
+        let mut app = open_pages("card", &letter(6), true);
+        app.set_bare(false);
+        app.event(Event::Size { w: 1200, h: 900 });
+        let m = app.px(CARD_M);
+        assert_eq!(app.card_m(), m);
+        // The card is as wide as the person made it, from the room at the left; the pages are laid out after the strip that is dragged.
+        assert_eq!((app.card_w(), app.list_w()), (app.px(app.sidebar_pref), app.px(app.sidebar_pref) + m));
+        assert_eq!(app.view_x, app.list_w() + app.px(SPLIT_GAP));
+        // The list begins under the header (the room above it, the control, the room under it), and ends the room short of the foot.
+        assert_eq!(app.tabs_h(), m + app.px(TAB_H));
+        assert_eq!(app.list_h(), app.view_h - app.tabs_h() - m);
+        // The tree of bookmarks is away while the thumbnails show.
+        assert!(app.chrome().iter().any(|a| matches!(a, Action::Sidebar(r) if r.w == 0)));
+        // A press in the room round the card does nothing (it is the window's); one on the control chooses a list.
+        let before = app.active_tab();
+        let bar = app.bar_h() as i32;
+        for (x, y) in [(2, 40), (40, 2)] {
+            assert!(app.event(Event::MouseDown { x, y: y + bar, ctrl: false, shift: false, clicks: 1 }).iter().all(|a| !matches!(a, Action::AskForm(_))));
+            app.event(Event::MouseUp { x, y: y + bar });
+            assert_eq!(app.active_tab(), before);
+        }
+        let seg_y = (m + app.px(TAB_H) / 2) as i32 + bar;
+        app.event(Event::MouseDown { x: (m + app.card_w() - 10) as i32, y: seg_y, ctrl: false, shift: false, clicks: 1 });
+        app.event(Event::MouseUp { x: (m + app.card_w() - 10) as i32, y: seg_y });
+        assert_eq!(app.active_tab(), Tab::Annots);
     }
 
     #[test]
@@ -784,9 +926,9 @@ pub(super) mod tests {
     fn the_thumbnails_are_a_fixed_size_centred_and_the_default_sidebar_just_fits_them() {
         let mut app = open_pages("fixed", &letter(30), true);
         pump(&mut app, "every picture wanted", |a| a.thumbs.asked.is_empty() && a.is_idle() && thumbs::wanted(&a.thumbs.strip, a.thumbs.scroll, a.list_h(), a.thumbs.cache.cap()).iter().all(|w| a.thumbs.fresh(w.page, 0)));
-        // Nothing was kept: the sidebar is as wide as a thumbnail with its margins and the bar needs (180 to 190 at 96 dpi).
+        // Nothing was kept: the sidebar is as wide as a thumbnail with its margins and the bar need, and the three names of the control above the list (228 to 238 at 96 dpi).
         assert_eq!(app.sidebar_pref, DEFAULT_WIDTH);
-        assert!((180..=190).contains(&DEFAULT_WIDTH), "{DEFAULT_WIDTH}");
+        assert!((228..=238).contains(&DEFAULT_WIDTH), "{DEFAULT_WIDTH}");
         assert_eq!(app.list_w(), app.px(DEFAULT_WIDTH));
         let row = app.thumbs.strip.row(0).copied().expect("a row");
         assert_eq!((row.img_w, row.img_h), (app.px(THUMB_W), app.px(THUMB_W) * 792 / 612));
@@ -928,8 +1070,8 @@ pub(super) mod tests {
         }
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.selected_bg), "the current row is highlighted");
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), 1);
+        // The current row is on the tint (as is the tab that is shown, which is the one other thing on it) and has a ring.
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.accent_tint).count(), 1 + 1);
         // The pictures are inside the list, centred, and the placeholders are lighter than the list.
         let width = app.list_w() as i32;
         assert!(rec.pictures.iter().any(|(r, ..)| r.x > 0 && r.x + r.w < width));

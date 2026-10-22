@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Draws the qingpdf program icon: the character 轻 in white on a rounded teal square (2026-10-21).
+"""Draws the qingpdf program icon: the character 轻 in white on a rounded teal square (2026-10-21, drawn again 2026-10-22).
 
     python tests/tools/make_icon.py            # writes crates/qingpdf-view-bin/qingpdf.ico
 
-The strokes are the ones of `crates/qingpdf-view/src/logo.rs` (read from that file, so the icon, the mark in the title strip and the one on
-the welcome page are the same drawing): a line through some points with round caps and joins, in a square of 100 units. Up to 24 pixels the
-simple build (`SMALL`) is used, as the window does. No libraries are needed (zlib and struct from the standard library). Each pixel is the
-average of a grid of points (smooth edges, no halo). Every size (16, 24, 32, 48 and 256) is a 32-bit PNG: Windows Vista and later read a PNG
-picture of any size in an icon, and a PNG of these flat colours is a tenth of the plain 32-bit picture (BMP) it replaces. Each PNG is coded
-with the filter that is smallest for it, zlib at its best level.
+What is drawn is what `crates/qingpdf-view/src/logo.rs` says (read from that file, so the icon, the mark in the title strip and the one on the welcome page are the
+same drawing). At 16, 24 and 32 pixels it is the bitmap made by hand there (`P16`, `P24`, `P32`: whole pixels, so that the bars and stems are sharp); at 48 and 256
+pixels it is the strokes (`FULL`): a line through some points with round caps and joins, in a square of 100 units. No libraries are needed (zlib and struct from the
+standard library). Each pixel of the square's edge (and of the strokes) is the average of a grid of points (smooth edges, no halo). Every size (16, 24, 32, 48 and
+256) is a 32-bit PNG: Windows Vista and later read a PNG picture of any size in an icon, and a PNG of these flat colours is a tenth of the plain 32-bit picture (BMP)
+it replaces. Each PNG is coded with the filter that is smallest for it, zlib at its best level.
 `crates/qingpdf-view-bin/build.rs` reads the .ico and puts the pictures into the program as resources.
 """
 import math
@@ -26,18 +26,20 @@ LOGO_RS = os.path.join(HERE, "..", "..", "crates", "qingpdf-view", "src", "logo.
 
 
 def read_logo():
-    """(radius, {"FULL": [(points, width)], "SMALL": [...]}) read from logo.rs."""
+    """(radius, strokes of FULL as [(points, width)], {size: rows of the bitmap}) read from logo.rs."""
     text = open(LOGO_RS, encoding="utf-8").read()
     radius = float(re.search(r"pub const RADIUS: f32 = ([0-9.]+);", text).group(1))
-    sets = {}
-    for name in ("FULL", "SMALL", "TINY"):
-        body = re.search(r"pub const " + name + r": &\[Stroke\] = &\[(.*?)\n\];", text, re.S).group(1)
-        strokes = []
-        for m in re.finditer(r"Stroke \{ pts: &\[(.*?)\], width: ([0-9.]+) \}", body):
-            pts = [(float(a), float(b)) for a, b in re.findall(r"\(([0-9.]+), ([0-9.]+)\)", m.group(1))]
-            strokes.append((pts, float(m.group(2))))
-        sets[name] = strokes
-    return radius, sets
+    body = re.search(r"pub const FULL: &\[Stroke\] = &\[(.*?)\n\];", text, re.S).group(1)
+    strokes = []
+    for m in re.finditer(r"Stroke \{ pts: &\[(.*?)\], width: ([0-9.]+) \}", body):
+        pts = [(float(a), float(b)) for a, b in re.findall(r"\(([0-9.]+), ([0-9.]+)\)", m.group(1))]
+        strokes.append((pts, float(m.group(2))))
+    bitmaps = {}
+    for size in (16, 24, 32):
+        rows = re.search(r"pub const P%d: &\[&str\] = &\[(.*?)\n\];" % size, text, re.S).group(1)
+        bitmaps[size] = re.findall(r'"([.#]+)"', rows)
+        assert len(bitmaps[size]) == size and all(len(r) == size for r in bitmaps[size]), size
+    return radius, strokes, bitmaps
 
 
 def segment_distance(px, py, a, b):
@@ -77,6 +79,27 @@ def draw(size, grid, radius, strokes):
     return rows
 
 
+def draw_bitmap(size, grid, radius, bitmap):
+    """Like `draw`, with the character from a bitmap (a pixel is all of it or none): the edge of the square is smooth, the character is not."""
+    rows = []
+    for py in range(size):
+        row = []
+        for px in range(size):
+            inside = 0
+            for sy in range(grid):
+                for sx in range(grid):
+                    x, y = (px + (sx + 0.5) / grid) * 100.0 / size, (py + (sy + 0.5) / grid) * 100.0 / size
+                    inside += in_square(x, y, radius)
+            if inside == 0:
+                row.append((0, 0, 0, 0))
+                continue
+            on = bitmap[py][px] == "#"
+            colour = MARK if on else TEAL
+            row.append(colour + (round(255 * inside / (grid * grid)),))
+        rows.append(row)
+    return rows
+
+
 def png_entry(rows):
     """The picture as a 32-bit PNG (8 bits per channel with alpha): the smallest of four ways to filter the rows (none, sub, up, and
     for each row the one whose bytes add up to the least, the PNG specification's suggestion), zlib at its best level."""
@@ -111,8 +134,11 @@ def png_entry(rows):
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "..", "crates", "qingpdf-view-bin", "qingpdf.ico")
-    radius, sets = read_logo()
-    images = [(size, png_entry(draw(size, grid, radius, sets["TINY" if size <= 16 else "SMALL" if size <= 24 else "FULL"]))) for size, grid in ((16, 12), (24, 10), (32, 8), (48, 8), (256, 4))]
+    radius, strokes, bitmaps = read_logo()
+    images = []
+    for size, grid in ((16, 12), (24, 10), (32, 8), (48, 8), (256, 4)):
+        rows = draw_bitmap(size, grid, radius, bitmaps[size]) if size in bitmaps else draw(size, grid, radius, strokes)
+        images.append((size, png_entry(rows)))
     data = struct.pack("<HHH", 0, 1, len(images))
     offset = 6 + 16 * len(images)
     for size, blob in images:

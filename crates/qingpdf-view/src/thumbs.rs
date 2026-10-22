@@ -507,16 +507,16 @@ pub fn bar(scroll: i64, view_h: i64, total: i64) -> Option<(i64, i64)> {
     if total <= view_h || view_h <= 0 {
         return None;
     }
-    let len = (view_h * view_h / total).clamp(24.min(view_h), view_h);
+    let len = crate::ui::clamp_to(view_h * view_h / total, 24.min(view_h), view_h);
     let top = scroll * (view_h - len) / (total - view_h);
-    Some((top.clamp(0, view_h - len), len))
+    Some((crate::ui::clamp_to(top, 0, view_h - len), len))
 }
 
 /// Where the list is scrolled to when the thumb of the bar is dragged to have its middle at `y` of the view.
 pub fn scroll_at_bar(y: i64, view_h: i64, total: i64) -> i64 {
     let Some((_, len)) = bar(0, view_h, total) else { return 0 };
     let room = (view_h - len).max(1);
-    ((y - len / 2).clamp(0, room) * (total - view_h) / room).clamp(0, (total - view_h).max(0))
+    crate::ui::clamp_to(crate::ui::clamp_to(y - len / 2, 0, room) * (total - view_h) / room, 0, (total - view_h).max(0))
 }
 
 // --- choosing thumbnails and moving them (2026-10-15) ------------------------------------------------------------------------------

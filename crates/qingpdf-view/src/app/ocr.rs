@@ -55,7 +55,7 @@ impl App {
 
     /// A message over the pages (what text recognition has got to; it is said again as the run goes on, and takes the place of the one showing).
     fn say_progress(&mut self, text: String) -> Vec<Action> {
-        self.say(text)
+        self.say_job(sticky::Job::Ocr, text)
     }
 
     /// Esc while text is being recognized: stop; the pages done so far get their text. `None`: nothing is running.
@@ -234,10 +234,10 @@ mod tests {
         assert!(app.menus().iter().any(|m| m.title == "&Tools"));
         app.ocr_test_opener = Some(fake(10_000, |_| Ok(one_line())));
         let started = app.event(Event::Command(CMD_OCR_ALL));
-        assert!(app.ocr.is_some() && started.iter().any(|a| matches!(a, Action::Invalidate)));
+        assert!(app.ocr.is_some() && started.iter().any(|a| matches!(a, Action::Invalidate | Action::InvalidateRect(_))));
         assert_eq!(app.note.as_deref(), Some("Looking for scanned pages... (Esc to stop)"));
         // While it runs the menu items are greyed, and a second start only says so.
-        assert!(app.start_ocr(false).iter().any(|a| matches!(a, Action::Invalidate)));
+        assert!(app.start_ocr(false).iter().any(|a| matches!(a, Action::Invalidate | Action::InvalidateRect(_))));
         assert_eq!(app.note.as_deref(), Some("Text is being recognized already (Esc stops it)."));
         let mut notes = Vec::new();
         pump(&mut app, "the run to end", |a| {

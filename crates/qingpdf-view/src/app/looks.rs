@@ -3,7 +3,7 @@
 //! `theme.rs`, the colours of a page `qingpdf_core::render::recolor`.
 
 use super::*;
-use crate::ui::ThemeSpec;
+use crate::ui::{Skin, ThemeSpec};
 
 impl App {
     /// How the pages are in rows now: what the person chose for this file; one to a row while the presentation is going on.
@@ -32,7 +32,8 @@ impl App {
     /// the text it draws is told the language, which decides the fonts).
     pub(super) fn theme_spec(&self) -> ThemeSpec {
         let p = &self.pal;
-        ThemeSpec { dark: self.dark, zh: self.lang == Lang::Zh, strip: p.strip_bg, text: p.status_fg, field_bg: p.field_bg, tree_bg: p.list_bg, tree_line: p.thumb_border }
+        let skin = Skin { surface: p.surface, text: p.status_fg, dim: p.dim_fg, off: p.disabled_fg, line: p.hairline, field: p.field_bg, accent: p.accent, accent_hover: p.accent_hover, tint: p.accent_tint, on_tint: p.accent_on_tint, on_accent: p.on_accent, hover: p.status_fg };
+        ThemeSpec { dark: self.dark, zh: self.lang == Lang::Zh, strip: p.strip_bg, text: p.status_fg, field_bg: p.field_bg, tree_bg: p.surface, tree_line: p.thumb_border, skin }
     }
 
     /// Take the colours that the choices and the system make now: a high-contrast theme's own, else light or dark with the accent (青, or the system's).
@@ -314,7 +315,8 @@ mod tests {
         assert!(app.thumbs_shown());
         let mut rec = Rec::default();
         app.paint(&mut rec);
-        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.selected_bg).count(), 2, "the two pages of the row are marked");
+        // (The tab that is shown is on the same tint.)
+        assert_eq!(rec.fills.iter().filter(|(_, c)| *c == app.pal.accent_tint).count(), 2 + 1, "the two pages of the row are marked");
     }
 
     /// What the page box says now.

@@ -84,9 +84,11 @@ impl App {
         let id = self.new_id();
         self.engine.print(self.doc_id, id, list);
         let name = self.path.as_ref().and_then(|p| p.file_name()).map_or_else(|| "qingpdf".to_string(), |n| n.to_string_lossy().into_owned());
-        self.note = Some(if self.rights.print_high_quality { i18n::printing(self.lang, 1, total) } else { t(self.lang, Msg::NotePrintLow).to_string() });
+        let first = if self.rights.print_high_quality { i18n::printing(self.lang, 1, total) } else { t(self.lang, Msg::NotePrintLow).to_string() };
         self.print = Some(PrintJob { id, setup, fits, total, bands: 0 });
-        vec![Action::Print(PrintOp::Start { name }), Action::Invalidate]
+        let mut actions = vec![Action::Print(PrintOp::Start { name }), Action::Invalidate];
+        actions.extend(self.say_job(sticky::Job::Print, first));
+        actions
     }
 
     /// A band is ready: put it on the page.
@@ -108,8 +110,8 @@ impl App {
         if last_band {
             actions.push(Action::Print(PrintOp::EndPage));
         }
-        self.note = Some(note);
         actions.push(Action::Invalidate);
+        actions.extend(self.say_job(sticky::Job::Print, note));
         actions
     }
 

@@ -55,7 +55,7 @@ impl App {
         if d.kind == Kind::Shapes {
             let Some((_, r)) = self.cmd_layout().buttons.iter().find(|(n, _)| *n == i).copied() else { return Vec::new() };
             let tool = self.tool_command();
-            let entries = cmdbar::SHAPES.iter().map(|&(id, m)| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: tool == id, enabled: true }).collect();
+            let entries = cmdbar::SHAPES.iter().map(|&(id, m)| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: tool == id, radio: true, enabled: true }).collect();
             // (In the coordinates of the pages' area: under the button.)
             let at = (r.x, clamp32(self.title_h() - self.bar_h()) + r.y + r.h);
             return vec![Action::ContextMenu { entries, at }];
@@ -117,8 +117,9 @@ impl App {
             if active {
                 p.fill_shape(r, [radius; 4], pal.accent_tint, 255);
             }
-            if enabled && (self.hot == Some(Hot::Cmd(*i)) || pressed) {
-                self.hover_fill(p, r, radius, pressed, 255);
+            let level = self.hover_level(Hot::Cmd(*i));
+            if enabled && level > 0 {
+                self.hover_fill(p, r, radius, pressed, level);
             }
             if d.kind == Kind::Shapes {
                 self.shape_icon(p, r, ink);
@@ -152,8 +153,9 @@ impl App {
         }
         let more = down(l.more);
         let more_pressed = self.pressed == Some(Hot::More) && self.hot == self.pressed;
-        if self.hot == Some(Hot::More) || more_pressed {
-            self.hover_fill(p, more, radius, more_pressed, 255);
+        let more_level = self.hover_level(Hot::More);
+        if more_level > 0 {
+            self.hover_fill(p, more, radius, more_pressed, more_level);
         }
         p.glyph(more, '\u{E712}', pal.status_fg);
     }

@@ -267,7 +267,7 @@ impl App {
         }
         self.bm.auto = None;
         if status != SaveStatus::Done {
-            return self.say(format!("{} {message}", t(self.lang, Msg::NoteEditFailed)));
+            return self.fail(format!("{} {message}", t(self.lang, Msg::NoteEditFailed)));
         }
         if items.is_empty() {
             return self.say(t(self.lang, Msg::NoteBmNoHeadings).to_string());
@@ -293,6 +293,11 @@ impl App {
         self.bm_send(found, Some(0))
     }
 
+    /// Is the search for the headings of the file going on?
+    pub(super) fn bm_searching(&self) -> bool {
+        self.bm.auto.is_some()
+    }
+
     /// Look for the headings of the file, to make its bookmarks of them (the person is asked first).
     pub(super) fn bm_auto(&mut self) -> Vec<Action> {
         if let Some(actions) = self.bm_not_now() {
@@ -304,7 +309,7 @@ impl App {
         let id = self.new_id();
         self.engine.headings(self.doc_id, id, None);
         self.bm.auto = Some(id);
-        self.say(t(self.lang, Msg::NoteBmSearching).to_string())
+        self.say_job(sticky::Job::Headings, t(self.lang, Msg::NoteBmSearching).to_string())
     }
 
     pub(super) fn bm_rename(&mut self) -> Vec<Action> {
@@ -376,10 +381,10 @@ impl App {
         let item = self.bm_item();
         let (deeper, shallower) = (item.is_some_and(|i| marks::can_indent(&self.outline, i)), item.is_some_and(|i| marks::can_outdent(&self.outline, i)));
         let plain = item.is_some_and(|i| self.outline.get(i).is_some_and(|x| !x.action));
-        let entry = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, enabled: allowed && enabled };
+        let entry = |id: u32, m: Msg, enabled: bool| MenuEntry::Item { id, label: t(self.lang, m).to_string(), checked: false, radio: false, enabled: allowed && enabled };
         let mut entries = Vec::new();
         if !allowed {
-            entries.push(MenuEntry::Item { id: 0, label: t(self.lang, Msg::NoteBmDenied).to_string(), checked: false, enabled: false });
+            entries.push(MenuEntry::Item { id: 0, label: t(self.lang, Msg::NoteBmDenied).to_string(), checked: false, radio: false, enabled: false });
             entries.push(MenuEntry::Separator);
         }
         entries.extend([

@@ -150,7 +150,7 @@ impl App {
         let id = self.new_id();
         self.engine.redact(self.doc_id, id, &path.to_string_lossy(), how);
         self.rd.running = Some((id, path));
-        Some(self.say(t(self.lang, Msg::RdWorking).to_string()))
+        Some(self.say_job(sticky::Job::Redact, t(self.lang, Msg::RdWorking).to_string()))
     }
 
     /// The engine has made the file (or not): the new file is opened.

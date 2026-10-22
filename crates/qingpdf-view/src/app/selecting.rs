@@ -323,7 +323,7 @@ impl App {
     pub(super) fn on_clipboard(&mut self, ok: bool) -> Vec<Action> {
         match self.copy_note.take() {
             Some(note) if ok => self.say(note),
-            _ if !ok => self.say(t(self.lang, Msg::NoteCopyFailed).to_string()),
+            _ if !ok => self.fail(t(self.lang, Msg::NoteCopyFailed).to_string()),
             _ => Vec::new(),
         }
     }

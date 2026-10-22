@@ -27,7 +27,7 @@ use crate::theme::Contrast;
 use qingpdf_core::bookmarks::Place;
 
 use crate::treedrop;
-use crate::ui::{Action, Cursor, Event, FieldBox, FieldExit, Font, FormAnswer, FormKind, FormSpec, Handler, Menu, MenuEntry, NcHit, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, SearchBox, ThemeSpec};
+use crate::ui::{Action, Cursor, Event, FieldBox, FieldExit, Font, FormAnswer, FormItem, FormKind, FormSpec, Handler, Menu, MenuEntry, NcHit, OutlineNode, Painter, PrintOp, PrinterPreset, PrinterSetup, Rect, Rgb, SaveChoice, SearchBox, Skin, ThemeSpec};
 use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
 
 // --- declarations ------------------------------------------------------------------------------------------------
@@ -374,6 +374,91 @@ struct DocInfo {
     kind: u32,
 }
 
+/// MEASUREITEMSTRUCT: what Windows asks of the owner of an item that is drawn by it (here, of a menu).
+#[repr(C)]
+struct MeasureItem {
+    kind: u32,
+    ctl_id: u32,
+    item_id: u32,
+    item_width: u32,
+    item_height: u32,
+    item_data: usize,
+}
+
+/// DRAWITEMSTRUCT.
+#[repr(C)]
+struct DrawItem {
+    kind: u32,
+    ctl_id: u32,
+    item_id: u32,
+    action: u32,
+    state: u32,
+    item: isize,
+    hdc: isize,
+    rc: WinRect,
+    item_data: usize,
+}
+
+/// MENUINFO.
+#[repr(C)]
+struct MenuInfo {
+    size: u32,
+    mask: u32,
+    style: u32,
+    cy_max: u32,
+    back: isize,
+    help_id: u32,
+    data: usize,
+}
+
+/// MENUITEMINFOW.
+#[repr(C)]
+struct MenuItemInfo {
+    size: u32,
+    mask: u32,
+    kind: u32,
+    state: u32,
+    id: u32,
+    sub_menu: isize,
+    checked: isize,
+    unchecked: isize,
+    data: usize,
+    type_data: *mut u16,
+    cch: u32,
+    item_bitmap: isize,
+}
+
+/// NMCUSTOMDRAW and NMTVCUSTOMDRAW: what the tree says before and after it draws, and for each item.
+#[repr(C)]
+struct NmCustomDraw {
+    hdr: NmHdr,
+    stage: u32,
+    hdc: isize,
+    rc: WinRect,
+    item_spec: usize,
+    item_state: u32,
+    item_param: isize,
+}
+
+#[repr(C)]
+struct NmTvCustomDraw {
+    nmcd: NmCustomDraw,
+    text: u32,
+    text_bk: u32,
+    level: i32,
+}
+
+/// APPBARDATA.
+#[repr(C)]
+struct AppBarData {
+    size: u32,
+    hwnd: isize,
+    callback: u32,
+    edge: u32,
+    rc: WinRect,
+    param: isize,
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn RegisterClassExW(class: *const WndClassExW) -> u16;
@@ -453,6 +538,17 @@ unsafe extern "system" {
     fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
     fn RedrawWindow(hwnd: isize, rect: *const WinRect, region: isize, flags: u32) -> i32;
     fn GetSysColor(index: i32) -> u32;
+    fn SetMenuInfo(menu: isize, info: *const MenuInfo) -> i32;
+    fn GetMenuItemInfoW(menu: isize, item: u32, by_position: i32, info: *mut MenuItemInfo) -> i32;
+    fn GetMenuItemCount(menu: isize) -> i32;
+    fn CreateMenu() -> isize;
+    fn SetMenu(hwnd: isize, menu: isize) -> i32;
+    fn DrawMenuBar(hwnd: isize) -> i32;
+    fn SetMenuItemInfoW(menu: isize, item: u32, by_position: i32, info: *const MenuItemInfo) -> i32;
+    fn GetDC(hwnd: isize) -> isize;
+    fn ReleaseDC(hwnd: isize, dc: isize) -> i32;
+    fn GetParent(hwnd: isize) -> isize;
+    fn IsWindowEnabled(hwnd: isize) -> i32;
 }
 
 #[link(name = "gdi32")]
@@ -483,6 +579,7 @@ unsafe extern "system" {
     fn GetClipBox(hdc: isize, rect: *mut WinRect) -> i32;
     fn GetTextFaceW(hdc: isize, count: i32, buffer: *mut u16) -> i32;
     fn SetBkColor(hdc: isize, color: u32) -> u32;
+    fn ExcludeClipRect(hdc: isize, left: i32, top: i32, right: i32, bottom: i32) -> i32;
 }
 
 #[link(name = "kernel32")]
@@ -519,6 +616,7 @@ unsafe extern "system" {
     fn ShellExecuteW(hwnd: isize, verb: *const u16, file: *const u16, params: *const u16, dir: *const u16, show: i32) -> isize;
     fn SHBrowseForFolderW(info: *mut BrowseInfo) -> *mut c_void;
     fn SHGetPathFromIDListW(list: *const c_void, path: *mut u16) -> i32;
+    fn SHAppBarMessage(message: u32, data: *mut AppBarData) -> usize;
 }
 
 #[link(name = "advapi32")]
@@ -561,8 +659,65 @@ unsafe extern "system" {
     fn InitCommonControlsEx(init: *const InitCommonControlsEx) -> i32;
 }
 
+#[link(name = "oleacc")]
+unsafe extern "system" {
+    /// The accessible object Windows makes for a window of a class it knows (the buttons of Windows, say): the name is the window's text, the state the one the
+    /// window answers to the messages of that class.
+    fn CreateStdAccessibleProxyW(hwnd: isize, class_name: *const u16, object_id: i32, riid: *const Guid, out: *mut *mut c_void) -> i32;
+    /// The answer to WM_GETOBJECT for an accessible object.
+    fn LresultFromObject(riid: *const Guid, wparam: usize, object: *mut c_void) -> isize;
+}
+
 // --- constants ---------------------------------------------------------------------------------------------------
 
+const CONTROL_CLASS: &str = "QingpdfCtl";
+const VK_SPACE_KEY: usize = 0x20;
+const BS_AUTORADIOBUTTON: u32 = 9;
+const BM_SETSTYLE: u32 = 0x00F4;
+const BM_CLICK: u32 = 0x00F5;
+const WM_KEYUP: u32 = 0x0101;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SETFOCUS: u32 = 0x0007;
+const WM_KILLFOCUS: u32 = 0x0008;
+const WM_ENABLE: u32 = 0x000A;
+const WM_GETDLGCODE: u32 = 0x0087;
+const DM_GETDEFID: u32 = 0x0400;
+const GWL_ID: i32 = -12;
+const WM_MEASUREITEM: u32 = 0x002C;
+const WM_DRAWITEM: u32 = 0x002B;
+const WM_MENUCHAR: u32 = 0x0120;
+const WM_CHAR: u32 = 0x0102;
+const MF_OWNERDRAW: u32 = 0x100;
+const MIM_BACKGROUND: u32 = 0x2;
+const MIM_APPLYTOSUBMENUS: u32 = 0x8000_0000;
+const MIIM_STATE: u32 = 0x1;
+const MIIM_DATA: u32 = 0x20;
+const MFS_HILITE: u32 = 0x80;
+const ODT_MENU: u32 = 1;
+const ODS_SELECTED: u32 = 0x1;
+const ODS_NOACCEL: u32 = 0x100;
+const MNC_EXECUTE: isize = 2;
+const MNC_SELECT: isize = 3;
+const NM_CUSTOMDRAW: u32 = -12i32 as u32;
+const CDDS_PREPAINT: u32 = 0x1;
+const CDDS_ITEMPREPAINT: u32 = 0x1_0001;
+const CDRF_DODEFAULT: isize = 0;
+const CDRF_SKIPDEFAULT: isize = 0x4;
+const CDRF_NOTIFYITEMDRAW: isize = 0x20;
+const CDIS_SELECTED: u32 = 0x1;
+const CDIS_HOT: u32 = 0x40;
+const CDIS_DROPHILITED: u32 = 0x1000;
+const TVM_SETINDENT: u32 = 0x1107;
+const TVM_SETITEMHEIGHT: u32 = 0x111B;
+const TVM_SETINSERTMARKCOLOR: u32 = 0x1118;
+const TVIF_STATE: u32 = 0x8;
+const TVS_FULLROWSELECT: u32 = 0x1000;
+const TVS_NONEVENHEIGHT: u32 = 0x4000;
+const TVS_NOHSCROLL: u32 = 0x8000;
+const TVS_TRACKSELECT: u32 = 0x200;
+const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
+const SPI_SETCLIENTAREAANIMATION: usize = 0x1043;
+const ABM_GETAUTOHIDEBAREX: u32 = 0xB;
 const WM_SIZE: u32 = 0x0005;
 const WM_PAINT: u32 = 0x000F;
 const WM_CLOSE: u32 = 0x0010;
@@ -613,11 +768,27 @@ const SRCCOPY: u32 = 0x00CC_0020;
 const COLORONCOLOR: i32 = 3;
 const TRANSPARENT: i32 = 1;
 const GWLP_USERDATA: i32 = -21;
-const MF_STRING: u32 = 0;
 const MF_SEPARATOR: u32 = 0x800;
 const MF_POPUP: u32 = 0x10;
-const MF_CHECKED: u32 = 0x8;
 const MF_GRAYED: u32 = 0x1;
+const MF_STRING: u32 = 0;
+const MF_CHECKED: u32 = 0x8;
+const MFT_RADIOCHECK: u32 = 0x200;
+const MIIM_FTYPE: u32 = 0x100;
+const MFS_CHECKED: u32 = 0x8;
+const WM_ENTERMENULOOP: u32 = 0x0211;
+const WM_EXITMENULOOP: u32 = 0x0212;
+const WM_GETOBJECT: u32 = 0x003D;
+const OBJID_CLIENT: i32 = -4;
+const SPI_GETSCREENREADER: u32 = 0x0046;
+const SPI_SETSCREENREADER: usize = 0x0047;
+const CBS_DROPDOWN: u32 = 2;
+const CBS_DROPDOWNLIST: u32 = 3;
+const CBS_AUTOHSCROLL: u32 = 0x40;
+const CB_SETEDITSEL: u32 = 0x0142;
+const CB_ADDSTRING: u32 = 0x0143;
+const CB_GETCURSEL: u32 = 0x0147;
+const CB_SETCURSEL: u32 = 0x014E;
 const MB_OK: u32 = 0;
 const MB_ICONINFORMATION: u32 = 0x40;
 const MB_ICONERROR: u32 = 0x10;
@@ -632,13 +803,6 @@ const ES_WANTRETURN: u32 = 0x1000;
 const BS_PUSHBUTTON: u32 = 0;
 const BS_DEFPUSHBUTTON: u32 = 1;
 const BS_AUTOCHECKBOX: u32 = 3;
-const BS_GROUPBOX: u32 = 7;
-const CBS_DROPDOWN: u32 = 2;
-const CBS_DROPDOWNLIST: u32 = 3;
-const CBS_AUTOHSCROLL: u32 = 0x40;
-const CB_ADDSTRING: u32 = 0x0143;
-const CB_GETCURSEL: u32 = 0x0147;
-const CB_SETCURSEL: u32 = 0x014E;
 const BM_GETCHECK: u32 = 0x00F0;
 const BM_SETCHECK: u32 = 0x00F1;
 const IDOK: usize = 1;
@@ -996,6 +1160,13 @@ fn set_text(hwnd: isize, text: &str) {
     unsafe { SetWindowTextW(hwnd, w.as_ptr()) };
 }
 
+/// Mark a part of the client area (`r`, in pixels from its top left corner) as out of date.
+fn invalidate_rect(hwnd: isize, r: Rect) {
+    let rc = WinRect { left: r.x, top: r.y, right: r.x.saturating_add(r.w), bottom: r.y.saturating_add(r.h) };
+    // SAFETY: `rc` is a live RECT that Windows reads and does not keep.
+    unsafe { InvalidateRect(hwnd, &rc, 0) };
+}
+
 fn invalidate(hwnd: isize) {
     // SAFETY: a null rectangle means the whole client area; nothing is kept by Windows.
     unsafe { InvalidateRect(hwnd, null(), 0) };
@@ -1072,6 +1243,18 @@ struct WindowState {
     /// The window is full screen, and what it was before (put back exactly when it is not).
     fullscreen: Cell<bool>,
     full_saved: RefCell<Option<FullSaved>>,
+    /// The items of the menu that is up, as they are drawn (the data of an item is its place in this list, plus one), and the letter pressed with Alt that chose
+    /// the menu (it is taken by the menu once it is up).
+    menu_items: RefCell<Vec<crate::menustyle::Entry>>,
+    menu_letter: Cell<Option<char>>,
+    /// A screen reader is running (Windows says so): the window has the system's own frame and a classic menu bar, its menus are the system's, and its boxes are made
+    /// of the system's controls. The menu bar the window has then (0: none), whether a menu of it is being used, and whether the menus changed meanwhile.
+    reader: Cell<bool>,
+    bar: Cell<isize>,
+    in_menu: Cell<bool>,
+    bar_stale: Cell<bool>,
+    /// The face the text is drawn in (the boxes make a heavier font of it for their headings).
+    face: Cell<&'static str>,
 }
 
 /// A window as it was before full screen: its place and its style.
@@ -1144,6 +1327,7 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
         let hwnd = state.hwnd.get();
         match action {
             Action::Invalidate => invalidate(hwnd),
+            Action::InvalidateRect(r) => invalidate_rect(hwnd, r),
             Action::SetTitle(t) => set_text(hwnd, &t),
             Action::SetTimer { id, ms } => {
                 // SAFETY: a null timer procedure means the timer posts WM_TIMER to the window; plain numbers only.
@@ -1178,11 +1362,11 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
                 queue.extend(deliver(state, Event::SaveChoice { tag, choice }));
             }
             Action::AskText { tag, title, prompt, secret, initial, ok, cancel } => {
-                let text = input_dialog(hwnd, state.dpi.get(), state.font.get(), &title, &prompt, secret, &initial, &ok, &cancel);
+                let text = input_dialog(state, hwnd, &title, &prompt, secret, &initial, &ok, &cancel);
                 queue.extend(deliver(state, Event::Text { tag, text }));
             }
             Action::AskForm(spec) => {
-                let answer = form_dialog(hwnd, state.dpi.get(), state.font.get(), &spec);
+                let answer = form_dialog(state, hwnd, &spec);
                 queue.extend(deliver(state, Event::Form { tag: spec.tag, answer }));
             }
             Action::Message { title, text } => {
@@ -1202,9 +1386,7 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
             Action::Outline { nodes, select } => fill_tree(state, &nodes, select),
             Action::OutlineRename(index) => start_rename(state, index),
             Action::Sidebar(r) => {
-                // (The tree stands a few pixels in from the window's edge, where the window is sized.)
-                let inset = if r.w > 0 { scale(state.dpi.get(), 4) } else { 0 };
-                place_child(state.tree.get(), Rect { x: r.x + inset, w: r.w - inset, ..r });
+                place_child(state.tree.get(), r);
             }
             Action::Find(rect) => show_find(state, hwnd, rect),
             Action::FieldEdit(Some(b)) => show_field(state, hwnd, b),
@@ -1217,21 +1399,14 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
                 }
             }
             Action::Choose { items, selected, at } => {
-                let chosen = choose(hwnd, &items, selected, at);
+                let chosen = choose(state, hwnd, &items, selected, at);
                 queue.extend(deliver(state, Event::Chosen(chosen)));
             }
             Action::ContextMenu { entries, at } => {
-                let menu = build_popup(&entries);
+                state.menu_items.borrow_mut().clear();
+                let menu = build_popup(state, &entries);
                 if menu != 0 {
-                    let mut p = Point { x: at.0, y: at.1 };
-                    // SAFETY: `p` is a live POINT turned into screen coordinates; the menu belongs to this window and is destroyed after
-                    // use; TPM_RETURNCMD answers with the item's command (0 if the menu was dismissed) instead of posting a message.
-                    let chosen = unsafe {
-                        ClientToScreen(hwnd, &mut p);
-                        let chosen = TrackPopupMenu(menu, TPM_RETURNCMD_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd, null());
-                        DestroyMenu(menu);
-                        chosen
-                    };
+                    let chosen = track_popup(state, hwnd, menu, TPM_RETURNCMD_NONOTIFY | TPM_RIGHTBUTTON, at, None, false);
                     if let Ok(cmd) = u32::try_from(chosen)
                         && cmd > 0
                     {
@@ -1337,9 +1512,24 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             }
         }
         // Alt or F10 alone: the menus, for the keyboard (Alt+Space is the system menu and is left to the system).
-        WM_SYSCOMMAND if wparam & 0xFFF0 == SC_KEYMENU && lparam != isize::from(b' ') => {
+        WM_SYSCOMMAND if wparam & 0xFFF0 == SC_KEYMENU && lparam != isize::from(b' ') && !state.reader.get() => {
+            // (With Alt and a letter, `lparam` is the letter: the menu it belongs to is opened.)
+            state.menu_letter.set(u32::try_from(lparam).ok().filter(|&c| c > 0).and_then(char::from_u32));
             dispatch(state, Event::MenuKey);
             return 0;
+        }
+        WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR => {
+            if let Some(answer) = menu_message(state, msg, wparam, lparam) {
+                return answer;
+            }
+        }
+        // A menu is in use: the menu bar of a screen reader's window is not changed under it (a change that came meanwhile is made when the menu is let go).
+        WM_ENTERMENULOOP => state.in_menu.set(true),
+        WM_EXITMENULOOP => {
+            state.in_menu.set(false);
+            if state.bar_stale.get() {
+                sync_menu_bar(state);
+            }
         }
         WM_ERASEBKGND => {
             // The pages are drawn over their area in one go, with no erasing first (that would flicker). What a child window asks this
@@ -1572,6 +1762,19 @@ unsafe extern "system" fn wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam:
             // The high-contrast setting changed.
             if wparam == SPI_SETHIGHCONTRAST {
                 refresh_contrast(state);
+            }
+            // A screen reader came or went (the setting is looked at again whatever was changed: asking is cheap).
+            if wparam == SPI_SETSCREENREADER || wparam == 0 {
+                refresh_reader(state);
+            }
+            if wparam == SPI_SETCLIENTAREAANIMATION {
+                dispatch(state, Event::Motion(animations_on()));
+            }
+            // The task bar was set to hide itself or not (the work area changed): a maximized window works out its edge again.
+            // SAFETY: plain handle of this window; reads whether it is maximized.
+            if wparam == 0x2F && unsafe { IsZoomed(hwnd) } != 0 {
+                // SAFETY: plain numbers and the handle of this window; its frame is calculated again.
+                unsafe { SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED) };
             }
             // "ImmersiveColorSet" is what the system says when Windows was set to light or dark apps (or another accent); anything else it says is not for the reader.
             if lparam != 0 {
@@ -1845,10 +2048,12 @@ fn tree_hit(tree: isize, pt: Point) -> TvHitTest {
 fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) -> isize {
     let tree = state.tree.get();
     match hdr.code {
+        NM_CUSTOMDRAW => return tree_custom_draw(state, tree, lparam),
         NM_CLICK => {
             let hit = tree_hit(tree, message_point(tree));
+            // (The whole row is the item: a click to the right of the title is on it too.)
             if hit.item != 0
-                && hit.flags & TVHT_ON_ITEM != 0
+                && hit.flags & (TVHT_ON_ITEM | 0x20) != 0
                 && let Some(index) = tree_param(tree, hit.item)
             {
                 dispatch(state, Event::OutlineClick(index));
@@ -1948,6 +2153,64 @@ fn tree_notified(state: &WindowState, hwnd: isize, hdr: &NmHdr, lparam: isize) -
         _ => {}
     }
     0
+}
+
+/// The place of an item of the tree (its title, or all of its row), or none when it is not in view.
+fn item_rect(tree: isize, item: isize, text_only: bool) -> Option<WinRect> {
+    // The tree takes the handle where the rectangle will be.
+    let h = item as u64;
+    let mut r = WinRect { left: h as i32, top: (h >> 32) as i32, right: 0, bottom: 0 };
+    // SAFETY: TVM_GETITEMRECT takes a pointer to a RECT that holds the handle (the size of two numbers) and is rewritten with the rectangle.
+    (unsafe { SendMessageW(tree, TVM_GETITEMRECT, usize::from(text_only), (&raw mut r) as isize) } != 0).then_some(r)
+}
+
+/// NM_CUSTOMDRAW of the tree: each row is drawn by the reader (`treestyle`), over the whole width of the tree.
+fn tree_custom_draw(state: &WindowState, tree: isize, lparam: isize) -> isize {
+    // SAFETY: for NM_CUSTOMDRAW of a tree, lparam points to an NMTVCUSTOMDRAW that is valid for the duration of this message; it is only read.
+    let Some(nm) = (unsafe { (lparam as *const NmTvCustomDraw).as_ref() }) else { return CDRF_DODEFAULT };
+    match nm.nmcd.stage {
+        CDDS_PREPAINT => CDRF_NOTIFYITEMDRAW,
+        CDDS_ITEMPREPAINT => {
+            let item = nm.nmcd.item_spec as isize;
+            let mut text = [0u16; 512];
+            let mut info = tv_item(TVIF_TEXT | TVIF_STATE | TVIF_HANDLE, text.as_mut_ptr(), 0);
+            (info.item, info.state_mask, info.text_max) = (item, TVIS_EXPANDED as u32, text.len() as i32);
+            // SAFETY: TVM_GETITEMW takes a pointer to a live TVITEMW whose text pointer has the room it says; the tree fills in what the mask names and keeps nothing.
+            let got = unsafe { SendMessageW(tree, TVM_GETITEMW, 0, (&raw mut info) as isize) } != 0;
+            let (Some(label), true) = (item_rect(tree, item, true), got) else { return CDRF_DODEFAULT };
+            let mut client = WinRect::default();
+            // SAFETY: `client` is a live RECT that Windows fills in.
+            unsafe { GetClientRect(tree, &mut client) };
+            let row = WinRect { left: 0, top: label.top, right: client.right, bottom: label.bottom };
+            let len = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+            let drawn = crate::treestyle::Row {
+                text: String::from_utf16_lossy(text.get(..len).unwrap_or(&[])),
+                // SAFETY: a plain message to the tree with a handle it gave (0 is no child).
+                has_children: unsafe { SendMessageW(tree, TVM_GETNEXTITEM, TVGN_CHILD, item) } != 0,
+                open: info.state & TVIS_EXPANDED as u32 != 0,
+                chosen: nm.nmcd.item_state & CDIS_SELECTED != 0,
+                hot: nm.nmcd.item_state & CDIS_HOT != 0,
+                drop: nm.nmcd.item_state & CDIS_DROPHILITED != 0,
+            };
+            let (skin, dpi) = (skin_of(state), state.dpi.get());
+            paint_on_dc(fonts_of(state), nm.nmcd.hdc, row, |g| crate::treestyle::paint(g, Rect { x: 0, y: 0, w: row.right - row.left, h: row.bottom - row.top }, label.left, &drawn, &skin, dpi));
+            CDRF_SKIPDEFAULT
+        }
+        _ => CDRF_DODEFAULT,
+    }
+}
+
+/// The tree takes the size of a row and of a level the reader draws, in the screen's dots per inch.
+fn style_tree(state: &WindowState) {
+    let (tree, dpi) = (state.tree.get(), state.dpi.get());
+    if tree == 0 {
+        return;
+    }
+    // SAFETY: plain messages to the tree: the height of a row and the width of a level.
+    unsafe {
+        SendMessageW(tree, TVM_SETITEMHEIGHT, scale(dpi, crate::treestyle::ROW_H) as usize, 0);
+        SendMessageW(tree, TVM_SETINDENT, scale(dpi, crate::treestyle::INDENT) as usize, 0);
+    }
 }
 
 /// Mark where a dragged item would land (or take the marks away): a line before or after an item, or the item itself lit for "inside".
@@ -2138,6 +2401,7 @@ fn fill_tree(state: &WindowState, nodes: &[OutlineNode], select: Option<usize>) 
 
 fn new_dpi(state: &WindowState, dpi: u32) {
     state.dpi.set(dpi);
+    style_tree(state);
     rebuild_fonts(state);
     set_icons(state.hwnd.get(), dpi);
     apply_frame(state);
@@ -2190,6 +2454,7 @@ fn rebuild_fonts(state: &WindowState) {
         return;
     }
     let text_face = if state.zh.get() { first_face(dc, &["Microsoft YaHei UI", "Segoe UI"]) } else { first_face(dc, &["Segoe UI Variable Text", "Segoe UI"]) };
+    state.face.set(text_face);
     let icon_face = cmdbar::pick_icon_font(has_font(dc, cmdbar::FLUENT));
     // SAFETY: the device context made above, not used again.
     unsafe { DeleteDC(dc) };
@@ -2248,7 +2513,7 @@ fn round_path(r: Rect, radii: [i32; 4]) -> Option<Path> {
     }
     let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
     let most = w.min(h) / 2.0;
-    let [tl, tr, br, bl] = radii.map(|v| (v as f32).clamp(0.0, most));
+    let [tl, tr, br, bl] = radii.map(|v| (v as f32).max(0.0).min(most.max(0.0)));
     let mut pb = PathBuilder::new();
     pb.move_to(x + tl, y);
     pb.line_to(x + w - tr, y);
@@ -2320,7 +2585,7 @@ impl Gdi {
     /// Make the strip's colour transparent over the first `rows` rows, and every other pixel there opaque (the window shows what is behind it, Mica, where it
     /// has that colour).
     fn key_out(&mut self, key: Rgb, rows: i32) {
-        let (w, rows) = (self.w as usize, rows.clamp(0, self.h) as usize);
+        let (w, rows) = (self.w as usize, crate::ui::clamp_to(rows, 0, self.h) as usize);
         let want = [key as u8, (key >> 8) as u8, (key >> 16) as u8];
         let Some(buf) = self.pixels() else { return };
         for px in buf.as_chunks_mut::<4>().0.iter_mut().take(w * rows) {
@@ -2391,7 +2656,7 @@ impl Painter for Gdi {
             return;
         }
         let needed = (src_w as usize).saturating_mul(src_h as usize).saturating_mul(4);
-        if bgra.len() < needed {
+        if bgra.len() < needed || (self.bits != 0 && self.clip(dest).is_none()) {
             return;
         }
         let header = BitmapInfoHeader {
@@ -2418,6 +2683,10 @@ impl Painter for Gdi {
     }
 
     fn text(&mut self, x: i32, y: i32, s: &str, color: Rgb) {
+        // (A line that is wholly above, below or to the right of the picture is not drawn: a part of the window is drawn on a picture of its own.)
+        if self.bits != 0 && (x >= self.w || y >= self.h || y.saturating_add(self.line_height()) <= 0) {
+            return;
+        }
         let w: Vec<u16> = s.encode_utf16().collect();
         self.pending = true;
         // SAFETY: `w` outlives the call and its length is passed; `self.dc` is the valid memory DC.
@@ -2429,11 +2698,7 @@ impl Painter for Gdi {
     }
 
     fn text_width(&mut self, s: &str) -> i32 {
-        let w: Vec<u16> = s.encode_utf16().collect();
-        let mut size = Size { cx: 0, cy: 0 };
-        // SAFETY: `w` outlives the call and its length is passed; `size` is a live SIZE that is filled in.
-        unsafe { GetTextExtentPoint32W(self.dc, w.as_ptr(), w.len() as i32, &mut size) };
-        size.cx
+        text_extent(self.dc, s)
     }
 
     fn line_height(&self) -> i32 {
@@ -2469,7 +2734,7 @@ impl Painter for Gdi {
         if w <= 0.0 || h <= 0.0 {
             return;
         }
-        let rad = (radius as f32 - half).clamp(0.0, w.min(h) / 2.0);
+        let rad = (radius as f32 - half).max(0.0).min((w.min(h) / 2.0).max(0.0));
         let mut pb = PathBuilder::new();
         pb.move_to(x + rad, y);
         pb.line_to(x + w - rad, y);
@@ -2503,21 +2768,88 @@ impl Painter for Gdi {
     }
 }
 
+/// The fonts of the window: the text, the same in bold, the big one and the one of the pictures.
+fn fonts_of(state: &WindowState) -> [isize; 4] {
+    [state.font.get(), state.fonts[0].get(), state.fonts[1].get(), state.fonts[2].get()]
+}
+
+/// A painter over the memory device context `dc`, whose bitmap is a section of `w` by `h` pixels at `bits`, with the height of a line of each font found.
+fn measured(dc: isize, bits: usize, w: i32, h: i32, fonts: [isize; 4]) -> Gdi {
+    let mut gdi = Gdi { dc, bits, w, h, fonts, lines: [16; 4], font: 0, pending: false };
+    for (i, &f) in fonts.iter().enumerate() {
+        if f != 0 {
+            // SAFETY: the memory DC and a font of the window.
+            unsafe { SelectObject(dc, f) };
+            if let Some(line) = gdi.lines.get_mut(i) {
+                *line = line_height(dc);
+            }
+        }
+    }
+    gdi.set_font(Font::Body);
+    gdi
+}
+
+/// Draw something with a painter on a picture of its own (`r` big) and put that on `dc` where `r` is: the shapes with smooth edges need pixels of their own to
+/// be drawn in, which a window's device context does not give.
+fn paint_on_dc(fonts: [isize; 4], dc: isize, r: WinRect, draw: impl FnOnce(&mut Gdi)) {
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let info = BitmapInfoHeader { size: std::mem::size_of::<BitmapInfoHeader>() as u32, width: w, height: -h, planes: 1, bit_count: 32, compression: 0, size_image: 0, x_pels: 0, y_pels: 0, clr_used: 0, clr_important: 0 };
+    let mut bits: *mut c_void = null_mut();
+    // SAFETY: `dc` is a valid device context; `info` is a live header of a 32-bit top-down picture; `bits` is a live pointer Windows fills with the address of the
+    // picture's memory, which lives until the bitmap is deleted below; handles are checked before use.
+    let (mem, bitmap) = unsafe {
+        let mem = CreateCompatibleDC(dc);
+        (mem, if mem != 0 { CreateDIBSection(dc, &info, 0, &mut bits, 0, 0) } else { 0 })
+    };
+    if bitmap != 0 && !bits.is_null() {
+        // SAFETY: the bitmap is made for `mem` and selected in it; the old one is put back before they are let go.
+        let old = unsafe { SelectObject(mem, bitmap) };
+        let mut gdi = measured(mem, bits as usize, w, h, fonts);
+        draw(&mut gdi);
+        gdi.finish();
+        // SAFETY: both device contexts are valid and the memory one holds a bitmap of w by h pixels.
+        unsafe {
+            BitBlt(dc, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+        }
+    }
+    // SAFETY: handles made above (or 0, which is checked), deleted once, the bitmap after the device context that held it.
+    unsafe {
+        if bitmap != 0 {
+            DeleteObject(bitmap);
+        }
+        if mem != 0 {
+            DeleteDC(mem);
+        }
+    }
+}
+
 fn paint(state: &WindowState, hwnd: isize) {
     let mut ps = PaintStruct { hdc: 0, erase: 0, paint: WinRect::default(), restore: 0, inc_update: 0, reserved: [0; 32] };
     // SAFETY: `ps` is a live PAINTSTRUCT; BeginPaint and EndPaint are paired below on every path.
     let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
     if hdc != 0 {
-        paint_to(state, hdc);
+        paint_to(state, hdc, Some(ps.paint));
     }
     // SAFETY: pairs the BeginPaint above with the same window and the same PAINTSTRUCT.
     unsafe { EndPaint(hwnd, &ps) };
 }
 
-/// Draw the reader on the back buffer (the whole client area) and put that on the window's device context `hdc`.
-fn paint_to(state: &WindowState, hdc: isize) {
+/// Draw the reader on the back buffer (the whole client area) and put that on the window's device context `hdc`. When only a small part of the window is out of
+/// date (`dirty`: a message fading, a scroll bar going), only that part is drawn, on a picture of its own: the pages and the rest are not drawn again.
+fn paint_to(state: &WindowState, hdc: isize, dirty: Option<WinRect>) {
     let (w, h) = client_size(state.hwnd.get());
     if w <= 0 || h <= 0 {
+        return;
+    }
+    let keyed = if state.mica.get() && state.custom.get() && !state.fullscreen.get() { scale(state.dpi.get(), crate::tabs::TITLE_H as i32) } else { 0 };
+    if let Some(d) = dirty
+        && let Some((left, top, right, bottom)) = crate::anim::part_to_paint((d.left, d.top, d.right, d.bottom), (w, h), keyed)
+    {
+        paint_part(state, hdc, WinRect { left, top, right, bottom });
         return;
     }
     let Ok(mut back) = state.back.try_borrow_mut() else { return };
@@ -2527,18 +2859,7 @@ fn paint_to(state: &WindowState, hdc: isize) {
     if back.dc == 0 || back.bitmap == 0 || back.bits == 0 {
         return;
     }
-    let fonts = [state.font.get(), state.fonts[0].get(), state.fonts[1].get(), state.fonts[2].get()];
-    let mut gdi = Gdi { dc: back.dc, bits: back.bits, w, h, fonts, lines: [16; 4], font: 0, pending: false };
-    for (i, &f) in fonts.iter().enumerate() {
-        if f != 0 {
-            // SAFETY: the memory DC of the back buffer and a font of the window.
-            unsafe { SelectObject(back.dc, f) };
-            if let Some(line) = gdi.lines.get_mut(i) {
-                *line = line_height(back.dc);
-            }
-        }
-    }
-    gdi.set_font(Font::Body);
+    let mut gdi = measured(back.dc, back.bits, w, h, fonts_of(state));
     let mut present = true;
     if let Ok(mut guard) = state.handler.try_borrow_mut()
         && let Some(handler) = guard.as_mut()
@@ -2554,6 +2875,15 @@ fn paint_to(state: &WindowState, hdc: isize) {
         // SAFETY: both DCs are valid and the memory DC holds a bitmap of w by h pixels.
         unsafe { BitBlt(hdc, 0, 0, w, h, back.dc, 0, 0, SRCCOPY) };
     }
+}
+
+/// Draw the part `r` of the window on a picture of its own and put that on `hdc`.
+fn paint_part(state: &WindowState, hdc: isize, r: WinRect) {
+    let Ok(mut guard) = state.handler.try_borrow_mut() else { return };
+    let Some(handler) = guard.as_mut() else { return };
+    paint_on_dc(fonts_of(state), hdc, r, |gdi| {
+        handler.paint_part(gdi, r.left, r.top);
+    });
 }
 
 /// Make the back buffer `w` by `h` (and its device context the first time): a section of 32-bit pixels, top row first, that is drawn in directly.
@@ -2675,6 +3005,8 @@ fn folder_dialog(owner: isize, title: &str) -> Option<PathBuf> {
     got.then(|| PathBuf::from(OsString::from_wide(path.get(..len).unwrap_or(&[])))).filter(|p| !p.as_os_str().is_empty())
 }
 
+/// What a box (a form box, a box with a line of text) holds while it is open: how it ends, the colours it is drawn in, the edit boxes (each stands in a frame that the
+/// box draws, which turns to the accent while the keyboard is in it) and the sketch of a page that a form box may have.
 struct DialogState {
     done: Cell<bool>,
     accepted: Cell<bool>,
@@ -2682,10 +3014,64 @@ struct DialogState {
     pressed: Cell<usize>,
     /// The sketch of a page a form box draws, if it has one.
     sketch: RefCell<Option<Sketch>>,
+    skin: Skin,
+    dark: bool,
+    dpi: u32,
+    /// The fonts of the window (the text, bold, big, pictures), and the brushes of the ground of the box and of the boxes typed in.
+    fonts: [isize; 4],
+    ground: isize,
+    field: isize,
+    /// The edit boxes with the frames they stand in (in pixels of the box), and the one that has the keyboard.
+    edits: RefCell<Vec<(isize, WinRect)>>,
+    focus: Cell<isize>,
+    /// The lists that drop down: the control that opens each, its entries, the one chosen, and the edit box it goes with (0: none, it is the list itself).
+    lists: RefCell<Vec<DropList>>,
 }
 
-/// What a form box draws as a sketch of a page: where, the shape of the page, the controls that hold the six places and the tick box that
-/// mirrors them, what the fields stand for, and the font and line height to draw with.
+struct DropList {
+    control: isize,
+    items: Vec<String>,
+    selected: usize,
+    edit: isize,
+}
+
+impl DialogState {
+    fn new(state: &WindowState) -> DialogState {
+        let mut skin = skin_of(state);
+        let dark = state.theme.get().is_some_and(|t| t.dark);
+        // The boxes that are typed in are white in a light box (not the pale grey the search box of the command bar has).
+        if !dark {
+            skin.field = 0xFFFFFF;
+        }
+        DialogState {
+            done: Cell::new(false),
+            accepted: Cell::new(false),
+            pressed: Cell::new(0),
+            sketch: RefCell::new(None),
+            skin,
+            dark,
+            dpi: state.dpi.get(),
+            fonts: fonts_of(state),
+            ground: brush_of(skin.surface),
+            field: brush_of(skin.field),
+            edits: RefCell::new(Vec::new()),
+            focus: Cell::new(0),
+            lists: RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl Drop for DialogState {
+    fn drop(&mut self) {
+        for brush in [self.ground, self.field].into_iter().filter(|&b| b != 0) {
+            // SAFETY: a brush made by `brush_of` for this box, deleted once, when the box is gone.
+            unsafe { DeleteObject(brush) };
+        }
+    }
+}
+
+/// What a form box draws as a sketch of a page: where, the shape of the page, the controls that hold the six places and the tick box that mirrors them, and what
+/// the fields stand for.
 struct Sketch {
     rect: Rect,
     shape: (i32, i32),
@@ -2693,42 +3079,52 @@ struct Sketch {
     mirror: isize,
     fields: [String; 4],
     left_page: bool,
-    font: isize,
-    line: i32,
 }
 
 /// Draw the sketch (a white page with the text of the six places on it, each as typed with its fields filled in).
-fn paint_sketch(hwnd: isize, sketch: &Sketch) {
+fn paint_sketch(g: &mut Gdi, sketch: &Sketch) {
+    let (r, (pw, ph)) = (sketch.rect, sketch.shape);
+    // The page: as big as fits, in the middle, with a grey edge.
+    let (w, h) = if r.w * ph <= r.h * pw { (r.w, r.w * ph / pw.max(1)) } else { (r.h * pw / ph.max(1), r.h) };
+    let page = Rect { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h };
+    g.fill_rect(page, 0x808080);
+    g.fill_rect(Rect { x: page.x + 1, y: page.y + 1, w: page.w - 2, h: page.h - 2 }, 0xFFFFFF);
+    // The six lines. (The left and the right ones change sides on a left-hand page when that is asked.)
+    // SAFETY: a plain query message to the tick box, which is alive while the box is.
+    let mirrored = sketch.left_page && unsafe { SendMessageW(sketch.mirror, BM_GETCHECK, 0, 0) } == 1;
+    let (f, line) = (&sketch.fields, g.line_height());
+    for i in 0..6 {
+        let at = if mirrored && i % 3 != 1 { i / 3 * 3 + 2 - i % 3 } else { i };
+        let text = window_text(sketch.slots.get(at).copied().unwrap_or(0), 400).replace("{page}", &f[0]).replace("{pages}", &f[1]).replace("{date}", &f[2]).replace("{file}", &f[3]);
+        let tw = g.text_width(&text);
+        let x = match i % 3 {
+            0 => page.x + 6,
+            1 => page.x + (page.w - tw) / 2,
+            _ => page.x + page.w - 6 - tw,
+        };
+        g.text(x, if i < 3 { page.y + 6 } else { page.y + page.h - 6 - line }, &text, 0x303030);
+    }
+}
+
+/// Draw the box: its ground, the frames of its edit boxes and the sketch.
+fn paint_dialog(hwnd: isize, st: &DialogState) {
     let mut ps = PaintStruct { hdc: 0, erase: 0, paint: WinRect::default(), restore: 0, inc_update: 0, reserved: [0; 32] };
     // SAFETY: `ps` is a live PAINTSTRUCT; BeginPaint and EndPaint are paired below on every path.
     let dc = unsafe { BeginPaint(hwnd, &mut ps) };
     if dc != 0 {
-        // SAFETY: selects the dialog's font into the paint DC (and back below); plain handles.
-        let old = unsafe { SelectObject(dc, sketch.font) };
-        let mut g = Gdi { dc, bits: 0, w: 0, h: 0, fonts: [0; 4], lines: [sketch.line; 4], font: 0, pending: false };
-        let (r, (pw, ph)) = (sketch.rect, sketch.shape);
-        // The page: as big as fits, in the middle, with a grey edge.
-        let (w, h) = if r.w * ph <= r.h * pw { (r.w, r.w * ph / pw.max(1)) } else { (r.h * pw / ph.max(1), r.h) };
-        let page = Rect { x: r.x + (r.w - w) / 2, y: r.y + (r.h - h) / 2, w, h };
-        g.fill_rect(page, 0x808080);
-        g.fill_rect(Rect { x: page.x + 1, y: page.y + 1, w: page.w - 2, h: page.h - 2 }, 0xFFFFFF);
-        // The six lines. (The left and the right ones change sides on a left-hand page when that is asked.)
-        // SAFETY: a plain query message to the tick box, which is alive while the box is.
-        let mirrored = sketch.left_page && unsafe { SendMessageW(sketch.mirror, BM_GETCHECK, 0, 0) } == 1;
-        let f = &sketch.fields;
-        for i in 0..6 {
-            let at = if mirrored && i % 3 != 1 { i / 3 * 3 + 2 - i % 3 } else { i };
-            let text = window_text(sketch.slots.get(at).copied().unwrap_or(0), 400).replace("{page}", &f[0]).replace("{pages}", &f[1]).replace("{date}", &f[2]).replace("{file}", &f[3]);
-            let tw = g.text_width(&text);
-            let x = match i % 3 {
-                0 => page.x + 6,
-                1 => page.x + (page.w - tw) / 2,
-                _ => page.x + page.w - 6 - tw,
-            };
-            g.text(x, if i < 3 { page.y + 6 } else { page.y + page.h - 6 - sketch.line }, &text, 0x303030);
-        }
-        // SAFETY: puts the DC's font back.
-        unsafe { SelectObject(dc, old) };
+        let mut r = WinRect::default();
+        // SAFETY: `r` is a live RECT that Windows fills in.
+        unsafe { GetClientRect(hwnd, &mut r) };
+        let (skin, dpi, focus) = (st.skin, st.dpi, st.focus.get());
+        paint_on_dc(st.fonts, dc, r, |g| {
+            g.fill_rect(Rect { x: 0, y: 0, w: r.right, h: r.bottom }, skin.surface);
+            for (edit, f) in st.edits.borrow().iter() {
+                crate::dlgstyle::paint_edit_frame(g, Rect { x: f.left, y: f.top, w: f.right - f.left, h: f.bottom - f.top }, *edit == focus, &skin, dpi);
+            }
+            if let Some(sketch) = st.sketch.borrow().as_ref() {
+                paint_sketch(g, sketch);
+            }
+        });
     }
     // SAFETY: pairs the BeginPaint above with the same window and the same PAINTSTRUCT.
     unsafe { EndPaint(hwnd, &ps) };
@@ -2745,10 +3141,34 @@ unsafe extern "system" fn dialog_proc(hwnd: isize, msg: u32, wparam: usize, lpar
     let state = unsafe { (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const DialogState).as_ref() };
     if let Some(state) = state {
         match msg {
-            WM_PAINT if state.sketch.borrow().is_some() => {
-                if let Some(sketch) = state.sketch.borrow().as_ref() {
-                    paint_sketch(hwnd, sketch);
+            WM_ERASEBKGND => return 1,
+            WM_PAINT => {
+                paint_dialog(hwnd, state);
+                return 0;
+            }
+            // The menu of a list that drops down is drawn by the reader, for the window that owns the box.
+            WM_MEASUREITEM | WM_DRAWITEM | WM_MENUCHAR => {
+                // SAFETY: plain handle; the owner of the box is the main window.
+                if let Some(answer) = state_of(unsafe { GetParent(hwnd) }).and_then(|main| menu_message(main, msg, wparam, lparam)) {
+                    return answer;
                 }
+            }
+            // The words and the boxes typed in are in the colours of the box.
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+                let field = msg != WM_CTLCOLORSTATIC;
+                // SAFETY: `wparam` is the device context of the control, valid for this message; plain colours.
+                unsafe {
+                    SetTextColor(wparam as isize, colorref(state.skin.text));
+                    SetBkColor(wparam as isize, colorref(if field { state.skin.field } else { state.skin.surface }));
+                }
+                return if field { state.field } else { state.ground };
+            }
+            // Enter is OK (the button the box answers with).
+            DM_GETDEFID => return (0x534B << 16) | IDOK as isize,
+            // The keyboard went into an edit box or left it: its frame is drawn in the accent, or not.
+            WM_COMMAND if matches!(hiword(wparam), EN_SETFOCUS | EN_KILLFOCUS) && lparam != 0 => {
+                state.focus.set(if hiword(wparam) == EN_SETFOCUS { lparam } else { 0 });
+                invalidate(hwnd);
                 return 0;
             }
             // Something in a form box was typed in or changed: the sketch is drawn again.
@@ -2781,6 +3201,294 @@ unsafe extern "system" fn dialog_proc(hwnd: isize, msg: u32, wparam: usize, lpar
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+// The state of a button or tick box of a box, in the user-data slot of its window.
+const CTL_CHECKED: isize = 1;
+const CTL_HOVER: isize = 2;
+const CTL_PRESSED: isize = 4;
+const CTL_TRACKING: isize = 8;
+const CTL_OPEN: isize = 16;
+/// The kinds of control that are not buttons of Windows: a list that drops down, and the arrow of one that goes with an edit box (the low bits of the style).
+const DROP_PICK: u32 = 0xA;
+const DROP_ARROW: u32 = 0xB;
+
+/// The state of the box a control of it is in, if it is in one that is up.
+fn dialog_of<'a>(control: isize) -> Option<&'a DialogState> {
+    // SAFETY: the parent's user-data slot holds 0 or the pointer to the `DialogState` on the stack of the box's caller, which outlives the box (see `dialog_proc`); a
+    // control is only used on that thread, while the box is up.
+    unsafe { (GetWindowLongPtrW(GetParent(control), GWLP_USERDATA) as *const DialogState).as_ref() }
+}
+
+/// What kind of control it is: the low bits of its style.
+fn ctl_style(control: isize) -> u32 {
+    // SAFETY: reads the style of a window of ours.
+    unsafe { GetWindowLongPtrW(control, GWL_STYLE) as u32 & 0xF }
+}
+
+fn ctl_flags(control: isize) -> isize {
+    // SAFETY: reads the user-data slot of a window of ours.
+    unsafe { GetWindowLongPtrW(control, GWLP_USERDATA) }
+}
+
+/// Set or clear a bit of the state of a control and draw it again.
+fn ctl_set(control: isize, bit: isize, on: bool) {
+    let flags = ctl_flags(control);
+    // SAFETY: writes the user-data slot of a window of ours, and has it drawn again.
+    unsafe { SetWindowLongPtrW(control, GWLP_USERDATA, if on { flags | bit } else { flags & !bit }) };
+    invalidate(control);
+}
+
+/// Open the list of a list that drops down (as a menu under it); what is chosen is put in the control, or in the edit box the control goes with, and the box is told.
+fn drop_list(control: isize) {
+    let Some(d) = dialog_of(control) else { return };
+    // SAFETY: plain handles: the box the control is in, and the main window that owns the box.
+    let (dialog, owner) = unsafe {
+        let dialog = GetParent(control);
+        (dialog, GetParent(dialog))
+    };
+    let Some(main) = state_of(owner) else { return };
+    let (items, selected, edit) = {
+        let lists = d.lists.borrow();
+        let Some(l) = lists.iter().find(|l| l.control == control) else { return };
+        (l.items.clone(), Some(l.selected).filter(|&s| s < l.items.len()), l.edit)
+    };
+    let (mut r, mut e) = (WinRect::default(), WinRect::default());
+    // SAFETY: `r` and `e` are live RECTs that Windows fills in (the box of the text a list goes with stands inside the frame the list opens under).
+    unsafe {
+        GetWindowRect(control, &mut r);
+        GetWindowRect(if edit != 0 { edit } else { control }, &mut e);
+    }
+    let mut at = Point { x: if edit != 0 { e.left - scale(d.dpi, crate::dlgstyle::EDIT_PAD + 1) } else { r.left }, y: r.bottom };
+    // SAFETY: `at` is a live POINT turned from screen coordinates into the box's in place.
+    unsafe { ScreenToClient(dialog, &mut at) };
+    ctl_set(control, CTL_OPEN, true);
+    let chosen = choose(main, dialog, &items, selected, (at.x, at.y));
+    ctl_set(control, CTL_OPEN, false);
+    let Some(i) = chosen else { return };
+    let edit = {
+        let mut lists = d.lists.borrow_mut();
+        let Some(l) = lists.iter_mut().find(|l| l.control == control) else { return };
+        l.selected = i;
+        l.edit
+    };
+    if edit != 0 {
+        let text = wide(items.get(i).map_or("", String::as_str));
+        // SAFETY: sets the text of an edit box of ours from a zero-terminated string that outlives the call (the box is told it changed).
+        unsafe { SetWindowTextW(edit, text.as_ptr()) };
+    }
+    invalidate(control);
+    notify_choice(control);
+}
+
+/// The box is told that the choice of a list that drops down changed (the way a combo box tells it: the id and, in the high word, 1).
+fn notify_choice(control: isize) {
+    // SAFETY: plain reads and a message to the box the control is in, with the id and the handle of the control.
+    unsafe { SendMessageW(GetParent(control), WM_COMMAND, (GetWindowLongPtrW(control, GWL_ID) as usize & 0xFFFF) | (1 << 16), control) };
+}
+
+/// A key pressed in a list that drops down, or in the box of a list that goes with one (`window` is what has the keyboard): the list it opens or moves.
+/// `true` when the key was the list's (and is not given on).
+fn list_key_pressed(state: &DialogState, window: isize, vk: u32, alt: bool) -> bool {
+    let found = state.lists.borrow().iter().find(|l| l.control == window || l.edit == window).map(|l| (l.control, l.edit == 0));
+    let Some((control, own)) = found else { return false };
+    let Some(key) = crate::dlgstyle::list_key(vk, alt, own) else { return false };
+    if key == crate::dlgstyle::ListKey::Open {
+        drop_list(control);
+        return true;
+    }
+    {
+        let mut lists = state.lists.borrow_mut();
+        let Some(l) = lists.iter_mut().find(|l| l.control == control) else { return true };
+        let Some(now) = crate::dlgstyle::step(Some(l.selected).filter(|&s| s < l.items.len()), l.items.len(), key) else { return true };
+        l.selected = now;
+    }
+    invalidate(control);
+    notify_choice(control);
+    true
+}
+
+/// The control was pressed and let go: a tick box turns over, a list opens, and the box is told (the way a button of Windows does).
+fn ctl_click(control: isize) {
+    // SAFETY: reads the style of a window of ours.
+    let kind = unsafe { GetWindowLongPtrW(control, GWL_STYLE) } as u32 & 0xF;
+    if kind == DROP_PICK || kind == DROP_ARROW {
+        drop_list(control);
+        return;
+    }
+    if kind == BS_AUTOCHECKBOX {
+        ctl_set(control, CTL_CHECKED, ctl_flags(control) & CTL_CHECKED == 0);
+    } else if kind == BS_AUTORADIOBUTTON {
+        ctl_set(control, CTL_CHECKED, true);
+    }
+    // SAFETY: plain reads and a message to the box with the id and the handle of the control (BN_CLICKED is 0, the high word).
+    unsafe {
+        let id = GetWindowLongPtrW(control, GWL_ID);
+        SendMessageW(GetParent(control), WM_COMMAND, id as usize & 0xFFFF, control);
+    }
+}
+
+/// Draw a button or tick box of a box, in the colours of the box.
+fn ctl_paint(control: isize) {
+    let mut ps = PaintStruct { hdc: 0, erase: 0, paint: WinRect::default(), restore: 0, inc_update: 0, reserved: [0; 32] };
+    // SAFETY: `ps` is a live PAINTSTRUCT; BeginPaint and EndPaint are paired below on every path.
+    let dc = unsafe { BeginPaint(control, &mut ps) };
+    if dc != 0
+        && let Some(d) = dialog_of(control)
+    {
+        let mut r = WinRect::default();
+        let flags = ctl_flags(control);
+        // SAFETY: `r` is a live RECT that Windows fills in; the others read a window of ours.
+        let (style, focus, enabled) = unsafe {
+            GetClientRect(control, &mut r);
+            (GetWindowLongPtrW(control, GWL_STYLE) as u32 & 0xF, GetFocus() == control, IsWindowEnabled(control) != 0)
+        };
+        let text = match style {
+            DROP_PICK => d.lists.borrow().iter().find(|l| l.control == control).and_then(|l| l.items.get(l.selected).cloned()).unwrap_or_default(),
+            _ => window_text(control, 200),
+        };
+        let st = crate::dlgstyle::State { hover: flags & CTL_HOVER != 0, pressed: flags & (CTL_PRESSED | CTL_OPEN) != 0, focus, checked: flags & CTL_CHECKED != 0, enabled };
+        let (skin, dpi, area) = (d.skin, d.dpi, Rect { x: 0, y: 0, w: r.right, h: r.bottom });
+        paint_on_dc(d.fonts, dc, r, |g| match style {
+            DROP_PICK => crate::dlgstyle::paint_dropdown(g, area, &text, st, &skin, dpi),
+            DROP_ARROW => crate::dlgstyle::paint_arrow(g, area, st, &skin, dpi),
+            BS_AUTOCHECKBOX => crate::dlgstyle::paint_check(g, area, &text, false, st, &skin, dpi),
+            BS_AUTORADIOBUTTON => crate::dlgstyle::paint_check(g, area, &text, true, st, &skin, dpi),
+            kind => crate::dlgstyle::paint_button(g, area, &text, kind == BS_DEFPUSHBUTTON, st, &skin, dpi),
+        });
+    }
+    // SAFETY: pairs the BeginPaint above with the same window and the same PAINTSTRUCT.
+    unsafe { EndPaint(control, &ps) };
+}
+
+/// The accessible object of a control the reader draws (a screen reader asks with WM_GETOBJECT): the one Windows makes for a button, whose name is the control's
+/// text and whose state is what the control answers to BM_GETCHECK. A list that drops down has the entry it shows for its text.
+fn std_accessible(control: isize, wparam: usize) -> Option<isize> {
+    if ctl_style(control) == DROP_PICK {
+        let shown = dialog_of(control).and_then(|d| d.lists.borrow().iter().find(|l| l.control == control).and_then(|l| l.items.get(l.selected).cloned()));
+        if let Some(text) = shown {
+            let w = wide(&text);
+            // SAFETY: sets the text of a control of ours from a zero-terminated string that outlives the call.
+            unsafe { SetWindowTextW(control, w.as_ptr()) };
+        }
+    }
+    let class = wide("Button");
+    let mut out: *mut c_void = null_mut();
+    // SAFETY: `class` is a zero-terminated UTF-16 string that outlives the call; `out` is a live pointer written once; the control is ours.
+    let hr = unsafe { CreateStdAccessibleProxyW(control, class.as_ptr(), OBJID_CLIENT, &IID_IACCESSIBLE, &mut out) };
+    if hr < 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so `out` is one reference to an interface, which `Obj` gives back (releases) when it is dropped.
+    let object = unsafe { Obj::new(out) }.ok()?;
+    // SAFETY: the interface is live; LresultFromObject takes a reference of its own for the client that asked.
+    Some(unsafe { LresultFromObject(&IID_IACCESSIBLE, wparam, object.0) })
+}
+
+/// The window procedure of the buttons and tick boxes of a box, which the reader draws (`dlgstyle`): they answer what a button of Windows is asked (checked or not,
+/// clicked), so that the box does not have to know the difference.
+unsafe extern "system" fn ctl_proc(control: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    match msg {
+        WM_PAINT => {
+            ctl_paint(control);
+            return 0;
+        }
+        WM_GETOBJECT if lparam as i32 == OBJID_CLIENT => {
+            if let Some(answer) = std_accessible(control, wparam) {
+                return answer;
+            }
+        }
+        WM_ERASEBKGND => return 1,
+        WM_GETDLGCODE => {
+            // SAFETY: reads the style of a window of ours.
+            let kind = unsafe { GetWindowLongPtrW(control, GWL_STYLE) } as u32 & 0xF;
+            return match kind {
+                // A list that drops down has the arrow keys (to go to the next entry or the one before).
+                DROP_PICK => 1,
+                DROP_ARROW => 0,
+                BS_DEFPUSHBUTTON => 0x2010,
+                BS_PUSHBUTTON => 0x2020,
+                BS_AUTORADIOBUTTON => 0x2040,
+                _ => 0x2000,
+            };
+        }
+        WM_MOUSEMOVE => {
+            if ctl_flags(control) & CTL_TRACKING == 0 {
+                let mut track = TrackMouse { size: std::mem::size_of::<TrackMouse>() as u32, flags: TME_LEAVE, hwnd: control, hover_time: 0 };
+                // SAFETY: `track` is a live TRACKMOUSEEVENT of the size it declares; the window is ours.
+                unsafe { TrackMouseEvent(&mut track) };
+                ctl_set(control, CTL_TRACKING | CTL_HOVER, true);
+            }
+            return 0;
+        }
+        WM_MOUSELEAVE => {
+            ctl_set(control, CTL_TRACKING | CTL_HOVER, false);
+            return 0;
+        }
+        WM_LBUTTONDOWN => {
+            // SAFETY: plain handle of a window of ours; the pointer is captured so that the button comes up here.
+            unsafe {
+                SetFocus(control);
+                SetCapture(control);
+            }
+            ctl_set(control, CTL_PRESSED, true);
+            return 0;
+        }
+        WM_LBUTTONUP => {
+            if ctl_flags(control) & CTL_PRESSED != 0 {
+                // SAFETY: gives the pointer back; plain handle.
+                unsafe { ReleaseCapture() };
+                ctl_set(control, CTL_PRESSED, false);
+                let mut r = WinRect::default();
+                // SAFETY: `r` is a live RECT that Windows fills in.
+                unsafe { GetClientRect(control, &mut r) };
+                let (x, y) = mouse_place(lparam);
+                if x >= 0 && y >= 0 && x < r.right && y < r.bottom {
+                    ctl_click(control);
+                }
+            }
+            return 0;
+        }
+        WM_CAPTURECHANGED => {
+            ctl_set(control, CTL_PRESSED, false);
+            return 0;
+        }
+        // A list that drops down: F4, Alt and an arrow, and the space bar open it, the arrows go to the entry before and after (`dlgstyle::list_key`); Alt and an arrow
+        // come as WM_SYSKEYDOWN.
+        WM_KEYDOWN | WM_SYSKEYDOWN if ctl_style(control) == DROP_PICK => {
+            if dialog_of(control).is_some_and(|d| list_key_pressed(d, control, wparam as u32, msg == WM_SYSKEYDOWN)) {
+                return 0;
+            }
+        }
+        WM_KEYDOWN if wparam == VK_SPACE_KEY => {
+            ctl_set(control, CTL_PRESSED, true);
+            return 0;
+        }
+        WM_KEYUP if wparam == VK_SPACE_KEY => {
+            if ctl_flags(control) & CTL_PRESSED != 0 {
+                ctl_set(control, CTL_PRESSED, false);
+                ctl_click(control);
+            }
+            return 0;
+        }
+        WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+            invalidate(control);
+        }
+        BM_GETCHECK => return isize::from(ctl_flags(control) & CTL_CHECKED != 0),
+        BM_SETCHECK => {
+            ctl_set(control, CTL_CHECKED, wparam == 1);
+            return 0;
+        }
+        BM_CLICK => {
+            ctl_click(control);
+            return 0;
+        }
+        // (The one that is the answer stays the one filled with the accent: the keyboard being on another button does not change that.)
+        BM_SETSTYLE => return 0,
+        _ => {}
+    }
+    // SAFETY: the default procedure takes the same arguments as this one.
+    unsafe { DefWindowProcW(control, msg, wparam, lparam) }
+}
+
 /// A box of its own over `owner`, whose inside is `w` by `h` units of a 96th of an inch: its window and the module. `state` is what the
 /// box's procedure reads; the caller keeps it alive until it has called `end_modal`.
 fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &DialogState) -> Option<(isize, isize)> {
@@ -2798,15 +3506,20 @@ fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &
         icon: load_icon(instance, dpi, false),
         // SAFETY: a small integer resource id in the pointer slot is how LoadCursorW names a stock cursor.
         cursor: unsafe { LoadCursorW(0, IDC_ARROW as *const u16) },
-        background: 16, // COLOR_BTNFACE + 1: the same grey as the labels and buttons on it
+        background: 0,
         menu_name: null(),
         class_name: class.as_ptr(),
         icon_small: load_icon(instance, dpi, true),
     };
     // SAFETY: `wc` is a live WNDCLASSEXW whose strings outlive the call; registering twice fails harmlessly.
     unsafe { RegisterClassExW(&wc) };
+    // The buttons and tick boxes of a box are a class of their own, which the reader draws.
+    let ctl_class = wide(CONTROL_CLASS);
+    let cc = WndClassExW { wnd_proc: Some(ctl_proc), cursor: wc.cursor, background: 0, class_name: ctl_class.as_ptr(), icon: 0, icon_small: 0, ..wc };
+    // SAFETY: as above.
+    unsafe { RegisterClassExW(&cc) };
 
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
     let mut frame = WinRect { left: 0, top: 0, right: s(w), bottom: s(h) };
     // SAFETY: `frame` is a live RECT that is rewritten in place.
     unsafe { AdjustWindowRectExForDpi(&mut frame, style, 0, WS_EX_DLGMODALFRAME, dpi) };
@@ -2835,6 +3548,10 @@ fn make_dialog(owner: isize, dpi: u32, title: &str, (w, h): (i32, i32), state: &
     // SAFETY: stores the address of `state` for `dialog_proc`; the caller keeps `state` alive until after the window is destroyed
     // (`end_modal`, which clears the slot), and the slot is only read on this thread.
     unsafe { SetWindowLongPtrW(dialog, GWLP_USERDATA, std::ptr::from_ref(state) as isize) };
+    let dark = i32::from(state.dark);
+    // SAFETY: DwmSetWindowAttribute takes this window, the number of an attribute and a pointer to a 4-byte BOOL that lives through the call; a system that does not
+    // know the attribute answers with an error, which does not matter.
+    unsafe { DwmSetWindowAttribute(dialog, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const dark).cast(), 4) };
     Some((dialog, instance))
 }
 
@@ -2847,14 +3564,13 @@ fn client_units(dialog: isize, dpi: u32) -> i32 {
     if ok && r.bottom > 0 { r.bottom * 96 / dpi.max(1) as i32 } else { i32::MAX }
 }
 
-/// A control inside a box made by `make_dialog`, at `(x, y, w, h)` units of a 96th of an inch, in the font of the program; 0 if it was not made.
+/// A control inside a box made by `make_dialog`, at `(x, y, w, h)` pixels, in `font`; 0 if it was not made.
 #[allow(clippy::too_many_arguments)]
-fn dialog_child(dialog: isize, instance: isize, dpi: u32, font: isize, class: &str, text: &str, style: u32, ex: u32, (x, y, w, h): (i32, i32, i32, i32), id: usize) -> isize {
-    let s = |v: i32| v * dpi as i32 / 96;
+fn dialog_child(dialog: isize, instance: isize, font: isize, class: &str, text: &str, style: u32, (x, y, w, h): (i32, i32, i32, i32), id: usize) -> isize {
     let (c, t) = (wide(class), wide(text));
     // SAFETY: the strings are zero-terminated UTF-16 that outlive the call; `dialog` is the parent window; the
     // control id goes in the menu slot as Windows defines for child windows. 0 means failure and is checked.
-    let child = unsafe { CreateWindowExW(ex, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, s(x), s(y), s(w), s(h), dialog, id as isize, instance, null_mut()) };
+    let child = unsafe { CreateWindowExW(0, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, x, y, w, h, dialog, id as isize, instance, null_mut()) };
     if child != 0 && font != 0 {
         // SAFETY: WM_SETFONT takes a font handle, which `font` is, and a redraw flag.
         unsafe { SendMessageW(child, WM_SETFONT, font as usize, 1) };
@@ -2884,6 +3600,10 @@ fn modal_loop(owner: isize, dialog: isize, state: &DialogState, focus: isize) {
             }
             break;
         }
+        // F4 and Alt and an arrow in the box of a list that goes with it (or in a list) open the list; the box itself does nothing with them.
+        if matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN) && list_key_pressed(state, msg.hwnd, msg.wparam as u32, msg.message == WM_SYSKEYDOWN) {
+            continue;
+        }
         // SAFETY: `msg` was filled in by GetMessageW; IsDialogMessageW handles Tab, Enter and Escape for the box.
         unsafe {
             if IsDialogMessageW(dialog, &mut msg) == 0 {
@@ -2908,33 +3628,10 @@ fn end_modal(owner: isize, dialog: isize) {
 
 /// A box with a line of text to fill in. Modal: it handles messages itself until it is closed.
 #[allow(clippy::too_many_arguments)]
-fn input_dialog(owner: isize, dpi: u32, font: isize, title: &str, prompt: &str, secret: bool, initial: &str, ok: &str, cancel: &str) -> Option<String> {
-    let state = DialogState { done: Cell::new(false), accepted: Cell::new(false), pressed: Cell::new(0), sketch: RefCell::new(None) };
-    let (dialog, instance) = make_dialog(owner, dpi, title, (380, 138), &state)?;
-    let child = |class: &str, text: &str, style: u32, ex: u32, at: (i32, i32, i32, i32), id: usize| dialog_child(dialog, instance, dpi, font, class, text, style, ex, at, id);
-    child("STATIC", prompt, 0, 0, (16, 14, 348, 20), 100);
-    let edit = child("EDIT", initial, WS_TABSTOP | ES_AUTOHSCROLL | if secret { ES_PASSWORD } else { 0 }, WS_EX_CLIENTEDGE, (16, 38, 348, 24), 101);
-    child("BUTTON", ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (176, 88, 90, 28), IDOK);
-    child("BUTTON", cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (274, 88, 90, 28), IDCANCEL);
-    modal_loop(owner, dialog, &state, edit);
-    let text = if state.accepted.get() && edit != 0 {
-        let mut buf = text_units(edit);
-        let text = String::from_utf16_lossy(&buf);
-        // The typed characters are overwritten (they may be a password).
-        buf.fill(0);
-        std::hint::black_box(&buf);
-        Some(text)
-    } else {
-        None
-    };
-    // SAFETY: clears the box's text before it goes (the edit control is alive).
-    unsafe {
-        if edit != 0 {
-            SetWindowTextW(edit, [0u16].as_ptr());
-        }
-    }
-    end_modal(owner, dialog);
-    text
+fn input_dialog(state: &WindowState, owner: isize, title: &str, prompt: &str, secret: bool, initial: &str, ok: &str, cancel: &str) -> Option<String> {
+    let items = vec![FormItem::new(FormKind::Label, prompt, (16, 14, 348, 20)), FormItem::new(if secret { FormKind::Secret } else { FormKind::Edit }, initial, (16, 38, 348, 24))];
+    let spec = FormSpec { tag: 0, title: title.to_string(), size: (380, 138), items, ok: ok.to_string(), cancel: cancel.to_string(), preview: None };
+    form_dialog(state, owner, &spec).and_then(|a| a.values.into_iter().next())
 }
 
 /// The text of a control, as UTF-16 (without the closing zero), for text that is wiped after it is used.
@@ -2950,69 +3647,128 @@ fn text_units(control: isize) -> Vec<u16> {
     }
 }
 
-/// A box with several things to fill in, laid out as `spec` says (`Action::AskForm`). Modal. `None` if it was cancelled or could not be made.
-fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<FormAnswer> {
-    let state = DialogState { done: Cell::new(false), accepted: Cell::new(false), pressed: Cell::new(0), sketch: RefCell::new(None) };
-    let (dialog, instance) = make_dialog(owner, dpi, &spec.title, spec.size, &state)?;
-    let child = |class: &str, text: &str, style: u32, ex: u32, at: (i32, i32, i32, i32), id: usize| dialog_child(dialog, instance, dpi, font, class, text, style, ex, at, id);
+/// The height of a line of text in `font`, in pixels.
+fn font_line(font: isize) -> i32 {
+    // SAFETY: a memory device context of the screen's kind, made and deleted here, with the font selected for the measuring and the old one put back.
+    unsafe {
+        let dc = CreateCompatibleDC(0);
+        let old = SelectObject(dc, font);
+        let line = line_height(dc);
+        SelectObject(dc, old);
+        DeleteDC(dc);
+        line
+    }
+}
+
+/// Put the entries in a list of the system's (a combo box).
+fn add_choices(combo: isize, choices: &[String]) {
+    if combo == 0 {
+        return;
+    }
+    for c in choices {
+        let w = wide(c);
+        // SAFETY: CB_ADDSTRING takes a pointer to a zero-terminated string, which `w` is and which outlives the call (the list copies it).
+        unsafe { SendMessageW(combo, CB_ADDSTRING, 0, w.as_ptr() as isize) };
+    }
+}
+
+/// A box with several things to fill in, laid out as `spec` says (`Action::AskForm`), in the style of the reader's boxes (`dlgstyle`). Modal. `None` if it was
+/// cancelled or could not be made.
+fn form_dialog(state: &WindowState, owner: isize, spec: &FormSpec) -> Option<FormAnswer> {
+    let ds = DialogState::new(state);
+    let (dpi, font) = (ds.dpi, state.font.get());
+    // With a screen reader the buttons, tick boxes and lists are the system's own controls, which it knows (the reader's own are drawn, and have no words for it).
+    let reader = state.reader.get();
+    let (button_class, combo_class) = (if reader { "BUTTON" } else { CONTROL_CLASS }, "COMBOBOX");
+    let s = |v: i32| v * dpi as i32 / 96;
+    let items: Vec<(FormKind, (i32, i32, i32, i32))> = spec.items.iter().map(|i| (i.kind, if i.kind == FormKind::Label && i.text.is_empty() { (i.rect.0, i.rect.1, i.rect.2, 0) } else { i.rect })).collect();
+    let laid = crate::dlgstyle::lay_out(&items, spec.preview.as_ref().map(|p| p.rect), &spec.ok, &spec.cancel);
+    let (dialog, instance) = make_dialog(owner, dpi, &spec.title, laid.size, &ds)?;
+    // The headings are a little heavier than the words.
+    let medium = make_font(state.face.get(), (9 * dpi as i32 + 36) / 72, 600, 5, 1);
+    let line = font_line(font);
+    let px = |r: (i32, i32, i32, i32)| (s(r.0), s(r.1), s(r.2), s(r.3));
     let mut made: Vec<(FormKind, isize)> = Vec::with_capacity(spec.items.len());
     let (mut buttons, mut focus) = (0usize, 0isize);
     for (k, item) in spec.items.iter().enumerate() {
-        let (class, style, ex) = match item.kind {
-            FormKind::Label => ("STATIC", SS_NOPREFIX, 0),
-            FormKind::Group => ("BUTTON", BS_GROUPBOX, 0),
-            FormKind::Edit => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE),
-            FormKind::Secret => ("EDIT", WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, WS_EX_CLIENTEDGE),
-            FormKind::Combo => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0),
-            FormKind::Pick => ("COMBOBOX", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, 0),
-            FormKind::Check => ("BUTTON", WS_TABSTOP | BS_AUTOCHECKBOX, 0),
-            FormKind::Button => ("BUTTON", WS_TABSTOP | BS_PUSHBUTTON, 0),
-        };
+        let rect = laid.rects.get(k).copied().unwrap_or(item.rect);
         let id = if item.kind == FormKind::Button { FORM_BUTTON + buttons } else { FORM_ITEM + k };
         buttons += usize::from(item.kind == FormKind::Button);
         let text = if matches!(item.kind, FormKind::Pick) { "" } else { item.text.as_str() };
-        let h = child(class, text, style, ex, item.rect, id);
+        let h = match item.kind {
+            FormKind::Label => dialog_child(dialog, instance, font, "STATIC", text, SS_NOPREFIX, px(rect), id),
+            FormKind::Group => dialog_child(dialog, instance, medium, "STATIC", text, SS_NOPREFIX, px(rect), id),
+            FormKind::Combo if reader => {
+                // The system's list with a box to type in (the control is as tall as the list that drops from it).
+                let (x, y, w, h) = px(rect);
+                let c = dialog_child(dialog, instance, font, combo_class, text, WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN | CBS_AUTOHSCROLL, (x, y, w, h * 9), id);
+                add_choices(c, &item.choices);
+                c
+            }
+            FormKind::Edit | FormKind::Secret | FormKind::Combo => {
+                // The frame is drawn by the box; the line of text stands in the middle of it (a list that goes with it has its arrow at the right end).
+                let combo = item.kind == FormKind::Combo;
+                let frame = px(rect);
+                let mut inner = crate::dlgstyle::edit_inner(frame, line, dpi);
+                if combo {
+                    inner.2 -= s(crate::dlgstyle::ARROW_W);
+                }
+                let h = dialog_child(dialog, instance, font, "EDIT", text, WS_TABSTOP | ES_AUTOHSCROLL | if item.kind == FormKind::Secret { ES_PASSWORD } else { 0 }, inner, id);
+                ds.edits.borrow_mut().push((h, WinRect { left: frame.0, top: frame.1, right: frame.0 + frame.2, bottom: frame.1 + frame.3 }));
+                if combo && h != 0 {
+                    let (a, pad) = (s(crate::dlgstyle::ARROW_W), s(2));
+                    let arrow = dialog_child(dialog, instance, font, CONTROL_CLASS, "", DROP_ARROW, (frame.0 + frame.2 - a - pad, frame.1 + pad, a, frame.3 - 2 * pad), id);
+                    // (The entry that is the text of the edit box is the one chosen; none is when the text is another.)
+                    let selected = item.choices.iter().position(|c| *c == item.text).unwrap_or(usize::MAX);
+                    ds.lists.borrow_mut().push(DropList { control: arrow, items: item.choices.clone(), selected, edit: h });
+                }
+                h
+            }
+            FormKind::Pick if reader => {
+                let (x, y, w, h) = px(rect);
+                let c = dialog_child(dialog, instance, font, combo_class, "", WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST, (x, y, w, h * 9), id);
+                add_choices(c, &item.choices);
+                if c != 0 {
+                    // SAFETY: a plain message to a control that was just made: the entry shown.
+                    unsafe { SendMessageW(c, CB_SETCURSEL, item.selected.min(item.choices.len().saturating_sub(1)), 0) };
+                }
+                c
+            }
+            FormKind::Pick => {
+                let h = dialog_child(dialog, instance, font, CONTROL_CLASS, "", WS_TABSTOP | DROP_PICK, px(rect), id);
+                ds.lists.borrow_mut().push(DropList { control: h, items: item.choices.clone(), selected: item.selected.min(item.choices.len().saturating_sub(1)), edit: 0 });
+                h
+            }
+            FormKind::Check => dialog_child(dialog, instance, font, button_class, text, WS_TABSTOP | BS_AUTOCHECKBOX, px(rect), id),
+            FormKind::Button => dialog_child(dialog, instance, font, button_class, text, WS_TABSTOP | BS_PUSHBUTTON, px(rect), id),
+        };
         if h != 0 {
             if focus == 0 && matches!(item.kind, FormKind::Edit | FormKind::Secret | FormKind::Combo) {
                 focus = h;
             }
-            let units: Vec<Vec<u16>> = item.choices.iter().map(|c| wide(c)).collect();
-            for entry in units.iter().filter(|_| matches!(item.kind, FormKind::Combo | FormKind::Pick)) {
-                // SAFETY: CB_ADDSTRING takes a zero-terminated UTF-16 string, which `wide` makes and which outlives the call.
-                unsafe { SendMessageW(h, CB_ADDSTRING, 0, entry.as_ptr() as isize) };
-            }
-            // SAFETY: plain messages to a control that was just made: the entry a list starts at, a tick box ticked or not.
-            unsafe {
-                match item.kind {
-                    FormKind::Pick => SendMessageW(h, CB_SETCURSEL, item.selected, 0),
-                    FormKind::Check => SendMessageW(h, BM_SETCHECK, item.selected.min(1), 0),
-                    _ => 0,
-                };
+            if item.kind == FormKind::Check {
+                // SAFETY: a plain message to a control that was just made: a tick box ticked or not.
+                unsafe { SendMessageW(h, BM_SETCHECK, item.selected.min(1), 0) };
             }
         }
         made.push((item.kind, h));
     }
-    if let Some(p) = &spec.preview {
-        let s = |v: i32| v * dpi as i32 / 96;
+    if let (Some(p), Some(r)) = (&spec.preview, laid.preview) {
         let handle = |k: usize| made.get(k).map_or(0, |m| m.1);
-        let (x, y, w, h) = p.rect;
-        *state.sketch.borrow_mut() = Some(Sketch {
-            rect: Rect { x: s(x), y: s(y), w: s(w), h: s(h) },
-            shape: p.shape,
-            slots: p.slots.map(handle),
-            mirror: handle(p.mirror),
-            fields: p.fields.clone(),
-            left_page: p.left_page,
-            font,
-            line: s(16),
-        });
+        let r = px(r);
+        *ds.sketch.borrow_mut() = Some(Sketch { rect: Rect { x: r.0, y: r.1, w: r.2, h: r.3 }, shape: p.shape, slots: p.slots.map(handle), mirror: handle(p.mirror), fields: p.fields.clone(), left_page: p.left_page });
     }
     // (The buttons are at the foot of the inside the box has, which is less than it was asked for when the box was cut to the screen.)
-    let foot = client_units(dialog, dpi).min(spec.size.1) - 36;
-    child("BUTTON", &spec.ok, WS_TABSTOP | BS_DEFPUSHBUTTON, 0, (spec.size.0 - 202, foot, 90, 28), IDOK);
-    child("BUTTON", &spec.cancel, WS_TABSTOP | BS_PUSHBUTTON, 0, (spec.size.0 - 104, foot, 90, 28), IDCANCEL);
-    modal_loop(owner, dialog, &state, focus);
-    let answer = state.accepted.get().then(|| {
+    let up = client_units(dialog, dpi).min(laid.size.1) - laid.size.1;
+    let at = |b: (i32, i32, i32, i32)| px((b.0, b.1 + up, b.2, b.3));
+    dialog_child(dialog, instance, font, button_class, &spec.ok, WS_TABSTOP | BS_DEFPUSHBUTTON, at(laid.ok), IDOK);
+    dialog_child(dialog, instance, font, button_class, &spec.cancel, WS_TABSTOP | BS_PUSHBUTTON, at(laid.cancel), IDCANCEL);
+    // The line a person is to type in starts selected, so that typing replaces it (in a list of the system's with a box to type in, the box).
+    let combo_focus = reader && spec.items.iter().zip(&made).any(|(i, m)| i.kind == FormKind::Combo && m.1 == focus);
+    // SAFETY: a plain message to a control of ours (a null handle does nothing): everything in it is selected (a start of 0 and an end of -1).
+    unsafe { SendMessageW(focus, if combo_focus { CB_SETEDITSEL } else { EM_SETSEL }, 0, if combo_focus { 0xFFFF_0000 } else { -1 }) };
+    modal_loop(owner, dialog, &ds, focus);
+    let answer = ds.accepted.get().then(|| {
         // SAFETY: plain query messages (the entry a list is at, whether a tick box is ticked) to a control that is alive; they take no arguments.
         let ask = |h: isize, msg: u32| unsafe { SendMessageW(h, msg, 0, 0) };
         let mut values = Vec::new();
@@ -3026,12 +3782,13 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
                     units.fill(0);
                     std::hint::black_box(&units);
                 }
-                FormKind::Pick => values.push(ask(h, CB_GETCURSEL).max(0).to_string()),
+                FormKind::Pick if reader => values.push(ask(h, CB_GETCURSEL).max(0).to_string()),
+                FormKind::Pick => values.push(ds.lists.borrow().iter().find(|l| l.control == h).map_or(0, |l| l.selected).to_string()),
                 FormKind::Check => values.push(String::from(if ask(h, BM_GETCHECK) == 1 { "1" } else { "0" })),
                 FormKind::Label | FormKind::Group | FormKind::Button => {}
             }
         }
-        FormAnswer { values, button: state.pressed.get().checked_sub(1) }
+        FormAnswer { values, button: ds.pressed.get().checked_sub(1) }
     });
     // What is left in a password box goes before the box does.
     for &(_, h) in made.iter().filter(|m| m.0 == FormKind::Secret) {
@@ -3039,41 +3796,274 @@ fn form_dialog(owner: isize, dpi: u32, font: isize, spec: &FormSpec) -> Option<F
         unsafe { SetWindowTextW(h, [0u16].as_ptr()) };
     }
     end_modal(owner, dialog);
+    if medium != 0 {
+        // SAFETY: a font made by `make_font` above; the box that used it is gone.
+        unsafe { DeleteObject(medium) };
+    }
     answer
 }
 
 // --- menus, child windows, the clipboard ------------------------------------------------------------------------
 
-/// A popup menu with these entries (submenus inside it are made too), or 0.
-fn build_popup(entries: &[MenuEntry]) -> isize {
+/// The colours of the menus and the boxes until the reader has said how the window looks (the light ones).
+const LIGHT_SKIN: Skin = Skin { surface: 0xFAFBFB, text: 0x1E2422, dim: 0x5E6865, off: 0xA3ABA8, line: 0xD6DBD9, field: 0xEFF2F1, accent: 0x1D9E75, accent_hover: 0x0F6E56, tint: 0xE1F5EE, on_tint: 0x0F6E56, on_accent: 0xFFFFFF, hover: 0x1E2422 };
+
+fn skin_of(state: &WindowState) -> Skin {
+    state.theme.get().map_or(LIGHT_SKIN, |t| t.skin)
+}
+
+/// Put an entry in the window's list of what the menu that is up draws; the number Windows keeps with the item (its place in the list, plus one), as a pointer.
+fn menu_data(state: &WindowState, entry: crate::menustyle::Entry) -> *const u16 {
+    let mut items = state.menu_items.borrow_mut();
+    items.push(entry);
+    items.len() as *const u16
+}
+
+fn menu_entry(label: &str, kind: crate::menustyle::Kind, checked: bool, radio: bool, enabled: bool) -> crate::menustyle::Entry {
+    crate::menustyle::Entry { label: crate::menustyle::parse(label), kind, checked, radio, enabled }
+}
+
+/// A popup menu with these entries (submenus inside it are made too), or 0. Every item is drawn by the reader (`MF_OWNERDRAW`): what it needs is in the
+/// window's list, and the data of the item is its place there, plus one.
+fn build_popup(state: &WindowState, entries: &[MenuEntry]) -> isize {
+    use crate::menustyle::Kind;
     // SAFETY: creates an empty popup menu; the handle is checked.
     let popup = unsafe { CreatePopupMenu() };
     if popup == 0 {
         return 0;
     }
     for entry in entries {
-        match entry {
-            MenuEntry::Item { id, label, checked, enabled } => {
-                let w = wide(label);
-                let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 } | if *enabled { 0 } else { MF_GRAYED };
-                // SAFETY: `w` is a zero-terminated UTF-16 string that outlives the call (Windows copies it).
-                unsafe { AppendMenuW(popup, flags, *id as usize, w.as_ptr()) };
-            }
-            MenuEntry::Submenu { title, entries } => {
-                let sub = build_popup(entries);
-                if sub != 0 {
-                    let w = wide(title);
-                    // SAFETY: `sub` becomes a submenu of `popup` (and is destroyed with it); `w` outlives the call.
-                    unsafe { AppendMenuW(popup, MF_POPUP, sub as usize, w.as_ptr()) };
-                }
-            }
-            // SAFETY: a separator takes no text; the arguments are plain.
-            MenuEntry::Separator => unsafe {
-                AppendMenuW(popup, MF_SEPARATOR, 0, null());
-            },
+        if state.reader.get() {
+            append_standard(state, popup, entry);
+            continue;
         }
+        let (flags, id, data) = match entry {
+            MenuEntry::Item { id, label, checked, radio, enabled } => (MF_OWNERDRAW | if *enabled { 0 } else { MF_GRAYED }, *id as usize, menu_data(state, menu_entry(label, Kind::Item, *checked, *radio, *enabled))),
+            MenuEntry::Submenu { title, entries } => {
+                let sub = build_popup(state, entries);
+                if sub == 0 {
+                    continue;
+                }
+                (MF_OWNERDRAW | MF_POPUP, sub as usize, menu_data(state, menu_entry(title, Kind::Sub, false, false, true)))
+            }
+            MenuEntry::Separator => (MF_OWNERDRAW | MF_SEPARATOR, 0, menu_data(state, menu_entry("", Kind::Separator, false, false, true))),
+        };
+        // SAFETY: for an item that is drawn by the owner the last argument is the item's own number, not a string: Windows reads nothing through it and hands it to
+        // WM_MEASUREITEM and WM_DRAWITEM; a submenu's handle was made above and goes away with `popup`.
+        unsafe { AppendMenuW(popup, flags, id, data) };
     }
     popup
+}
+
+/// What a menu item of words (the system's own, which a screen reader reads) is made with: its flags, and whether it is one of a set of which one is chosen
+/// (it then shows a dot, not a tick, and says so to a screen reader).
+fn standard_item(enabled: bool, checked: bool, radio: bool) -> (u32, Option<(u32, u32)>) {
+    let flags = MF_STRING | if enabled { 0 } else { MF_GRAYED } | if checked && !radio { MF_CHECKED } else { 0 };
+    (flags, radio.then_some((MFT_RADIOCHECK, if checked { MFS_CHECKED } else { 0 })))
+}
+
+/// Add an entry to `popup` as the system's own kind of menu item: its words (with the letter to press marked by `&` and the key after a tab, as Windows menus
+/// have them), not a drawing the reader makes.
+fn append_standard(state: &WindowState, popup: isize, entry: &MenuEntry) {
+    match entry {
+        MenuEntry::Item { id, label, checked, radio, enabled } => {
+            let (flags, radio_check) = standard_item(*enabled, *checked, *radio);
+            let text = wide(label);
+            // SAFETY: `text` is a zero-terminated UTF-16 string that outlives the call (Windows copies it); the id is a command.
+            unsafe { AppendMenuW(popup, flags, *id as usize, text.as_ptr()) };
+            if let Some((kind, state_bits)) = radio_check {
+                let info = MenuItemInfo { size: std::mem::size_of::<MenuItemInfo>() as u32, mask: MIIM_FTYPE | MIIM_STATE, kind, state: state_bits, id: 0, sub_menu: 0, checked: 0, unchecked: 0, data: 0, type_data: null_mut(), cch: 0, item_bitmap: 0 };
+                // SAFETY: `info` is a live MENUITEMINFOW of the size it says, with the mask of what it sets (the type and the state); it is read and not kept; the
+                // item is the one just added, the last.
+                unsafe { SetMenuItemInfoW(popup, (GetMenuItemCount(popup) - 1).max(0) as u32, 1, &info) };
+            }
+        }
+        MenuEntry::Submenu { title, entries } => {
+            let sub = build_popup(state, entries);
+            if sub != 0 {
+                let text = wide(title);
+                // SAFETY: `sub` becomes a submenu of `popup` (and is destroyed with it); `text` outlives the call.
+                unsafe { AppendMenuW(popup, MF_STRING | MF_POPUP, sub as usize, text.as_ptr()) };
+            }
+        }
+        // SAFETY: a separator has no text and no id.
+        MenuEntry::Separator => unsafe {
+            AppendMenuW(popup, MF_SEPARATOR, 0, null());
+        },
+    }
+}
+
+/// The classic menu bar of a screen reader's window: each of the reader's menus is a popup of words in it (0 if Windows would not make it).
+fn build_classic_bar(state: &WindowState) -> isize {
+    // SAFETY: creates an empty menu bar; the handle is checked.
+    let bar = unsafe { CreateMenu() };
+    if bar == 0 {
+        return 0;
+    }
+    for menu in state.menus.borrow().iter() {
+        let popup = build_popup(state, &menu.entries);
+        if popup == 0 {
+            continue;
+        }
+        let title = wide(&menu.title);
+        // SAFETY: `popup` becomes a submenu of `bar` (and is destroyed with it); `title` outlives the call.
+        unsafe { AppendMenuW(bar, MF_STRING | MF_POPUP, popup as usize, title.as_ptr()) };
+    }
+    bar
+}
+
+/// Put the menu bar of the window as it should be: the classic one of the reader's menus while a screen reader runs, none otherwise. It is made again whenever the
+/// menus change (what is checked or greyed), but not while a menu is in use.
+fn sync_menu_bar(state: &WindowState) {
+    let hwnd = state.hwnd.get();
+    if state.in_menu.get() {
+        state.bar_stale.set(true);
+        return;
+    }
+    state.bar_stale.set(false);
+    let bar = if state.reader.get() && !state.menus.borrow().is_empty() { build_classic_bar(state) } else { 0 };
+    let old = state.bar.replace(bar);
+    if old == 0 && bar == 0 {
+        return;
+    }
+    // SAFETY: the window is ours; the bar made above becomes its menu, and the old one (which SetMenu does not destroy) is destroyed after it was taken away; the
+    // frame is calculated again because the room the bar takes is the client area's loss.
+    unsafe {
+        SetMenu(hwnd, bar);
+        if old != 0 {
+            DestroyMenu(old);
+        }
+        DrawMenuBar(hwnd);
+        SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+    apply_layout(state);
+}
+
+/// Show `menu` at `at` (a place of the client area) with the flags, destroy it, and answer with what was chosen (its command; 0: nothing). With `letter` the
+/// menu starts with that letter pressed in it; with `keyboard`, with its first item chosen.
+fn track_popup(state: &WindowState, hwnd: isize, menu: isize, flags: u32, at: (i32, i32), letter: Option<char>, keyboard: bool) -> i32 {
+    // (A menu of the system's own words keeps the system's colours.)
+    let brush = if state.reader.get() { 0 } else { brush_of(skin_of(state).surface) };
+    let info = MenuInfo { size: std::mem::size_of::<MenuInfo>() as u32, mask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS, style: 0, cy_max: 0, back: brush, help_id: 0, data: 0 };
+    let mut p = Point { x: at.0, y: at.1 };
+    // SAFETY: `info` is a live MENUINFO that Windows reads and does not keep (the brush lives until after the menu is destroyed, below); `p` is a live POINT turned
+    // into screen coordinates; the menu belongs to this window and is destroyed after use; TPM_RETURNCMD answers with the item's command (0 if the menu was
+    // dismissed) instead of posting a message; the keys posted have no pointers in them.
+    let chosen = unsafe {
+        if brush != 0 {
+            SetMenuInfo(menu, &info);
+        }
+        ClientToScreen(hwnd, &mut p);
+        if let Some(c) = letter {
+            PostMessageW(hwnd, WM_CHAR, c as usize, 0);
+        } else if keyboard {
+            PostMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+        }
+        let chosen = TrackPopupMenu(menu, flags, p.x, p.y, 0, hwnd, null());
+        DestroyMenu(menu);
+        if brush != 0 {
+            DeleteObject(brush);
+        }
+        chosen
+    };
+    state.menu_items.borrow_mut().clear();
+    chosen
+}
+
+/// The item Windows asks about (an item of a menu that is drawn by the reader): what the list has, or a separator when it has nothing.
+fn menu_item_of(state: &WindowState, data: usize, f: impl FnOnce(&crate::menustyle::Entry)) {
+    let items = state.menu_items.borrow();
+    let sep = menu_entry("", crate::menustyle::Kind::Separator, false, false, true);
+    f(data.checked_sub(1).and_then(|i| items.get(i)).unwrap_or(&sep));
+}
+
+/// WM_MEASUREITEM for an item of a menu: how big it is.
+fn measure_menu_item(state: &WindowState, m: &mut MeasureItem) {
+    let hwnd = state.hwnd.get();
+    menu_item_of(state, m.item_data, |e| {
+        let (mut text, mut key) = (0, 0);
+        if e.kind != crate::menustyle::Kind::Separator {
+            // SAFETY: a device context of the window, its font selected for the measuring and the old one put back before it is let go.
+            unsafe {
+                let dc = GetDC(hwnd);
+                if dc != 0 {
+                    let old = SelectObject(dc, state.font.get());
+                    (text, key) = (text_extent(dc, &e.label.text), text_extent(dc, &e.label.key));
+                    SelectObject(dc, old);
+                    ReleaseDC(hwnd, dc);
+                }
+            }
+        }
+        let (w, h) = crate::menustyle::measure(e, state.dpi.get(), text, key);
+        (m.item_width, m.item_height) = (w as u32, h as u32);
+    });
+}
+
+/// WM_DRAWITEM for an item of a menu.
+fn draw_menu_item(state: &WindowState, d: &DrawItem) {
+    let (skin, dpi, r) = (skin_of(state), state.dpi.get(), d.rc);
+    let (selected, accel) = (d.state & ODS_SELECTED != 0, d.state & ODS_NOACCEL == 0);
+    menu_item_of(state, d.item_data, |e| {
+        paint_on_dc(fonts_of(state), d.hdc, r, |g| crate::menustyle::paint(g, Rect { x: 0, y: 0, w: r.right - r.left, h: r.bottom - r.top }, e, selected, accel, &skin, dpi));
+        if e.kind == crate::menustyle::Kind::Sub {
+            // Windows draws the little arrow of a submenu over the item after this, in the clip it finds: the place of ours is taken out of it.
+            // SAFETY: a plain call on the device context Windows gave for this message.
+            unsafe { ExcludeClipRect(d.hdc, r.right - scale(dpi, 28), r.top, r.right, r.bottom) };
+        }
+    });
+}
+
+/// WM_MENUCHAR: a key was pressed in a menu that is drawn by the reader (Windows cannot find the letters of items it does not draw the words of). The answer says
+/// which item the letter chooses: it is opened or done when no other has the letter, else the next one with it is chosen.
+fn menu_char(state: &WindowState, wparam: usize, menu: isize) -> isize {
+    let Some(c) = char::from_u32(loword(wparam)) else { return 0 };
+    let items = state.menu_items.borrow();
+    // SAFETY: a plain query of the menu Windows names.
+    let count = unsafe { GetMenuItemCount(menu) }.max(0);
+    let (mut letters, mut current) = (Vec::new(), None);
+    for pos in 0..count {
+        let mut info = MenuItemInfo { size: std::mem::size_of::<MenuItemInfo>() as u32, mask: MIIM_DATA | MIIM_STATE, kind: 0, state: 0, id: 0, sub_menu: 0, checked: 0, unchecked: 0, data: 0, type_data: null_mut(), cch: 0, item_bitmap: 0 };
+        // SAFETY: `info` is a live MENUITEMINFOW of the size it says, with the mask of what is asked (state and data); Windows fills it in and keeps nothing.
+        let known = unsafe { GetMenuItemInfoW(menu, pos as u32, 1, &mut info) } != 0;
+        let entry = known.then(|| info.data.checked_sub(1).and_then(|i| items.get(i))).flatten().filter(|e| e.enabled);
+        letters.push(entry.and_then(|e| e.label.accel.and_then(|i| e.label.text.chars().nth(i))));
+        if known && info.state & MFS_HILITE != 0 {
+            current = Some(pos as usize);
+        }
+    }
+    match crate::menustyle::choose_by_letter(&letters, c, current) {
+        Some((i, only)) => ((if only { MNC_EXECUTE } else { MNC_SELECT }) << 16) | i as isize,
+        None => 0,
+    }
+}
+
+/// The messages of a menu that the reader draws, for the window that owns it (the main window, or a box with a list that drops down): `None` for anything else.
+fn menu_message(state: &WindowState, msg: u32, wparam: usize, lparam: isize) -> Option<isize> {
+    match msg {
+        WM_MEASUREITEM => {
+            // SAFETY: for WM_MEASUREITEM, lparam points to a MEASUREITEMSTRUCT that is valid, and ours to fill in, for the duration of this message.
+            let m = unsafe { (lparam as *mut MeasureItem).as_mut() }.filter(|m| m.kind == ODT_MENU)?;
+            measure_menu_item(state, m);
+            Some(1)
+        }
+        WM_DRAWITEM => {
+            // SAFETY: for WM_DRAWITEM, lparam points to a DRAWITEMSTRUCT that is valid for the duration of this message; it is only read.
+            let d = unsafe { (lparam as *const DrawItem).as_ref() }.filter(|d| d.kind == ODT_MENU)?;
+            draw_menu_item(state, d);
+            Some(1)
+        }
+        WM_MENUCHAR => Some(menu_char(state, wparam, lparam)),
+        _ => None,
+    }
+}
+
+/// The width of text in the font that is selected in `dc`.
+fn text_extent(dc: isize, s: &str) -> i32 {
+    let w: Vec<u16> = s.encode_utf16().collect();
+    let mut size = Size { cx: 0, cy: 0 };
+    // SAFETY: `w` outlives the call and its length is passed; `size` is a live SIZE that is filled in; `dc` is a device context of ours.
+    unsafe { GetTextExtentPoint32W(dc, w.as_ptr(), w.len() as i32, &mut size) };
+    size.cx
 }
 
 /// Show the find box at a place and give it the keyboard (with its text selected), or hide it and take the keyboard back.
@@ -3182,28 +4172,15 @@ fn finish_field(state: &WindowState, exit: FieldExit) {
 }
 
 /// A list of choices at a place of the client area; the number of the one chosen.
-fn choose(hwnd: isize, items: &[String], selected: Option<usize>, at: (i32, i32)) -> Option<usize> {
-    // SAFETY: creates an empty pop-up menu; the handle is checked.
-    let menu = unsafe { CreatePopupMenu() };
+fn choose(state: &WindowState, hwnd: isize, items: &[String], selected: Option<usize>, at: (i32, i32)) -> Option<usize> {
+    let entries: Vec<MenuEntry> = items.iter().take(MAX_CHOICES).enumerate().map(|(i, item)| MenuEntry::Item { id: i as u32 + 1, label: item.replace('&', "&&"), checked: selected == Some(i), radio: false, enabled: true }).collect();
+    state.menu_items.borrow_mut().clear();
+    let menu = build_popup(state, &entries);
     if menu == 0 {
         return None;
     }
-    for (i, item) in items.iter().take(MAX_CHOICES).enumerate() {
-        let label = wide(&item.replace('&', "&&"));
-        let flags = MF_STRING | if selected == Some(i) { MF_CHECKED } else { 0 };
-        // SAFETY: `menu` is the menu just made; the item's number is its place plus one (0 is "nothing chosen"); `label` is
-        // zero-terminated UTF-16 that outlives the call (the menu copies it).
-        unsafe { AppendMenuW(menu, flags, i + 1, label.as_ptr()) };
-    }
-    let mut at = Point { x: at.0, y: at.1 };
-    // SAFETY: `at` is a live POINT turned into screen coordinates; the menu belongs to this window and is destroyed after use;
-    // TPM_RETURNCMD answers with the item's number (0 if the menu was dismissed) instead of posting a message.
-    let answer = unsafe {
-        ClientToScreen(hwnd, &mut at);
-        let answer = TrackPopupMenu(menu, TPM_RETURNCMD_NONOTIFY, at.x, at.y, 0, hwnd, null());
-        DestroyMenu(menu);
-        answer
-    };
+    // The item's number is its place plus one (0 is "nothing chosen").
+    let answer = track_popup(state, hwnd, menu, TPM_RETURNCMD_NONOTIFY, at, None, false);
     usize::try_from(answer).ok().filter(|&n| n > 0).map(|n| n - 1)
 }
 
@@ -3465,11 +4442,34 @@ fn apply_frame(state: &WindowState) {
     unsafe { DwmExtendFrameIntoClientArea(state.hwnd.get(), &margins) };
 }
 
+/// Is a screen reader running? Windows keeps that setting for them (Narrator, NVDA and JAWS set it). The variable `QINGPDF_SCREEN_READER` (set to 1) says so
+/// too, to try the window as it is then without one.
+fn screen_reader_on() -> bool {
+    if std::env::var_os("QINGPDF_SCREEN_READER").is_some_and(|v| v == "1") {
+        return true;
+    }
+    let mut on: i32 = 0;
+    // SAFETY: SPI_GETSCREENREADER writes a BOOL (4 bytes) to the pointer, which is a live i32; nothing is kept.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETSCREENREADER, 0, (&raw mut on).cast(), 0) } != 0;
+    ok && on != 0
+}
+
+/// Windows was set to change something (`WM_SETTINGCHANGE`): a screen reader may have been started or stopped. The window then takes the system's own frame
+/// and a classic menu bar of words, or gives them up (the boxes made after that are made of the system's controls, or of the reader's own).
+fn refresh_reader(state: &WindowState) {
+    let on = screen_reader_on();
+    if state.reader.replace(on) == on {
+        return;
+    }
+    refresh_contrast(state);
+    sync_menu_bar(state);
+}
+
 /// Windows is set to a high-contrast theme, or is not any more: the frame is the system's own (with its title bar above the window) in a high-contrast
-/// theme, and the reader is told the colours.
+/// theme (and while a screen reader runs), and the reader is told the colours.
 fn refresh_contrast(state: &WindowState) {
     let colors = high_contrast();
-    let custom = colors.is_none();
+    let custom = colors.is_none() && !state.reader.get();
     if state.custom.replace(custom) != custom {
         apply_frame(state);
         // SAFETY: plain numbers and the handle of this window; the frame is calculated again.
@@ -3530,7 +4530,8 @@ fn apply_theme(state: &WindowState, spec: ThemeSpec) {
     // through the call); a system that does not know the attribute answers with an error, which does not matter.
     unsafe { DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&raw const on).cast(), 4) };
     set_tree_theme(state.tree.get(), spec.dark);
-    for (message, color) in [(TVM_SETBKCOLOR, colorref(spec.tree_bg)), (TVM_SETTEXTCOLOR, colorref(spec.text)), (TVM_SETLINECOLOR, colorref(spec.tree_line))] {
+    style_tree(state);
+    for (message, color) in [(TVM_SETBKCOLOR, colorref(spec.tree_bg)), (TVM_SETTEXTCOLOR, colorref(spec.text)), (TVM_SETLINECOLOR, colorref(spec.tree_line)), (TVM_SETINSERTMARKCOLOR, colorref(spec.skin.accent))] {
         // SAFETY: plain messages to the tree of bookmarks, with a colour; a window that is not there is not an error.
         unsafe { SendMessageW(state.tree.get(), message, 0, color as isize) };
     }
@@ -3539,6 +4540,14 @@ fn apply_theme(state: &WindowState, spec: ThemeSpec) {
     }
     // SAFETY: this window and everything in it is invalidated and erased (no rectangle, no region).
     unsafe { RedrawWindow(hwnd, null(), 0, RDW_INVALIDATE_ALL) };
+}
+
+/// Does Windows show animations (Settings > Accessibility > Visual effects)? True when it cannot be asked.
+fn animations_on() -> bool {
+    let mut on: i32 = 1;
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes a BOOL (4 bytes) to the pointer, which is a live i32; nothing is kept.
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut on).cast(), 0) } != 0;
+    !ok || on != 0
 }
 
 /// Is Windows set to dark apps? Read from the registry (`AppsUseLightTheme` of the current user's Personalize key), never written.
@@ -3583,6 +4592,17 @@ pub fn high_contrast() -> Option<Contrast> {
     Some(Contrast { window: color(COLOR_WINDOW), text: color(COLOR_WINDOWTEXT), gray: color(COLOR_GRAYTEXT), highlight: color(COLOR_HIGHLIGHT), highlight_text: color(COLOR_HIGHLIGHTTEXT), face: color(COLOR_BTNFACE) })
 }
 
+/// Which edges of the screen the window is on have a task bar that hides itself: left, top, right, bottom.
+fn autohide_edges(hwnd: isize) -> [bool; 4] {
+    let Some(screen) = monitor_rect(hwnd) else { return [false; 4] };
+    std::array::from_fn(|edge| {
+        let mut data = AppBarData { size: std::mem::size_of::<AppBarData>() as u32, hwnd: 0, callback: 0, edge: edge as u32, rc: screen, param: 0 };
+        // SAFETY: ABM_GETAUTOHIDEBAREX takes a live APPBARDATA of the size it says, with the edge asked about and the rectangle of the screen; it answers with the
+        // window of the task bar that hides itself there (0 when there is none) and keeps nothing.
+        unsafe { SHAppBarMessage(ABM_GETAUTOHIDEBAREX, &mut data) != 0 }
+    })
+}
+
 /// WM_NCCALCSIZE with the reader's own title strip: the client area is the whole window, except that a maximized window is taken in by the frame it
 /// overhangs the screen by (so that nothing is drawn off the screen). Returns the answer for the message.
 fn nc_calc_size(hwnd: isize, wparam: usize, lparam: isize) -> isize {
@@ -3598,6 +4618,9 @@ fn nc_calc_size(hwnd: isize, wparam: usize, lparam: isize) -> isize {
             let pad = metric(SM_CXPADDEDBORDER, dpi);
             let (fx, fy) = (metric(SM_CXSIZEFRAME, dpi) + pad, metric(SM_CYSIZEFRAME, dpi) + pad);
             (r.left, r.right, r.top, r.bottom) = (r.left + fx, r.right - fx, r.top + fy, r.bottom - fy);
+            // A task bar that hides itself is reached by the pointer at the edge of the screen: one pixel of it is left, or the window would cover it.
+            let [l, t, rt, b] = placement::leave_edge([r.left, r.top, r.right, r.bottom], autohide_edges(hwnd));
+            (r.left, r.top, r.right, r.bottom) = (l, t, rt, b);
         }
     }
     0
@@ -3643,49 +4666,50 @@ fn nc_hit_test(state: &WindowState, hwnd: isize, wparam: usize, lparam: isize) -
 }
 
 /// A popup menu of the window's menus: each of them is an item that opens its own. 0 if Windows would not make it.
-fn build_top_menu(menus: &[Menu]) -> isize {
+fn build_top_menu(state: &WindowState, menus: &[Menu]) -> isize {
     // SAFETY: creates an empty popup menu; the handle is checked.
     let root = unsafe { CreatePopupMenu() };
     if root == 0 {
         return 0;
     }
     for menu in menus {
-        let popup = build_popup(&menu.entries);
+        let popup = build_popup(state, &menu.entries);
         if popup == 0 {
             continue;
         }
-        let w = wide(&menu.title);
-        // SAFETY: `popup` becomes a submenu of `root` (and is destroyed with it); `w` outlives the call.
-        unsafe { AppendMenuW(root, MF_POPUP, popup as usize, w.as_ptr()) };
+        if state.reader.get() {
+            let title = wide(&menu.title);
+            // SAFETY: `popup` becomes a submenu of `root` (and is destroyed with it); `title` outlives the call.
+            unsafe { AppendMenuW(root, MF_STRING | MF_POPUP, popup as usize, title.as_ptr()) };
+            continue;
+        }
+        let data = menu_data(state, menu_entry(&menu.title, crate::menustyle::Kind::Sub, false, false, true));
+        // SAFETY: `popup` becomes a submenu of `root` (and is destroyed with it); the last argument is the item's own number, as in `build_popup`.
+        unsafe { AppendMenuW(root, MF_OWNERDRAW | MF_POPUP, popup as usize, data) };
     }
     root
 }
 
 /// Show the menus as a pop-up menu with its top right corner at `at` (a place of the client area); the command of the item chosen. With `keyboard` its first
-/// item is chosen to begin with (a key press is posted to the menu's loop), as a menu opened by Alt is.
+/// item is chosen to begin with (a key press is posted to the menu's loop), as a menu opened by Alt is; with a letter (Alt and a letter were pressed) the menu that
+/// letter belongs to is opened.
 fn show_menu(state: &WindowState, hwnd: isize, at: (i32, i32), keyboard: bool) -> Option<u32> {
-    let root = build_top_menu(&state.menus.borrow());
+    state.menu_items.borrow_mut().clear();
+    let root = build_top_menu(state, &state.menus.borrow());
     if root == 0 {
         return None;
     }
-    let mut p = Point { x: at.0, y: at.1 };
-    // SAFETY: `p` is a live POINT turned into screen coordinates; the menu belongs to this window and is destroyed after use; TPM_RETURNCMD answers with the
-    // item's command (0 if the menu was dismissed) instead of posting a message; the key press is posted with no pointers in it.
-    let chosen = unsafe {
-        ClientToScreen(hwnd, &mut p);
-        if keyboard {
-            PostMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
-        }
-        let chosen = TrackPopupMenu(root, TPM_RETURNCMD_NONOTIFY | TPM_RIGHTBUTTON | TPM_RIGHTALIGN, p.x, p.y, 0, hwnd, null());
-        DestroyMenu(root);
-        chosen
-    };
+    let letter = state.menu_letter.take();
+    let chosen = track_popup(state, hwnd, root, TPM_RETURNCMD_NONOTIFY | TPM_RIGHTBUTTON | TPM_RIGHTALIGN, at, letter, keyboard);
     u32::try_from(chosen).ok().filter(|&c| c > 0)
 }
 
 /// Put these menus by (for the pop-up).
 fn set_menus(state: &WindowState, menus: Vec<Menu>) {
     *state.menus.borrow_mut() = menus;
+    if state.reader.get() {
+        sync_menu_bar(state);
+    }
 }
 
 /// Move a child window to a rectangle of the client area and show it, or hide it when the rectangle has no area.
@@ -3954,7 +4978,8 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
         return 1;
     }
     // With the reader's own title strip the window is its client area; with the system's own frame (a high-contrast theme) the frame is added to the size.
-    let plain_frame = high_contrast().is_some();
+    let reader = screen_reader_on();
+    let plain_frame = high_contrast().is_some() || reader;
     let style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     let mut frame = WinRect { left: 0, top: 0, right: DEFAULT_WIDTH * system_dpi as i32 / 96, bottom: DEFAULT_HEIGHT * system_dpi as i32 / 96 };
     if plain_frame {
@@ -4039,6 +5064,13 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
         field_brush: Cell::new(0),
         fullscreen: Cell::new(false),
         full_saved: RefCell::new(None),
+        menu_items: RefCell::new(Vec::new()),
+        menu_letter: Cell::new(None),
+        reader: Cell::new(reader),
+        bar: Cell::new(0),
+        in_menu: Cell::new(false),
+        bar_stale: Cell::new(false),
+        face: Cell::new("Segoe UI"),
     });
     let raw = Box::into_raw(state);
     // SAFETY: stores the pointer from `Box::into_raw`; it is freed once, by `free_state` below, after the message loop.
@@ -4046,7 +5078,7 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
     let Some(state) = state_of(hwnd) else { return 1 };
     // The bookmarks tree and the find box: children of the window, hidden until the reader says where to put them.
     // The tree of bookmarks has the look of the file windows (chevrons, no lines, no sunken edge).
-    state.tree.set(make_child(hwnd, instance, "SysTreeView32", 0, WS_TABSTOP | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_EDITLABELS, ID_TREE));
+    state.tree.set(make_child(hwnd, instance, "SysTreeView32", 0, WS_TABSTOP | TVS_HASBUTTONS | TVS_SHOWSELALWAYS | TVS_EDITLABELS | TVS_FULLROWSELECT | TVS_NONEVENHEIGHT | TVS_NOHSCROLL | TVS_TRACKSELECT, ID_TREE));
     set_tree_theme(state.tree.get(), false);
     state.find.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIND));
     state.field_single.set(make_child(hwnd, instance, "EDIT", WS_EX_CLIENTEDGE, WS_TABSTOP | ES_AUTOHSCROLL, ID_FIELD1));
@@ -4085,6 +5117,7 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
     set_icons(hwnd, dpi);
     new_dpi(state, dpi);
     dispatch(state, Event::Dpi(dpi));
+    dispatch(state, Event::Motion(animations_on()));
     // The reader has not heard of the size yet (what was told before it was made is lost): it is told now.
     state.size.set((-1, -1));
     state.frame_told.set(None);
@@ -4264,6 +5297,8 @@ struct Guid {
     data4: [u8; 8],
 }
 
+/// `IAccessible`
+const IID_IACCESSIBLE: Guid = Guid { data1: 0x6187_36E0, data2: 0x3C3D, data3: 0x11CF, data4: [0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71] };
 /// `Windows.Media.Ocr.IOcrEngineStatics`
 const IID_OCR_ENGINE_STATICS: Guid = Guid { data1: 0x5BFF_A85A, data2: 0x3384, data3: 0x3540, data4: [0x99, 0x40, 0x69, 0x91, 0x20, 0xD4, 0x28, 0xA8] };
 /// `Windows.Foundation.IAsyncInfo`
@@ -4727,6 +5762,15 @@ impl Recognizer for Recogniser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_menu_item_of_the_systems_own_kind_is_greyed_ticked_or_dotted_as_it_is_asked() {
+        assert_eq!(standard_item(true, false, false), (MF_STRING, None));
+        assert_eq!(standard_item(false, true, false), (MF_GRAYED | MF_CHECKED, None));
+        // One of a set of which one is chosen: a dot, and it says so (the type), whether it is the chosen one or not.
+        assert_eq!(standard_item(true, true, true), (MF_STRING, Some((MFT_RADIOCHECK, MFS_CHECKED))));
+        assert_eq!(standard_item(true, false, true), (MF_STRING, Some((MFT_RADIOCHECK, 0))));
+    }
+
     use super::*;
 
     #[test]
@@ -4738,6 +5782,11 @@ mod tests {
         assert_eq!(std::mem::size_of::<Margins>(), 16);
         assert_eq!(std::mem::size_of::<NcCalcSize>(), 56);
         assert_eq!(std::mem::size_of::<HighContrastW>(), 16);
+        // The structures of the menus that the reader draws, of the tree's custom drawing and of the task bar (winuser.h, commctrl.h, shellapi.h).
+        assert_eq!(
+            [std::mem::size_of::<MeasureItem>(), std::mem::size_of::<DrawItem>(), std::mem::size_of::<MenuInfo>(), std::mem::size_of::<MenuItemInfo>(), std::mem::size_of::<NmCustomDraw>(), std::mem::size_of::<NmTvCustomDraw>(), std::mem::size_of::<AppBarData>()],
+            [32, 64, 40, 80, 80, 96, 48]
+        );
     }
 
     /// A painter over a memory device context of its own, with a section of 32-bit pixels `w` by `h` (no window needed).
@@ -4946,6 +5995,42 @@ mod tests {
     }
 
     #[test]
+    fn a_part_of_the_window_drawn_by_itself_is_what_the_whole_has_there_and_takes_a_fraction_of_the_time() {
+        let mut app = real_reader(1400, 900, 96, false, Some("hello_world_2_pages.pdf"));
+        // A message over the pages (the room it fades in), the bars and the pill are there.
+        app.event(Event::Command(crate::app::CMD_TOOL_INK));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let (mut whole, (x, y, w, h)) = (Canvas::with_fonts(1400, 900, 96, false), (180, 700, 1000, 140));
+        let mut part = Canvas::with_fonts(w, h, 96, false);
+        app.paint(&mut whole.gdi);
+        app.paint_part(&mut part.gdi, x, y);
+        let mut different = 0;
+        for j in 0..h {
+            for i in 0..w {
+                if whole.at(x + i, y + j) != part.at(i, j) {
+                    different += 1;
+                }
+            }
+        }
+        assert_eq!(different, 0, "{different} pixels of the part differ from the same place of the whole");
+        let time = |f: &mut dyn FnMut()| {
+            let started = std::time::Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / 20.0
+        };
+        let all = time(&mut || {
+            app.paint(&mut whole.gdi);
+        });
+        let some = time(&mut || {
+            app.paint_part(&mut part.gdi, x, y);
+        });
+        println!("paint of the whole 1400x900: {all:.2} ms, of a part 1000x140 (a message's room): {some:.2} ms");
+        assert!(some < all, "{some} ms against {all} ms");
+    }
+
+    #[test]
     fn the_window_is_painted_by_the_real_reader_in_a_few_milliseconds() {
         let mut app = real_reader(1920, 1080, 96, false, Some("hello_world_2_pages.pdf"));
         let mut c = Canvas::with_fonts(1920, 1080, 96, false);
@@ -5019,6 +6104,12 @@ mod tests {
             let zoom_in = pill.parts.iter().find(|(p, _)| *p == crate::pill::Part::ZoomIn).map(|(_, r)| *r).unwrap_or(Rect { x: 0, y: 0, w: 0, h: 0 });
             app.event(Event::Hover { x: zoom_in.x + 5, y: s(84) + zoom_in.y + 5 });
             shot(&mut app, zh, &format!("hover-pill-{tag}"));
+            // The sidebar as a card, with the pointer on the second thumbnail.
+            app.event(Event::Key { vk: crate::ui::vk::F4, ctrl: false, shift: false });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            app.event(Event::Timer(3));
+            app.event(Event::Hover { x: s(120), y: s(84) + s(52) + s(330) });
+            shot(&mut app, zh, &format!("hover-thumb-{tag}"));
         }
         // The welcome page, with a list.
         for (zh, dark) in [(true, false), (false, false)] {
