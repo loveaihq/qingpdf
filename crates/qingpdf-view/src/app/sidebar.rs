@@ -607,7 +607,7 @@ pub(super) mod tests {
         assert_eq!(app.current_page(), 2);
         assert!(app.thumb_focus);
         // The pages move on by themselves (the toolbar's button, the page box): the list shows the page.
-        app.event(Event::PageBox("150".to_string()));
+        app.type_page("150");
         assert_eq!(app.current_page(), 149);
         assert_eq!(app.thumb_current(), 149);
         let row = app.thumbs.strip.row(149).copied().expect("a row");

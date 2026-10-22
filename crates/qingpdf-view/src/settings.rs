@@ -5,7 +5,8 @@
 //! and (2026-10-17) `single_window` and `remember_place` (`0` turns off handing a file to the copy of the program that is running, and opening a
 //! file where it was left; both are on unless they are `0`), and (2026-10-20) `theme` (`system`, `light` or `dark`: the look of the window), `page_color`
 //! (`original`, `night` or `sepia`) and `layout` (`single`, `spread` or `cover`: how the pages of a file nothing is kept about are laid out); those three are
-//! written only when they are not the first of their words. Nothing is sent anywhere. The file is
+//! written only when they are not the first of their words; and (2026-10-21) `accent` (`qing`, the teal of the program, or `system`, the colour Windows is set
+//! to; written only when it is `system`). `toolbar` is now whether the command bar is shown. Nothing is sent anywhere. The file is
 //! not trusted (another program may have written it): a name that is too long or has control characters in it is not used, a setting
 //! that is not understood or is out of range is ignored.
 
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 
 use qingpdf_core::view::MAX_AUTHOR_CHARS;
 
+use crate::accent::AccentChoice;
 use crate::i18n::LangChoice;
 use crate::layout::Spread;
 use crate::placement::Placement;
@@ -70,6 +72,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     pub page_color: Tint,
     pub layout: Spread,
+    /// The accent colour of the window (`accent=qing` or `accent=system`).
+    pub accent: AccentChoice,
 }
 
 impl Default for Settings {
@@ -86,6 +90,7 @@ impl Default for Settings {
             theme: ThemeChoice::System,
             page_color: Tint::Original,
             layout: Spread::Single,
+            accent: AccentChoice::Qing,
         }
     }
 }
@@ -109,6 +114,7 @@ impl Settings {
                 "theme" => s.theme = ThemeChoice::parse(value).unwrap_or_default(),
                 "page_color" => s.page_color = theme::parse_tint(value).unwrap_or_default(),
                 "layout" => s.layout = Spread::parse(value).unwrap_or_default(),
+                "accent" => s.accent = AccentChoice::parse(value).unwrap_or_default(),
                 _ => {}
             }
         }
@@ -134,7 +140,7 @@ impl Settings {
             out.push_str("remember_place=0\n");
         }
         // (The look and the layout are written when they are not the usual.)
-        for (key, value, usual) in [("theme", self.theme.word(), "system"), ("page_color", theme::tint_word(self.page_color), "original"), ("layout", self.layout.word(), "single")] {
+        for (key, value, usual) in [("theme", self.theme.word(), "system"), ("page_color", theme::tint_word(self.page_color), "original"), ("layout", self.layout.word(), "single"), ("accent", self.accent.word(), "qing")] {
             if value != usual {
                 out.push_str(&format!("{key}={value}\n"));
             }
@@ -217,6 +223,7 @@ mod tests {
             theme: ThemeChoice::Dark,
             page_color: Tint::Sepia,
             layout: Spread::Cover,
+            accent: AccentChoice::System,
         };
         let text = s.render();
         assert_eq!(text.lines().next(), Some("张三"));
@@ -247,6 +254,11 @@ mod tests {
         assert!(!Settings::parse(&off.render()).single_window);
         assert!(!Settings::parse(&Settings::default().render()).render().contains("single_window"));
         assert_eq!(Settings::parse("N\ntab=thumbnails\n").tab, None);
+        // The accent is 青 unless the file says `system`; a word that is not understood is 青 too, and 青 is not written.
+        assert_eq!(Settings::parse("N\naccent=system\n").accent, AccentChoice::System);
+        assert_eq!(Settings::parse("N\naccent=pink\n").accent, AccentChoice::Qing);
+        assert!(!Settings::default().render().contains("accent"));
+        assert!(Settings { accent: AccentChoice::System, ..Settings::default() }.render().contains("accent=system"));
         // Too long a first line is not a name, and does not stop the rest.
         let long = format!("{}\nlang=en\n", "x".repeat(MAX_AUTHOR_CHARS + 1));
         let s = Settings::parse(&long);

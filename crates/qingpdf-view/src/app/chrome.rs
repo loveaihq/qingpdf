@@ -1,6 +1,6 @@
-//! The window round the pages, as far as the reader decides it (2026-10-14): what the toolbar and the status bar say and when they are
-//! told, the language, the settings kept between runs, the menu on the page, double and triple clicks, the I-beam over text, and the
-//! edge of the bookmarks that is dragged.
+//! The window round the pages, as far as the reader decides it (2026-10-14): what the window is told about its search box and its colours and when, the
+//! language, the settings kept between runs, the menu on the page, double and triple clicks, the I-beam over text, and the edge of the bookmarks that is
+//! dragged.
 
 use qingpdf_core::view::is_blank;
 
@@ -8,7 +8,6 @@ use super::editing::Tool;
 use super::*;
 use crate::select::{CharPos, Selection};
 use crate::settings::{self, SIDEBAR_RANGE, Settings};
-use crate::toolbar::{self, Inputs};
 use crate::ui::MenuEntry;
 use crate::wordsel;
 
@@ -35,18 +34,19 @@ impl PendingSelect {
 }
 
 impl App {
-    /// The toolbar is on the window (the speed test has none: its page area is the size it was asked for).
+    /// The command bar is on the window (the speed test and full screen have none).
     pub(super) fn toolbar_visible(&self) -> bool {
-        self.toolbar_on && self.bench.is_none() && !self.full
+        self.toolbar_on && self.bench.is_none() && !self.full && !self.bare
     }
 
-    /// Take what was kept between runs: the language, whether the toolbar is shown, the width of the bookmarks.
+    /// Take what was kept between runs: the language, whether the command bar is shown, the width of the bookmarks, the accent.
     pub fn apply_settings(&mut self, s: &Settings) {
         self.lang_choice = s.lang;
         self.lang = s.lang.resolve(self.system_lang);
         self.toolbar_on = s.toolbar;
         self.remember_place = s.remember_place;
         self.theme_choice = s.theme;
+        self.accent_choice = s.accent;
         self.apply_theme();
         self.tint = s.page_color;
         self.cache_tint = s.page_color;
@@ -59,8 +59,22 @@ impl App {
             self.thumbs_alone = tab != Tab::Bookmarks;
             self.annots_focus = false;
         }
-        self.toolbar_dirty = true;
         self.menus_dirty = true;
+    }
+
+    /// The window is made bare (nothing round the pages) or not: the tests of the pages have it bare, those of the window's own parts do not.
+    #[cfg(test)]
+    pub fn set_bare(&mut self, bare: bool) {
+        self.bare = bare;
+    }
+
+    /// Draw only what is round the pages (for the test that times it).
+    #[cfg(test)]
+    pub fn paint_chrome_only(&mut self, p: &mut dyn Painter) {
+        self.draw_overlays(p);
+        self.draw_cmdbar(p);
+        self.draw_title(p);
+        self.draw_tooltip(p);
     }
 
     /// Change the settings in the file (not in the tests, which must not touch the person's).
@@ -70,66 +84,54 @@ impl App {
         }
     }
 
-    /// What the window is to be told about its toolbar and status bar after an event: only what has changed since it was last told.
+    /// What the window is to be told after an event: how it looks (when that changed), and where the box of the search pill is (when it moved).
     pub(super) fn chrome_updates(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         if std::mem::take(&mut self.theme_dirty) {
             actions.push(Action::Theme(self.theme_spec()));
-            // (The toolbar's pictures are drawn in the colour of its ink: the window draws them again.)
-            self.last_toolbar = None;
         }
-        if std::mem::take(&mut self.toolbar_dirty) {
-            actions.push(Action::Toolbar(toolbar::spec(self.lang, self.toolbar_visible())));
-            // The buttons are made again, from nothing: they are told how they are.
-            self.last_toolbar = None;
-        }
-        let inputs = Inputs { has_doc: self.doc.is_some(), page: self.current_page(), last: self.last_of_row().saturating_sub(1), pages: self.page_count(), can_edit: self.doc.is_some() && self.rights.annotate, tool: self.tool_command() };
-        let state = toolbar::state(&inputs);
-        if self.last_toolbar.as_ref() != Some(&state) {
-            self.last_toolbar = Some(state.clone());
-            actions.push(Action::ToolbarState(state));
-        }
-        let status = self.status_text();
-        if self.last_status.as_ref() != Some(&status) {
-            self.last_status = Some(status.clone());
-            actions.push(Action::Status(status));
+        let search = self.search_box();
+        if self.last_search_box != search {
+            self.last_search_box = search.clone();
+            actions.push(Action::SearchBox(search));
         }
         actions
     }
 
-    /// The status bar: the page, a note, the zoom.
-    pub(super) fn status_text(&self) -> StatusText {
-        if self.doc.is_none() {
-            return StatusText::default();
-        }
-        StatusText {
-            page: i18n::page_of(self.lang, self.current_page() + 1, self.last_of_row(), self.page_count()),
-            note: self.note.clone().unwrap_or_default(),
-            zoom: format!("{}%", (f64::from(self.zoom) / 10.0).round() as u32),
-        }
+    /// The pages' area is laid out again for the window as it is now (the command bar came or went, the dots per inch changed).
+    pub(super) fn resize_view(&mut self) -> Vec<Action> {
+        self.view_x = self.sidebar_width();
+        self.view_w = (self.client_w - self.view_x).max(0);
+        self.view_h = (self.client_h - self.bar_h()).max(0);
+        let (ax, ay) = (self.view_w / 2, self.view_h / 2);
+        self.relayout(ax, ay, None);
+        let mut actions = self.after_view_change(false);
+        actions.extend(self.chrome());
+        actions
     }
 
     // --- the language, the toolbar, the pages ------------------------------------------------------------------
 
-    /// View > Language: the menus, the toolbar's tooltips, the status bar and the title are put again in the language, now.
+    /// View > Language: the menus, the words on the window, the fonts and the title are put again in the language, now.
     pub(super) fn set_language(&mut self, choice: LangChoice) -> Vec<Action> {
         self.lang_choice = choice;
         self.lang = choice.resolve(self.system_lang);
         self.keep(|s| s.lang = choice);
         self.menus_dirty = true;
-        self.toolbar_dirty = true;
+        self.theme_dirty = true;
         vec![Action::SetTitle(self.title()), Action::Invalidate]
     }
 
-    /// View > Toolbar.
+    /// View > Command bar.
     pub(super) fn toggle_toolbar(&mut self) -> Vec<Action> {
         self.toolbar_on = !self.toolbar_on;
         let on = self.toolbar_on;
         self.keep(|s| s.toolbar = on);
-        self.toolbar_dirty = true;
         self.menus_dirty = true;
-        // The find box of the toolbar is gone, or comes: what is open starts again with the other.
-        if self.find_open { self.close_find() } else { Vec::new() }
+        // The find box of the command bar is gone, or comes: what is open starts again with the other.
+        let mut actions = if self.find_open { self.close_find() } else { Vec::new() };
+        actions.extend(self.resize_view());
+        actions
     }
 
     /// The button of a tool: a tool in use is let go of.
@@ -338,32 +340,57 @@ mod tests {
         assert_eq!(app.lang, Lang::Zh);
         let actions = app.event(Event::Command(CMD_LANG_EN));
         assert_eq!(app.lang, Lang::En);
-        // The menus and the toolbar's words come again in the new language, and the window is told what the title is.
+        // The menus come again in the new language, the window is told the fonts (Chinese or not) and what the title is.
         assert!(actions.iter().any(|a| matches!(a, Action::SetMenus(m) if m.first().is_some_and(|m| m.title.contains("File")))));
-        assert!(actions.iter().any(|a| matches!(a, Action::Toolbar(s) if s.items.iter().any(|i| matches!(i, crate::ui::ToolItem::Button { tip, .. } if tip.starts_with("Open"))))));
+        assert!(actions.iter().any(|a| matches!(a, Action::Theme(spec) if !spec.zh)));
         assert!(actions.iter().any(|a| matches!(a, Action::SetTitle(_))));
         let actions = app.event(Event::Command(CMD_LANG_ZH));
         assert!(actions.iter().any(|a| matches!(a, Action::SetMenus(m) if m.first().is_some_and(|m| m.title.starts_with("文件")))));
-        assert!(actions.iter().any(|a| matches!(a, Action::Toolbar(s) if s.items.iter().any(|i| matches!(i, crate::ui::ToolItem::Button { tip, .. } if tip.starts_with("打开"))))));
+        assert!(actions.iter().any(|a| matches!(a, Action::Theme(spec) if spec.zh)));
+        // The hint of the search box is in the language too.
+        app.bare = false;
+        app.event(Event::Size { w: 1000, h: 700 });
+        assert_eq!(app.search_box().map(|b| b.hint), Some("在文件中查找".to_string()));
         // "Follow the system" is the language the program started in (English here).
         app.event(Event::Command(CMD_LANG_SYSTEM));
         assert_eq!(app.lang, Lang::En);
+        assert_eq!(app.search_box().map(|b| b.hint), Some("Find in this file".to_string()));
     }
 
     #[test]
-    fn the_toolbar_is_told_once_and_again_only_when_something_changes() {
+    fn the_look_and_the_search_box_are_told_once_and_again_only_when_something_changes() {
         let mut app = app();
+        app.bare = false;
         let first = app.event(Event::Size { w: 1000, h: 700 });
-        assert!(first.iter().any(|a| matches!(a, Action::Toolbar(s) if s.visible && s.items.len() == 17)));
-        assert!(first.iter().any(|a| matches!(a, Action::ToolbarState(s) if s.buttons.iter().filter(|b| b.1).count() == 1)));
+        assert!(first.iter().any(|a| matches!(a, Action::SearchBox(Some(b)) if !b.enabled && b.rect.w > 0)));
+        assert!(first.iter().any(|a| matches!(a, Action::Theme(spec) if !spec.dark && spec.strip == crate::theme::LIGHT.strip_bg)));
         // Nothing changed: nothing is said.
         let second = app.event(Event::Size { w: 1000, h: 700 });
-        assert!(!second.iter().any(|a| matches!(a, Action::Toolbar(_) | Action::ToolbarState(_) | Action::Status(_))));
-        // Hiding the toolbar tells the window, and the menu's tick goes.
+        assert!(!second.iter().any(|a| matches!(a, Action::SearchBox(_) | Action::Theme(_))));
+        // A narrower window moves the box; hiding the command bar takes it away, and the pages have the room.
+        let narrower = app.event(Event::Size { w: 900, h: 700 });
+        assert!(narrower.iter().any(|a| matches!(a, Action::SearchBox(Some(_)))));
         let hidden = app.event(Event::Command(CMD_TOOLBAR));
-        assert!(hidden.iter().any(|a| matches!(a, Action::Toolbar(s) if !s.visible)));
+        assert!(hidden.iter().any(|a| matches!(a, Action::SearchBox(None))));
+        assert_eq!((app.bar_h(), app.view_h), (40, 660));
         let shown = app.event(Event::Command(CMD_TOOLBAR));
-        assert!(shown.iter().any(|a| matches!(a, Action::Toolbar(s) if s.visible)));
+        assert!(shown.iter().any(|a| matches!(a, Action::SearchBox(Some(_)))));
+        assert_eq!((app.bar_h(), app.view_h), (84, 616));
+        // Dark mode and the accent change what the window is told, and what the palette is.
+        let dark = app.event(Event::Command(CMD_THEME_DARK));
+        assert!(dark.iter().any(|a| matches!(a, Action::Theme(spec) if spec.dark && spec.strip == crate::theme::DARK.strip_bg)));
+        assert_eq!(app.pal.accent, crate::accent::QING_DARK.base);
+        app.apply_settings(&Settings { accent: crate::accent::AccentChoice::System, theme: ThemeChoice::Light, ..Settings::default() });
+        app.event(Event::SystemAccent(Some(0x0078D4)));
+        assert_eq!(app.pal.accent, 0x0078D4);
+        // A high-contrast theme is the colours of the system, and going back is 青 again.
+        let hc = crate::theme::Contrast { window: 0, text: 0xFFFFFF, gray: 0x3FF23F, highlight: 0x1AEBFF, highlight_text: 0, face: 0 };
+        let actions = app.event(Event::HighContrast(Some(hc)));
+        assert!(actions.iter().any(|a| matches!(a, Action::Theme(spec) if spec.dark)));
+        assert_eq!((app.pal.background, app.pal.accent), (0, 0x1AEBFF));
+        app.apply_settings(&Settings::default());
+        app.event(Event::HighContrast(None));
+        assert_eq!(app.pal.accent, crate::accent::QING_LIGHT.base);
     }
 
     fn pump(app: &mut App, what: &str, until: impl Fn(&App) -> bool) {
@@ -455,30 +482,31 @@ mod tests {
         let corpus = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/public/xref-classic/hello_world_2_pages.pdf");
         app.open_path(std::path::Path::new(corpus), "");
         pump(&mut app, "the file to open", |a| a.has_document());
-        let state = |actions: &[Action]| actions.iter().rev().find_map(|a| if let Action::ToolbarState(s) = a { Some(s.clone()) } else { None });
-        let of = |s: &ToolbarState, cmd: u32| s.buttons.iter().find(|b| b.0 == cmd).map(|b| (b.1, b.2));
         assert_eq!(app.current_page(), 0);
-        let next = app.event(Event::Command(CMD_NEXT_PAGE));
+        assert!(app.pill_part_enabled(crate::pill::Part::Next) && !app.pill_part_enabled(crate::pill::Part::Prev));
+        app.event(Event::Command(CMD_NEXT_PAGE));
         assert_eq!(app.current_page(), 1);
-        let st = state(&next).expect("the toolbar is told the page changed");
-        assert_eq!(st.page_text, "2 / 2");
-        assert_eq!((of(&st, CMD_PREV_PAGE), of(&st, CMD_NEXT_PAGE)), (Some((true, false)), Some((false, false))));
+        // The pill says where it is, and its buttons stop at the ends.
+        assert_eq!(crate::pill::page_label(app.current_page() + 1, app.last_of_row(), app.page_count()), "2 / 2");
+        assert!(app.pill_part_enabled(crate::pill::Part::Prev) && !app.pill_part_enabled(crate::pill::Part::Next));
         // The keys: Ctrl+PgUp goes back, Ctrl+PgDn forward (and stops at the last page).
         app.event(Event::Key { vk: vk::PRIOR, ctrl: true, shift: false });
         assert_eq!(app.current_page(), 0);
         app.event(Event::Key { vk: vk::NEXT, ctrl: true, shift: false });
         app.event(Event::Key { vk: vk::NEXT, ctrl: true, shift: false });
         assert_eq!(app.current_page(), 1);
-        // What is typed in the page box.
-        app.event(Event::PageBox("1 / 2".to_string()));
+        // What is typed in the box over the pill.
+        app.type_page("1 / 2");
         assert_eq!(app.current_page(), 0);
-        app.event(Event::PageBox("nonsense".to_string()));
+        app.type_page("nonsense");
         assert_eq!(app.current_page(), 0);
         // A tool button presses its tool, and the same button lets it go.
-        let on = app.event(Event::Command(CMD_TOOL_INK));
-        assert_eq!(of(&state(&on).expect("told"), CMD_TOOL_INK), Some((true, true)));
-        let off = app.event(Event::Command(CMD_TOOL_INK));
-        assert_eq!(of(&state(&off).expect("told"), CMD_TOOL_INK), Some((true, false)));
+        let ink = crate::cmdbar::BUTTONS.iter().find(|d| d.cmd == CMD_TOOL_INK).expect("the button of the pen");
+        let state = |app: &App| crate::cmdbar::button_state(ink, &app.cmd_inputs());
+        app.event(Event::Command(CMD_TOOL_INK));
+        assert_eq!(state(&app), (true, true));
+        app.event(Event::Command(CMD_TOOL_INK));
+        assert_eq!(state(&app), (true, false));
     }
 
     #[test]

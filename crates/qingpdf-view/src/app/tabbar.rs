@@ -1,16 +1,14 @@
-//! The strip of tabs above the pages (2026-10-17): drawn here, in the window's own painter, and only when two files or more are open.
-//! Each tab says the name of its file, a dot when the file has changes that are not saved, and a cross to close it; the full path of the
-//! tab under the pointer is shown in a small box. What a place of the strip is on is plain arithmetic in `tabs.rs`.
+//! The title strip (2026-10-21; before that, the strip of tabs, shown from two files on): at the top of the window, always, in the place of the system's
+//! title bar. From the left: the mark, the tabs (one for each file, the shown one raised, with a line of the accent colour on top; each says the name of
+//! its file, has a dot in the accent colour when the file has changes not saved, and a cross to close it), the "+" that opens a file, and what is left is
+//! where the window is dragged. The system draws its buttons (minimize, maximize, close) over the right end. Where the parts are is plain arithmetic in `tabs.rs`.
 
+use super::overlay::{Hot, draw_logo, rc};
 use super::*;
-use crate::tabs::{self, CLOSE_EDGE, CLOSE_SIDE, Hit, MAX_TAB_W, MIN_TAB_W, WIDE_TAB};
-use crate::ui::Rgb;
+use crate::tabs::{self, Strip, WIDE_TAB};
+use crate::ui::{Font, Rgb};
 
-/// Space left and right of a name, and the room a dot before it takes, at 96 dpi.
-const PAD: i64 = 8;
-const DOT: i64 = 12;
-
-/// The painter of the pages when the strip of tabs is above them: everything is drawn the strip's height lower.
+/// The painter of the pages when something is above them: everything is drawn `dy` lower.
 pub(super) struct Shifted<'a> {
     pub(super) inner: &'a mut dyn Painter,
     pub(super) dy: i32,
@@ -50,99 +48,173 @@ impl Painter for Shifted<'_> {
     fn line_height(&self) -> i32 {
         self.inner.line_height()
     }
+
+    fn set_font(&mut self, font: Font) {
+        self.inner.set_font(font);
+    }
+
+    fn fill_shape(&mut self, r: Rect, radii: [i32; 4], color: Rgb, alpha: u8) {
+        let r = self.down(r);
+        self.inner.fill_shape(r, radii, color, alpha);
+    }
+
+    fn stroke_round(&mut self, r: Rect, radius: i32, width: i32, color: Rgb, alpha: u8) {
+        let r = self.down(r);
+        self.inner.stroke_round(r, radius, width, color, alpha);
+    }
+
+    fn polyline(&mut self, points: &[(f32, f32)], width: f32, color: Rgb, alpha: u8) {
+        let dy = self.dy as f32;
+        let moved: Vec<(f32, f32)> = points.iter().map(|&(x, y)| (x, y + dy)).collect();
+        self.inner.polyline(&moved, width, color, alpha);
+    }
+
+    fn glyph(&mut self, r: Rect, ch: char, color: Rgb) {
+        let r = self.down(r);
+        self.inner.glyph(r, ch, color);
+    }
 }
 
 impl App {
-    /// The width of each tab, in pixels.
-    pub(super) fn tab_w(&self) -> i64 {
-        tabs::tab_width(self.tabs.len(), self.client_w, self.px(MIN_TAB_W), self.px(MAX_TAB_W))
+    /// The height of the title strip, in pixels (0 in full screen and in the speed test).
+    pub(super) fn title_h(&self) -> i64 {
+        if self.full || self.bench.is_some() || self.bare { 0 } else { self.px(tabs::TITLE_H) }
+    }
+
+    /// The width of the system's buttons at the right end of the strip, in pixels (none when the system has its own title bar above the window).
+    fn caption_px(&self) -> i64 {
+        if self.frame_custom { self.caption_w } else { 0 }
+    }
+
+    /// Where the parts of the strip are.
+    pub(super) fn strip(&self) -> Strip {
+        Strip::new(self.tabs.len(), self.dpi, self.client_w - self.caption_px() - self.px(tabs::DRAG_MIN))
     }
 
     /// Does tab `i` show its close button? The shown one does, the one under the pointer does, and so does any that is wide enough.
-    fn shows_close(&self, i: usize, w: i64) -> bool {
-        self.tabs.active() == Some(i) || self.tab_hover == Some(i) || w >= self.px(WIDE_TAB)
+    pub(super) fn shows_close(&self, i: usize) -> bool {
+        self.tabs.active() == Some(i) || matches!(self.hot, Some(Hot::Tab(n) | Hot::Close(n)) if n == i) || self.strip().width >= self.px(WIDE_TAB)
     }
 
-    /// What a place of the strip is on (`x` across the window).
-    fn strip_hit(&self, x: i64) -> Hit {
-        let w = self.tab_w();
-        tabs::hit(self.tabs.len(), w, x, self.px(CLOSE_SIDE), self.px(CLOSE_EDGE), |i| self.shows_close(i, w))
-    }
-
-    /// A mouse button went down in the strip.
-    pub(super) fn strip_down(&mut self, x: i64) -> Vec<Action> {
-        self.strip_press = true;
-        match self.strip_hit(x) {
-            Hit::Tab(i) => self.show_tab(i),
-            Hit::Close(i) => self.close_tab(i),
-            Hit::Nothing => Vec::new(),
+    /// What the frame of the window should treat this place as: the empty part of the title strip is the title bar (dragged, and a double click makes the
+    /// window big or small); the rest is the reader's.
+    pub(super) fn nc_at(&self, x: i64, y: i64) -> crate::ui::NcHit {
+        use crate::ui::NcHit;
+        if !self.frame_custom || y < 0 || y >= self.title_h() {
+            return NcHit::Client;
+        }
+        match tabs::hit(&self.strip(), x, y, |i| self.shows_close(i)) {
+            tabs::Hit::Nothing => NcHit::Caption,
+            _ => NcHit::Client,
         }
     }
 
     /// The middle button came up in the strip: it closes the tab under it.
-    pub(super) fn strip_middle(&mut self, x: i64) -> Vec<Action> {
-        match self.strip_hit(x) {
-            Hit::Tab(i) | Hit::Close(i) => self.close_tab(i),
-            Hit::Nothing => Vec::new(),
+    pub(super) fn strip_middle(&mut self, x: i64, y: i64) -> Vec<Action> {
+        match tabs::hit(&self.strip(), x, y, |i| self.shows_close(i)) {
+            tabs::Hit::Tab(i) | tabs::Hit::Close(i) => self.close_tab(i),
+            _ => Vec::new(),
         }
     }
 
-    /// The pointer is at `x` in the strip (`None`: it is not in the strip): the box with the path follows it.
-    pub(super) fn strip_hover(&mut self, x: Option<i64>) -> Vec<Action> {
-        let now = x.and_then(|x| match self.strip_hit(x) {
-            Hit::Tab(i) | Hit::Close(i) => Some(i),
-            Hit::Nothing => None,
-        });
-        if now == self.tab_hover {
-            return Vec::new();
-        }
-        self.tab_hover = now;
-        vec![Action::Invalidate]
+    /// The shape of a tab: the rectangle with its top corners rounded.
+    fn tab_radii(&self) -> [i32; 4] {
+        let r = clamp32(self.px(8));
+        [r, r, 0, 0]
     }
 
-    /// Draw the strip over the top `bar_h()` rows of the window.
-    pub(super) fn draw_tabbar(&self, p: &mut dyn Painter) {
-        let bar = self.bar_h();
-        if bar == 0 {
+    /// Draw the title strip over the top of the window.
+    pub(super) fn draw_title(&self, p: &mut dyn Painter) {
+        let h = self.title_h();
+        if h == 0 {
             return;
         }
-        let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
-        p.fill_rect(rect(0, 0, self.client_w, bar), self.pal.strip_bg);
-        let w = self.tab_w();
-        let line = self.px(1).max(1);
-        let ty = clamp32((bar - i64::from(p.line_height())) / 2);
+        let pal = &self.pal;
+        let strip = self.strip();
+        p.fill_rect(rc(0, 0, self.client_w, h), pal.strip_bg);
+        let (mx, my, ms) = strip.mark;
+        draw_logo(p, rc(mx, my, ms, ms));
+        p.set_font(Font::Body);
+        let lh = i64::from(p.line_height());
+        if self.tabs.is_empty() {
+            p.set_font(Font::Bold);
+            let ty = (h - i64::from(p.line_height())) / 2;
+            p.text(clamp32(strip.first), clamp32(ty), "qingpdf", pal.status_fg);
+            p.set_font(Font::Body);
+            return;
+        }
+        let (pad, dot) = (self.px(10), self.px(12));
+        let radii = self.tab_radii();
         for (i, tab) in self.tabs.iter().enumerate() {
-            let x = i as i64 * w;
+            let x = strip.xs.get(i).copied().unwrap_or(0);
             let shown = self.tabs.active() == Some(i);
-            p.fill_rect(rect(x, 0, w - line, bar), if shown { self.pal.tab_on } else { self.pal.tab_off });
+            let hot = matches!(self.hot, Some(Hot::Tab(n) | Hot::Close(n)) if n == i);
+            // The shown tab is the surface of the command bar, a little taller than the strip so that it flows into it, with the accent on its top edge.
             if shown {
-                p.fill_rect(rect(x, 0, w - line, self.px(2)), self.pal.accent);
-            } else {
-                p.fill_rect(rect(x, bar - line, w, line), self.pal.tab_edge);
+                let body = rc(x, strip.top, strip.width, strip.height + 1);
+                p.fill_shape(body, radii, pal.accent, 255);
+                p.fill_shape(rc(x, strip.top + self.px(2), strip.width, strip.height + 1 - self.px(2)), radii, pal.tab_on, 255);
+            } else if hot {
+                let body = rc(x, strip.top + self.px(2), strip.width, strip.height - self.px(4));
+                self.hover_fill(p, body, clamp32(self.px(8)), false, 255);
             }
-            let close = self.shows_close(i, w);
-            let mut left = x + self.px(PAD);
-            let mut room = w - 2 * self.px(PAD) - if close { self.px(CLOSE_SIDE) } else { 0 };
+            let close = self.shows_close(i);
+            let mut left = x + pad;
+            let mut room = strip.width - 2 * pad - if close { strip.close.0 + self.px(2) } else { 0 };
+            let ty = strip.top + (strip.height - lh) / 2;
             if tab.dirty {
-                p.text(clamp32(left), ty, "\u{25CF}", self.pal.dirty_fg);
-                (left, room) = (left + self.px(DOT), room - self.px(DOT));
+                let d = self.px(8);
+                p.fill_shape(rc(left, strip.top + (strip.height - d) / 2, d, d), [clamp32(d / 2); 4], pal.dirty_fg, 255);
+                (left, room) = (left + dot, room - dot);
             }
             let name = tabs::shorten_to(&tabs::label(&tab.path), |s| i64::from(p.text_width(s)) <= room);
-            p.text(clamp32(left), ty, &name, self.pal.tab_fg);
-            if close {
-                let cross = p.text_width("\u{00D7}");
-                p.text(clamp32(x + w - self.px(CLOSE_EDGE) - (self.px(CLOSE_SIDE) + i64::from(cross)) / 2), ty, "\u{00D7}", self.pal.tab_fg);
+            p.text(clamp32(left), clamp32(ty), &name, if shown || hot { pal.tab_fg } else { pal.dim_fg });
+            if close && let Some((cl, ct, side)) = strip.close_box(i) {
+                let r = rc(cl, ct, side, side);
+                let on = self.hot == Some(Hot::Close(i));
+                if on || self.pressed == Some(Hot::Close(i)) {
+                    self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Close(i)) && on, 255);
+                }
+                let (cx, cy, a) = (cl as f32 + side as f32 / 2.0, ct as f32 + side as f32 / 2.0, side as f32 * 0.23);
+                let w = (1.4 * self.dpi as f32 / 96.0).max(1.0);
+                let ink = if shown || hot { pal.status_fg } else { pal.dim_fg };
+                p.polyline(&[(cx - a, cy - a), (cx + a, cy + a)], w, ink, 255);
+                p.polyline(&[(cx + a, cy - a), (cx - a, cy + a)], w, ink, 255);
             }
         }
-        // The full path of the tab under the pointer, just under the strip.
-        if let Some(i) = self.tab_hover
-            && let Some(tab) = self.tabs.get(i)
-        {
-            let text = tab.path.to_string_lossy();
-            let (tw, th) = (i64::from(p.text_width(&text)), i64::from(p.line_height()));
-            let (bw, bx) = (tw + 2 * self.px(6), (i as i64 * w).min((self.client_w - tw - 2 * self.px(6)).max(0)));
-            p.fill_rect(rect(bx, bar + self.px(2), bw, th + 2 * self.px(3)), self.pal.tip_bg);
-            p.text(clamp32(bx + self.px(6)), clamp32(bar + self.px(5)), &text, self.pal.tip_fg);
+        if let Some((l, t, side)) = strip.plus {
+            let r = rc(l, t, side, side);
+            let on = self.hot == Some(Hot::Plus);
+            if on || self.pressed == Some(Hot::Plus) {
+                self.hover_fill(p, r, clamp32(self.px(6)), self.pressed == Some(Hot::Plus) && on, 255);
+            }
+            let (cx, cy, a) = (l as f32 + side as f32 / 2.0, t as f32 + side as f32 / 2.0, side as f32 * 0.21);
+            let w = (1.5 * self.dpi as f32 / 96.0).max(1.0);
+            p.polyline(&[(cx - a, cy), (cx + a, cy)], w, pal.status_fg, 255);
+            p.polyline(&[(cx, cy - a), (cx, cy + a)], w, pal.status_fg, 255);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::sidebar::tests::Rec;
+    use super::*;
+
+    #[test]
+    fn the_shifted_painter_moves_everything_down() {
+        let mut rec = Rec::default();
+        {
+            let mut s = Shifted { inner: &mut rec, dy: 30 };
+            s.fill_rect(Rect { x: 1, y: 2, w: 3, h: 4 }, 5);
+            s.fill_shape(Rect { x: 1, y: 2, w: 3, h: 4 }, [1; 4], 6, 255);
+            s.text(7, 8, "x", 9);
+            s.glyph(Rect { x: 0, y: 10, w: 20, h: 20 }, 'a', 1);
+        }
+        assert_eq!(rec.fills[0].0.y, 32);
+        assert_eq!(rec.fills[1].0.y, 32);
+        assert!(rec.texts.iter().any(|(x, y, s)| (*x, *y, s.as_str()) == (7, 38, "x")));
+        // The letter of the icon font is put by the painter under it, at the place moved.
+        assert!(rec.texts.iter().any(|(_, y, s)| s == "a" && *y >= 40));
     }
 }

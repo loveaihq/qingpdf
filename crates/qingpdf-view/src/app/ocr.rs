@@ -53,10 +53,9 @@ impl App {
         self.say_progress(t(self.lang, Msg::OcrLooking).to_string())
     }
 
-    /// A line in the status bar that stays until something else is said.
+    /// A message over the pages (what text recognition has got to; it is said again as the run goes on, and takes the place of the one showing).
     fn say_progress(&mut self, text: String) -> Vec<Action> {
-        self.note = Some(text);
-        vec![Action::KillTimer(TIMER_NOTE), Action::Invalidate]
+        self.say(text)
     }
 
     /// Esc while text is being recognized: stop; the pages done so far get their text. `None`: nothing is running.
@@ -238,7 +237,7 @@ mod tests {
         assert!(app.ocr.is_some() && started.iter().any(|a| matches!(a, Action::Invalidate)));
         assert_eq!(app.note.as_deref(), Some("Looking for scanned pages... (Esc to stop)"));
         // While it runs the menu items are greyed, and a second start only says so.
-        assert!(app.start_ocr(false).iter().any(|a| matches!(a, Action::SetTimer { .. })));
+        assert!(app.start_ocr(false).iter().any(|a| matches!(a, Action::Invalidate)));
         assert_eq!(app.note.as_deref(), Some("Text is being recognized already (Esc stops it)."));
         let mut notes = Vec::new();
         pump(&mut app, "the run to end", |a| {

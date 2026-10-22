@@ -28,28 +28,41 @@ impl App {
         actions
     }
 
-    /// The window is told how it looks when the reader next answers (the title bar, the toolbar and the status bar, the boxes and the tree of
-    /// bookmarks are Windows' own and are told the colours).
+    /// The window is told how it looks when the reader next answers (the frame, the boxes and the tree of bookmarks are Windows' own and are told the colours;
+    /// the text it draws is told the language, which decides the fonts).
     pub(super) fn theme_spec(&self) -> ThemeSpec {
-        let p = self.pal;
-        ThemeSpec {
-            dark: self.theme_choice.dark(self.system_dark),
-            face: p.status_bg,
-            text: p.status_fg,
-            dim: p.disabled_fg,
-            hot: p.tab_on,
-            down: p.tab_edge,
-            field_bg: p.tab_on,
-            tree_bg: p.list_bg,
-            tree_line: p.thumb_border,
-        }
+        let p = &self.pal;
+        ThemeSpec { dark: self.dark, zh: self.lang == Lang::Zh, strip: p.strip_bg, text: p.status_fg, field_bg: p.field_bg, tree_bg: p.list_bg, tree_line: p.thumb_border }
     }
 
-    /// Take the colours that the choice and the system make now.
+    /// Take the colours that the choices and the system make now: a high-contrast theme's own, else light or dark with the accent (青, or the system's).
     pub(super) fn apply_theme(&mut self) {
-        self.pal = Palette::of(self.theme_choice.dark(self.system_dark));
+        self.dark = match &self.contrast {
+            Some(c) => accent::luminance(c.window) < 0.18,
+            None => self.theme_choice.dark(self.system_dark),
+        };
+        self.pal = match &self.contrast {
+            Some(c) => Palette::high_contrast(c),
+            None => Palette::with_accent(self.dark, &accent::pick(self.accent_choice, self.system_accent, self.dark)),
+        };
         self.theme_dirty = true;
         self.menus_dirty = true;
+    }
+
+    /// The colour Windows has as its accent, told at the start and when it changes (used when the settings say `accent=system`).
+    pub fn set_system_accent(&mut self, rgb: Option<Rgb>) -> Vec<Action> {
+        self.system_accent = rgb;
+        if self.accent_choice == AccentChoice::System {
+            self.apply_theme();
+        }
+        vec![Action::Invalidate]
+    }
+
+    /// Windows is set to a high-contrast theme (with its colours), or not any more.
+    pub fn set_contrast(&mut self, colors: Option<theme::Contrast>) -> Vec<Action> {
+        self.contrast = colors;
+        self.apply_theme();
+        vec![Action::Invalidate]
     }
 
     /// View > Interface.
@@ -274,9 +287,8 @@ mod tests {
         assert_eq!(app.page_at_point(x, y).map(|p| (p.0, p.1, p.2)), Some((0, 5.0, 7.0)));
         let (x, y) = at(&app, 0, -3, 7);
         assert!(app.page_at_point(x, y).is_none(), "left of the pages is no page");
-        // The status bar and the page box: "Page 1-2 / 7", "1 / 7".
-        let status = app.status_text();
-        assert_eq!(status.page, "Page 1-2 / 7");
+        // The page pill and the page box: "1-2 / 7", "1 / 7".
+        assert_eq!(pill_page(&app), "1-2 / 7");
         assert_eq!(toolbar_page(&app), "1 / 7");
         // The next page button goes a row on, the one before a row back; at the ends they stop (the last row is page 7 alone).
         let next = |app: &mut App| app.event(Event::Command(CMD_NEXT_PAGE));
@@ -286,15 +298,15 @@ mod tests {
         next(&mut app);
         next(&mut app);
         assert_eq!(app.current_page(), 6);
-        assert_eq!(app.status_text().page, "Page 7 / 7");
+        assert_eq!(pill_page(&app), "7 / 7");
         assert!(!button_enabled(&app, CMD_NEXT_PAGE) && button_enabled(&app, CMD_PREV_PAGE));
         next(&mut app);
         assert_eq!(app.current_page(), 6);
         prev(&mut app);
         assert_eq!(app.current_page(), 4);
         // The page box and Ctrl+G go to the page, and the row it is in is shown.
-        app.event(Event::PageBox("4".to_string()));
-        assert_eq!((app.current_page(), app.status_text().page), (2, "Page 3-4 / 7".to_string()));
+        app.type_page("4");
+        assert_eq!((app.current_page(), pill_page(&app)), (2, "3-4 / 7".to_string()));
         assert!(app.scroll_y <= app.doc.as_ref().unwrap().layout.top(3));
         // Both pages of the row are the page in view for the thumbnails.
         app.apply_settings(&Settings { tab: Some(crate::thumbs::Tab::Pages), ..Settings::default() });
@@ -307,12 +319,17 @@ mod tests {
 
     /// What the page box says now.
     fn toolbar_page(app: &App) -> String {
-        crate::toolbar::page_text(app.current_page(), app.page_count())
+        crate::cmdbar::page_text(app.current_page(), app.page_count())
     }
 
+    /// What the page pill says now.
+    fn pill_page(app: &App) -> String {
+        crate::pill::page_label(app.current_page() + 1, app.last_of_row(), app.page_count())
+    }
+
+    /// Can the button of the page before (or after) be used?
     fn button_enabled(app: &App, cmd: u32) -> bool {
-        let inputs = crate::toolbar::Inputs { has_doc: true, page: app.current_page(), last: app.last_of_row() - 1, pages: app.page_count(), can_edit: true, tool: CMD_TOOL_SELECT };
-        crate::toolbar::state(&inputs).buttons.iter().find(|b| b.0 == cmd).is_some_and(|b| b.1)
+        app.pill_part_enabled(if cmd == CMD_NEXT_PAGE { crate::pill::Part::Next } else { crate::pill::Part::Prev })
     }
 
     #[test]

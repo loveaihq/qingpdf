@@ -3,8 +3,9 @@
 //! written it): what cannot be read is skipped, and no line, no number and no count can make the reader do more than a
 //! little.
 //!
-//! The format: the first line is `qingpdf-recent 1`, then one file to a line, newest first: `page`, `zoom`, `mode` and the path,
-//! separated by tabs (the path last: it may hold anything but a tab or a line end).
+//! The format: the first line is `qingpdf-recent 2`, then one file to a line, newest first: `page`, `zoom`, `mode`, the day it was opened (`YYYY-MM-DD` in
+//! the person's time zone, or `-` when it is not known) and the path, separated by tabs (the path last: it may hold anything but a tab or a line end).
+//! Lines of the first version (`qingpdf-recent 1`, with no day) are read too.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,8 @@ pub const MAX_RECENT: usize = 10;
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_LINE_BYTES: usize = 4096;
 const MAX_PATH_CHARS: usize = 1024;
-const HEADER: &str = "qingpdf-recent 1";
+const HEADER: &str = "qingpdf-recent 2";
+const HEADER_V1: &str = "qingpdf-recent 1";
 
 /// How the zoom of a file was set, as the file keeps it.
 pub const MODE_FIT_WIDTH: u8 = 0;
@@ -32,12 +34,14 @@ pub struct Entry {
     /// The zoom, in thousandths (1000 is 100 percent), and how it was set ([`MODE_FIT_WIDTH`] and so on).
     pub zoom: u32,
     pub mode: u8,
+    /// The day it was opened last (`YYYY-MM-DD`, empty when it is not known).
+    pub date: String,
 }
 
 #[cfg(test)]
 impl Entry {
     pub fn new(path: &str) -> Entry {
-        Entry { path: path.to_string(), page: 0, zoom: zoom::ACTUAL_SIZE, mode: MODE_FIT_WIDTH }
+        Entry { path: path.to_string(), page: 0, zoom: zoom::ACTUAL_SIZE, mode: MODE_FIT_WIDTH, date: String::new() }
     }
 }
 
@@ -59,17 +63,22 @@ pub fn parse(text: &str) -> Vec<Entry> {
         if out.len() >= MAX_RECENT {
             break;
         }
-        if line.len() > MAX_LINE_BYTES || line == HEADER {
+        if line.len() > MAX_LINE_BYTES || line == HEADER || line == HEADER_V1 {
             continue;
         }
-        let mut parts = line.splitn(4, '\t');
-        let (Some(page), Some(zoom_text), Some(mode), Some(path)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        // Five columns (with the day) or four (the first version's); a day that is not one makes the line unreadable.
+        let fields: Vec<&str> = line.splitn(5, '\t').collect();
+        let (page, zoom_text, mode, date, path) = match fields.as_slice() {
+            [page, zoom_text, mode, date, path] if *date == "-" || crate::welcome::parse_date(date).is_some() => (*page, *zoom_text, *mode, if *date == "-" { "" } else { *date }, *path),
+            [page, zoom_text, mode, path] => (*page, *zoom_text, *mode, "", *path),
+            _ => continue,
+        };
         let (Ok(page), Ok(z), Ok(mode)) = (page.trim().parse::<u32>(), zoom_text.trim().parse::<u32>(), mode.trim().parse::<u8>()) else { continue };
         if !path_ok(path) || out.iter().any(|e| same_file(&e.path, path)) {
             continue;
         }
         let mode = if mode <= MODE_CUSTOM { mode } else { MODE_FIT_WIDTH };
-        out.push(Entry { path: path.to_string(), page: page.min(10_000_000), zoom: zoom::clamp(z), mode });
+        out.push(Entry { path: path.to_string(), page: page.min(10_000_000), zoom: zoom::clamp(z), mode, date: date.trim().to_string() });
     }
     out
 }
@@ -79,7 +88,8 @@ pub fn serialize(entries: &[Entry]) -> String {
     let mut out = String::from(HEADER);
     out.push('\n');
     for e in entries.iter().filter(|e| path_ok(&e.path)).take(MAX_RECENT) {
-        out.push_str(&format!("{}\t{}\t{}\t{}\n", e.page, e.zoom, e.mode, e.path));
+        let date = if crate::welcome::parse_date(&e.date).is_some() { e.date.trim() } else { "-" };
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", e.page, e.zoom, e.mode, date, e.path));
     }
     out
 }
@@ -173,15 +183,26 @@ mod tests {
     use super::*;
 
     fn entry(path: &str, page: u32) -> Entry {
-        Entry { path: path.to_string(), page, zoom: 1500, mode: MODE_CUSTOM }
+        Entry { path: path.to_string(), page, zoom: 1500, mode: MODE_CUSTOM, date: String::new() }
     }
 
     #[test]
     fn a_list_goes_to_text_and_back() {
         let list = vec![entry("C:\\a\\一.pdf", 4), Entry::new("D:\\b c\\d.pdf")];
         let text = serialize(&list);
-        assert!(text.starts_with("qingpdf-recent 1\n"));
+        assert!(text.starts_with("qingpdf-recent 2\n"));
         assert_eq!(parse(&text), list);
+        // The day it was opened comes back too; a day that cannot be is not kept.
+        let dated = vec![Entry { date: "2026-10-21".to_string(), ..entry("C:\\d.pdf", 1) }, Entry { date: "garbage".to_string(), ..entry("C:\\e.pdf", 2) }];
+        let got = parse(&serialize(&dated));
+        assert_eq!((got[0].date.as_str(), got[1].date.as_str()), ("2026-10-21", ""));
+    }
+
+    #[test]
+    fn the_first_versions_lines_without_a_day_are_still_read() {
+        let got = parse("qingpdf-recent 1\n3\t1000\t0\tC:\\old.pdf\n4\t1500\t2\t2026-10-20\tC:\\new.pdf\n5\t1000\t0\t-\tC:\\none.pdf\n6\t1000\t0\tnot-a-day\tC:\\bad.pdf\n");
+        let shown: Vec<(&str, &str)> = got.iter().map(|e| (e.path.as_str(), e.date.as_str())).collect();
+        assert_eq!(shown, [("C:\\old.pdf", ""), ("C:\\new.pdf", "2026-10-20"), ("C:\\none.pdf", "")]);
     }
 
     #[test]

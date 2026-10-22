@@ -150,44 +150,92 @@ impl<S> Tabs<S> {
 
 // --- the strip ---------------------------------------------------------------------------------------------------
 
-/// Sizes of the strip at 96 dpi.
-pub const BAR_H: i64 = 28;
-pub const MIN_TAB_W: i64 = 40;
+/// Sizes of the title strip at 96 dpi: its height, the mark (the logo) and its room to the left, the gap above a tab, the width a tab may have, the gap
+/// between tabs, the button that opens another file ("+"), the button that closes a tab and the room to its right, and the least of the strip that is left
+/// for dragging the window (to the left of the buttons of the frame).
+pub const TITLE_H: i64 = 40;
+pub const MARK: i64 = 20;
+pub const MARK_X: i64 = 14;
+pub const TAB_TOP: i64 = 6;
+pub const MIN_TAB_W: i64 = 44;
 pub const MAX_TAB_W: i64 = 220;
-/// The side of the square button that closes a tab, and the room on its right.
-pub const CLOSE_SIDE: i64 = 18;
+pub const TAB_GAP: i64 = 2;
+pub const PLUS: i64 = 28;
+pub const PLUS_GAP: i64 = 4;
+pub const CLOSE_SIDE: i64 = 20;
 pub const CLOSE_EDGE: i64 = 6;
+pub const DRAG_MIN: i64 = 48;
 /// A tab narrower than this shows its close button only when it is the shown one or the pointer is on it.
 pub const WIDE_TAB: i64 = 120;
 
-/// The width of each of `count` tabs in a strip `avail` wide: they share it equally, between `min` and `max`. (Tabs that do not fit at
-/// `min` run off the right edge: sixteen of the least width fit a window of 640 pixels.)
-pub fn tab_width(count: usize, avail: i64, min: i64, max: i64) -> i64 {
-    let n = i64::try_from(count.max(1)).unwrap_or(1);
-    (avail / n).clamp(min, max)
+/// Where the parts of the title strip are, in pixels, from the number of tabs, the dots per inch and the edge the strip may not go past (the left
+/// edge of the buttons of the frame, less what is kept for dragging).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Strip {
+    /// The mark: its left edge, its top and its side.
+    pub mark: (i64, i64, i64),
+    /// Where tabs begin, their top and height, and each tab's left edge, all of one width.
+    pub first: i64,
+    pub top: i64,
+    pub height: i64,
+    pub width: i64,
+    pub xs: Vec<i64>,
+    /// The "+": its left edge, its top and its side (none without a tab: the welcome page has the button).
+    pub plus: Option<(i64, i64, i64)>,
+    /// The close button's side and its distance from the right edge of a tab.
+    pub close: (i64, i64),
 }
 
-/// What a place of the strip is on.
+impl Strip {
+    pub fn new(count: usize, dpi: u32, right: i64) -> Strip {
+        let s = |v: i64| v * i64::from(dpi.max(1)) / 96;
+        let first = s(MARK_X + MARK + 10);
+        let n = i64::try_from(count).unwrap_or(0);
+        let reserved = if n > 0 { s(PLUS + PLUS_GAP) } else { 0 };
+        let room = (right - first - reserved - (n - 1).max(0) * s(TAB_GAP)).max(0);
+        let width = if n > 0 { (room / n).clamp(s(MIN_TAB_W), s(MAX_TAB_W)) } else { s(MAX_TAB_W) };
+        let xs: Vec<i64> = (0..n).map(|i| first + i * (width + s(TAB_GAP))).collect();
+        let top = s(TAB_TOP);
+        let height = s(TITLE_H) - top;
+        let end = if n > 0 { first + n * (width + s(TAB_GAP)) - s(TAB_GAP) } else { first };
+        let plus = (n > 0).then(|| (end + s(PLUS_GAP), top + (height - s(PLUS)) / 2, s(PLUS)));
+        Strip { mark: (s(MARK_X), (s(TITLE_H) - s(MARK)) / 2, s(MARK)), first, top, height, width, xs, plus, close: (s(CLOSE_SIDE), s(CLOSE_EDGE)) }
+    }
+
+    /// The close button of tab `i`: left, top, side.
+    pub fn close_box(&self, i: usize) -> Option<(i64, i64, i64)> {
+        let x = *self.xs.get(i)?;
+        Some((x + self.width - self.close.1 - self.close.0, self.top + (self.height - self.close.0) / 2, self.close.0))
+    }
+}
+
+/// What a place of the title strip is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Tab(usize),
     /// The button that closes the tab.
     Close(usize),
+    /// The button that opens a file in a tab of its own.
+    Plus,
+    /// Nothing: the strip is where the window is dragged.
     Nothing,
 }
 
-/// What is at `x` of the strip: the tabs are `width` wide each from the left edge, `count` of them; `close_shown(i)` says whether the
-/// button of tab `i` is there; the button is `side` wide and ends `edge` before the tab's right edge.
-pub fn hit(count: usize, width: i64, x: i64, side: i64, edge: i64, close_shown: impl Fn(usize) -> bool) -> Hit {
-    if x < 0 || width <= 0 {
+/// What is at (`x`, `y`) of the strip; `close_shown(i)` says whether the button of tab `i` is there.
+pub fn hit(strip: &Strip, x: i64, y: i64, close_shown: impl Fn(usize) -> bool) -> Hit {
+    let inside = |(l, t, side): (i64, i64, i64)| x >= l && x < l + side && y >= t && y < t + side;
+    if strip.plus.is_some_and(inside) {
+        return Hit::Plus;
+    }
+    if y < strip.top || x < strip.first {
         return Hit::Nothing;
     }
-    let i = usize::try_from(x / width).unwrap_or(usize::MAX);
-    if i >= count {
-        return Hit::Nothing;
+    for (i, &left) in strip.xs.iter().enumerate() {
+        if x >= left && x < left + strip.width {
+            return if close_shown(i) && strip.close_box(i).is_some_and(inside) { Hit::Close(i) } else { Hit::Tab(i) };
+        }
     }
-    let right = (i as i64 + 1) * width - edge;
-    if close_shown(i) && x >= right - side && x < right { Hit::Close(i) } else { Hit::Tab(i) }
+    Hit::Nothing
 }
 
 /// Cut `text` so that it fits `fits` (a test of a width the caller knows how to measure), with an ellipsis at the end when it was cut.
@@ -367,33 +415,53 @@ mod tests {
 
     #[test]
     fn tabs_share_the_strip_between_the_least_and_the_most_width() {
-        assert_eq!(tab_width(1, 1000, MIN_TAB_W, MAX_TAB_W), MAX_TAB_W);
-        assert_eq!(tab_width(2, 1000, MIN_TAB_W, MAX_TAB_W), MAX_TAB_W);
-        assert_eq!(tab_width(5, 1000, MIN_TAB_W, MAX_TAB_W), 200);
-        assert_eq!(tab_width(16, 1000, MIN_TAB_W, MAX_TAB_W), 62);
-        assert_eq!(tab_width(16, 400, MIN_TAB_W, MAX_TAB_W), MIN_TAB_W);
-        assert_eq!(tab_width(16, 640, MIN_TAB_W, MAX_TAB_W), MIN_TAB_W);
-        assert_eq!(tab_width(0, 1000, MIN_TAB_W, MAX_TAB_W), MAX_TAB_W);
-        assert_eq!(tab_width(3, -5, MIN_TAB_W, MAX_TAB_W), MIN_TAB_W);
+        let right = 1000;
+        assert_eq!(Strip::new(1, 96, right).width, MAX_TAB_W);
+        assert_eq!(Strip::new(2, 96, right).width, MAX_TAB_W);
+        // Five tabs: what is left after the mark, the "+" and the gaps, shared.
+        let five = Strip::new(5, 96, right);
+        assert_eq!(five.width, (right - 44 - (PLUS + PLUS_GAP) - 4 * TAB_GAP) / 5);
+        assert_eq!(five.xs, (0..5).map(|i| 44 + i * (five.width + TAB_GAP)).collect::<Vec<_>>());
+        assert!(Strip::new(16, 96, right).width >= MIN_TAB_W && Strip::new(16, 96, right).width < 60);
+        assert_eq!(Strip::new(16, 96, 400).width, MIN_TAB_W);
+        assert_eq!(Strip::new(0, 96, right).width, MAX_TAB_W);
+        assert_eq!(Strip::new(3, 96, -5).width, MIN_TAB_W);
+        // Everything is in proportion at 150 dpi.
+        let big = Strip::new(2, 144, 1500);
+        assert_eq!((big.width, big.top, big.height), (MAX_TAB_W * 3 / 2, TAB_TOP * 3 / 2, (TITLE_H - TAB_TOP) * 3 / 2));
+        // The "+" follows the last tab, and a strip with no tab has none.
+        let two = Strip::new(2, 96, right);
+        let (px, _, side) = two.plus.unwrap();
+        assert_eq!((px, side), (two.xs[1] + two.width + PLUS_GAP, PLUS));
+        assert!(Strip::new(0, 96, right).plus.is_none());
     }
 
     #[test]
-    fn a_click_is_on_a_tab_on_its_close_button_or_on_nothing() {
+    fn a_click_is_on_a_tab_on_its_close_button_on_the_plus_or_on_nothing() {
+        let strip = Strip::new(3, 96, 1000);
         let shown = |i: usize| i == 1;
-        // Three tabs of 100: the button of tab 1 is at 74..92 (18 wide, 6 from the edge, which is at 200).
-        assert_eq!(hit(3, 100, 10, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Tab(0));
-        assert_eq!(hit(3, 100, 150, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Tab(1));
-        assert_eq!(hit(3, 100, 180, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Close(1));
-        assert_eq!(hit(3, 100, 176, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Close(1));
-        assert_eq!(hit(3, 100, 175, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Tab(1));
-        assert_eq!(hit(3, 100, 194, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Tab(1));
+        let (w, y) = (strip.width, strip.top + strip.height / 2);
+        let (t0, t1) = (strip.xs[0], strip.xs[1]);
+        assert_eq!(hit(&strip, t0 + 10, y, shown), Hit::Tab(0));
+        assert_eq!(hit(&strip, t1 + 30, y, shown), Hit::Tab(1));
+        // The button of tab 1 is 20 square, 6 from its right edge, in the middle of its height.
+        let (cl, ct, side) = strip.close_box(1).unwrap();
+        assert_eq!((cl, side), (t1 + w - CLOSE_EDGE - CLOSE_SIDE, CLOSE_SIDE));
+        assert_eq!(hit(&strip, cl + side / 2, ct + side / 2, shown), Hit::Close(1));
+        assert_eq!(hit(&strip, cl, ct, shown), Hit::Close(1));
+        assert_eq!(hit(&strip, cl - 1, y, shown), Hit::Tab(1));
+        assert_eq!(hit(&strip, cl + side, y, shown), Hit::Tab(1));
         // The button of a tab that does not show one is not there.
-        assert_eq!(hit(3, 100, 80, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Tab(0));
-        assert_eq!(hit(3, 100, 300, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Nothing);
-        assert_eq!(hit(3, 100, -1, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Nothing);
-        assert_eq!(hit(3, 0, 5, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Nothing);
-        assert_eq!(hit(0, 100, 5, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Nothing);
-        assert_eq!(hit(3, 100, i64::MAX, CLOSE_SIDE, CLOSE_EDGE, shown), Hit::Nothing);
+        assert_eq!(hit(&strip, strip.xs[0] + w - CLOSE_EDGE - 5, y, shown), Hit::Tab(0));
+        // The gap between tabs, above them, left of them, right of the "+": nothing (the window is dragged there).
+        assert_eq!(hit(&strip, t1 - 1, y, shown), Hit::Nothing);
+        assert_eq!(hit(&strip, t0 + 10, strip.top - 1, shown), Hit::Nothing);
+        assert_eq!(hit(&strip, strip.first - 1, y, shown), Hit::Nothing);
+        let (pl, pt, ps) = strip.plus.unwrap();
+        assert_eq!(hit(&strip, pl + ps / 2, pt + ps / 2, shown), Hit::Plus);
+        assert_eq!(hit(&strip, pl + ps + 40, y, shown), Hit::Nothing);
+        assert_eq!(hit(&strip, i64::MAX, y, shown), Hit::Nothing);
+        assert_eq!(hit(&Strip::new(0, 96, 1000), 100, y, |_| true), Hit::Nothing);
     }
 
     #[test]

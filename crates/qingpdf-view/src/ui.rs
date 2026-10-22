@@ -18,6 +18,16 @@ pub struct Rect {
 /// A colour as 0xRRGGBB.
 pub type Rgb = u32;
 
+/// The fonts the reader draws text in: the usual one, the same in bold, a big bold one (the name on the welcome page), and the font of the pictures of the
+/// buttons (Segoe Fluent Icons, or Segoe MDL2 Assets).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Font {
+    Body,
+    Bold,
+    Title,
+    Icon,
+}
+
 /// Drawing on the window (a back buffer that is put on the screen when the reader has done).
 pub trait Painter {
     fn fill_rect(&mut self, r: Rect, color: Rgb);
@@ -26,37 +36,29 @@ pub trait Painter {
     /// A BGRA picture of `src_w` by `src_h` pixels (rows from the top, no padding) put into `dest`, stretched if the
     /// sizes differ. A picture whose bytes are fewer than its size says is not drawn.
     fn draw_bgra(&mut self, dest: Rect, src_w: i32, src_h: i32, bgra: &[u8]);
-    /// Text with its top left corner at (x, y), in the window's font.
+    /// Text with its top left corner at (x, y), in the window's font (see [`Painter::set_font`]).
     fn text(&mut self, x: i32, y: i32, s: &str, color: Rgb);
     fn text_width(&mut self, s: &str) -> i32;
     fn line_height(&self) -> i32;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bar {
-    Vertical,
-    Horizontal,
-}
-
-/// A scroll bar: positions from `min` to `max` (inclusive) with a thumb as long as `page`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScrollInfo {
-    pub min: i32,
-    pub max: i32,
-    pub page: u32,
-    pub pos: i32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScrollCode {
-    LineUp,
-    LineDown,
-    PageUp,
-    PageDown,
-    Top,
-    Bottom,
-    /// The thumb is at this position.
-    Thumb(i32),
+    /// The font that text is drawn and measured in from now on.
+    fn set_font(&mut self, _font: Font) {}
+    /// A shape with smooth edges, filled: the rectangle `r` with the radii of its corners (top left, top right, bottom right, bottom left; a radius is held to
+    /// half the shorter side), the colour laid over what is there with `alpha`. Without smooth edges it is the rectangle.
+    fn fill_shape(&mut self, r: Rect, _radii: [i32; 4], color: Rgb, alpha: u8) {
+        self.fill_rect_alpha(r, color, alpha);
+    }
+    /// The outline of a rounded rectangle, `width` pixels thick and inside the rectangle's edge.
+    fn stroke_round(&mut self, _r: Rect, _radius: i32, _width: i32, _color: Rgb, _alpha: u8) {}
+    /// A line through these points (pixels), `width` thick, with round ends and joins.
+    fn polyline(&mut self, _points: &[(f32, f32)], _width: f32, _color: Rgb, _alpha: u8) {}
+    /// A letter of the icon font, in the middle of `r`.
+    fn glyph(&mut self, r: Rect, ch: char, color: Rgb) {
+        self.set_font(Font::Icon);
+        let s = ch.to_string();
+        let (w, h) = (self.text_width(&s), self.line_height());
+        self.text(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, &s, color);
+        self.set_font(Font::Body);
+    }
 }
 
 /// Virtual-key codes the reader uses (winuser.h).
@@ -117,7 +119,6 @@ pub enum Event {
     /// The wheel turned: `delta` is 120 for a click away from the user (up). `x`, `y` is the pointer.
     Wheel { delta: i32, ctrl: bool, shift: bool, x: i32, y: i32 },
     HWheel { delta: i32 },
-    Scroll { bar: Bar, code: ScrollCode },
     /// A menu item (its id).
     Command(u32),
     /// Files dropped on the window.
@@ -178,14 +179,24 @@ pub enum Event {
     Chosen(Option<usize>),
     /// The right button was pressed (or the menu key) at this place of the page area: the reader may answer with an [`Action::ContextMenu`].
     ContextMenu { x: i32, y: i32 },
-    /// The keyboard went into the search box of the toolbar.
+    /// The keyboard went into the search box of the command bar.
     FindFocus,
-    /// Enter in the page number box of the toolbar: what is in it.
-    PageBox(String),
+    /// The box over the page number or the zoom of the page pill ([`Action::PillEdit`]) is closed: what is in it when Enter closed it, none when it was left
+    /// any other way (Esc, a click outside).
+    PillEdit(Option<String>),
     /// The answer to [`Action::AskForm`]: what was filled in, or none if it was cancelled.
     Form { tag: u32, answer: Option<FormAnswer> },
     /// Windows is set to dark apps (`true`) or to light ones, as it was at the start or has become (the person changed it).
     SystemDark(bool),
+    /// The colour Windows is set to as its accent (none if it could not be read), at the start and when it changes.
+    SystemAccent(Option<Rgb>),
+    /// Windows is set to a high-contrast theme (with its colours), or is not any more.
+    HighContrast(Option<crate::theme::Contrast>),
+    /// How the frame of the window is: `custom` when the reader draws the title strip (the system's buttons are drawn over its right end, `caption` pixels
+    /// wide), not when the system's own title bar is above the window (a high-contrast theme).
+    Frame { custom: bool, caption: i32 },
+    /// Alt or F10 alone was pressed: the menus are asked for, to be used by the keyboard.
+    MenuKey,
 }
 
 /// One thing in a form box ([`Action::AskForm`]): what it is, what it says, and where it is in the box (`x, y, w, h` in units of a 96th of
@@ -378,7 +389,6 @@ pub enum Action {
     /// Draw the window again.
     Invalidate,
     SetTitle(String),
-    SetScroll { bar: Bar, info: ScrollInfo },
     SetTimer { id: u32, ms: u32 },
     KillTimer(u32),
     /// Show the open-file box; the answer comes as [`Event::FilePicked`]. `filters`: (name, pattern) pairs.
@@ -429,71 +439,43 @@ pub enum Action {
     Choose { items: Vec<String>, selected: Option<usize>, at: (i32, i32) },
     /// Show a menu at this place of the page area; the item chosen comes as [`Event::Command`].
     ContextMenu { entries: Vec<MenuEntry>, at: (i32, i32) },
-    /// The toolbar: its buttons and words (put again when the language changes), and whether it is shown.
-    Toolbar(ToolbarSpec),
-    /// What is greyed or pressed in the toolbar, and what its page box says.
-    ToolbarState(ToolbarState),
-    /// The words of the status bar.
-    Status(StatusText),
+    /// The box the words to find are typed in, over the search pill of the command bar (none when the command bar is not shown); the pill itself is drawn by the
+    /// reader.
+    SearchBox(Option<SearchBox>),
+    /// A box to type the page or the zoom in, over the page pill, with this text selected (or take it away); the answer is [`Event::PillEdit`].
+    PillEdit(Option<(Rect, String)>),
+    /// Show the menus as a pop-up menu: the menus of the window's top level are its items, each opening its own. `at` is where its top right corner goes;
+    /// with `keyboard` the first item is selected, as it is when it was opened by Alt or F10.
+    ShowMenu { at: (i32, i32), keyboard: bool },
     /// How the window looks (View > Interface): the parts that are Windows' own take the colours.
     Theme(ThemeSpec),
-    /// Make the window full screen, on the monitor it is on, with no frame, menu, toolbar or status bar; or give it back its place exactly as it was.
+    /// Make the window full screen, on the monitor it is on, with no frame or title strip; or give it back its place exactly as it was.
     FullScreen(bool),
     /// Hide the pointer until it moves.
     HideCursor,
 }
 
-/// The colours Windows' own parts of the window (the title bar, the toolbar, the status bar, the boxes typed in, the tree of bookmarks) are given when the
-/// window is dark; when it is light they keep the system's.
+/// How the window looks to Windows' own parts of it (the frame, the boxes typed in, the tree of bookmarks) and to the text it draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThemeSpec {
     pub dark: bool,
-    /// The face of the toolbar and the status bar, the words on it, the words of what is greyed, a button under the pointer, a button pressed.
-    pub face: Rgb,
+    /// The words are Chinese (the fonts are chosen by the language).
+    pub zh: bool,
+    /// The colour of the title strip: where the window is that colour, it shows what is behind it instead (Mica), when Windows can do that.
+    pub strip: Rgb,
+    /// The words in the boxes and in the tree, the boxes the person types in, the tree of bookmarks with the lines in it.
     pub text: Rgb,
-    pub dim: Rgb,
-    pub hot: Rgb,
-    pub down: Rgb,
-    /// The boxes the person types in, and the tree of bookmarks with the lines in it.
     pub field_bg: Rgb,
     pub tree_bg: Rgb,
     pub tree_line: Rgb,
 }
 
-/// One thing in the toolbar, in order.
+/// The search box of the command bar: where it is, what it says while it is empty, and whether it can be used.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolItem {
-    /// A button that does the menu command `cmd`. `glyph` is its picture in the icon font of Windows, `label` is what it says when
-    /// there is no such font, `tip` the words of its tooltip (with the shortcut). A `toggle` stays pressed while its tool is in use.
-    Button { cmd: u32, glyph: char, label: String, tip: String, toggle: bool },
-    Separator,
-    /// The box with the page number ("3 / 120"); Enter in it goes to that page.
-    PageBox,
-    /// The box for the words to find; `hint` is what it says while it is empty.
-    SearchBox { hint: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolbarSpec {
-    pub visible: bool,
-    pub items: Vec<ToolItem>,
-}
-
-/// The state of the toolbar: for each button its command, whether it can be used and whether it is pressed; whether the boxes can be
-/// used; and what the page box says.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ToolbarState {
-    pub buttons: Vec<(u32, bool, bool)>,
-    pub boxes_enabled: bool,
-    pub page_text: String,
-}
-
-/// The three parts of the status bar.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StatusText {
-    pub page: String,
-    pub note: String,
-    pub zoom: String,
+pub struct SearchBox {
+    pub rect: Rect,
+    pub hint: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug)]
@@ -509,6 +491,13 @@ pub struct Menu {
     pub entries: Vec<MenuEntry>,
 }
 
+/// What a place of the window is to its frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NcHit {
+    Client,
+    Caption,
+}
+
 /// The reader as the window sees it.
 pub trait Handler {
     fn event(&mut self, event: Event) -> Vec<Action>;
@@ -517,6 +506,11 @@ pub trait Handler {
     fn paint(&mut self, painter: &mut dyn Painter) -> bool;
     /// The shape of the pointer over this place of the client area.
     fn cursor_at(&mut self, x: i32, y: i32) -> Cursor;
+    /// What this place of the client area is to the frame: part of the title bar (the window is dragged there, and a double click makes it big or small) or
+    /// the reader's own.
+    fn nc_hit(&mut self, _x: i32, _y: i32) -> NcHit {
+        NcHit::Client
+    }
     /// Why the system should not end the session (log off, restart, shut down) while this window has something unsaved, worded for
     /// the person; `None` when it may end. The window then holds the shutdown up and asks, as it does when it is closed.
     fn unsaved_reason(&self) -> Option<String> {

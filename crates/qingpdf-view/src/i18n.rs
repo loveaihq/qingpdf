@@ -91,7 +91,16 @@ pub enum Msg {
     Cancel,
     Error,
     Opening,
-    Hint,
+    // The command bar, the welcome page (2026-10-21).
+    ToolShapes,
+    MoreMenu,
+    SearchHint,
+    WelcomeTagline,
+    WelcomeOpen,
+    WelcomeDrop,
+    WelcomeRecent,
+    WelcomeNone,
+    WelcomeRemove,
     NoticeIncomplete,
     NoticeFailed,
     CannotRead,
@@ -485,7 +494,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 428] = [
+pub const ALL: [Msg; 436] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -524,7 +533,15 @@ pub const ALL: [Msg; 428] = [
     Msg::Cancel,
     Msg::Error,
     Msg::Opening,
-    Msg::Hint,
+    Msg::ToolShapes,
+    Msg::MoreMenu,
+    Msg::SearchHint,
+    Msg::WelcomeTagline,
+    Msg::WelcomeOpen,
+    Msg::WelcomeDrop,
+    Msg::WelcomeRecent,
+    Msg::WelcomeNone,
+    Msg::WelcomeRemove,
     Msg::NoticeIncomplete,
     Msg::NoticeFailed,
     Msg::CannotRead,
@@ -956,7 +973,15 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::Cancel => ("Cancel", "取消"),
         Msg::Error => ("qingpdf", "qingpdf"),
         Msg::Opening => ("Opening...", "正在打开…"),
-        Msg::Hint => ("Press Ctrl+O to open a PDF, or drop one here", "按 Ctrl+O 打开 PDF，或把文件拖到这里"),
+        Msg::ToolShapes => ("Shapes", "形状"),
+        Msg::MoreMenu => ("Menu	Alt", "菜单	Alt"),
+        Msg::SearchHint => ("Find in this file", "在文件中查找"),
+        Msg::WelcomeTagline => ("Small, fast, offline PDF tool", "轻巧、快速、离线的 PDF 工具"),
+        Msg::WelcomeOpen => ("Open file", "打开文件"),
+        Msg::WelcomeDrop => ("or drop a PDF here", "或把 PDF 拖到这里"),
+        Msg::WelcomeRecent => ("Recent", "最近打开"),
+        Msg::WelcomeNone => ("No recent files yet", "还没有最近打开的文件"),
+        Msg::WelcomeRemove => ("Del removes from the list", "按 Del 从列表中移除"),
         Msg::NoticeIncomplete => ("This page is too complex to draw in full; part of it is shown.", "这一页内容太复杂，没有画完，只显示了一部分。"),
         Msg::NoticeFailed => ("This page cannot be drawn.", "这一页画不出来。"),
         Msg::CannotRead => ("The file cannot be read:", "读不了这个文件："),
@@ -1149,7 +1174,7 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoteNothingRedo => ("Nothing to redo.", "没有可重做的。"),
         Msg::PrevPage => ("Pre&vious page	Ctrl+PgUp", "上一页(&U)	Ctrl+PgUp"),
         Msg::NextPage => ("&Next page	Ctrl+PgDn", "下一页(&N)	Ctrl+PgDn"),
-        Msg::ShowToolbar => ("&Toolbar", "工具栏(&T)"),
+        Msg::ShowToolbar => ("Command &bar", "命令栏(&B)"),
         Msg::LanguageMenu => ("&Language", "语言(&L)"),
         Msg::LangSystem => ("Follow &system", "跟随系统(&S)"),
         Msg::LangChinese => ("中文", "中文"),
@@ -1428,7 +1453,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 428);
+        assert_eq!(ALL.len(), 436);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");

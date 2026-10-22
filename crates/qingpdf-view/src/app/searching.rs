@@ -55,6 +55,10 @@ impl App {
         if let Some(actions) = self.stop_ocr() {
             return actions;
         }
+        // A message over the pages is closed by Esc before the find box, the tool or the selection is.
+        if let Some(actions) = self.dismiss_toast() {
+            return actions;
+        }
         if self.find_open {
             return self.close_find();
         }
@@ -163,7 +167,8 @@ impl App {
 
     /// The count beside the find box, drawn over the pages.
     pub(super) fn draw_find_panel(&self, p: &mut dyn Painter) {
-        if !self.find_open {
+        // (With the command bar the count is in its search pill, drawn there.)
+        if !self.find_open || self.toolbar_visible() {
             return;
         }
         let label = match &self.search {
@@ -174,13 +179,8 @@ impl App {
                 i18n::found(self.lang, s.current.map_or(0, |c| s.number_of(c)), s.total(), s.limit, progress)
             }
         };
-        // With the toolbar the count is all there is to show, and there is nothing to show before a search.
-        if label.is_empty() && self.toolbar_visible() {
-            return;
-        }
         let e = self.find_rect();
-        // With the toolbar the panel is as wide as the count, and sits against the right side of the pages.
-        let label_w = if self.toolbar_visible() { p.text_width(&label) } else { clamp32(self.px(FIND_LABEL_W)) };
+        let label_w = clamp32(self.px(FIND_LABEL_W));
         let pad = clamp32(self.px(8));
         let panel = Rect { x: (e.x - label_w - pad).max(clamp32(self.view_x)), y: e.y - pad / 2, w: e.w + label_w + 2 * pad, h: e.h + pad };
         p.fill_rect(Rect { x: panel.x - 1, y: panel.y - 1, w: panel.w + 2, h: panel.h + 2 }, self.pal.border);

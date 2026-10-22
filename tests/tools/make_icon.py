@@ -1,89 +1,78 @@
 #!/usr/bin/env python3
-"""Draws the qingpdf program icon: a blue document with a folded corner and a white Q on it, flat colours.
+"""Draws the qingpdf program icon: the character 轻 in white on a rounded teal square (2026-10-21).
 
     python tests/tools/make_icon.py            # writes crates/qingpdf-view-bin/qingpdf.ico
 
-No libraries are needed (zlib and struct from the standard library). Every size is drawn from the same shapes (so they match), each
-pixel is the average of a grid of points (smooth edges, no halo). Every size (16, 32, 48 and 256) is a 32-bit PNG: Windows Vista and
-later read a PNG picture of any size in an icon, and a PNG of these flat colours is a tenth of the plain 32-bit picture (BMP) it
-replaces (13 KB of the 20 KB of the program's icon resource; the program's size is capped, 2026-10-16). Each PNG is coded with
-the filter that is smallest for it, zlib at its best level.
+The strokes are the ones of `crates/qingpdf-view/src/logo.rs` (read from that file, so the icon, the mark in the title strip and the one on
+the welcome page are the same drawing): a line through some points with round caps and joins, in a square of 100 units. Up to 24 pixels the
+simple build (`SMALL`) is used, as the window does. No libraries are needed (zlib and struct from the standard library). Each pixel is the
+average of a grid of points (smooth edges, no halo). Every size (16, 24, 32, 48 and 256) is a 32-bit PNG: Windows Vista and later read a PNG
+picture of any size in an icon, and a PNG of these flat colours is a tenth of the plain 32-bit picture (BMP) it replaces. Each PNG is coded
+with the filter that is smallest for it, zlib at its best level.
 `crates/qingpdf-view-bin/build.rs` reads the .ico and puts the pictures into the program as resources.
 """
 import math
 import os
+import re
 import struct
 import sys
 import zlib
 
-BODY = (0x2B, 0x6C, 0xDE)  # the document
-FLAP = (0xA9, 0xC9, 0xF7)  # the folded corner
-MARK = (0xFF, 0xFF, 0xFF)  # the Q
+TEAL = (0x1D, 0x9E, 0x75)  # the accent of the program (light)
+MARK = (0xFF, 0xFF, 0xFF)  # the character
 
-# The shapes, in a unit square (0..1, y down).
-PAGE = (0.17, 0.06, 0.83, 0.94)  # left, top, right, bottom
-PAGE_RADIUS = 0.08
-FOLD = 0.22  # the corner that is folded over: its size along each side
-RING = (0.50, 0.57, 0.225, 0.145)  # centre x, centre y, outer radius, inner radius
-TAIL = (0.552, 0.622, 0.708, 0.778, 0.036)  # from, to, half width: a short stroke across the ring, its end flat, so the Q is not a magnifying glass
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOGO_RS = os.path.join(HERE, "..", "..", "crates", "qingpdf-view", "src", "logo.rs")
 
 
-def in_page(x, y):
-    l, t, r, b = PAGE
-    if not (l <= x <= r and t <= y <= b):
-        return False
-    # Round corners (the top right one is cut off by the fold instead).
-    k = PAGE_RADIUS
-    for cx, cy, sx, sy in ((l + k, t + k, -1, -1), (l + k, b - k, -1, 1), (r - k, b - k, 1, 1)):
-        if (x - cx) * sx > 0 and (y - cy) * sy > 0 and math.hypot(x - cx, y - cy) > k:
-            return False
-    # The fold cuts the top right corner along a diagonal.
-    return (x - (r - FOLD)) - (y - t) <= 0.0
+def read_logo():
+    """(radius, {"FULL": [(points, width)], "SMALL": [...]}) read from logo.rs."""
+    text = open(LOGO_RS, encoding="utf-8").read()
+    radius = float(re.search(r"pub const RADIUS: f32 = ([0-9.]+);", text).group(1))
+    sets = {}
+    for name in ("FULL", "SMALL", "TINY"):
+        body = re.search(r"pub const " + name + r": &\[Stroke\] = &\[(.*?)\n\];", text, re.S).group(1)
+        strokes = []
+        for m in re.finditer(r"Stroke \{ pts: &\[(.*?)\], width: ([0-9.]+) \}", body):
+            pts = [(float(a), float(b)) for a, b in re.findall(r"\(([0-9.]+), ([0-9.]+)\)", m.group(1))]
+            strokes.append((pts, float(m.group(2))))
+        sets[name] = strokes
+    return radius, sets
 
 
-def in_flap(x, y):
-    l, t, r, b = PAGE
-    # The triangle that is the back of the corner: right of the fold's left edge, above its lower edge, below the cut.
-    return in_page(x, y) and x >= r - FOLD and y <= t + FOLD
+def segment_distance(px, py, a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    l2 = dx * dx + dy * dy
+    t = 0.0 if l2 == 0 else max(0.0, min(1.0, ((px - a[0]) * dx + (py - a[1]) * dy) / l2))
+    return math.hypot(px - (a[0] + t * dx), py - (a[1] + t * dy))
 
 
-def in_mark(x, y):
-    cx, cy, ro, ri = RING
-    d = math.hypot(x - cx, y - cy)
-    if ri <= d <= ro:
-        return True
-    x0, y0, x1, y1, hw = TAIL
-    dx, dy = x1 - x0, y1 - y0
-    length2 = dx * dx + dy * dy
-    along = ((x - x0) * dx + (y - y0) * dy) / length2
-    across = abs((x - x0) * dy - (y - y0) * dx) / math.sqrt(length2)
-    return 0.0 <= along <= 1.0 and across <= hw
+def in_square(x, y, radius):
+    cx, cy = min(max(x, radius), 100 - radius), min(max(y, radius), 100 - radius)
+    return math.hypot(x - cx, y - cy) <= radius
 
 
-def colour_at(x, y):
-    if not in_page(x, y):
-        return None
-    if in_mark(x, y):
-        return MARK
-    if in_flap(x, y):
-        return FLAP
-    return BODY
-
-
-def draw(size, grid):
+def draw(size, grid, radius, strokes):
     """size x size pixels as (r, g, b, a) rows from the top; each pixel is the average of grid x grid points."""
     rows = []
     for py in range(size):
         row = []
         for px in range(size):
-            r = g = b = n = 0
+            inside = glyph = 0
             for sy in range(grid):
                 for sx in range(grid):
-                    c = colour_at((px + (sx + 0.5) / grid) / size, (py + (sy + 0.5) / grid) / size)
-                    if c:
-                        r, g, b, n = r + c[0], g + c[1], b + c[2], n + 1
-            a = round(255 * n / (grid * grid))
-            row.append((r // n, g // n, b // n, a) if n else (0, 0, 0, 0))
+                    x, y = (px + (sx + 0.5) / grid) * 100.0 / size, (py + (sy + 0.5) / grid) * 100.0 / size
+                    if not in_square(x, y, radius):
+                        continue
+                    inside += 1
+                    if any(segment_distance(x, y, a, b) <= w / 2 for pts, w in strokes for a, b in zip(pts, pts[1:])):
+                        glyph += 1
+            if inside == 0:
+                row.append((0, 0, 0, 0))
+                continue
+            g = glyph / inside
+            colour = tuple(round(TEAL[i] * (1 - g) + MARK[i] * g) for i in range(3))
+            row.append(colour + (round(255 * inside / (grid * grid)),))
         rows.append(row)
     return rows
 
@@ -121,9 +110,9 @@ def png_entry(rows):
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "..", "..", "crates", "qingpdf-view-bin", "qingpdf.ico")
-    images = [(size, png_entry(draw(size, grid))) for size, grid in ((16, 12), (32, 8), (48, 8), (256, 4))]
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "..", "..", "crates", "qingpdf-view-bin", "qingpdf.ico")
+    radius, sets = read_logo()
+    images = [(size, png_entry(draw(size, grid, radius, sets["TINY" if size <= 16 else "SMALL" if size <= 24 else "FULL"]))) for size, grid in ((16, 12), (24, 10), (32, 8), (48, 8), (256, 4))]
     data = struct.pack("<HHH", 0, 1, len(images))
     offset = 6 + 16 * len(images)
     for size, blob in images:

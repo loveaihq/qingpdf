@@ -18,7 +18,8 @@ impl App {
             ZoomMode::Custom => MODE_CUSTOM,
         };
         let path = self.path_text();
-        recent::touch(&mut self.recent, Entry { path, page, zoom: self.zoom, mode });
+        let date = (self.pn.today)();
+        recent::touch(&mut self.recent, Entry { path, page, zoom: self.zoom, mode, date });
         self.places_dirty = true;
         // ... and, further, how far down and across and the turn of the view (only in the places, which know the file by its size and time).
         if self.remember_place

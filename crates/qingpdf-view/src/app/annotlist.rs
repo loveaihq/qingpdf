@@ -10,7 +10,7 @@ use super::editing::Asked;
 use super::sidebar::TAB_H;
 use super::*;
 use crate::thumbs::{self, ListKey};
-use crate::toolbar::plain_label;
+use crate::cmdbar::plain_label;
 
 // Sizes at 96 dpi.
 const HEAD_H: i64 = 22;

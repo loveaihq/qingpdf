@@ -248,6 +248,7 @@ name = "qingpdf-view"
 version = "0.2.0"
 dependencies = [
  "qingpdf-core",
+ "tiny-skia",
 ]
 
 [[package]]

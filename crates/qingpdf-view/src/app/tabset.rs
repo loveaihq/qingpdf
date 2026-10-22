@@ -17,9 +17,9 @@ use super::*;
 const PARKED_PICTURES: u64 = 40_000_000;
 
 impl App {
-    /// The height of the strip of tabs, in pixels (0: it is not there, with fewer than two files open).
+    /// The height of what is above the pages (the title strip and the command bar), in pixels: none in full screen and in the speed test.
     pub(super) fn bar_h(&self) -> i64 {
-        if self.tabs.len() >= 2 && !self.full { self.px(crate::tabs::BAR_H) } else { 0 }
+        self.title_h() + self.cmd_h()
     }
 
     /// The most pixels the pages can be shown in (for the engine's plan).
@@ -151,7 +151,7 @@ impl App {
         // (A state without a document waits for the file to be read again.)
         let waiting = at == Where::Waiting && kept.doc.is_some();
         self.exchange(*kept);
-        self.bars = (None, None);
+        self.last_pos = (0, 0, 0);
         self.sharp_on_screen = false;
         self.moving = false;
         self.menus_dirty = true;
@@ -476,7 +476,7 @@ impl App {
             if let Some(p) = path {
                 tab.path = p;
             }
-            self.tab_hover = None;
+            self.hot = None;
         }
     }
 
@@ -676,12 +676,11 @@ mod tests {
         let (a, b, c) = (file(&dir, "a.pdf", 6), file(&dir, "b.pdf", 6), file(&dir, "c.pdf", 1));
         let mut app = app();
         open(&mut app, &a);
-        assert_eq!((app.tabs.len(), app.bar_h()), (1, 0), "one file: no strip");
+        assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.engine_total(), app.total, "one file: the engine has the whole of it");
         open(&mut app, &b);
         open(&mut app, &c);
         assert_eq!((app.tabs.len(), app.tabs.active()), (3, Some(2)));
-        assert!(app.bar_h() > 0 && app.view_h + app.bar_h() == 700, "the strip takes its height from the pages' area");
         assert!(app.title().starts_with("c.pdf"), "{}", app.title());
         // Ctrl+Shift+Tab goes to the tab before: b, where the view is changed.
         key(&mut app, vk::TAB, true);
@@ -744,63 +743,102 @@ mod tests {
         let dir = folder("strip");
         let (a, b) = (file(&dir, "first.pdf", 2), file(&dir, "second.pdf", 2));
         let mut app = app();
+        app.bare = false;
+        app.event(Event::Size { w: 900, h: 700 });
         open(&mut app, &a);
+        // The strip is always there, with one file as with two: the title strip and the command bar are above the pages.
+        assert_eq!((app.bar_h(), app.view_h), (84, 616));
         open(&mut app, &b);
-        let w = app.tab_w();
-        let click = |app: &mut App, x: i64| {
-            app.event(Event::MouseDown { x: x as i32, y: 5, ctrl: false, shift: false, clicks: 1 });
-            app.event(Event::MouseUp { x: x as i32, y: 5 });
+        let strip = app.strip();
+        let y = (strip.top + strip.height / 2) as i32;
+        let tab_x = |i: usize| (strip.xs[i] + 30) as i32;
+        let click = |app: &mut App, x: i32, y: i32| {
+            app.event(Event::MouseDown { x, y, ctrl: false, shift: false, clicks: 1 });
+            app.event(Event::MouseUp { x, y });
             ready(app);
         };
         // The first tab is clicked and shown; a click above the pages is not a click on them (no selection began).
-        click(&mut app, w / 2);
+        click(&mut app, tab_x(0), y);
         assert_eq!(app.tabs.active(), Some(0));
-        assert!(app.press.is_none() && !app.strip_press);
-        // A dot says a file has changes that are not saved; the pointer over a tab shows the path in full.
+        assert!(app.press.is_none() && !app.chrome_press);
+        // A dot says a file has changes that are not saved; the pointer over a tab shows the path in full, after a moment.
         app.edit.dirty = true;
         app.event(Event::Wake);
         assert!(app.tabs.get(0).unwrap().dirty && app.unsaved_reason().is_some());
-        app.event(Event::Hover { x: (w + w / 2) as i32, y: 5 });
-        assert_eq!(app.tab_hover, Some(1));
+        app.event(Event::Hover { x: tab_x(1), y });
+        assert_eq!(app.hot, Some(super::overlay::Hot::Tab(1)));
+        app.event(Event::Timer(TIMER_TIP));
         let mut rec = Rec::default();
         assert!(app.paint(&mut rec));
         let said = |rec: &Rec, text: &str| rec.texts.iter().any(|(_, _, s)| s == text);
-        assert!(said(&rec, "first.pdf") && said(&rec, "second.pdf") && said(&rec, "\u{25CF}"), "{:?}", rec.texts);
+        assert!(said(&rec, "first.pdf") && said(&rec, "second.pdf"), "{:?}", rec.texts);
         assert!(said(&rec, &b.to_string_lossy()), "the path of the tab under the pointer");
+        assert!(rec.fills.iter().any(|(_, c)| *c == app.pal.dirty_fg), "the dot of the tab with changes, in the accent");
         app.event(Event::HoverEnd);
-        assert_eq!(app.tab_hover, None);
-        // Pages are drawn below the strip: nothing of them is drawn over it, and the strip is on top.
+        assert_eq!(app.hot, None);
+        // Pages are drawn below the strip and the bar: nothing of them is drawn over those, and they are on top.
         let mut rec = Rec::default();
         app.paint(&mut rec);
         let bar = app.bar_h() as i32;
         assert!(rec.pictures.iter().all(|(r, ..)| r.y + r.h > bar), "a picture lies in the strip");
-        // The pages' area starts under the strip: a click there is on the page; the same click moved up is not.
+        // The pages' area starts under the bar: a click there is on the page.
         app.event(Event::MouseDown { x: 400, y: bar + 100, ctrl: false, shift: false, clicks: 1 });
         assert!(app.press.is_some());
         app.event(Event::MouseUp { x: 400, y: bar + 100 });
         // The middle button closes the tab under it: the second.
         app.edit.dirty = false;
         app.event(Event::Wake);
-        app.event(Event::MiddleClick { x: (w + 10) as i32, y: 5 });
+        app.event(Event::MiddleClick { x: tab_x(1), y });
         ready(&mut app);
         assert_eq!(app.tabs.len(), 1);
-        assert_eq!((app.bar_h(), app.view_h), (0, 700), "one file: the strip is gone and the pages have the room");
+        assert_eq!((app.bar_h(), app.view_h), (84, 616), "one file: the strip is still there");
         assert!(app.title().starts_with("first.pdf"));
-        // The cross of the shown tab closes it.
-        open(&mut app, &b);
-        let w = app.tab_w();
-        let cross = 2 * w - app.px(crate::tabs::CLOSE_EDGE) - app.px(crate::tabs::CLOSE_SIDE) / 2;
-        click_only(&mut app, cross);
-        ready(&mut app);
-        assert_eq!(app.tabs.len(), 1);
-        assert!(app.title().starts_with("first.pdf"));
+        // The "+" opens the box that picks a file; the cross of the shown tab closes it (and then the welcome page is there).
+        let strip = app.strip();
+        let (pl, pt, ps) = strip.plus.expect("a plus");
+        let actions = {
+            let (x, yy) = ((pl + ps / 2) as i32, (pt + ps / 2) as i32);
+            app.event(Event::MouseDown { x, y: yy, ctrl: false, shift: false, clicks: 1 });
+            app.event(Event::MouseUp { x, y: yy })
+        };
+        assert!(actions.iter().any(|a| matches!(a, Action::PickFile { .. })));
+        let (cl, ct, side) = strip.close_box(0).expect("the shown tab has its cross");
+        let (x, y) = ((cl + side / 2) as i32, (ct + side / 2) as i32);
+        app.event(Event::MouseDown { x, y, ctrl: false, shift: false, clicks: 1 });
+        app.event(Event::MouseUp { x, y });
+        assert_eq!(app.tabs.len(), 0);
+        assert!(app.welcome_shown());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn click_only(app: &mut App, x: i64) {
-        app.event(Event::MouseDown { x: x as i32, y: 5, ctrl: false, shift: false, clicks: 1 });
-        app.event(Event::MouseUp { x: x as i32, y: 5 });
+    #[test]
+    fn the_empty_part_of_the_strip_is_the_title_bar_and_the_tabs_and_buttons_are_not() {
+        let dir = folder("caption");
+        let a = file(&dir, "a.pdf", 1);
+        let mut app = app();
+        app.bare = false;
+        app.event(Event::Size { w: 900, h: 700 });
+        app.event(Event::Frame { custom: true, caption: 138 });
+        open(&mut app, &a);
+        let strip = app.strip();
+        let y = (strip.top + strip.height / 2) as i32;
+        use crate::ui::{Handler, NcHit};
+        assert_eq!(app.nc_hit(strip.xs[0] as i32 + 20, y), NcHit::Client, "a tab");
+        assert_eq!(app.nc_hit(500, y), NcHit::Caption, "empty strip: the window is dragged there");
+        assert_eq!(app.nc_hit(500, 2), NcHit::Caption, "above the tabs too");
+        let (pl, pt, ps) = strip.plus.unwrap();
+        assert_eq!(app.nc_hit((pl + ps / 2) as i32, (pt + ps / 2) as i32), NcHit::Client, "the plus");
+        assert_eq!(app.nc_hit(500, 60), NcHit::Client, "the command bar");
+        assert_eq!(app.nc_hit(500, 300), NcHit::Client, "the pages");
+        // With the system's own title bar (a high-contrast theme) nothing of the strip is the title bar.
+        app.event(Event::Frame { custom: false, caption: 0 });
+        assert_eq!(app.nc_hit(500, y), NcHit::Client);
+        // The tabs stop short of the system's buttons at the right end of the strip, and leave room to drag.
+        app.event(Event::Frame { custom: true, caption: 138 });
+        assert!(app.strip().plus.unwrap().0 + app.strip().plus.unwrap().2 <= 900 - 138);
+        let _ = std::fs::remove_dir_all(&dir);
     }
+
 
     #[test]
     fn closing_a_tab_with_changes_asks_and_ctrl_w_closes_the_shown_one() {
@@ -920,7 +958,7 @@ mod tests {
         // A save is going (its answer is for this tab): another file is not opened beside it, and the tab is not left.
         app.edit.saving = Some((99, a.clone(), false));
         let told = app.open_path(&b, "");
-        assert!(app.tabs.len() == 1 && told.iter().any(|x| matches!(x, Action::SetTimer { id: TIMER_NOTE, .. })), "{told:?}");
+        assert!(app.tabs.len() == 1 && told.iter().any(|x| matches!(x, Action::SetTimer { id: TIMER_ANIM, .. })), "{told:?}");
         assert!(app.note.as_deref().is_some_and(|n| n.contains("busy")), "{:?}", app.note);
         app.edit.saving = None;
         // An edit that is not answered yet is the same.

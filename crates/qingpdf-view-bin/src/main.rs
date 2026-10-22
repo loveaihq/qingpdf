@@ -131,18 +131,19 @@ fn main() {
         std::process::exit(qingpdf_view::ocr::ocr_test(&file.to_string_lossy(), &out.to_string_lossy(), pages, chinese));
     }
     show_panics(lang);
-    let menus = App::initial_menus(lang);
     // The most pixels the window can show: the work area of the screen, or the size the speed test asked for.
     let (work_w, work_h) = win32::work_area_size();
     let screen = bench_size.unwrap_or((work_w, work_h));
     let max_view_pixels = u64::try_from(screen.0.max(0)).unwrap_or(0) * u64::try_from(screen.1.max(0)).unwrap_or(0);
-    let code = win32::run("qingpdf", &menus, bench_size, kept.window.filter(|_| !tests), !tests, move |waker| {
+    let code = win32::run("qingpdf", bench_size, kept.window.filter(|_| !tests), !tests, move |waker| {
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || waker.wake());
         // Who the annotations are by: the name that was chosen, else the Windows user's.
         let author = kept.author.clone().or_else(|| settings::clean(&win32::user_name())).unwrap_or_default();
         let mut app = App::new(system_lang, wake, started, max_view_pixels, author);
         app.apply_settings(&kept);
         app.set_system_dark(win32::system_uses_dark());
+        app.set_system_accent(win32::system_accent());
+        app.set_contrast(win32::high_contrast());
         app.set_clock(win32::local_date);
         app.set_local_time(win32::local_time);
         app.set_random(win32::random_bytes);

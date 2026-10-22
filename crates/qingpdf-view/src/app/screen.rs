@@ -40,7 +40,6 @@ impl App {
             return Vec::new();
         }
         self.full = on;
-        self.toolbar_dirty = true;
         self.menus_dirty = true;
         // (The find box of the toolbar is gone, or comes: what is open starts again with the other.)
         let mut actions = if self.find_open { self.close_find() } else { Vec::new() };
@@ -191,12 +190,15 @@ mod tests {
     }
 
     #[test]
-    fn full_screen_gives_up_the_sidebar_the_toolbar_and_the_strip_and_esc_gives_them_back() {
+    fn full_screen_gives_up_the_sidebar_the_command_bar_and_the_strip_and_esc_gives_them_back() {
         let mut app = open("full", &[(612, 792, 0); 5], true);
-        assert!(app.view_x > 0 && app.toolbar_visible());
+        app.bare = false;
+        app.event(Event::Size { w: 1600, h: 900 });
+        assert!(app.view_x > 0 && app.toolbar_visible() && app.bar_h() == 84);
         let actions = key(&mut app, vk::F11);
         assert!(actions.iter().any(|a| matches!(a, Action::FullScreen(true))));
-        assert!(actions.iter().any(|a| matches!(a, Action::Toolbar(s) if !s.visible)));
+        assert!(actions.iter().any(|a| matches!(a, Action::SearchBox(None))), "the search box of the command bar goes");
+        assert_eq!(app.bar_h(), 0);
         // The window tells the new size of the page area: the whole of the monitor, with no sidebar.
         app.event(Event::Size { w: 1920, h: 1080 });
         assert!((app.view_x, app.view_w, app.view_h, app.bar_h()) == (0, 1920, 1080, 0), "{} {}", app.view_x, app.view_w);

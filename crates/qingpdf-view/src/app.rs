@@ -5,7 +5,10 @@
 //! and moving to a place), `selecting` (the mouse, selected text, copying), `searching` (the find box), `printjob` (printing),
 //! `menus` and `recents` (the menus; the files opened last), `ocr` (recognizing the text of scans), `sidebar` (the tabs, and the
 //! thumbnails: the list is drawn and handled there). `looks` (2026-10-20) is how the pages go in rows, how the window looks and in what colours the pages are
-//! shown; `screen` is full screen and the presentation.
+//! shown; `screen` is full screen and the presentation. The parts of the window the reader draws itself since the redesign (2026-10-21): `tabbar` (the title
+//! strip with the tabs), `cmdbarui` (the command bar), `overlay` (the thin scroll bars, the page pill, the little messages, the tooltips and the
+//! hover and press state of all of it), `welcomeui` (the page shown when no file is open). Where each part is, and what a place of it is on, is plain
+//! arithmetic in `crate::tabs`, `cmdbar`, `pill`, `toast`, `overbar` and `welcome`.
 
 #[cfg(test)]
 mod annot_tests;
@@ -15,6 +18,7 @@ mod annotedit;
 mod annotlist;
 mod bookmarks;
 mod chrome;
+mod cmdbarui;
 mod compress;
 mod cropping;
 mod editing;
@@ -23,6 +27,7 @@ mod looks;
 mod menus;
 mod ocr;
 mod outline;
+mod overlay;
 mod pagenum;
 mod pages;
 mod pictures;
@@ -37,6 +42,7 @@ mod selecting;
 mod sidebar;
 mod tabbar;
 mod tabset;
+mod welcomeui;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -60,7 +66,10 @@ use crate::tabs::Tabs;
 use crate::theme::{self, Palette, ThemeChoice, Tint};
 use crate::thumbs::{self, Tab};
 use crate::tiles;
-use crate::ui::{Action, Bar, Cursor, Event, Handler, Menu, Painter, Rect, ScrollCode, ScrollInfo, StatusText, ToolbarState, vk};
+use crate::accent::{self, AccentChoice};
+use crate::overbar::Vis;
+use crate::toast::Toasts;
+use crate::ui::{Action, Cursor, Event, Font, Handler, Menu, Painter, Rect, Rgb, SearchBox, vk};
 use qingpdf_core::view::{MarkupKind, ShapeKind};
 use crate::zoom::{self, ZoomMode};
 
@@ -229,9 +238,8 @@ const SETTLE_MS: u32 = 30;
 /// The words in the find box have been left alone for a moment: look for them.
 const TIMER_FIND: u32 = 2;
 const FIND_MS: u32 = 250;
-/// The note in the status line has been there long enough.
-const TIMER_NOTE: u32 = 3;
-const NOTE_MS: u32 = 6000;
+/// Something over the pages fades or grows: the next picture of it is due.
+const TIMER_ANIM: u32 = 3;
 /// The pointer is dragging a selection: scroll if it is outside the pages.
 const TIMER_DRAG: u32 = 4;
 const DRAG_MS: u32 = 50;
@@ -242,6 +250,8 @@ const TIMER_NUDGE: u32 = 6;
 /// The pointer has been still for two seconds in the presentation: it is hidden.
 const TIMER_CURSOR: u32 = 7;
 const CURSOR_MS: u32 = 2000;
+/// The pointer has rested on a button: its tooltip shows.
+const TIMER_TIP: u32 = 8;
 
 // Sizes at 96 dpi.
 const GAP: i64 = 10;
@@ -340,8 +350,6 @@ app_fields! {
         left_count: u64,
         /// The memory goal handed to the engine for all the files together (the tests make it small to see files let go of).
         pub(crate) total: u64,
-        /// What the scroll bars show now, so that they are set only when it changes.
-        bars: (Option<ScrollInfo>, Option<ScrollInfo>),
         /// Files to open, one after the other (those named on the command line, dropped on the window, handed over by another copy of
         /// the program), and whether the window has its size yet (nothing is opened before).
         queue: VecDeque<PathBuf>,
@@ -357,7 +365,7 @@ app_fields! {
         find_open: bool,
         /// What is in the find box now.
         find_text: String,
-        /// A line for the status bar, between the page number and the zoom.
+        /// The last thing said over the pages (the messages themselves are in `toasts`).
         note: Option<String>,
         recent: Vec<recent::Entry>,
         recent_path: Option<PathBuf>,
@@ -371,12 +379,9 @@ app_fields! {
         /// What the person chose in View > Language, and the language of Windows (what "follow the system" means).
         lang_choice: LangChoice,
         system_lang: Lang,
-        /// The toolbar is shown (View > Toolbar); it is told to the window with the next answer when `toolbar_dirty`.
+        /// The command bar is shown (View > Command bar), and the box of the search pill as the window was last told it.
         toolbar_on: bool,
-        toolbar_dirty: bool,
-        /// What the toolbar and the status bar were last told to say, so that they are told only when it changes.
-        last_toolbar: Option<ToolbarState>,
-        last_status: Option<StatusText>,
+        last_search_box: Option<SearchBox>,
         /// The width of the bookmarks the person has made them (at 96 dpi), and the start of a drag of their edge: where the pointer was
         /// and the width then.
         sidebar_pref: i64,
@@ -395,9 +400,42 @@ app_fields! {
         places_path: Option<PathBuf>,
         places_dirty: bool,
         remember_place: bool,
-        /// The pointer is over this tab of the strip, and a click that began in the strip is not over yet.
-        tab_hover: Option<usize>,
-        strip_press: bool,
+        /// What the pointer is on, what it pressed (the button is done when the mouse comes up on it), and whether a click that began on the reader's own
+        /// chrome is not over yet (it is not the pages').
+        hot: Option<overlay::Hot>,
+        pressed: Option<overlay::Hot>,
+        chrome_press: bool,
+        /// The tooltip of what is hot shows.
+        tip_on: bool,
+        /// The little messages, the thin scroll bars (how visible and how wide each is, and the one being dragged), the page pill (when the view was last scrolled
+        /// and which of its boxes is open), the place of the view when the bars were last woken, and whether the clock for the things that fade is going.
+        toasts: Toasts,
+        vis_v: Vis,
+        vis_h: Vis,
+        bar_drag: Option<overlay::BarDrag>,
+        pill_scrolled: Option<u64>,
+        pill_edit: Option<overlay::PillField>,
+        last_pos: (i64, i64, i64),
+        anim_on: bool,
+        /// The width of a digit, the height of a line of text and of the big name, and the width of the message shown, in the font the window draws in (found when
+        /// it draws): what the pill, the welcome page and the messages are laid out by.
+        digit_w: i32,
+        line_h: i32,
+        title_font_h: i32,
+        toast_w: i32,
+        /// The row of the welcome page the keyboard is on.
+        welcome_focus: Option<usize>,
+        /// The window has nothing round the pages (no title strip, command bar, bars, pill or messages), as the speed test's has not: what the tests of the pages
+        /// have, so that the places they give are the pages'. (Always false outside the tests.)
+        bare: bool,
+        /// How the frame of the window is: drawn by the reader (with the system's buttons over its right end, this wide) or the system's own.
+        frame_custom: bool,
+        caption_w: i64,
+        /// The accent the person chose, the one Windows has, the colours of a high-contrast theme, and whether the window is dark.
+        accent_choice: AccentChoice,
+        system_accent: Option<Rgb>,
+        contrast: Option<theme::Contrast>,
+        dark: bool,
         /// A document that waited was asked for: nothing is drawn of it until the engine says what the plan is now.
         activating: bool,
         /// The tab asked for while a file was being read again (it is shown when that is done).
@@ -457,7 +495,7 @@ app_fields! {
         /// whether the window is to be told them (`Action::Theme`) with the next answer.
         theme_choice: ThemeChoice,
         system_dark: bool,
-        pal: &'static Palette,
+        pal: Palette,
         theme_dirty: bool,
         /// The colours of the pages (View > Page colours), and how the pages go in rows for a file nothing is kept about (the last choice made).
         tint: Tint,
@@ -542,7 +580,6 @@ impl App {
             next_doc: 1,
             left_count: 0,
             total: TOTAL_BYTES,
-            bars: (None, None),
             queue: VecDeque::new(),
             ready: false,
             wake,
@@ -563,9 +600,7 @@ impl App {
             lang_choice: LangChoice::System,
             system_lang: lang,
             toolbar_on: true,
-            toolbar_dirty: true,
-            last_toolbar: None,
-            last_status: None,
+            last_search_box: None,
             sidebar_pref: sidebar::DEFAULT_WIDTH,
             split_drag: None,
             persist: true,
@@ -576,8 +611,30 @@ impl App {
             places_path,
             places_dirty: false,
             remember_place: true,
-            tab_hover: None,
-            strip_press: false,
+            hot: None,
+            pressed: None,
+            chrome_press: false,
+            tip_on: false,
+            toasts: Toasts::new(),
+            vis_v: Vis::default(),
+            vis_h: Vis::default(),
+            bar_drag: None,
+            pill_scrolled: None,
+            pill_edit: None,
+            last_pos: (0, 0, 0),
+            anim_on: false,
+            digit_w: 8,
+            line_h: 16,
+            title_font_h: 36,
+            toast_w: 0,
+            welcome_focus: None,
+            bare: cfg!(test),
+            frame_custom: true,
+            caption_w: 138,
+            accent_choice: AccentChoice::Qing,
+            system_accent: None,
+            contrast: None,
+            dark: false,
             activating: false,
             pending_tab: None,
             last_title: String::new(),
@@ -613,7 +670,7 @@ impl App {
             rd: redact::Redacting::new(),
             theme_choice: ThemeChoice::System,
             system_dark: false,
-            pal: &theme::LIGHT,
+            pal: theme::LIGHT,
             theme_dirty: true,
             tint: Tint::Original,
             default_spread: Spread::Single,
@@ -900,43 +957,13 @@ impl App {
             }
         }
         self.sync_thumbs();
-        self.sync_bars(&mut actions);
+        actions.extend(self.wake_bars());
         self.schedule();
         self.ask_for_links();
         self.ask_for_annots();
         actions.extend(self.reposition_editor());
         actions.push(Action::Invalidate);
         actions
-    }
-
-    fn sync_bars(&mut self, actions: &mut Vec<Action>) {
-        let Some(doc) = &self.doc else {
-            let none = ScrollInfo { min: 0, max: 0, page: 0, pos: 0 };
-            if self.bars != (Some(none), None) {
-                self.bars = (Some(none), None);
-                actions.push(Action::SetScroll { bar: Bar::Vertical, info: none });
-                actions.push(Action::SetScroll { bar: Bar::Horizontal, info: none });
-            }
-            return;
-        };
-        let l = &doc.layout;
-        // The bar counts in whole numbers up to 2^31: a very long document is counted in bigger steps.
-        let step = (l.content_height() / 2_000_000_000 + 1).max(1);
-        let v = ScrollInfo {
-            min: 0,
-            max: (l.content_height() / step - 1).max(0) as i32,
-            page: (self.view_h / step).max(0) as u32,
-            pos: (self.scroll_y / step) as i32,
-        };
-        let h = ScrollInfo { min: 0, max: (l.content_width() - 1).clamp(0, i64::from(i32::MAX)) as i32, page: self.view_w.max(0) as u32, pos: self.scroll_x.clamp(0, i64::from(i32::MAX)) as i32 };
-        if self.bars.0 != Some(v) {
-            self.bars.0 = Some(v);
-            actions.push(Action::SetScroll { bar: Bar::Vertical, info: v });
-        }
-        if self.bars.1 != Some(h) {
-            self.bars.1 = Some(h);
-            actions.push(Action::SetScroll { bar: Bar::Horizontal, info: h });
-        }
     }
 
     /// What the window shows, for the scheduler.
@@ -1183,6 +1210,19 @@ impl App {
         self.scroll_to(self.scroll_x + dx, self.scroll_y + dy, moving)
     }
 
+    /// A command from a button or the menus: what that rests on is let go of first (the keyboard goes back to the pages, a nudge is sent), then it is done.
+    pub(super) fn run_command(&mut self, cmd: u32) -> Vec<Action> {
+        if cmd != CMD_BOOKMARKS && !pages::is_page_command(cmd) {
+            self.thumb_focus = false;
+        }
+        if !(CMD_BM_ADD..=CMD_BM_AUTO).contains(&cmd) {
+            self.bm.focus = false;
+        }
+        let mut actions = self.flush_nudge();
+        actions.extend(self.command(cmd));
+        actions
+    }
+
     fn command(&mut self, cmd: u32) -> Vec<Action> {
         match cmd {
             CMD_OPEN => {
@@ -1305,6 +1345,10 @@ impl App {
     }
 
     fn key_now(&mut self, key: u32, ctrl: bool, shift: bool) -> Vec<Action> {
+        // The welcome page has the keyboard when no file is open: the arrow keys choose a file, Enter opens it, Delete takes it out of the list.
+        if !ctrl && let Some(actions) = self.welcome_key(key) {
+            return actions;
+        }
         // The list of thumbnails has the keyboard: the arrow keys move from page to page.
         if !ctrl && self.thumb_focus && self.thumbs_shown() && let Some(list_key) = sidebar::list_key(key) {
             return self.thumb_key(list_key);
@@ -1383,38 +1427,24 @@ impl App {
         }
     }
 
-    fn scrolled_by_bar(&mut self, bar: Bar, code: ScrollCode) -> Vec<Action> {
-        let line = self.px(LINE_STEP);
-        let page_step = (self.view_h * 9 / 10).max(1);
-        let Some(doc) = &self.doc else { return Vec::new() };
-        let step = (doc.layout.content_height() / 2_000_000_000 + 1).max(1);
-        match (bar, code) {
-            (Bar::Vertical, ScrollCode::LineUp) => self.scroll_by(0, -line, false),
-            (Bar::Vertical, ScrollCode::LineDown) => self.scroll_by(0, line, false),
-            (Bar::Vertical, ScrollCode::PageUp) => self.scroll_by(0, -page_step, false),
-            (Bar::Vertical, ScrollCode::PageDown) => self.scroll_by(0, page_step, false),
-            (Bar::Vertical, ScrollCode::Top) => self.scroll_to(self.scroll_x, 0, false),
-            (Bar::Vertical, ScrollCode::Bottom) => self.scroll_to(self.scroll_x, i64::MAX / 4, false),
-            (Bar::Vertical, ScrollCode::Thumb(p)) => self.scroll_to(self.scroll_x, i64::from(p) * step, true),
-            (Bar::Horizontal, ScrollCode::LineUp) => self.scroll_by(-line, 0, false),
-            (Bar::Horizontal, ScrollCode::LineDown) => self.scroll_by(line, 0, false),
-            (Bar::Horizontal, ScrollCode::PageUp) => self.scroll_by(-self.view_w * 9 / 10, 0, false),
-            (Bar::Horizontal, ScrollCode::PageDown) => self.scroll_by(self.view_w * 9 / 10, 0, false),
-            (Bar::Horizontal, ScrollCode::Top) => self.scroll_to(0, self.scroll_y, false),
-            (Bar::Horizontal, ScrollCode::Bottom) => self.scroll_to(i64::MAX / 4, self.scroll_y, false),
-            (Bar::Horizontal, ScrollCode::Thumb(p)) => self.scroll_to(i64::from(p), self.scroll_y, true),
+    // --- drawing ---------------------------------------------------------------------------------------------
+
+    /// The soft shadow under a page: three thin frames round it, each fainter than the one inside it, a little lower than the page is high (none in the
+    /// presentation, where the ground is black).
+    fn draw_shadow(&self, p: &mut dyn Painter, left: i64, top: i64, pw: i64, ph: i64) {
+        if self.present.is_some() || self.pal.shadow_alpha == 0 || pw <= 0 || ph <= 0 {
+            return;
+        }
+        let a = u32::from(self.pal.shadow_alpha);
+        let (t, lower) = (self.px(1).max(1), self.px(2));
+        for (i, alpha) in [(3, a / 3), (2, a * 2 / 3), (1, a)] {
+            let d = i * t;
+            let (x, y, w, h) = (left - d, top - d + lower, pw + 2 * d, ph + 2 * d);
+            for r in [(x, y, w, t), (x, y + h - t, w, t), (x, y + t, t, h - 2 * t), (x + w - t, y + t, t, h - 2 * t)] {
+                p.fill_rect_alpha(Rect { x: clamp32(r.0), y: clamp32(r.1), w: clamp32(r.2), h: clamp32(r.3) }, 0x000000, alpha as u8);
+            }
         }
     }
-
-    // --- a line in the status bar ------------------------------------------------------------------------------
-
-    /// Say something in the status bar for a few seconds.
-    fn say(&mut self, text: String) -> Vec<Action> {
-        self.note = Some(text);
-        vec![Action::SetTimer { id: TIMER_NOTE, ms: NOTE_MS }, Action::Invalidate]
-    }
-
-    // --- drawing ---------------------------------------------------------------------------------------------
 
     /// Draw a page; `true` if some of its bitmaps are on it.
     fn draw_page(&self, p: &mut dyn Painter, page: usize) -> bool {
@@ -1423,6 +1453,7 @@ impl App {
         let (pw, ph) = l.size_px(page);
         let (left, top) = (l.left(page, self.view_w, self.scroll_x) + self.view_x, l.top(page) - self.scroll_y);
         let rect = |x: i64, y: i64, w: i64, h: i64| Rect { x: clamp32(x), y: clamp32(y), w: clamp32(w), h: clamp32(h) };
+        self.draw_shadow(p, left, top, pw, ph);
         p.fill_rect(rect(left - 1, top - 1, pw + 2, ph + 2), self.page_border());
         p.fill_rect(rect(left, top, pw, ph), self.tint.paper());
         let want = self.draw_scale;
@@ -1487,50 +1518,55 @@ fn fit_zoom(l: &Layout, mode: ZoomMode, page: usize, (view_w, view_h): (i64, i64
     }
 }
 
-/// Move the places in an action that the window puts in its client area down by the height of the strip of tabs (the reader thinks in the
-/// coordinates of the pages' area, which is below the strip).
+/// Move the places in an action that the window puts in its client area down by the height of the title strip and the command bar (the reader thinks in
+/// the coordinates of the pages' area, which is below them).
 fn below_strip(action: &mut Action, dy: i32) {
     match action {
         Action::Sidebar(r) | Action::FieldMove(r) | Action::Find(Some(r)) => r.y = r.y.saturating_add(dy),
         Action::FieldEdit(Some(b)) => b.rect.y = b.rect.y.saturating_add(dy),
-        Action::Choose { at, .. } | Action::ContextMenu { at, .. } => at.1 = at.1.saturating_add(dy),
+        Action::SearchBox(Some(b)) => b.rect.y = b.rect.y.saturating_add(dy),
+        Action::PillEdit(Some((r, _))) => r.y = r.y.saturating_add(dy),
+        Action::Choose { at, .. } | Action::ContextMenu { at, .. } | Action::ShowMenu { at, .. } => at.1 = at.1.saturating_add(dy),
         _ => {}
     }
 }
 
 impl App {
-    /// An event as the strip of tabs sees it: `Err` with the actions when the strip took it (a click on a tab, the pointer moving over it); `Ok`
-    /// with the event in the coordinates of the pages' area, which is below the strip, when it is for the pages.
+    /// An event as the title strip, the command bar and what lies over the pages see it: `Err` with the actions when they took it (a click on a tab or a button
+    /// or the pill, a bar dragged, the pointer moving over them); `Ok` with the event in the coordinates of the pages' area, which is below the strip and the bar,
+    /// when it is for the pages.
     fn route(&mut self, event: Event) -> Result<Event, Vec<Action>> {
-        let bar = self.bar_h();
-        let dy = clamp32(bar);
-        // A click that began in the strip is not for the pages, nor is what follows it.
+        let dy = clamp32(self.bar_h());
+        // A click that began on the chrome (or on the thumb of a bar) is not for the pages, nor is what follows it.
+        let held = self.chrome_press || self.bar_drag.is_some();
         match event {
-            Event::MouseMove { .. } if self.strip_press => return Err(Vec::new()),
-            Event::MouseUp { .. } if std::mem::take(&mut self.strip_press) => return Err(Vec::new()),
-            Event::HoverEnd => return Err(self.strip_hover(None)),
+            Event::MouseMove { x, y, .. } if held => return Err(self.chrome_move(i64::from(x), i64::from(y))),
+            Event::MouseUp { x, y } if held => return Err(self.chrome_up(i64::from(x), i64::from(y))),
+            Event::MouseLost if held => return Err(self.chrome_cancel()),
+            Event::HoverEnd => return Err(self.hover_at(None)),
             _ => {}
         }
-        if bar == 0 {
-            return match event {
-                Event::Hover { .. } | Event::MiddleClick { .. } => Err(self.strip_hover(None)),
-                other => Ok(other),
-            };
-        }
         match event {
-            Event::MouseDown { x, y, .. } if y < dy => Err(self.strip_down(i64::from(x))),
-            Event::MouseDown { x, y, ctrl, shift, clicks } => Ok(Event::MouseDown { x, y: y - dy, ctrl, shift, clicks }),
-            Event::MouseMove { x, y, shift } => Ok(Event::MouseMove { x, y: y - dy, shift }),
-            Event::MouseUp { x, y } => Ok(Event::MouseUp { x, y: y - dy }),
-            Event::Wheel { y, .. } | Event::ContextMenu { y, .. } if y < dy => Err(Vec::new()),
-            Event::Wheel { delta, ctrl, shift, x, y } => Ok(Event::Wheel { delta, ctrl, shift, x, y: y - dy }),
-            Event::ContextMenu { x, y } => Ok(Event::ContextMenu { x, y: y - dy }),
-            Event::OutlineMenu { index, x, y } => Ok(Event::OutlineMenu { index, x, y: y - dy }),
-            Event::Hover { x, y } => Err(self.strip_hover((y < dy).then_some(i64::from(x)))),
-            Event::MiddleClick { x, y } if y < dy => Err(self.strip_middle(i64::from(x))),
-            Event::MiddleClick { .. } => Err(Vec::new()),
-            other => Ok(other),
+            Event::MouseDown { x, y, .. } => {
+                if let Some(actions) = self.chrome_down(i64::from(x), i64::from(y)) {
+                    return Err(actions);
+                }
+            }
+            Event::Hover { x, y } => return Err(self.hover_at(Some((i64::from(x), i64::from(y))))),
+            Event::MiddleClick { x, y } if y < clamp32(self.title_h()) => return Err(self.strip_middle(i64::from(x), i64::from(y))),
+            Event::MiddleClick { .. } => return Err(Vec::new()),
+            Event::Wheel { y, .. } | Event::ContextMenu { y, .. } if y < dy => return Err(Vec::new()),
+            _ => {}
         }
+        Ok(match event {
+            Event::MouseDown { x, y, ctrl, shift, clicks } => Event::MouseDown { x, y: y - dy, ctrl, shift, clicks },
+            Event::MouseMove { x, y, shift } => Event::MouseMove { x, y: y - dy, shift },
+            Event::MouseUp { x, y } => Event::MouseUp { x, y: y - dy },
+            Event::Wheel { delta, ctrl, shift, x, y } => Event::Wheel { delta, ctrl, shift, x, y: y - dy },
+            Event::ContextMenu { x, y } => Event::ContextMenu { x, y: y - dy },
+            Event::OutlineMenu { index, x, y } => Event::OutlineMenu { index, x, y: y - dy },
+            other => other,
+        })
     }
 
     /// Whatever the event was, the engine may have something waiting; the speed test may have its next step.
@@ -1580,12 +1616,21 @@ impl Handler for App {
     }
 
     fn paint(&mut self, p: &mut dyn Painter) -> bool {
+        // What the pill, the welcome page and the messages are laid out by: the size of the text in the fonts that are drawn with.
+        p.set_font(Font::Body);
+        (self.digit_w, self.line_h) = (p.text_width("0").max(1), p.line_height());
+        p.set_font(Font::Title);
+        self.title_font_h = p.line_height();
+        p.set_font(Font::Body);
         let dy = clamp32(self.bar_h());
-        if dy == 0 {
-            return self.paint_pages(p);
+        let drawn = if dy == 0 { self.paint_pages(p) } else { self.paint_pages(&mut tabbar::Shifted { inner: &mut *p, dy }) };
+        self.draw_overlays(p);
+        if dy > 0 {
+            // (The command bar first: the tab that is shown is a little taller than the strip, and flows into it.)
+            self.draw_cmdbar(p);
+            self.draw_title(p);
         }
-        let drawn = self.paint_pages(&mut tabbar::Shifted { inner: &mut *p, dy });
-        self.draw_tabbar(p);
+        self.draw_tooltip(p);
         drawn
     }
 
@@ -1594,6 +1639,10 @@ impl Handler for App {
             return Cursor::Hidden;
         }
         let dy = clamp32(self.bar_h());
+        // A hand over what can be pressed: the buttons, the tabs, the pill, the button and the rows of the welcome page.
+        if matches!(self.hot_at(i64::from(x), i64::from(y)), Some(h) if !matches!(h, overlay::Hot::Search | overlay::Hot::BarV | overlay::Hot::BarH)) {
+            return Cursor::Hand;
+        }
         if y < dy {
             return Cursor::Arrow;
         }
@@ -1602,6 +1651,10 @@ impl Handler for App {
             Cursor::Arrow => self.text_cursor(x, y),
             shape => shape,
         }
+    }
+
+    fn nc_hit(&mut self, x: i32, y: i32) -> crate::ui::NcHit {
+        self.nc_at(i64::from(x), i64::from(y))
     }
 
     fn unsaved_reason(&self) -> Option<String> {
@@ -1663,18 +1716,7 @@ impl App {
                 }
             }
             Event::HWheel { delta } => self.scroll_by(i64::from(delta) * self.px(WHEEL_STEP) / 120, 0, true),
-            Event::Scroll { bar, code } => self.scrolled_by_bar(bar, code),
-            Event::Command(cmd) => {
-                if cmd != CMD_BOOKMARKS && !pages::is_page_command(cmd) {
-                    self.thumb_focus = false;
-                }
-                if !(CMD_BM_ADD..=CMD_BM_AUTO).contains(&cmd) {
-                    self.bm.focus = false;
-                }
-                let mut actions = self.flush_nudge();
-                actions.extend(self.command(cmd));
-                actions
-            }
+            Event::Command(cmd) => self.run_command(cmd),
             Event::Drop(files) => {
                 // (A file that comes in the presentation ends it.)
                 let mut actions = self.end_present(false);
@@ -1689,10 +1731,8 @@ impl App {
                 vec![Action::KillTimer(TIMER_SETTLE)]
             }
             Event::Timer(TIMER_FIND) => self.find_timer(),
-            Event::Timer(TIMER_NOTE) => {
-                self.note = None;
-                vec![Action::KillTimer(TIMER_NOTE), Action::Invalidate]
-            }
+            Event::Timer(TIMER_ANIM) => self.anim_tick(),
+            Event::Timer(TIMER_TIP) => self.tip_timer(),
             Event::Timer(TIMER_DRAG) => self.drag_timer(),
             Event::Timer(TIMER_THUMB_DRAG) => self.thumb_drag_tick(),
             Event::Timer(TIMER_NUDGE) => self.flush_nudge(),
@@ -1755,10 +1795,15 @@ impl App {
             Event::ContextMenu { .. } if self.present.is_some() => self.present_turn(-1),
             Event::ContextMenu { x, y } => self.context_menu(i64::from(x), i64::from(y)),
             Event::FindFocus => self.find_focused(),
-            Event::PageBox(text) => match crate::toolbar::parse_page_box(&text, self.page_count()) {
-                Some(page) => self.go_to_page(page),
-                None => Vec::new(),
-            },
+            Event::PillEdit(text) => self.pill_edited(text),
+            Event::Frame { custom, caption } => {
+                self.frame_custom = custom;
+                self.caption_w = i64::from(caption.max(0));
+                vec![Action::Invalidate]
+            }
+            Event::SystemAccent(rgb) => self.set_system_accent(rgb),
+            Event::HighContrast(colors) => self.set_contrast(colors),
+            Event::MenuKey => self.open_menu(true),
             Event::MouseMove { x, y, .. } if self.present.is_some() => self.present_pointer(i64::from(x), i64::from(y)),
             Event::MouseUp { .. } if self.present.is_some() => Vec::new(),
             Event::MouseMove { x, y, shift } => self.mouse_move(i64::from(x), i64::from(y), shift),
@@ -1807,8 +1852,9 @@ impl App {
                     drew |= self.draw_page(p, page);
                 }
             }
+            None if self.welcome_shown() => self.draw_welcome(p),
             None => {
-                let s = t(self.lang, if self.opening { Msg::Opening } else { Msg::Hint });
+                let s = t(self.lang, Msg::Opening);
                 let w = p.text_width(s);
                 p.text(clamp32(self.view_x) + (clamp32(self.view_w) - w) / 2, (clamp32(self.view_h) - p.line_height()) / 2, s, self.pal.hint_fg);
             }

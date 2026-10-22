@@ -50,6 +50,7 @@ pub(super) struct MenuState {
 
 impl MenuState {
     /// Nothing open, nothing changed.
+    #[cfg(test)]
     pub(super) fn idle() -> MenuState {
         MenuState {
             has_doc: false,
@@ -285,11 +286,6 @@ pub(super) fn build_menus(lang: Lang, st: &MenuState) -> Vec<Menu> {
 }
 
 impl App {
-    /// The menus before anything is open (the window is made with these; the reader puts the others).
-    pub fn initial_menus(lang: Lang) -> Vec<Menu> {
-        build_menus(lang, &MenuState::idle())
-    }
-
     /// The command of the tool in use.
     pub(super) fn tool_command(&self) -> u32 {
         match self.edit.tool {
