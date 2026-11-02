@@ -172,7 +172,7 @@ mod tests {
     fn numbers_come_out_as_the_standard_sort_has_them() {
         for n in (0..70).chain([127, 128, 129, 1000, 4097]) {
             for modulus in [1, 3, 50, u64::MAX] {
-                let mut mine = numbers(n, n as u64 + modulus, modulus);
+                let mut mine = numbers(n, (n as u64).wrapping_add(modulus), modulus);
                 let mut std_sorted = mine.clone();
                 std_sorted.sort_unstable();
                 sort_u64(&mut mine);
