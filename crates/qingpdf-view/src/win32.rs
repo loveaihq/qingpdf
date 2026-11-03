@@ -1223,7 +1223,6 @@ struct WindowState {
     /// The frame is drawn by the reader (not in a high-contrast theme), Windows can show Mica (the answer to asking for it), the colour of the title strip where
     /// the window is transparent, the size of the client area and the frame as the reader was last told.
     custom: Cell<bool>,
-    mica: Cell<bool>,
     key: Cell<Rgb>,
     size: Cell<(i32, i32)>,
     frame_told: Cell<Option<(bool, i32)>>,
@@ -2845,7 +2844,7 @@ fn paint_to(state: &WindowState, hdc: isize, dirty: Option<WinRect>) {
     if w <= 0 || h <= 0 {
         return;
     }
-    let keyed = if state.mica.get() && state.custom.get() && !state.fullscreen.get() { scale(state.dpi.get(), crate::tabs::TITLE_H as i32) } else { 0 };
+    let keyed = if state.custom.get() && !state.fullscreen.get() { scale(state.dpi.get(), crate::tabs::TITLE_H as i32) } else { 0 };
     if let Some(d) = dirty
         && let Some((left, top, right, bottom)) = crate::anim::part_to_paint((d.left, d.top, d.right, d.bottom), (w, h), keyed)
     {
@@ -2868,8 +2867,9 @@ fn paint_to(state: &WindowState, hdc: isize, dirty: Option<WinRect>) {
     }
     if present {
         gdi.finish();
-        // Where the title strip is the colour of the strip, the window shows Mica through it.
-        if state.mica.get() && state.custom.get() && !state.fullscreen.get() {
+        // Where the title strip is the colour of the strip, the window shows the frame through it (Mica on Windows 11, the frame's own colour on Windows 10, where
+        // the system's buttons are drawn too); the rest is made opaque, or GDI's pixels (alpha 0) let the frame wash out the strip.
+        if state.custom.get() && !state.fullscreen.get() {
             gdi.key_out(state.key.get(), scale(state.dpi.get(), crate::tabs::TITLE_H as i32));
         }
         // SAFETY: both DCs are valid and the memory DC holds a bitmap of w by h pixels.
@@ -5049,7 +5049,6 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
         search_on: Cell::new(false),
         pill_open: Cell::new(false),
         custom: Cell::new(!plain_frame),
-        mica: Cell::new(false),
         key: Cell::new(0),
         size: Cell::new((-1, -1)),
         frame_told: Cell::new(None),
@@ -5087,12 +5086,11 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
     // no border, the colour of the pill.
     state.tb_page.set(make_child(hwnd, instance, "EDIT", 0, WS_TABSTOP | ES_AUTOHSCROLL | ES_CENTER, ID_PAGE_BOX));
     state.tb_search.set(make_child(hwnd, instance, "EDIT", 0, WS_TABSTOP | ES_AUTOHSCROLL, ID_SEARCH_BOX));
-    // Windows 11 can show Mica behind the title strip; where it cannot, asking is an error, and the strip is its own colour.
+    // Windows 11 can show Mica behind the title strip (Windows 10 shows the frame's colour).
     let backdrop = DWMSBT_MAINWINDOW;
     // SAFETY: DwmSetWindowAttribute takes this window, the number of an attribute and a pointer to a value of the size told (a 4-byte integer that lives through
-    // the call); a system that does not know the attribute answers with an error, which is the answer wanted here.
-    let mica = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&raw const backdrop).cast(), 4) } == 0;
-    state.mica.set(mica && !plain_frame);
+    // the call); a system that does not know the attribute answers with an error, which leaves the frame's own colour behind the strip.
+    unsafe { DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&raw const backdrop).cast(), 4) };
     // The frame is calculated again now that the window has its state (what `WM_NCCALCSIZE` answers depends on it).
     // SAFETY: plain numbers and the handle of the window just made.
     unsafe { SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZOMORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED) };
