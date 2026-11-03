@@ -2952,6 +2952,9 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
         }
     }
     // (A name without an extension gets the one the box started with: .docx for a Word file, else .pdf.)
+    // The folder of that name is where the box starts. Windows takes the folder the person last used when no folder is given (or the same one every time),
+    // which put every "save as" in the last folder of any box, not next to the file.
+    let start_dir = save_name.and_then(|n| std::path::Path::new(n).parent()).filter(|d| !d.as_os_str().is_empty()).map(|d| wide(&d.to_string_lossy()));
     let def_ext = wide(if save_name.is_some_and(|n| n.to_ascii_lowercase().ends_with(".docx")) { "docx" } else { "pdf" });
     let mut ofn = OpenFileNameW {
         struct_size: std::mem::size_of::<OpenFileNameW>() as u32,
@@ -2965,7 +2968,7 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
         max_file: file.len() as u32,
         file_title: null_mut(),
         max_file_title: 0,
-        initial_dir: null(),
+        initial_dir: start_dir.as_ref().map_or(null(), |d| d.as_ptr()),
         title: title.as_ptr(),
         flags: if save_name.is_some() { OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER } else { OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | if many { OFN_ALLOWMULTISELECT } else { 0 } },
         file_offset: 0,
@@ -2978,7 +2981,7 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
         reserved_dw: 0,
         flags_ex: 0,
     };
-    // SAFETY: `ofn` is a live OPENFILENAMEW of the size it declares; the strings it points to (`filter`, `title`, `def_ext`)
+    // SAFETY: `ofn` is a live OPENFILENAMEW of the size it declares; the strings it points to (`filter`, `title`, `def_ext`, `start_dir`)
     // and the buffer `file` (of the length declared in `max_file`) outlive the call; the box is modal and Windows
     // keeps none of the pointers after it returns.
     let chosen = unsafe { if save_name.is_some() { GetSaveFileNameW(&mut ofn) } else { GetOpenFileNameW(&mut ofn) } } != 0;
