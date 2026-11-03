@@ -200,20 +200,12 @@ struct Tm {
     zone: *const c_char,
 }
 
-/// `struct rusage` up to the field that is used (the two `timeval`s come first, then `ru_maxrss`, in bytes on macOS), and the rest as padding.
-#[repr(C)]
-struct Rusage {
-    times: [i64; 4],
-    maxrss: i64,
-    rest: [i64; 13],
-}
-
 unsafe extern "C" {
     fn time(t: *mut i64) -> i64;
     fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
-    fn getrusage(who: i32, out: *mut Rusage) -> i32;
     fn pthread_main_np() -> i32;
     fn getpid() -> i32;
+    fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut c_void) -> i32;
 }
 
 macro_rules! sender {
@@ -2908,10 +2900,20 @@ pub fn local_time(utc_secs: i64) -> String {
 
 /// The most memory this process has had in use, in bytes (0 if the system will not say).
 pub fn peak_working_set() -> u64 {
-    let mut usage = Rusage { times: [0; 4], maxrss: 0, rest: [0; 13] };
-    // SAFETY: `usage` is live and as big as a `struct rusage` (144 bytes); 0 is RUSAGE_SELF.
-    let ok = unsafe { getrusage(0, &mut usage) } == 0;
-    if ok { u64::try_from(usage.maxrss).unwrap_or(0) } else { 0 }
+    // The most physical memory the program has had to itself (`ri_lifetime_max_phys_footprint` of `rusage_info_v4`, what Activity
+    // Monitor shows). Not `ru_maxrss`: that counts every page of the system's shared libraries the program has touched, which on
+    // macOS is some 400 MB that every program shares.
+    let mut info = RusageInfo { uuid: [0; 16], fields: [0; 40] };
+    // SAFETY: `info` is live and bigger than a `rusage_info_v4` (16 bytes and 35 64-bit fields), which is all flavour 4 writes; the
+    // process is this one. 0 is success.
+    let ok = unsafe { proc_pid_rusage(getpid(), 4, (&raw mut info).cast()) } == 0;
+    if ok { info.fields[28] } else { 0 }
+}
+
+#[repr(C)]
+struct RusageInfo {
+    uuid: [u8; 16],
+    fields: [u64; 40],
 }
 
 /// A macOS program started from a terminal has its console already.

@@ -2772,3 +2772,9 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **顺带修好**：AppKit 默认把命令行里不是开关的参数都当文件打开，`--print-test` 的输出文件还不存在，于是弹出一个错误框一直等着。阅读器自己读命令行，所以启动时把 `NSTreatUnknownArgumentsAsOpen` 设成 NO。
 - **实测**：`--print-test` 打《阿Q正传》1–2 页：2 页 8 条，输出 PDF 渲染出来方向和位置都对。release 下峰值内存 1 页 558 MB、3 页 564 MB、6 页 565 MB，不随页数增长；不把条带画进 PDF 也是 542 MB，只开着这个文件看也有 484 MB，所以大头是 Mac 阅读器平时就占的内存，不是打印（Windows 打 3 页是 127 MB），以后单独查。
 - **没验证**：表单框和真打印机都没在界面上点过（屏幕锁了）；`PMPrinterPrintWithFile` 返回后马上删临时文件，按理它已经把文件交给了打印系统，没实测。
+
+## Mac 版：内存峰值量错了（2026-11-04）
+
+- 原来的 `peak_working_set` 用 `getrusage` 的 `ru_maxrss`，它把程序碰过的系统共享库页面都算进去（`vmmap`：`__TEXT` 常驻 442 MB，是所有程序共用的、干净的页），所以只开着一个文件看就显示 484 MB。改成 `proc_pid_rusage` 的 `ri_lifetime_max_phys_footprint`（程序自己独占的物理内存的峰值，“活动监视器”显示的就是这个）。
+- **重新量（release）：** 只看《阿Q正传》：当前 111 MB，峰值 229 MB（`footprint` 工具）；`--ocr-test` 公报 3 页 118 MB（原来报 162 MB）；`--print-test` 1 页 273 MB、6 页 278 MB，不把条带画进 PDF 时 225～253 MB。
+- **结论：** 没有泄漏，也不随页数增长。峰值在设计之内：阅读器的总内存目标是 200 MB（`plan::TOTAL_BYTES`，大头是页面位图缓存），Retina 屏上同样大小的页面像素是 4 倍，缓存会用满，再加 AppKit 和窗口缓冲约 30 MB。Windows 在 96 dpi 下缓存用不满，所以打印时是 127 MB。打印额外多 25～50 MB 是 CGPDFContext 写 PDF 时的一份条带和压缩缓冲。没改别的。
