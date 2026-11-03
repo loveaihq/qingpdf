@@ -29,7 +29,7 @@ impl App {
             Some(opener) => opener,
             None => {
                 let chinese = self.lang == Lang::Zh;
-                Box::new(move || crate::win32::open_recognizer(chinese))
+                Box::new(move || crate::host::open_recognizer(chinese))
             }
         }
     }

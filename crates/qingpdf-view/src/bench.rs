@@ -168,7 +168,7 @@ impl Bench {
         println!("page turns, nothing ready (cold): {}", summary(&self.cold));
         println!("turns whose pieces were all there when the turn began: {}", self.ready);
         println!("turns drawn at a smaller scale and stretched: {}", self.reduced);
-        let peak = crate::win32::peak_working_set();
+        let peak = crate::host::peak_working_set();
         println!("peak working set: {:.1} MB ({} bytes)", peak as f64 / 1_000_000.0, peak);
         vec![Action::Quit]
     }

@@ -1,0 +1,26 @@
+[package]
+name = "qingpdf-view-mac"
+description = "macOS reader for qingpdf: the window, menus and system calls of macOS around the shared reader qingpdf-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "qingpdf-view-mac"
+path = "src/main.rs"
+
+[dependencies]
+qingpdf-core = { path = "../qingpdf-core" }
+qingpdf-view = { path = "../qingpdf-view" }
+
+[lints.rust]
+# `unsafe` is allowed in one module only, `macos.rs` (it calls macOS), as `win32.rs` is on Windows.
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+undocumented_unsafe_blocks = "deny"

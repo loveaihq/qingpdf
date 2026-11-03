@@ -21,6 +21,7 @@ pub mod copydata;
 pub mod clicks;
 pub mod dlgstyle;
 pub mod find;
+pub mod host;
 pub mod i18n;
 pub mod layout;
 pub mod logo;
@@ -43,6 +44,7 @@ pub mod treestyle;
 pub mod tiles;
 pub mod treedrop;
 pub mod ui;
+#[cfg(windows)]
 #[allow(unsafe_code)]
 pub mod win32;
 pub mod welcome;

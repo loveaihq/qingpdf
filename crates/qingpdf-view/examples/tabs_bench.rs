@@ -101,7 +101,7 @@ fn main() {
         app.open_path(f, "");
         let t = wait_until(&mut app, &signal, "the file to open", |a| a.has_document() && a.visible_ready());
         opening.push(t.as_secs_f64() * 1000.0);
-        println!("opened {} in {:.0} ms; peak so far {:.1} MB", f.file_name().unwrap().to_string_lossy(), t.as_secs_f64() * 1000.0, mb(qingpdf_view::win32::peak_working_set()));
+        println!("opened {} in {:.0} ms; peak so far {:.1} MB", f.file_name().unwrap().to_string_lossy(), t.as_secs_f64() * 1000.0, mb(qingpdf_view::host::peak_working_set()));
     }
     stats("opening a file in a new tab (to its first page drawn sharp)", opening);
     let (mut shown, mut sharp) = (Vec::new(), Vec::new());
@@ -127,5 +127,5 @@ fn main() {
     shown.retain(|v| v.is_finite());
     stats("showing a tab: the page on the screen (command to its first picture)", shown);
     stats("showing a tab: every piece in view sharp", sharp);
-    println!("peak working set {:.1} MB (goal {} MB)", mb(qingpdf_view::win32::peak_working_set()), goal.map_or(200, |g| g / 1_000_000));
+    println!("peak working set {:.1} MB (goal {} MB)", mb(qingpdf_view::host::peak_working_set()), goal.map_or(200, |g| g / 1_000_000));
 }

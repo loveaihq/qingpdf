@@ -501,7 +501,7 @@ pub fn ocr_test(input: &str, output: &str, pages: Option<(u32, u32)>, chinese: b
     };
     let scope = pages.map_or(Scope::Scans, |(a, b)| Scope::Range(a.saturating_sub(1), b.saturating_sub(1)));
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-    let mut run = Run::start(&engine, 1, scope, Box::new(move || crate::win32::open_recognizer(chinese)), PAGE_TIMEOUT, wake, &mut next_id);
+    let mut run = Run::start(&engine, 1, scope, Box::new(move || crate::host::open_recognizer(chinese)), PAGE_TIMEOUT, wake, &mut next_id);
     let finished = loop {
         let progress = run.pump(&engine, &mut next_id);
         let mut result = None;
@@ -568,7 +568,7 @@ pub fn ocr_test(input: &str, output: &str, pages: Option<(u32, u32)>, chinese: b
             }
         }
     }
-    println!("memory peak {:.1} MB", crate::win32::peak_working_set() as f64 / 1_048_576.0);
+    println!("memory peak {:.1} MB", crate::host::peak_working_set() as f64 / 1_048_576.0);
     0
 }
 
@@ -839,7 +839,7 @@ pub(crate) mod tests {
     /// The real recogniser of Windows, where it is there: it reads a page that our own renderer drew from text in a PDF.
     #[test]
     fn windows_reads_a_page_drawn_by_the_engine() {
-        let Ok(mut recognizer) = crate::win32::open_recognizer(false) else { return };
+        let Ok(mut recognizer) = crate::host::open_recognizer(false) else { return };
         let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
         let mut offsets = Vec::new();
         let body = "BT /F 28 Tf 40 300 Td (Hello World 2026) Tj 0 -50 Td (The quick brown fox) Tj ET";

@@ -2707,3 +2707,13 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **为什么：** 用户定的：命令行基本没人用，Mac 版也只做图形界面，省掉第二个程序的维护和发布。
 - **代码怎么处理：** `qingpdf-cli` 留在工作区里，测试和 `tests/tools` 的比对脚本还要用它；它的规矩（`random.rs` 那一处 `unsafe` 例外）不变。
 - **阅读器还缺的（粗查，没逐项核对）：** 合并多个 PDF、图片转 PDF、去掉密码；“添加文字”在命令里有，阅读器里要再核对一下。
+
+## Mac 版第一步（2026-11-03）
+
+- **Windows 版和 Mac 版是两个独立的包（用户定）：** Windows 版仍是 `qingpdf-view-bin` 加 `qingpdf-view` 里的 `win32.rs`，原样不动；Mac 版是新包 `qingpdf-view-mac`（程序名 `qingpdf-view-mac`），窗口、菜单和系统调用都在它的 `macos.rs`。两边共用的只有引擎和阅读器的界面逻辑（`qingpdf-view` 库）。
+- **共用部分为此改的：** `win32` 只在 `cfg(windows)` 下编译；共用代码原来直接调 `win32::open_recognizer` 和 `win32::peak_working_set` 的 9 处改调新的 `host.rs`。在 Windows 上 `host` 就是 `win32` 的这两个函数（`pub use`，行为不变）；在别的系统上由程序启动时 `host::set` 给进来，没给时识别文字返回“没有语言”、内存峰值是 0。
+- **`qingpdf-view-mac` 在每个系统上都能编译**（工作区在 Dell 上照常 `cargo build`/`cargo test`），只是在 macOS 以外它的 `main` 什么都不做。反过来，`qingpdf-view-bin` 在 Mac 上编译不了（它直接用 `win32`），Mac 上要用 `-p qingpdf-view -p qingpdf-view-mac`。
+- `unsafe` 也允许出现在 `qingpdf-view-mac` 的 `macos.rs`（与 `win32.rs` 同样的规矩：每处注明为什么安全，Objective-C 运行时、CoreGraphics、CoreText、CoreFoundation 的声明自己写，不加任何 crate）。
+- 已经能用：一个 NSWindow 加一个自定义 NSView；后备缓冲是 CGBitmapContext（单位是像素，Dpi 事件给 96×backing scale）；`Painter` 的全部方法（文字用 CoreText 系统字体，中文靠系统回退；`text_width`/`line_height` 是真实度量）；事件：Size、Dpi、鼠标（含点击次数、右键、中键、悬停）、滚轮（触控板精确增量换成 Windows 每格 120）、捏合缩放（当作 Ctrl+滚轮）、键盘（macOS 键码换成 Windows VK，Cmd 当 Ctrl）、Timer、Wake（`Waker` 从任意线程发到主线程）、CloseRequested、文件拖入；动作：Invalidate、SetTitle、SetTimer/KillTimer、PickFile/PickFiles/PickSavePath/PickFolder、Message/Confirm/AskSave（NSAlert）、SetClipboard、OpenUri、Quit、SetMenus（真正的菜单栏，条目发 `Event::Command`）。
+- 还没做（代码里都有 `TODO(macos)`）：图标字体（按钮图标现在显示为方框）、AskText/AskForm/FieldEdit/SearchBox/PillEdit/Choose/ContextMenu/ShowMenu/Outline/Sidebar/Find、打印、Theme/全屏/HideCursor、菜单快捷键显示、窗口位置记忆、单实例（`first_copy`/`hand_over`）、按钮文字的本地化、`open_recognizer`（现在返回错误）。
+- **测试：** Mac 上 `qingpdf-view` 有 7 个测试写死了 Windows 路径（`C:\...`），在 Mac 上失败；它们属于 Windows 版，没有改。`qingpdf-view-mac` 自己的 6 个测试通过。

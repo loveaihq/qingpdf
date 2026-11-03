@@ -260,6 +260,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qingpdf-view-mac"
+version = "0.3.1"
+dependencies = [
+ "qingpdf-core",
+ "qingpdf-view",
+]
+
+[[package]]
 name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

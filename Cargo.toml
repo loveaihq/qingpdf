@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qingpdf-base", "crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view", "crates/qingpdf-view-bin"]
+members = ["crates/qingpdf-base", "crates/qingpdf-core", "crates/qingpdf-cli", "crates/qingpdf-view", "crates/qingpdf-view-bin", "crates/qingpdf-view-mac"]
 
 [workspace.package]
 version = "0.3.1"

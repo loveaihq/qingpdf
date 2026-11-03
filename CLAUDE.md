@@ -19,8 +19,8 @@
 - 依赖越少越好。加任何依赖前先说明理由。
 - 引擎核心自己写：解析、写回、内容解释、文字、渲染、编辑。通用零件可以用现成的库：压缩、字体文件解析、JPEG 解码、光栅化（tiny-skia）。
 - MuPDF、qpdf、Chrome 只当测试时的参考答案，不进产品。
-- `unsafe` 只许出现在 `qingpdf-view` 的 `win32.rs`（调用 Windows 函数），每处注明为什么安全；`qingpdf-base`、`qingpdf-core` 仍然 `forbid`；`qingpdf-cli` 只有一处例外（2026-10-16 用户定）：取系统随机数（加密码要用）的那一个模块可以调 `BCryptGenRandom`，同样自己声明、注明为什么安全，`qingpdf-cli` 其余地方 `deny`。Windows 函数的声明自己写，不加 windows-sys。
-- 阅读器的 exe 来自 `qingpdf-view-bin`（它 `forbid(unsafe_code)`）；`unsafe` 仍然只在 `qingpdf-view`（库）的 `win32.rs`，别处不加（测试里也不写自定义分配器之类的 `unsafe`）。
+- `unsafe` 只许出现在 `qingpdf-view` 的 `win32.rs`（调用 Windows 函数）和 `qingpdf-view-mac` 的 `macos.rs`（调用 Objective-C 运行时和 CoreGraphics/CoreText，自己声明、不加 objc 之类的 crate），每处注明为什么安全；`qingpdf-base`、`qingpdf-core` 仍然 `forbid`；`qingpdf-cli` 只有一处例外（2026-10-16 用户定）：取系统随机数（加密码要用）的那一个模块可以调 `BCryptGenRandom`，同样自己声明、注明为什么安全，`qingpdf-cli` 其余地方 `deny`。Windows 函数的声明自己写，不加 windows-sys。
+- Windows 阅读器的 exe 来自 `qingpdf-view-bin`（它 `forbid(unsafe_code)`），Mac 阅读器是独立的包 `qingpdf-view-mac`；`unsafe` 仍然只在 `qingpdf-view`（库）的 `win32.rs` 和 `qingpdf-view-mac` 的 `macos.rs`，别处不加（测试里也不写自定义分配器之类的 `unsafe`）。
 - 代码、注释、提交信息用英文；`docs/` 下的文档用中文。
 
 ## 范围

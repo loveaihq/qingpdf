@@ -177,7 +177,7 @@ impl App {
     /// The end of `--print-test`: say how it went (and how much memory the process used at most) and quit.
     fn finish_test(&mut self, result: &str) -> Vec<Action> {
         println!("print-test: {result}");
-        println!("print-test: peak working set {:.1} MB", crate::win32::peak_working_set() as f64 / 1_000_000.0);
+        println!("print-test: peak working set {:.1} MB", crate::host::peak_working_set() as f64 / 1_000_000.0);
         vec![Action::Quit]
     }
 }
