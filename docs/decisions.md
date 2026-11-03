@@ -2764,3 +2764,11 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **文字层的字体**（改了共用的 `fontsub.rs`）：候选字体原来只有 Windows 的文件名，Mac 上找不到，识别出的汉字都被丢掉。加了 `STHeiti Light.ttc`（允许嵌入）和 `Arial Unicode.ttf`（可编辑嵌入），放在 Windows 字体后面；Windows 上没有这两个文件名，不受影响。Mac 的宋体（Songti.ttc）禁止嵌入，冬青黑体（Hiragino Sans GB）是 CFF，都没加。
 - **实测**（release，`--ocr-test`，1954 年国务院公报扫描件前 3 页，繁体）：1013 个词，全部进了文字层；第一页 12.3 秒（Vision 第一次加载模型），之后每页 0.14～0.31 秒；内存峰值 162 MB。抽出的文字顺序和页面一致，有少量识别错字（“人口”认成“入口”）。在窗口里点“识别文字”、搜索识别出的词还没试（屏幕锁了）。
 - `qingpdf-core` 的 `many_content_streams_and_empty_strings_…` 测试在 Mac 上失败，撤掉这次改动也一样失败，是原来就有的，没查。
+
+## Mac 版：表单框和打印（2026-11-04）
+
+- **表单框（`AskForm`）**：用 NSAlert（自带模态循环、“轻”字图标、底部的确定/取消；取消按钮加了 Esc），附加视图里放系统控件，位置用共用的 `dlgstyle::lay_out`（1/96 英寸当 1 点）。Label/Group 是文字标签（Group 用粗体当小标题），Edit/Secret 是输入框，Combo 是 NSComboBox，Pick 是 NSPopUpButton，Check 是勾选框，Button 用 `stopModalWithCode:`（2000 加它在按钮里的序号）关掉框。返回值和 Windows 一样：按条目顺序给 Edit/Combo 的文字、Pick 的序号、Check 的 1/0，`button` 是第几个按钮，确定时为空，取消时整个答案为空；密码框的内容取走后清空。页面示意图是自己的视图，画的时候读控件的当前文字，一个放在“共同模式”里的定时器每秒重画五次（模态循环也在这些模式里），所以会跟着输入变。
+- **打印**：阅读器按 Windows 的方式一条一条交打印机像素。Mac 上把这些条带按页画进一个 PDF（CGPDFContext，页面是纸张大小，条带放在可打印区域里，按 300 dpi 换算成点），打完把文件交给用户在系统打印面板里选的打印机（PrintCore 的 `PMPrinterPrintWithFile`，带上面板里的份数、纸张、双面等设置；文件里只有要打的页，所以把设置里的页码范围改成全部），然后删掉临时文件。打印面板显示份数、页码范围、纸张、方向；没有任何打印机时报错（和 Windows 一样，阅读器自己说明）。隐藏参数 `--print-test` 不问打印机，直接把 PDF（A4）写到给的输出文件。
+- **顺带修好**：AppKit 默认把命令行里不是开关的参数都当文件打开，`--print-test` 的输出文件还不存在，于是弹出一个错误框一直等着。阅读器自己读命令行，所以启动时把 `NSTreatUnknownArgumentsAsOpen` 设成 NO。
+- **实测**：`--print-test` 打《阿Q正传》1–2 页：2 页 8 条，输出 PDF 渲染出来方向和位置都对。release 下峰值内存 1 页 558 MB、3 页 564 MB、6 页 565 MB，不随页数增长；不把条带画进 PDF 也是 542 MB，只开着这个文件看也有 484 MB，所以大头是 Mac 阅读器平时就占的内存，不是打印（Windows 打 3 页是 127 MB），以后单独查。
+- **没验证**：表单框和真打印机都没在界面上点过（屏幕锁了）；`PMPrinterPrintWithFile` 返回后马上删临时文件，按理它已经把文件交给了打印系统，没实测。

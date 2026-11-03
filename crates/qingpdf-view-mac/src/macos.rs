@@ -32,6 +32,13 @@ type Sel = *const c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct CgSize {
+    w: f64,
+    h: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct CgPoint {
     x: f64,
     y: f64,
@@ -69,6 +76,8 @@ unsafe extern "C" {
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {
     static NSPasteboardTypeString: Id;
+    static NSFontAttributeName: Id;
+    static NSForegroundColorAttributeName: Id;
 }
 
 #[link(name = "Foundation", kind = "framework")]
@@ -93,6 +102,7 @@ unsafe extern "C" {
     fn CFAttributedStringCreate(alloc: Id, string: Id, attributes: Id) -> Id;
     fn CFLocaleCopyPreferredLanguages() -> Id;
     fn CFDataCreate(alloc: Id, bytes: *const u8, len: isize) -> Id;
+    fn CFURLCreateFromFileSystemRepresentation(alloc: Id, bytes: *const u8, len: isize, directory: bool) -> Id;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -127,6 +137,10 @@ unsafe extern "C" {
     fn CGDataProviderRelease(provider: Id);
     fn CGDataProviderCreateWithCFData(data: Id) -> Id;
     fn CGColorSpaceCreateDeviceGray() -> Id;
+    fn CGPDFContextCreateWithURL(url: Id, media: *const CgRect, info: Id) -> Id;
+    fn CGPDFContextBeginPage(ctx: Id, info: Id);
+    fn CGPDFContextEndPage(ctx: Id);
+    fn CGPDFContextClose(ctx: Id);
     fn CGImageCreate(
         w: usize,
         h: usize,
@@ -153,6 +167,14 @@ unsafe extern "C" {
     fn CTLineCreateWithAttributedString(string: Id) -> Id;
     fn CTLineDraw(line: Id, ctx: Id);
     fn CTLineGetTypographicBounds(line: Id, ascent: *mut f64, descent: *mut f64, leading: *mut f64) -> f64;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn PMSessionGetCurrentPrinter(session: *mut c_void, printer: *mut *mut c_void) -> i32;
+    fn PMSetFirstPage(settings: *mut c_void, first: u32, lock: bool) -> i32;
+    fn PMSetLastPage(settings: *mut c_void, last: u32, lock: bool) -> i32;
+    fn PMPrinterPrintWithFile(printer: *mut c_void, settings: *mut c_void, format: *mut c_void, mime: Id, url: Id) -> i32;
 }
 
 #[link(name = "Vision", kind = "framework")]
@@ -1584,8 +1606,20 @@ fn perform(action: Action) {
         Action::ShowMenu { at, .. } => show_menus(at),
         Action::HideCursor => send1::<(), bool>(class(c"NSCursor"), c"setHiddenUntilMouseMoves:", true),
         Action::FullScreen(on) => set_full_screen(on),
-        // TODO(macos): the rest of the actions: AskForm, ChoosePrinter, Print.
-        _ => {}
+        Action::AskForm(spec) => {
+            let answer = ask_form(&spec);
+            dispatch(Event::Form { tag: spec.tag, answer });
+        }
+        Action::ChoosePrinter { max_page, preset } => match choose_printer(max_page, preset) {
+            Ok(setup) => dispatch(Event::Printer(setup)),
+            // No printer, or the panel would not open: the reader says so.
+            Err(()) => dispatch(Event::PrintError(String::new())),
+        },
+        Action::Print(op) => match print_op(op) {
+            Ok(true) => dispatch(Event::PrintStepDone),
+            Ok(false) => {}
+            Err(message) => dispatch(Event::PrintError(message)),
+        },
     }
 }
 
@@ -2727,6 +2761,10 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
     // The reader's View menu has its own "Full screen"; without this AppKit adds a second "Enter Full Screen" item to it.
     let defaults: Id = send0(class(c"NSUserDefaults"), c"standardUserDefaults");
     send2::<(), bool, Id>(defaults, c"setBool:forKey:", false, cfstr("NSFullScreenMenuItemEverywhere").0);
+    // The reader reads its own command line; without this AppKit also opens every argument that is not a switch as a file, and the
+    // output file of `--print-test` (not there yet) ends in an alert that waits for ever.
+    let no = cfstr("NO");
+    send2::<(), Id, Id>(defaults, c"setObject:forKey:", no.0, cfstr("NSTreatUnknownArgumentsAsOpen").0);
     let (view_class, delegate_class, field_class) = register_classes();
     if view_class.is_null() || delegate_class.is_null() || field_class.is_null() {
         return 1;
@@ -2985,6 +3023,468 @@ pub fn fatal_box(title: &str, text: &str) {
         let _: Id = send0(class(c"NSApplication"), c"sharedApplication");
         alert(title, text, &["OK"]);
     }
+}
+
+// --- the form box (`Action::AskForm`) -------------------------------------------------------------------------------
+//
+// An NSAlert (its own modal loop, the reader's icon, OK and Cancel at its foot) whose accessory view holds the system's controls at the
+// places `dlgstyle::lay_out` gives (a 96th of an inch is a point). A `Button` item closes the box with `stopModalWithCode:` (2000 and
+// its number among the buttons). The sketch of a page is a view of ours that reads the controls when it draws; a timer in the common
+// run-loop modes (which the modal loop is in) draws it again five times a second, so it follows what is typed.
+
+/// What the sketch of the open form box draws from (the controls are the box's, alive while it is open).
+struct FormSketch {
+    shape: (i32, i32),
+    slots: [usize; 6],
+    mirror: usize,
+    fields: [String; 4],
+    left_page: bool,
+}
+
+thread_local! {
+    static SKETCH: RefCell<Option<FormSketch>> = const { RefCell::new(None) };
+}
+
+/// The most characters taken from a line of a form box (as `win32.rs`).
+const FORM_MAX_TEXT: usize = 4_000;
+/// What `runModal` answers for a `Button` item (plus its number).
+const FORM_BUTTON_CODE: i64 = 2000;
+
+/// The class `name`, made with `methods` the first time.
+fn class_once(name: &CStr, superclass: &CStr, methods: &[Method]) -> Id {
+    let existing = class(name);
+    if existing.is_null() { make_class(name, superclass, methods) } else { existing }
+}
+
+extern "C" fn flipped_yes(_this: Id, _sel: Sel) -> i8 {
+    1
+}
+
+extern "C" fn form_button_pressed(_this: Id, _sel: Sel, sender: Id) {
+    let tag: i64 = send0(sender, c"tag");
+    let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+    send1::<(), i64>(app, c"stopModalWithCode:", FORM_BUTTON_CODE + tag);
+}
+
+extern "C" fn sketch_tick(this: Id, _sel: Sel, _timer: Id) {
+    send1::<(), bool>(this, c"setNeedsDisplay:", true);
+}
+
+/// The text of a control (at most `FORM_MAX_TEXT` characters).
+fn control_text(control: usize) -> String {
+    if control == 0 {
+        return String::new();
+    }
+    rust_string(send0(control as Id, c"stringValue")).chars().take(FORM_MAX_TEXT).collect()
+}
+
+/// Width and height of `text` in the system font of `size`.
+fn text_attributes(size: f64, color: Rgb) -> Id {
+    let font: Id = send1::<Id, f64>(class(c"NSFont"), c"systemFontOfSize:", size);
+    // SAFETY: the two keys are AppKit's constant strings, alive for the whole program.
+    let keys = unsafe { [NSFontAttributeName, NSForegroundColorAttributeName] };
+    let values = [font, srgb_color(color)];
+    send3::<Id, *const Id, *const Id, usize>(class(c"NSDictionary"), c"dictionaryWithObjects:forKeys:count:", values.as_ptr(), keys.as_ptr(), 2)
+}
+
+extern "C" fn sketch_draw(this: Id, _sel: Sel, _dirty: CgRect) {
+    let bounds = send_rect(this, c"bounds");
+    let graphics: Id = send0(class(c"NSGraphicsContext"), c"currentContext");
+    let ctx: Id = send0(graphics, c"CGContext");
+    if ctx.is_null() {
+        return;
+    }
+    SKETCH.with(|s| {
+        let Ok(s) = s.try_borrow() else { return };
+        let Some(s) = s.as_ref() else { return };
+        let (rw, rh) = (bounds.w, bounds.h);
+        let (pw, ph) = (f64::from(s.shape.0.max(1)), f64::from(s.shape.1.max(1)));
+        let (w, h) = if rw * ph <= rh * pw { (rw, rw * ph / pw) } else { (rh * pw / ph, rh) };
+        let page = CgRect { x: (rw - w) / 2.0, y: (rh - h) / 2.0, w, h };
+        // SAFETY: the view's own drawing context, alive through `drawRect:`; plain rectangles.
+        unsafe {
+            CGContextSetRGBFillColor(ctx, 0.5, 0.5, 0.5, 1.0);
+            CGContextFillRect(ctx, page);
+            CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+            CGContextFillRect(ctx, CgRect { x: page.x + 1.0, y: page.y + 1.0, w: page.w - 2.0, h: page.h - 2.0 });
+        }
+        let mirrored = s.left_page && s.mirror != 0 && send0::<i64>(s.mirror as Id, c"state") == 1;
+        let attributes = text_attributes(9.0, 0x303030);
+        let f = &s.fields;
+        for i in 0..6 {
+            let at = if mirrored && i % 3 != 1 { i / 3 * 3 + 2 - i % 3 } else { i };
+            let text = control_text(s.slots.get(at).copied().unwrap_or(0)).replace("{page}", &f[0]).replace("{pages}", &f[1]).replace("{date}", &f[2]).replace("{file}", &f[3]);
+            if text.is_empty() {
+                continue;
+            }
+            let t = cfstr(&text);
+            let size: CgSize = send1(t.0, c"sizeWithAttributes:", attributes);
+            let x = match i % 3 {
+                0 => page.x + 6.0,
+                1 => page.x + (page.w - size.w) / 2.0,
+                _ => page.x + page.w - 6.0 - size.w,
+            };
+            let y = if i < 3 { page.y + 6.0 } else { page.y + page.h - 6.0 - size.h };
+            send2::<(), CgPoint, Id>(t.0, c"drawAtPoint:withAttributes:", CgPoint { x, y }, attributes);
+        }
+    });
+}
+
+/// Ask for several things (`Action::AskForm`); none if it was cancelled.
+fn ask_form(spec: &FormSpec) -> Option<FormAnswer> {
+    let flipped = class_once(c"QingpdfFlipped", c"NSView", &[(c"isFlipped", flipped_yes as *const c_void, c"c@:")]);
+    let sketch_class = class_once(
+        c"QingpdfSketch",
+        c"NSView",
+        &[(c"isFlipped", flipped_yes as *const c_void, c"c@:"), (c"drawRect:", sketch_draw as *const c_void, c"v@:{CGRect=dddd}"), (c"tick:", sketch_tick as *const c_void, c"v@:@")],
+    );
+    let target_class = class_once(c"QingpdfFormTarget", c"NSObject", &[(c"pressed:", form_button_pressed as *const c_void, c"v@:@")]);
+    if flipped.is_null() || sketch_class.is_null() || target_class.is_null() {
+        return None;
+    }
+    let items: Vec<(FormKind, (i32, i32, i32, i32))> = spec.items.iter().map(|i| (i.kind, if i.kind == FormKind::Label && i.text.is_empty() { (i.rect.0, i.rect.1, i.rect.2, 0) } else { i.rect })).collect();
+    let laid = qingpdf_view::dlgstyle::lay_out(&items, spec.preview.as_ref().map(|p| p.rect), &spec.ok, &spec.cancel);
+    // The accessory view holds what is above the foot (NSAlert has its own margins and buttons).
+    let pad = qingpdf_view::dlgstyle::PAD;
+    let top = laid.rects.iter().chain(laid.preview.iter()).filter(|r| r.3 > 0).map(|r| r.1).min().unwrap_or(pad);
+    let bottom = laid.rects.iter().chain(laid.preview.iter()).map(|r| r.1 + r.3).max().unwrap_or(top);
+    let width = (laid.size.0 - 2 * pad).max(200);
+    let frame = |r: (i32, i32, i32, i32), h: Option<f64>| {
+        let full = f64::from(r.3);
+        let h = h.map_or(full, |h| h.min(full.max(h)));
+        CgRect { x: f64::from(r.0 - pad), y: f64::from(r.1 - top) + (full - h).max(0.0) / 2.0, w: f64::from(r.2), h }
+    };
+    let content: Id = send1(send0(flipped, c"alloc"), c"initWithFrame:", CgRect { x: 0.0, y: 0.0, w: f64::from(width), h: f64::from((bottom - top).max(1)) });
+    let target = new_object_of(target_class);
+    let mut made: Vec<(FormKind, usize)> = Vec::with_capacity(spec.items.len());
+    let (mut buttons, mut focus): (i64, Id) = (0, null_mut());
+    for (k, item) in spec.items.iter().enumerate() {
+        let r = laid.rects.get(k).copied().unwrap_or(item.rect);
+        let text = cfstr(&item.text);
+        let control: Id = match item.kind {
+            FormKind::Label | FormKind::Group => {
+                let label: Id = if r.3 > qingpdf_view::dlgstyle::LABEL_H {
+                    send1(class(c"NSTextField"), c"wrappingLabelWithString:", text.0)
+                } else {
+                    send1(class(c"NSTextField"), c"labelWithString:", text.0)
+                };
+                if item.kind == FormKind::Group {
+                    let bold: Id = send1::<Id, f64>(class(c"NSFont"), c"boldSystemFontOfSize:", 13.0);
+                    send1::<(), Id>(label, c"setFont:", bold);
+                }
+                send1::<(), CgRect>(label, c"setFrame:", frame(r, None));
+                label
+            }
+            FormKind::Edit | FormKind::Secret => {
+                let c: Id = send1(send0(class(if item.kind == FormKind::Secret { c"NSSecureTextField" } else { c"NSTextField" }), c"alloc"), c"initWithFrame:", frame(r, Some(22.0)));
+                if item.kind == FormKind::Edit {
+                    send1::<(), Id>(c, c"setStringValue:", text.0);
+                }
+                let _: Id = send0(c, c"autorelease");
+                c
+            }
+            FormKind::Combo => {
+                let c: Id = send1(send0(class(c"NSComboBox"), c"alloc"), c"initWithFrame:", frame(r, Some(26.0)));
+                let choices = cf_array_of_strings(&item.choices);
+                send1::<(), Id>(c, c"addItemsWithObjectValues:", choices.0);
+                send1::<(), Id>(c, c"setStringValue:", text.0);
+                let _: Id = send0(c, c"autorelease");
+                c
+            }
+            FormKind::Pick => {
+                let c: Id = send2(send0(class(c"NSPopUpButton"), c"alloc"), c"initWithFrame:pullsDown:", frame(r, Some(26.0)), false);
+                let choices = cf_array_of_strings(&item.choices);
+                send1::<(), Id>(c, c"addItemsWithTitles:", choices.0);
+                if item.selected < item.choices.len() {
+                    send1::<(), i64>(c, c"selectItemAtIndex:", item.selected as i64);
+                }
+                let _: Id = send0(c, c"autorelease");
+                c
+            }
+            FormKind::Check => {
+                let c: Id = send3(class(c"NSButton"), c"checkboxWithTitle:target:action:", text.0, null_mut::<c_void>(), null::<c_void>());
+                send1::<(), i64>(c, c"setState:", i64::from(item.selected == 1));
+                send1::<(), CgRect>(c, c"setFrame:", frame(r, Some(18.0)));
+                c
+            }
+            FormKind::Button => {
+                let c: Id = send3(class(c"NSButton"), c"buttonWithTitle:target:action:", text.0, target, sel(c"pressed:"));
+                send1::<(), i64>(c, c"setTag:", buttons);
+                buttons += 1;
+                send1::<(), CgRect>(c, c"setFrame:", frame(r, Some(28.0)));
+                c
+            }
+        };
+        if !control.is_null() {
+            send1::<(), Id>(content, c"addSubview:", control);
+            if focus.is_null() && matches!(item.kind, FormKind::Edit | FormKind::Secret | FormKind::Combo) {
+                focus = control;
+            }
+        }
+        made.push((item.kind, control as usize));
+    }
+    let mut timer: Id = null_mut();
+    if let (Some(p), Some(r)) = (&spec.preview, laid.preview) {
+        let handle = |k: usize| made.get(k).map_or(0, |m| m.1);
+        SKETCH.with(|s| *s.borrow_mut() = Some(FormSketch { shape: p.shape, slots: p.slots.map(handle), mirror: handle(p.mirror), fields: p.fields.clone(), left_page: p.left_page }));
+        let view: Id = send1(send0(sketch_class, c"alloc"), c"initWithFrame:", frame(r, None));
+        send1::<(), Id>(content, c"addSubview:", view);
+        release(view);
+        timer = send5::<Id, f64, Id, Sel, Id, bool>(class(c"NSTimer"), c"timerWithTimeInterval:target:selector:userInfo:repeats:", 0.2, view, sel(c"tick:"), null_mut(), true);
+        let run_loop: Id = send0(class(c"NSRunLoop"), c"currentRunLoop");
+        // SAFETY: Foundation's constant string, alive for the whole program.
+        send2::<(), Id, Id>(run_loop, c"addTimer:forMode:", timer, unsafe { NSRunLoopCommonModes });
+    }
+
+    let alert = new_object(c"NSAlert");
+    set_alert_icon(alert);
+    let title = cfstr(&spec.title);
+    send1::<(), Id>(alert, c"setMessageText:", title.0);
+    let (ok, cancel) = (cfstr(if spec.ok.is_empty() { "OK" } else { &spec.ok }), cfstr(if spec.cancel.is_empty() { "Cancel" } else { &spec.cancel }));
+    let _: Id = send1(alert, c"addButtonWithTitle:", ok.0);
+    let cancel_button: Id = send1(alert, c"addButtonWithTitle:", cancel.0);
+    let escape = cfstr("\u{1b}");
+    send1::<(), Id>(cancel_button, c"setKeyEquivalent:", escape.0);
+    send1::<(), Id>(alert, c"setAccessoryView:", content);
+    send0::<()>(alert, c"layout");
+    if !focus.is_null() {
+        let window: Id = send0(alert, c"window");
+        send1::<(), Id>(window, c"setInitialFirstResponder:", focus);
+    }
+    let pressed: i64 = send0(alert, c"runModal");
+    if !timer.is_null() {
+        send0::<()>(timer, c"invalidate");
+    }
+    SKETCH.with(|s| *s.borrow_mut() = None);
+
+    let button = (pressed >= FORM_BUTTON_CODE).then(|| (pressed - FORM_BUTTON_CODE) as usize);
+    let accepted = pressed == 1000 || button.is_some();
+    let mut values = Vec::new();
+    for &(kind, control) in &made {
+        let c = control as Id;
+        match kind {
+            FormKind::Edit | FormKind::Combo if accepted => values.push(control_text(control)),
+            FormKind::Secret => {
+                if accepted {
+                    values.push(control_text(control));
+                }
+                // What was typed (a password) is wiped from the box before it goes.
+                let empty = cfstr("");
+                send1::<(), Id>(c, c"setStringValue:", empty.0);
+            }
+            FormKind::Pick if accepted => values.push(send0::<i64>(c, c"indexOfSelectedItem").max(0).to_string()),
+            FormKind::Check if accepted => values.push(if send0::<i64>(c, c"state") == 1 { "1" } else { "0" }.to_string()),
+            _ => {}
+        }
+    }
+    release(alert);
+    release(content);
+    release(target);
+    accepted.then_some(FormAnswer { values, button })
+}
+
+fn new_object_of(class: Id) -> Id {
+    let allocated: Id = send0(class, c"alloc");
+    send0(allocated, c"init")
+}
+
+// --- printing (`Action::ChoosePrinter`, `Action::Print`) ------------------------------------------------------------------
+//
+// The reader prints in bands of printer pixels, as Windows' GDI wants. Here the bands are drawn into a PDF file page by page
+// (CGPDFContext, the paper's size, the bands placed in the part that can be printed on); at the end the file is given to the printer the
+// person chose in the system's print panel (PrintCore's `PMPrinterPrintWithFile`, with the panel's settings: copies, paper, two-sided)
+// and then deleted. The hidden `--print-test` (a preset) writes the PDF to its output file and prints nothing.
+
+/// Dots per inch the reader is asked to draw at (the PDF is the same size whatever it is; this is the sharpness of the pictures).
+const PRINT_DPI: i32 = 300;
+/// A4 in points, for the preset (no printer is asked).
+const A4_POINTS: (f64, f64) = (595.0, 842.0);
+
+struct PrintJob {
+    /// The NSPrintInfo the panel filled in (ours: one reference), or nil for a preset.
+    info: Id,
+    /// The file the PDF is written to, and whether it is the preset's own (kept) rather than a passing one (printed, then deleted).
+    path: PathBuf,
+    keep: bool,
+    paper: (f64, f64),
+    /// The part of the paper that can be printed on, in points from the bottom left.
+    area: CgRect,
+    /// The PDF being written (once the job has started).
+    ctx: Id,
+}
+
+thread_local! {
+    static PRINT: RefCell<Option<PrintJob>> = const { RefCell::new(None) };
+}
+
+fn cf_url(path: &std::path::Path) -> Cf {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // SAFETY: the bytes are live through the call and copied; a null allocator is the default one.
+    Cf(unsafe { CFURLCreateFromFileSystemRepresentation(null_mut(), bytes.as_ptr(), bytes.len() as isize, false) })
+}
+
+/// Stop the job there is (its PDF is closed; the passing file is deleted unless it is printed: `print`).
+fn end_print(print: bool) -> Result<(), String> {
+    let Some(job) = PRINT.with(|p| p.borrow_mut().take()) else { return Ok(()) };
+    if !job.ctx.is_null() {
+        // SAFETY: the PDF context made by `Start`, closed and released once.
+        unsafe {
+            CGPDFContextClose(job.ctx);
+            CGContextRelease(job.ctx);
+        }
+    }
+    let mut result = Ok(());
+    if print && !job.keep && !job.info.is_null() && !job.ctx.is_null() {
+        let (session, settings, format): (*mut c_void, *mut c_void, *mut c_void) = (send0(job.info, c"PMPrintSession"), send0(job.info, c"PMPrintSettings"), send0(job.info, c"PMPageFormat"));
+        let mut printer: *mut c_void = null_mut();
+        let url = cf_url(&job.path);
+        let mime = cfstr("application/pdf");
+        // SAFETY: the session, settings and page format belong to `info`, which is alive; `printer` is written once and belongs to the
+        // session; the URL and the type are live CF objects. The file holds only the pages asked for, so the settings' page range is
+        // set to all of them. 0 is success.
+        let status = unsafe {
+            let mut s = PMSessionGetCurrentPrinter(session, &mut printer);
+            if s == 0 {
+                PMSetFirstPage(settings, 1, false);
+                PMSetLastPage(settings, u32::MAX, false);
+                s = PMPrinterPrintWithFile(printer, settings, format, mime.0, url.0);
+            }
+            s
+        };
+        if status != 0 {
+            result = Err(format!("the printer would not take the job ({status})"));
+        }
+    }
+    if !job.keep || (!print && !job.ctx.is_null()) {
+        let _ = std::fs::remove_file(&job.path);
+    }
+    release(job.info);
+    result
+}
+
+/// Which printer (the system's print panel, with pages and copies), or the preset's file. `Err` if there is no printer.
+fn choose_printer(max_page: u32, preset: Option<PrinterPreset>) -> Result<Option<PrinterSetup>, ()> {
+    let _ = end_print(false);
+    let setup = |name: String, area: CgRect, ranges: Vec<(u32, u32)>| PrinterSetup {
+        name,
+        dpi: PRINT_DPI,
+        width: (area.w * f64::from(PRINT_DPI) / 72.0).floor() as i32,
+        height: (area.h * f64::from(PRINT_DPI) / 72.0).floor() as i32,
+        ranges,
+    };
+    if let Some(preset) = preset {
+        let area = CgRect { x: 0.0, y: 0.0, w: A4_POINTS.0, h: A4_POINTS.1 };
+        PRINT.with(|p| *p.borrow_mut() = Some(PrintJob { info: null_mut(), path: preset.output.clone(), keep: true, paper: A4_POINTS, area, ctx: null_mut() }));
+        return Ok(Some(setup(preset.name, area, preset.ranges)));
+    }
+    let names: Id = send0(class(c"NSPrinter"), c"printerNames");
+    if array_items(names).is_empty() {
+        return Err(());
+    }
+    let shared: Id = send0(class(c"NSPrintInfo"), c"sharedPrintInfo");
+    let info: Id = send0(shared, c"copy");
+    let panel: Id = send0(class(c"NSPrintPanel"), c"printPanel");
+    // Copies, page range, paper size, orientation.
+    send1::<(), u64>(panel, c"setOptions:", 1 | 2 | 4 | 8);
+    let dictionary: Id = send0(info, c"dictionary");
+    let number = |n: u32| -> Id { send1(class(c"NSNumber"), c"numberWithUnsignedInt:", n) };
+    let (first_key, last_key, all_key) = (cfstr("NSFirstPage"), cfstr("NSLastPage"), cfstr("NSAllPages"));
+    send2::<(), Id, Id>(dictionary, c"setObject:forKey:", number(1), first_key.0);
+    send2::<(), Id, Id>(dictionary, c"setObject:forKey:", number(max_page.max(1)), last_key.0);
+    let answer: i64 = send1(panel, c"runModalWithPrintInfo:", info);
+    if answer != 1 {
+        release(info);
+        return Ok(None);
+    }
+    let all = send0::<i8>(send1(dictionary, c"objectForKey:", all_key.0), c"boolValue") != 0;
+    let page = |key: &Cf| -> u32 { send0::<i64>(send1(dictionary, c"objectForKey:", key.0), c"integerValue").clamp(1, i64::from(max_page.max(1))) as u32 };
+    let (first, last) = (page(&first_key), page(&last_key));
+    let ranges = if all || (first <= 1 && last >= max_page) { Vec::new() } else { vec![(first.min(last), first.max(last))] };
+    let printer: Id = send0(info, c"printer");
+    let name = rust_string(send0(printer, c"name"));
+    let paper: CgSize = send0(info, c"paperSize");
+    let area = send_rect(info, c"imageablePageBounds");
+    if paper.w <= 0.0 || paper.h <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
+        release(info);
+        return Err(());
+    }
+    let path = std::env::temp_dir().join(format!("qingpdf-print-{}.pdf", std::process::id()));
+    PRINT.with(|p| *p.borrow_mut() = Some(PrintJob { info, path, keep: false, paper: (paper.w, paper.h), area, ctx: null_mut() }));
+    Ok(Some(setup(name, area, ranges)))
+}
+
+/// One step of a print job. `Ok(true)`: a band was put on the page. `Err`: it could not be done.
+fn print_op(op: PrintOp) -> Result<bool, String> {
+    match op {
+        PrintOp::End => return end_print(true).map(|()| false),
+        PrintOp::Abort => return end_print(false).map(|()| false),
+        _ => {}
+    }
+    PRINT.with(|p| {
+        let mut slot = p.borrow_mut();
+        // A job that was stopped is not carried on.
+        let Some(job) = slot.as_mut() else { return Ok(false) };
+        match op {
+            PrintOp::Start { .. } => {
+                let url = cf_url(&job.path);
+                let media = CgRect { x: 0.0, y: 0.0, w: job.paper.0, h: job.paper.1 };
+                // SAFETY: the URL is live and the box is read during the call; no extra information (null). The context is ours.
+                job.ctx = unsafe { CGPDFContextCreateWithURL(url.0, &media, null_mut()) };
+                if job.ctx.is_null() {
+                    return Err("the printer would not start the job".to_string());
+                }
+                Ok(false)
+            }
+            PrintOp::StartPage | PrintOp::EndPage if job.ctx.is_null() => Err("the printer would not start a page".to_string()),
+            PrintOp::StartPage => {
+                // SAFETY: the live PDF context of the job; no page information (null).
+                unsafe { CGPDFContextBeginPage(job.ctx, null_mut()) };
+                Ok(false)
+            }
+            PrintOp::EndPage => {
+                // SAFETY: the live PDF context, with a page begun.
+                unsafe { CGPDFContextEndPage(job.ctx) };
+                Ok(false)
+            }
+            PrintOp::Band { x, y, w, h, src_w, src_h, bgra } => {
+                let needed = (src_w.max(0) as usize).saturating_mul(src_h.max(0) as usize).saturating_mul(4);
+                if job.ctx.is_null() || src_w <= 0 || src_h <= 0 || w <= 0 || h <= 0 || bgra.len() < needed {
+                    return Ok(true);
+                }
+                let k = 72.0 / f64::from(PRINT_DPI);
+                let rect = CgRect { x: job.area.x + f64::from(x) * k, y: job.area.y + job.area.h - f64::from(y + h) * k, w: f64::from(w) * k, h: f64::from(h) * k };
+                // SAFETY: `needed` bytes of `bgra` (checked) are copied into the CFData; the provider and the colour space are released
+                // after the image has taken its own references; the image is src_w x src_h, 8 bits a component, 4 bytes a pixel in the
+                // order B G R x (32-bit little-endian, the first byte skipped), which is what a band is; it is drawn into the live PDF
+                // context and released.
+                let ok = unsafe {
+                    let data = CFDataCreate(null_mut(), bgra.as_ptr(), needed as isize);
+                    let provider = if data.is_null() { null_mut() } else { CGDataProviderCreateWithCFData(data) };
+                    if !data.is_null() {
+                        CFRelease(data);
+                    }
+                    if provider.is_null() {
+                        false
+                    } else {
+                        let space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                        let image = CGImageCreate(src_w as usize, src_h as usize, 8, 32, src_w as usize * 4, space, 0x2000 | 6, provider, null(), true, 0);
+                        CGColorSpaceRelease(space);
+                        CGDataProviderRelease(provider);
+                        if !image.is_null() {
+                            CGContextDrawImage(job.ctx, rect, image);
+                            CGImageRelease(image);
+                        }
+                        !image.is_null()
+                    }
+                };
+                if !ok {
+                    return Err("the printer would not take a part of the page".to_string());
+                }
+                Ok(true)
+            }
+            PrintOp::End | PrintOp::Abort => Ok(false),
+        }
+    })
 }
 
 // --- text recognition (5c): Vision -------------------------------------------------------------------------------------
