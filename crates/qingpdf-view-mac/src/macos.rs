@@ -2715,6 +2715,9 @@ pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, re
     let pool = unsafe { objc_autoreleasePoolPush() };
     let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
     send1::<i8, i64>(app, c"setActivationPolicy:", 0);
+    // The reader's View menu has its own "Full screen"; without this AppKit adds a second "Enter Full Screen" item to it.
+    let defaults: Id = send0(class(c"NSUserDefaults"), c"standardUserDefaults");
+    send2::<(), bool, Id>(defaults, c"setBool:forKey:", false, cfstr("NSFullScreenMenuItemEverywhere").0);
     let (view_class, delegate_class, field_class) = register_classes();
     if view_class.is_null() || delegate_class.is_null() || field_class.is_null() {
         return 1;
