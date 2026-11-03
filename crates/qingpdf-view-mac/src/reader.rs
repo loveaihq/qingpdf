@@ -11,6 +11,7 @@ use qingpdf_view::theme::{self, Tint};
 use qingpdf_view::copydata;
 use qingpdf_view::i18n::{Lang, Msg, t};
 use qingpdf_view::settings;
+use qingpdf_view::ui::{Action, Cursor, Event, Handler, NcHit, Painter};
 
 use crate::macos as sys;
 
@@ -64,6 +65,10 @@ pub fn main() {
     while let Some(arg) = args.next() {
         if arg == "--bench" {
             bench_file = args.next().map(PathBuf::from);
+        } else if arg == "--write-icon" {
+            // Hidden: draws the mark as a PNG (`make-app.sh` makes the `.app`'s icon from it).
+            let ok = args.next().is_some_and(|p| sys::write_icon(&p.to_string_lossy(), 1024));
+            std::process::exit(if ok { 0 } else { 1 });
         } else if arg == "--bench-thumbs" {
             bench_thumbs = true;
         } else if arg == "--bench-spread" {
@@ -88,7 +93,8 @@ pub fn main() {
             }
         } else if arg == "--ocr-lang" {
             ocr_chinese = args.next().map(|s| s.to_string_lossy().to_ascii_lowercase().starts_with("zh"));
-        } else if !arg.to_string_lossy().starts_with("--") {
+        } else if !arg.to_string_lossy().starts_with('-') {
+            // (Not a switch: the system may add some of its own, like `-psn_0_12345` or `-NSDocumentRevisionsDebugMode`.)
             open.push(arg);
         }
     }
@@ -152,9 +158,47 @@ pub fn main() {
         } else {
             app.open_all_when_ready(open);
         }
-        Box::new(app)
+        Box::new(MacReader { app, full: false })
     });
     std::process::exit(code);
+}
+
+/// The reader with the one thing only the Mac needs: the room for the window's buttons at the left of the title strip goes in full screen,
+/// where the buttons are gone, and comes back after.
+struct MacReader {
+    app: App,
+    full: bool,
+}
+
+impl Handler for MacReader {
+    fn event(&mut self, event: Event) -> Vec<Action> {
+        let full = sys::full_screen();
+        let changed = full != self.full;
+        if changed {
+            self.full = full;
+            self.app.set_left_inset(if full { 0 } else { sys::BUTTONS_ROOM });
+        }
+        let mut actions = self.app.event(event);
+        if changed {
+            actions.push(Action::Invalidate);
+        }
+        actions
+    }
+    fn paint(&mut self, painter: &mut dyn Painter) -> bool {
+        self.app.paint(painter)
+    }
+    fn paint_part(&mut self, painter: &mut dyn Painter, x: i32, y: i32) -> bool {
+        self.app.paint_part(painter, x, y)
+    }
+    fn cursor_at(&mut self, x: i32, y: i32) -> Cursor {
+        self.app.cursor_at(x, y)
+    }
+    fn nc_hit(&mut self, x: i32, y: i32) -> NcHit {
+        self.app.nc_hit(x, y)
+    }
+    fn unsaved_reason(&self) -> Option<String> {
+        self.app.unsaved_reason()
+    }
 }
 
 #[cfg(test)]

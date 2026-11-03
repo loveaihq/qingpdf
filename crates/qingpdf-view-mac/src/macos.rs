@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 use qingpdf_view::ocr::{OcrError, Recognizer};
-use qingpdf_view::placement::Placement;
+use qingpdf_view::placement::{self, Placement};
+use qingpdf_core::bookmarks::Place;
 use qingpdf_view::theme::Contrast;
 use qingpdf_view::ui::*;
 
@@ -181,6 +182,7 @@ unsafe extern "C" {
     fn localtime_r(t: *const i64, out: *mut Tm) -> *mut Tm;
     fn getrusage(who: i32, out: *mut Rusage) -> i32;
     fn pthread_main_np() -> i32;
+    fn getpid() -> i32;
 }
 
 macro_rules! sender {
@@ -415,6 +417,14 @@ struct Mac {
     search_on: bool,
     /// The colours of the reader's theme: the words, the ground of a box typed in.
     theme: Option<(Rgb, Rgb)>,
+    /// The bookmarks tree: its scroll view, the outline view in it and its one column (0: not made yet), and its colours (ground, words).
+    scroll: usize,
+    outline: usize,
+    column: usize,
+    tree_look: Option<(Rgb, Rgb)>,
+    /// The window's place when it is neither maximized nor full screen (kept for the next run), and whether it is kept at all.
+    normal: Option<Placement>,
+    remember: bool,
 }
 
 /// What the callbacks need to know, copied out so that nothing is held while Cocoa is called.
@@ -1038,19 +1048,67 @@ fn place_buttons() {
     }
 }
 
+/// The reader's mark (the white 轻 on the rounded blue square) drawn into a new square buffer of `side` pixels.
+fn render_mark(space: Id, side: i32) -> Option<Buffer> {
+    let buffer = make_buffer(space, side, side)?;
+    let mut painter = MacPainter::new(buffer.ctx, space, side, 1.0);
+    // Apple's icon grid: the rounded square is about 80% of the canvas, centred, so that the mark is as big as the other icons in the Dock.
+    let inner = (side as f32 * 0.805).round() as i32;
+    let off = (side - inner) / 2;
+    let r = Rect { x: off, y: off, w: inner, h: inner };
+    let k = inner as f32 / 100.0;
+    painter.fill_shape(r, [(qingpdf_view::logo::RADIUS * k).round() as i32; 4], qingpdf_view::accent::QING_LIGHT.base, 255);
+    let o = off as f32;
+    for stroke in qingpdf_view::logo::strokes(inner) {
+        let points: Vec<(f32, f32)> = stroke.pts.iter().map(|&(x, y)| (o + x * k, o + y * k)).collect();
+        painter.polyline(&points, stroke.width * k, 0xFFFFFF, 255);
+    }
+    drop(painter);
+    Some(buffer)
+}
+
+/// Writes a CGImage as a PNG file; false if it could not be.
+fn write_png(image: Id, path: &str) -> bool {
+    let allocated: Id = send0(class(c"NSBitmapImageRep"), c"alloc");
+    let rep: Id = send1(allocated, c"initWithCGImage:", image);
+    if rep.is_null() {
+        return false;
+    }
+    // 4 is NSBitmapImageFileTypePNG.
+    let data: Id = send2::<Id, u64, Id>(rep, c"representationUsingType:properties:", 4, null_mut());
+    let name = cfstr(path);
+    let ok = !data.is_null() && send2::<i8, Id, bool>(data, c"writeToFile:atomically:", name.0, true) != 0;
+    release(rep);
+    ok
+}
+
+/// The hidden `--write-icon`: the mark as a PNG of `side` pixels (the build script of the `.app` makes the icon from it).
+pub fn write_icon(path: &str, side: i32) -> bool {
+    // SAFETY: the pool is popped below, before the function ends; a Core Graphics constant for the colour space, released below.
+    let (pool, space) = unsafe { (objc_autoreleasePoolPush(), CGColorSpaceCreateWithName(kCGColorSpaceSRGB)) };
+    let mut ok = false;
+    if let Some(buffer) = render_mark(space, side) {
+        // SAFETY: the buffer's context is live until `buffer` goes at the end of this block; the image is a copy made now and released below.
+        let image = unsafe { CGBitmapContextCreateImage(buffer.ctx) };
+        if !image.is_null() {
+            ok = write_png(image, path);
+            // SAFETY: the image made above, released once.
+            unsafe { CGImageRelease(image) };
+        }
+    }
+    // SAFETY: the colour space made above and the pool pushed above, each once.
+    unsafe {
+        CGColorSpaceRelease(space);
+        objc_autoreleasePoolPop(pool);
+    }
+    ok
+}
+
 /// The reader's mark as the application's icon, so that the Dock and the boxes (password, save) show it and not a generic folder.
 fn set_app_icon() {
     const SIDE: i32 = 256;
     let s = snap();
-    let Some(buffer) = make_buffer(s.space as Id, SIDE, SIDE) else { return };
-    let mut painter = MacPainter::new(buffer.ctx, s.space as Id, SIDE, 1.0);
-    let r = Rect { x: 0, y: 0, w: SIDE, h: SIDE };
-    let k = SIDE as f32 / 100.0;
-    painter.fill_shape(r, [(qingpdf_view::logo::RADIUS * k).round() as i32; 4], qingpdf_view::accent::QING_LIGHT.base, 255);
-    for stroke in qingpdf_view::logo::strokes(SIDE) {
-        let points: Vec<(f32, f32)> = stroke.pts.iter().map(|&(x, y)| (x * k, y * k)).collect();
-        painter.polyline(&points, stroke.width * k, 0xFFFFFF, 255);
-    }
+    let Some(buffer) = render_mark(s.space as Id, SIDE) else { return };
     // SAFETY: the buffer's context is live until `buffer` goes at the end of this function; the image is a copy made now and released below.
     let image = unsafe { CGBitmapContextCreateImage(buffer.ctx) };
     if image.is_null() {
@@ -1165,12 +1223,19 @@ extern "C" fn delegate_should_terminate(_this: Id, _sel: Sel, _app: Id) -> u64 {
         return 1;
     }
     dispatch(Event::CloseRequested);
-    0
+    // The reader quits at once when nothing is unsaved (or after its own boxes, which are modal and so are over by now): say yes then, so that
+    // a Quit from the Dock, AppleScript or logging out is not reported as cancelled. Otherwise it is the reader's to finish later.
+    u64::from(QUIT.get())
 }
 
 extern "C" fn delegate_should_close(_this: Id, _sel: Sel, _window: Id) -> i8 {
+    if QUIT.get() {
+        return 1;
+    }
     dispatch(Event::CloseRequested);
-    0
+    // Quitting asks the window first: a no here would be taken as the person cancelling the Quit (AppleScript gets "User cancelled" and
+    // the program stays), so it is yes when the reader has quit.
+    i8::from(QUIT.get())
 }
 
 extern "C" fn delegate_no(_this: Id, _sel: Sel, _app: Id) -> i8 {
@@ -1179,6 +1244,11 @@ extern "C" fn delegate_no(_this: Id, _sel: Sel, _app: Id) -> i8 {
 
 extern "C" fn delegate_resized(_this: Id, _sel: Sel, _note: Id) {
     sync_size();
+    note_place();
+}
+
+extern "C" fn delegate_moved(_this: Id, _sel: Sel, _note: Id) {
+    note_place();
 }
 
 extern "C" fn delegate_timer(_this: Id, _sel: Sel, timer: Id) {
@@ -1193,6 +1263,23 @@ extern "C" fn delegate_wake(_this: Id, _sel: Sel) {
 
 extern "C" fn delegate_menu_item(_this: Id, _sel: Sel, item: Id) {
     let tag: i64 = send0(item, c"tag");
+    if CHOOSING.get() {
+        CHOSEN.set(u32::try_from(tag).ok());
+        return;
+    }
+    // A shortcut that is shown in the menu and was pressed: the key goes to the reader as a key, as it would have if the menu had not shown it
+    // (the same `Event::Key` the pages get). A key that only chose the item in a menu being tracked (Return, say) is no shortcut.
+    let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+    let event: Id = send0(app, c"currentEvent");
+    let key: Id = send0(item, c"keyEquivalent");
+    if !event.is_null() && !key.is_null() && send0::<u64>(event, c"type") == 10 && send0::<u64>(key, c"length") > 0 {
+        let code: u16 = send0(event, c"keyCode");
+        let (ctrl, shift) = flags(event);
+        if let Some(vk) = vk_of(code).filter(|&v| ctrl || (vk::F2..=vk::F11).contains(&v)) {
+            dispatch(Event::Key { vk, ctrl, shift });
+            return;
+        }
+    }
     if let Ok(id) = u32::try_from(tag) {
         dispatch(Event::Command(id));
     }
@@ -1233,6 +1320,25 @@ fn register_classes() -> (Id, Id, Id) {
             (c"timerFired:", delegate_timer as *const c_void, c"v@:@"),
             (c"wakeUp", delegate_wake as *const c_void, c"v@:"),
             (c"menuItem:", delegate_menu_item as *const c_void, c"v@:@"),
+            (c"windowDidMove:", delegate_moved as *const c_void, c"v@:@"),
+            (c"windowDidEnterFullScreen:", delegate_entered_full as *const c_void, c"v@:@"),
+            (c"windowDidExitFullScreen:", delegate_left_full as *const c_void, c"v@:@"),
+            (c"application:openFiles:", delegate_open_files as *const c_void, c"v@:@@"),
+            (c"systemChanged:", delegate_system_changed as *const c_void, c"v@:@"),
+            (c"systemLook", delegate_system_look as *const c_void, c"v@:"),
+            (c"outlineView:numberOfChildrenOfItem:", tree_count as *const c_void, c"q@:@@"),
+            (c"outlineView:child:ofItem:", tree_child as *const c_void, c"@@:@q@"),
+            (c"outlineView:isItemExpandable:", tree_expandable as *const c_void, c"c@:@@"),
+            (c"outlineView:objectValueForTableColumn:byItem:", tree_value as *const c_void, c"@@:@@@"),
+            (c"outlineView:setObjectValue:forTableColumn:byItem:", tree_set_value as *const c_void, c"v@:@@@@"),
+            (c"outlineView:shouldEditTableColumn:item:", tree_may_edit as *const c_void, c"c@:@@@"),
+            (c"outlineViewSelectionDidChange:", tree_selected as *const c_void, c"v@:@"),
+            (c"outlineViewItemDidExpand:", tree_expanded as *const c_void, c"v@:@"),
+            (c"outlineViewItemDidCollapse:", tree_collapsed as *const c_void, c"v@:@"),
+            (c"outlineView:writeItems:toPasteboard:", tree_write as *const c_void, c"c@:@@@"),
+            (c"outlineView:validateDrop:proposedItem:proposedChildIndex:", tree_validate as *const c_void, c"Q@:@@@q"),
+            (c"outlineView:acceptDrop:item:childIndex:", tree_accept as *const c_void, c"c@:@@@q"),
+            (c"treeClicked:", tree_clicked as *const c_void, c"v@:@"),
             (c"control:textView:doCommandBySelector:", delegate_command as *const c_void, c"c@:@@:"),
             (c"controlTextDidChange:", delegate_text_changed as *const c_void, c"v@:@"),
             (c"controlTextDidEndEditing:", delegate_text_ended as *const c_void, c"v@:@"),
@@ -1417,6 +1523,7 @@ fn perform(action: Action) {
             }
         }
         Action::Quit => {
+            save_placement();
             QUIT.set(true);
             let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
             send1::<(), Id>(app, c"stop:", null_mut());
@@ -1436,7 +1543,7 @@ fn perform(action: Action) {
             );
             send2::<(), Id, bool>(app, c"postEvent:atStart:", event, true);
         }
-        Action::SetMenus(menus) => install_menus(&menus),
+        Action::SetMenus(menus) => install_menus_kept(menus),
         Action::AskText { tag, title, prompt, secret, initial, ok, cancel } => {
             let text = ask_text(&title, &prompt, secret, &initial, &ok, &cancel);
             dispatch(Event::Text { tag, text });
@@ -1452,8 +1559,23 @@ fn perform(action: Action) {
                 place(active as Id, r);
             }
         }
-        Action::Theme(t) => with_mac(|m| m.theme = Some((t.text, t.field_bg))),
-        // TODO(macos): the rest of the actions: AskForm, Outline*, Sidebar, ChoosePrinter, Print, Choose, ContextMenu, ShowMenu, FullScreen, HideCursor.
+        Action::Theme(t) => apply_theme(t),
+        Action::Outline { nodes, select } => fill_tree(&nodes, select),
+        Action::OutlineRename(index) => start_rename(index),
+        Action::Sidebar(r) => {
+            // (A tree that was never shown has nothing to hide.)
+            if (r.w > 0 && r.h > 0 || read_mac(|m| m.scroll).unwrap_or(0) != 0)
+                && let Some((scroll, _)) = ensure_tree()
+            {
+                place(scroll, r);
+            }
+        }
+        Action::ContextMenu { entries, at } => context_menu(&entries, at),
+        Action::Choose { items, selected, at } => dispatch(Event::Chosen(choose(&items, selected, at))),
+        Action::ShowMenu { at, .. } => show_menus(at),
+        Action::HideCursor => send1::<(), bool>(class(c"NSCursor"), c"setHiddenUntilMouseMoves:", true),
+        Action::FullScreen(on) => set_full_screen(on),
+        // TODO(macos): the rest of the actions: AskForm, ChoosePrinter, Print.
         _ => {}
     }
 }
@@ -1882,6 +2004,40 @@ fn clean_label(label: &str) -> String {
     out
 }
 
+/// The shortcut a menu label shows after its tab (`Ctrl+Shift+O`, `F2`, `Ctrl++`) as a key equivalent: the key and the modifier flags (Ctrl is Command).
+/// Only keys that cannot be a letter typed into a box get one: with Command (or Control for Tab) or a function key. The menu then swallows the key,
+/// and `delegate_menu_item` gives it to the reader as the `Event::Key` it would have been. Delete, Tab and the like have no key equivalent
+/// (a menu would take them from a text box too); they are written after the title (see `build_menu`). Ctrl+C is left to the text boxes' own Copy.
+fn shortcut(label: &str) -> Option<(String, u64)> {
+    let (_, text) = label.rsplit_once('\t')?;
+    let (mut rest, mut mask, mut ctrl) = (text.trim(), 0u64, false);
+    loop {
+        if let Some(r) = rest.strip_prefix("Ctrl+").filter(|r| !r.is_empty()) {
+            (rest, ctrl) = (r, true);
+        } else if let Some(r) = rest.strip_prefix("Shift+").filter(|r| !r.is_empty()) {
+            (rest, mask) = (r, mask | 1 << 17);
+        } else {
+            break;
+        }
+    }
+    let function = rest.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=12).contains(n));
+    let key: String = if let Some(n) = function {
+        char::from_u32(0xF704 + n - 1)?.to_string()
+    } else if rest == "Tab" && ctrl {
+        // Control, not Command: Command+Tab is the system's.
+        mask |= 1 << 18;
+        return Some(("\t".to_string(), mask));
+    } else if ctrl && rest.chars().count() == 1 && !rest.eq_ignore_ascii_case("c") {
+        rest.to_lowercase()
+    } else {
+        return None;
+    };
+    if ctrl {
+        mask |= 1 << 20;
+    }
+    Some((key, mask))
+}
+
 fn build_menu(title: &str, entries: &[MenuEntry], target: Id) -> Id {
     let t = cfstr(&clean_label(title));
     let allocated: Id = send0(class(c"NSMenu"), c"alloc");
@@ -1895,9 +2051,18 @@ fn build_menu(title: &str, entries: &[MenuEntry], target: Id) -> Id {
                 continue;
             }
             MenuEntry::Item { id, label, checked, enabled, .. } => {
-                let (l, key) = (cfstr(&clean_label(label)), cfstr(""));
+                let equivalent = shortcut(label);
+                // A shortcut that is not a key equivalent is still shown, after the title.
+                let shown = match (&equivalent, label.rsplit_once('\t')) {
+                    (None, Some((_, text))) if !text.trim().is_empty() => format!("{}    {}", clean_label(label), text.trim()),
+                    _ => clean_label(label),
+                };
+                let (l, key) = (cfstr(&shown), cfstr(equivalent.as_ref().map_or("", |e| e.0.as_str())));
                 let allocated: Id = send0(class(c"NSMenuItem"), c"alloc");
                 let item: Id = send3(allocated, c"initWithTitle:action:keyEquivalent:", l.0, sel(c"menuItem:"), key.0);
+                if let Some((_, mask)) = equivalent {
+                    send1::<(), u64>(item, c"setKeyEquivalentModifierMask:", mask);
+                }
                 send1::<(), i64>(item, c"setTag:", i64::from(*id));
                 send1::<(), Id>(item, c"setTarget:", target);
                 send1::<(), bool>(item, c"setEnabled:", *enabled);
@@ -1920,7 +2085,13 @@ fn build_menu(title: &str, entries: &[MenuEntry], target: Id) -> Id {
     menu
 }
 
-/// The menu bar: the application's own menu (Quit), then the reader's menus. TODO(macos): accelerators are not shown (the keys work through `Event::Key`).
+/// The menus of the reader, kept for the pop-up (`Action::ShowMenu`).
+fn install_menus_kept(menus: Vec<Menu>) {
+    install_menus(&menus);
+    MENUS.with(|m| *m.borrow_mut() = menus);
+}
+
+/// The menu bar: the application's own menu (Quit), then the reader's menus. The shortcuts are shown (see `shortcut`); the keys reach the reader as `Event::Key`.
 fn install_menus(menus: &[Menu]) {
     let s = snap();
     let bar = build_menu("", &[], s.delegate as Id);
@@ -1968,6 +2139,559 @@ fn install_menus(menus: &[Menu]) {
     release(bar);
 }
 
+// --- the bookmarks tree ----------------------------------------------------------------------------------------------
+
+/// The bookmarks as the tree shows them. An item of the tree is an NSNumber holding the index of its node; the numbers and the titles are ours (retained)
+/// for as long as the tree shows this list.
+#[derive(Default)]
+struct Tree {
+    items: Vec<Cf>,
+    names: Vec<Cf>,
+    children: Vec<Vec<usize>>,
+    parent: Vec<Option<usize>>,
+    roots: Vec<usize>,
+}
+
+thread_local! {
+    static TREE: RefCell<Tree> = RefCell::new(Tree::default());
+    /// The tree is being filled by the reader (what it tells then is not the person's doing).
+    static FILLING: Cell<bool> = const { Cell::new(false) };
+    /// The reader asked for a title to be typed over (the tree's own slow click is not allowed to).
+    static RENAMING: Cell<bool> = const { Cell::new(false) };
+    /// The node being dragged.
+    static DRAGGED: Cell<Option<usize>> = const { Cell::new(None) };
+    /// A drop-down list is open: the item chosen goes to `CHOSEN` and not to the reader as a command.
+    static CHOOSING: Cell<bool> = const { Cell::new(false) };
+    static CHOSEN: Cell<Option<u32>> = const { Cell::new(None) };
+    /// The reader's menus, for `Action::ShowMenu`.
+    static MENUS: RefCell<Vec<Menu>> = const { RefCell::new(Vec::new()) };
+    /// Whether the reader thinks the window is full screen.
+    static FULL_ASKED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn tree_read<R>(f: impl FnOnce(&Tree) -> R) -> Option<R> {
+    TREE.with(|t| t.try_borrow().ok().map(|t| f(&t)))
+}
+
+/// The node an item of the tree stands for.
+fn node_of(item: Id) -> Option<usize> {
+    if item.is_null() {
+        return None;
+    }
+    usize::try_from(send0::<i64>(item, c"longLongValue")).ok()
+}
+
+fn item_of(node: usize) -> Id {
+    tree_read(|t| t.items.get(node).map_or(null_mut(), |c| c.0)).unwrap_or(null_mut())
+}
+
+extern "C" fn tree_count(_this: Id, _sel: Sel, _outline: Id, item: Id) -> i64 {
+    let n = if item.is_null() { tree_read(|t| t.roots.len()) } else { node_of(item).and_then(|i| tree_read(|t| t.children.get(i).map_or(0, Vec::len))) };
+    i64::try_from(n.unwrap_or(0)).unwrap_or(0)
+}
+
+extern "C" fn tree_child(_this: Id, _sel: Sel, _outline: Id, index: i64, item: Id) -> Id {
+    let parent = node_of(item);
+    tree_read(|t| {
+        let list = if item.is_null() { Some(&t.roots) } else { parent.and_then(|p| t.children.get(p)) };
+        let node = list.and_then(|l| l.get(usize::try_from(index).ok()?))?;
+        t.items.get(*node).map(|c| c.0)
+    })
+    .flatten()
+    .unwrap_or(null_mut())
+}
+
+extern "C" fn tree_expandable(_this: Id, _sel: Sel, _outline: Id, item: Id) -> i8 {
+    i8::from(node_of(item).and_then(|i| tree_read(|t| t.children.get(i).is_some_and(|c| !c.is_empty()))).unwrap_or(false))
+}
+
+extern "C" fn tree_value(_this: Id, _sel: Sel, _outline: Id, _column: Id, item: Id) -> Id {
+    node_of(item).and_then(|i| tree_read(|t| t.names.get(i).map(|c| c.0))).flatten().unwrap_or(null_mut())
+}
+
+extern "C" fn tree_set_value(_this: Id, _sel: Sel, _outline: Id, value: Id, _column: Id, item: Id) {
+    if let Some(index) = node_of(item) {
+        dispatch(Event::OutlineRename { index, text: rust_string(value) });
+        focus_view();
+    }
+}
+
+extern "C" fn tree_may_edit(_this: Id, _sel: Sel, _outline: Id, _column: Id, _item: Id) -> i8 {
+    i8::from(RENAMING.get())
+}
+
+/// The person went up or down the tree with the keys: that is a click on the bookmark. (A mouse click is `tree_clicked`; the reader's own selecting is not told.)
+extern "C" fn tree_selected(_this: Id, _sel: Sel, note: Id) {
+    if FILLING.get() {
+        return;
+    }
+    let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+    let event: Id = send0(app, c"currentEvent");
+    if event.is_null() || send0::<u64>(event, c"type") != 10 {
+        return;
+    }
+    let outline: Id = send0(note, c"object");
+    let row: i64 = send0(outline, c"selectedRow");
+    if row < 0 {
+        return;
+    }
+    let item: Id = send1(outline, c"itemAtRow:", row);
+    if let Some(index) = node_of(item) {
+        dispatch(Event::OutlineClick(index));
+    }
+}
+
+/// A click on a bookmark. The pages get the keyboard back, so that the keys scroll them (not while a title is being typed over).
+extern "C" fn tree_clicked(_this: Id, _sel: Sel, outline: Id) {
+    let row: i64 = send0(outline, c"clickedRow");
+    if row < 0 {
+        return;
+    }
+    let item: Id = send1(outline, c"itemAtRow:", row);
+    if let Some(index) = node_of(item) {
+        dispatch(Event::OutlineClick(index));
+        if send0::<i64>(outline, c"editedRow") < 0 {
+            focus_view();
+        }
+    }
+}
+
+fn tree_opened(note: Id, open: bool) {
+    if FILLING.get() {
+        return;
+    }
+    let info: Id = send0(note, c"userInfo");
+    let key = cfstr("NSObject");
+    let item: Id = send1(info, c"objectForKey:", key.0);
+    if let Some(index) = node_of(item) {
+        dispatch(Event::OutlineExpand { index, open });
+    }
+}
+
+extern "C" fn tree_expanded(_this: Id, _sel: Sel, note: Id) {
+    tree_opened(note, true);
+}
+
+extern "C" fn tree_collapsed(_this: Id, _sel: Sel, note: Id) {
+    tree_opened(note, false);
+}
+
+extern "C" fn tree_write(_this: Id, _sel: Sel, _outline: Id, items: Id, board: Id) -> i8 {
+    let Some(node) = array_items(items).first().and_then(|&i| node_of(i)) else { return 0 };
+    DRAGGED.set(Some(node));
+    // SAFETY: an AppKit constant.
+    let kind = unsafe { NSPasteboardTypeString };
+    let kinds = cf_array(&[kind]);
+    let _: i64 = send2(board, c"declareTypes:owner:", kinds.0, null_mut::<c_void>() as Id);
+    let text = cfstr(&node.to_string());
+    let ok: i8 = send2(board, c"setString:forType:", text.0, kind);
+    ok
+}
+
+/// Where a drop at `index` of the children of `item` (nil: the top; -1: on the item itself) would put the node: next to a node, or inside one.
+fn drop_target(item: Id, index: i64) -> Option<(usize, Place)> {
+    let parent = node_of(item);
+    tree_read(|t| {
+        let list = if item.is_null() { &t.roots } else { t.children.get(parent?)? };
+        if index < 0 {
+            return parent.map(|p| (p, Place::Inside));
+        }
+        match list.get(usize::try_from(index).ok()?) {
+            Some(&n) => Some((n, Place::Before)),
+            None => list.last().map(|&n| (n, Place::After)).or(parent.map(|p| (p, Place::Inside))),
+        }
+    })
+    .flatten()
+}
+
+/// Is `node` the node `from` or below it (a branch cannot be dropped into itself)?
+fn within(node: usize, from: usize) -> bool {
+    tree_read(|t| {
+        let mut at = Some(node);
+        for _ in 0..t.parent.len() + 1 {
+            match at {
+                Some(n) if n == from => return true,
+                Some(n) => at = t.parent.get(n).copied().flatten(),
+                None => return false,
+            }
+        }
+        false
+    })
+    .unwrap_or(false)
+}
+
+extern "C" fn tree_validate(_this: Id, _sel: Sel, _outline: Id, _info: Id, item: Id, index: i64) -> u64 {
+    let (Some(from), Some((to, _))) = (DRAGGED.get(), drop_target(item, index)) else { return 0 };
+    // 16 is NSDragOperationMove.
+    if within(to, from) { 0 } else { 16 }
+}
+
+extern "C" fn tree_accept(_this: Id, _sel: Sel, _outline: Id, _info: Id, item: Id, index: i64) -> i8 {
+    let (Some(from), Some((to, place))) = (DRAGGED.take(), drop_target(item, index)) else { return 0 };
+    dispatch(Event::OutlineDrop { from, to, place });
+    1
+}
+
+/// A right click on the tree: the bookmark under the pointer is the one the menu is for; the reader makes the menu (`Action::ContextMenu`).
+extern "C" fn tree_menu_for_event(this: Id, _sel: Sel, event: Id) -> Id {
+    let (x, y) = pointer(event);
+    let local: CgPoint = send0(event, c"locationInWindow");
+    let at: CgPoint = send2(this, c"convertPoint:fromView:", local, null_mut::<c_void>() as Id);
+    let row: i64 = send1(this, c"rowAtPoint:", at);
+    let item: Id = if row >= 0 { send1(this, c"itemAtRow:", row) } else { null_mut() };
+    if row >= 0 {
+        let rows: Id = send1(class(c"NSIndexSet"), c"indexSetWithIndex:", row as u64);
+        FILLING.set(true);
+        send2::<(), Id, bool>(this, c"selectRowIndexes:byExtendingSelection:", rows, false);
+        FILLING.set(false);
+    }
+    dispatch(Event::OutlineMenu { index: node_of(item), x, y });
+    null_mut()
+}
+
+/// The scroll view and the outline view of the bookmarks, made when first needed (hidden until the reader says where they go).
+fn ensure_tree() -> Option<(Id, Id)> {
+    if let Some((scroll, outline)) = read_mac(|m| (m.scroll, m.outline)).filter(|p| p.0 != 0) {
+        return Some((scroll as Id, outline as Id));
+    }
+    let s = snap();
+    if s.view == 0 {
+        return None;
+    }
+    let outline_class = make_class(c"QingpdfOutline", c"NSOutlineView", &[(c"menuForEvent:", tree_menu_for_event as *const c_void, c"@@:@")]);
+    if outline_class.is_null() {
+        return None;
+    }
+    let allocated: Id = send0(outline_class, c"alloc");
+    let outline: Id = send1(allocated, c"initWithFrame:", CgRect::default());
+    let allocated: Id = send0(class(c"NSTableColumn"), c"alloc");
+    let name = cfstr("title");
+    let column: Id = send1(allocated, c"initWithIdentifier:", name.0);
+    let allocated: Id = send0(class(c"NSScrollView"), c"alloc");
+    let scroll: Id = send1(allocated, c"initWithFrame:", CgRect::default());
+    if outline.is_null() || column.is_null() || scroll.is_null() {
+        return None;
+    }
+    send1::<(), bool>(column, c"setEditable:", true);
+    // NSTableColumnAutoresizingMask: the column is as wide as the tree.
+    send1::<(), u64>(column, c"setResizingMask:", 1);
+    let cell: Id = send0(column, c"dataCell");
+    let font: Id = send1::<Id, f64>(class(c"NSFont"), c"systemFontOfSize:", 13.0);
+    send1::<(), Id>(cell, c"setFont:", font);
+    // NSLineBreakByTruncatingTail.
+    send1::<(), u64>(cell, c"setLineBreakMode:", 4);
+    send1::<(), Id>(outline, c"addTableColumn:", column);
+    send1::<(), Id>(outline, c"setOutlineTableColumn:", column);
+    send1::<(), Id>(outline, c"setHeaderView:", null_mut());
+    send1::<(), u64>(outline, c"setColumnAutoresizingStyle:", 1);
+    send1::<(), f64>(outline, c"setRowHeight:", 24.0);
+    send1::<(), f64>(outline, c"setIndentationPerLevel:", 14.0);
+    send1::<(), i64>(outline, c"setFocusRingType:", 1);
+    send1::<(), Id>(outline, c"setDataSource:", s.delegate as Id);
+    send1::<(), Id>(outline, c"setDelegate:", s.delegate as Id);
+    send1::<(), Id>(outline, c"setTarget:", s.delegate as Id);
+    send1::<(), Sel>(outline, c"setAction:", sel(c"treeClicked:"));
+    // SAFETY: an AppKit constant.
+    let kind = unsafe { NSPasteboardTypeString };
+    let kinds = cf_array(&[kind]);
+    send1::<(), Id>(outline, c"registerForDraggedTypes:", kinds.0);
+    send2::<(), u64, bool>(outline, c"setDraggingSourceOperationMask:forLocal:", 16, true);
+    send1::<(), Id>(scroll, c"setDocumentView:", outline);
+    send1::<(), bool>(scroll, c"setHasVerticalScroller:", true);
+    send1::<(), bool>(scroll, c"setAutohidesScrollers:", true);
+    send1::<(), u64>(scroll, c"setBorderType:", 0);
+    send1::<(), bool>(scroll, c"setHidden:", true);
+    send1::<(), Id>(s.view as Id, c"addSubview:", scroll);
+    with_mac(|m| {
+        m.scroll = scroll as usize;
+        m.outline = outline as usize;
+        m.column = column as usize;
+    });
+    apply_tree_look();
+    Some((scroll, outline))
+}
+
+/// The colours of the reader's theme on the tree.
+fn apply_tree_look() {
+    let Some((scroll, outline, column, Some((ground, text)))) = read_mac(|m| (m.scroll as Id, m.outline as Id, m.column as Id, m.tree_look)) else { return };
+    if scroll.is_null() {
+        return;
+    }
+    send1::<(), Id>(outline, c"setBackgroundColor:", srgb_color(ground));
+    send1::<(), Id>(scroll, c"setBackgroundColor:", srgb_color(ground));
+    let cell: Id = send0(column, c"dataCell");
+    send1::<(), Id>(cell, c"setTextColor:", srgb_color(text));
+    send1::<(), bool>(outline, c"setNeedsDisplay:", true);
+}
+
+/// Fill the tree with the bookmarks (what was in it goes): the nodes open that the list says are open, `select` selected and brought into view, and
+/// without one the tree is as far scrolled as it was.
+fn fill_tree(nodes: &[OutlineNode], select: Option<usize>) {
+    let Some((scroll, outline)) = ensure_tree() else { return };
+    let clip: Id = send0(scroll, c"contentView");
+    let top = send_rect(clip, c"bounds").y;
+    let mut tree = Tree::default();
+    // The latest node at each depth of the branch being filled: a node goes under the latest one a level up.
+    let mut path: Vec<usize> = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let depth = (node.depth as usize).min(path.len());
+        let parent = if depth == 0 { None } else { path.get(depth - 1).copied() };
+        tree.parent.push(parent);
+        tree.children.push(Vec::new());
+        match parent.and_then(|p| tree.children.get_mut(p)) {
+            Some(list) => list.push(i),
+            None => tree.roots.push(i),
+        }
+        path.truncate(depth);
+        path.push(i);
+        tree.names.push(cfstr(&node.title));
+        let number: Id = send1::<Id, u64>(class(c"NSNumber"), c"numberWithUnsignedLongLong:", i as u64);
+        // SAFETY: a live object (autoreleased); the retain is the one the `Cf` releases.
+        tree.items.push(Cf(unsafe { CFRetain(number) }));
+    }
+    FILLING.set(true);
+    let old = TREE.with(|t| t.replace(tree));
+    send0::<()>(outline, c"reloadData");
+    drop(old);
+    for (i, node) in nodes.iter().enumerate() {
+        if node.open {
+            send1::<(), Id>(outline, c"expandItem:", item_of(i));
+        }
+    }
+    let row: i64 = match select {
+        Some(i) => send1(outline, c"rowForItem:", item_of(i)),
+        None => -1,
+    };
+    if row >= 0 {
+        let rows: Id = send1(class(c"NSIndexSet"), c"indexSetWithIndex:", row as u64);
+        send2::<(), Id, bool>(outline, c"selectRowIndexes:byExtendingSelection:", rows, false);
+        send1::<(), i64>(outline, c"scrollRowToVisible:", row);
+    } else {
+        send0::<()>(outline, c"deselectAll:");
+        send1::<(), CgPoint>(clip, c"scrollToPoint:", CgPoint { x: 0.0, y: top });
+        send1::<(), Id>(scroll, c"reflectScrolledClipView:", clip);
+    }
+    FILLING.set(false);
+}
+
+/// A title is typed over (the reader asked: the file allows it).
+fn start_rename(index: usize) {
+    let Some((_, outline)) = read_mac(|m| (m.scroll, m.outline)).filter(|p| p.0 != 0) else { return };
+    let outline = outline as Id;
+    let row: i64 = send1(outline, c"rowForItem:", item_of(index));
+    if row < 0 {
+        return;
+    }
+    RENAMING.set(true);
+    send4::<(), i64, i64, Id, bool>(outline, c"editColumn:row:withEvent:select:", 0, row, null_mut(), true);
+    RENAMING.set(false);
+}
+
+// --- the pop-up menus ------------------------------------------------------------------------------------------------
+
+/// Shows a menu at a place of the window (pixels, y from the top) and returns when it is closed; the chosen item has been sent to `menu_item` by then.
+fn pop_up(menu: Id, at: (i32, i32), right_aligned: bool) {
+    let s = snap();
+    if s.view == 0 {
+        return;
+    }
+    let k = 1.0 / s.scale.max(1.0);
+    let width = if right_aligned { send0::<CgPoint>(menu, c"size").x } else { 0.0 };
+    let point = CgPoint { x: f64::from(at.0) * k - width, y: s.pts.1 - f64::from(at.1) * k };
+    send3::<i8, Id, CgPoint, Id>(menu, c"popUpMenuPositioningItem:atLocation:inView:", null_mut(), point, s.view as Id);
+}
+
+fn context_menu(entries: &[MenuEntry], at: (i32, i32)) {
+    let s = snap();
+    let menu = build_menu("", entries, s.delegate as Id);
+    pop_up(menu, at, false);
+    release(menu);
+}
+
+/// A drop-down list: the number of the item chosen, or none.
+fn choose(items: &[String], selected: Option<usize>, at: (i32, i32)) -> Option<usize> {
+    let s = snap();
+    let entries: Vec<MenuEntry> = items
+        .iter()
+        .take(512)
+        .enumerate()
+        .map(|(i, item)| MenuEntry::Item { id: i as u32 + 1, label: item.replace('&', "&&"), checked: selected == Some(i), radio: false, enabled: true })
+        .collect();
+    let menu = build_menu("", &entries, s.delegate as Id);
+    CHOSEN.set(None);
+    CHOOSING.set(true);
+    pop_up(menu, at, false);
+    CHOOSING.set(false);
+    release(menu);
+    // The item's number is its place plus one.
+    CHOSEN.take().and_then(|n| usize::try_from(n).ok()).and_then(|n| n.checked_sub(1))
+}
+
+/// The menu bar's menus as one pop-up (for the menu button of the command bar), the menus as submenus.
+fn show_menus(at: (i32, i32)) {
+    let s = snap();
+    let root = build_menu("", &[], s.delegate as Id);
+    let item_class = class(c"NSMenuItem");
+    MENUS.with(|menus| {
+        for menu in menus.borrow().iter() {
+            let (title, empty) = (cfstr(&clean_label(&menu.title)), cfstr(""));
+            let allocated: Id = send0(item_class, c"alloc");
+            let item: Id = send3(allocated, c"initWithTitle:action:keyEquivalent:", title.0, null::<c_void>(), empty.0);
+            let sub = build_menu(&menu.title, &menu.entries, s.delegate as Id);
+            send1::<(), Id>(item, c"setSubmenu:", sub);
+            send1::<(), Id>(root, c"addItem:", item);
+            release(item);
+            release(sub);
+        }
+    });
+    pop_up(root, at, true);
+    release(root);
+}
+
+// --- the window ------------------------------------------------------------------------------------------------------
+
+/// The height of the main screen, in points: what the places of windows (from the top) are counted from.
+fn main_screen_height() -> f64 {
+    let screens: Id = send0(class(c"NSScreen"), c"screens");
+    array_items(screens).first().map_or(0.0, |&s| send_rect(s, c"frame").h)
+}
+
+/// The work areas of the screens (less the menu bar and the Dock), the main one first, in points from the top left of the main screen.
+fn work_areas() -> Vec<Rect> {
+    let screens: Id = send0(class(c"NSScreen"), c"screens");
+    let height = main_screen_height();
+    array_items(screens)
+        .into_iter()
+        .map(|s| {
+            let v = send_rect(s, c"visibleFrame");
+            Rect { x: v.x.round() as i32, y: (height - v.y - v.h).round() as i32, w: v.w.round() as i32, h: v.h.round() as i32 }
+        })
+        .collect()
+}
+
+/// Notes where the window is, if it is in its usual state (not full screen): that is what is kept for the next run.
+fn note_place() {
+    let s = snap();
+    if s.window == 0 {
+        return;
+    }
+    let window = s.window as Id;
+    let style: u64 = send0(window, c"styleMask");
+    if style & (1 << 14) != 0 {
+        return;
+    }
+    let zoomed = send0::<i8>(window, c"isZoomed") != 0;
+    let f = send_rect(window, c"frame");
+    let height = main_screen_height();
+    with_mac(|m| {
+        if zoomed {
+            // Maximized: the place it goes back to is the one it had before.
+            if let Some(p) = m.normal.as_mut() {
+                p.maximized = true;
+            }
+        } else {
+            m.normal = Some(Placement { x: f.x.round() as i32, y: (height - f.y - f.h).round() as i32, w: f.w.round() as i32, h: f.h.round() as i32, maximized: false });
+        }
+    });
+}
+
+/// Keeps the window's place for the next run (not for the speed test or the other hidden tests).
+fn save_placement() {
+    note_place();
+    if let Some(Some(place)) = read_mac(|m| m.normal.filter(|_| m.remember)) {
+        qingpdf_view::settings::update(|s| s.window = Some(place));
+    }
+}
+
+fn set_full_screen(on: bool) {
+    FULL_ASKED.set(on);
+    let s = snap();
+    if s.window == 0 {
+        return;
+    }
+    let style: u64 = send0(s.window as Id, c"styleMask");
+    if (style & (1 << 14) != 0) != on {
+        send1::<(), Id>(s.window as Id, c"toggleFullScreen:", null_mut());
+    }
+}
+
+/// The person went full screen or back with the system's button or keys: the reader is told with its own key for it.
+/// Whether the window is in full screen (the window's buttons are gone there, so the reader keeps no room for them).
+pub fn full_screen() -> bool {
+    FULL_ASKED.get()
+}
+
+fn full_screen_changed(on: bool) {
+    if FULL_ASKED.replace(on) != on {
+        dispatch(Event::Key { vk: vk::F11, ctrl: false, shift: false });
+    }
+}
+
+extern "C" fn delegate_entered_full(_this: Id, _sel: Sel, _note: Id) {
+    full_screen_changed(true);
+}
+
+extern "C" fn delegate_left_full(_this: Id, _sel: Sel, _note: Id) {
+    full_screen_changed(false);
+    place_buttons();
+}
+
+/// The reader's colours on the window: the strip's colour behind the title bar, light or dark controls (menus, boxes, the scroll bars of the tree).
+fn apply_theme(spec: ThemeSpec) {
+    with_mac(|m| {
+        m.theme = Some((spec.text, spec.field_bg));
+        m.tree_look = Some((spec.tree_bg, spec.text));
+    });
+    let s = snap();
+    if s.window != 0 {
+        let window = s.window as Id;
+        let name = cfstr(if spec.dark { "NSAppearanceNameDarkAqua" } else { "NSAppearanceNameAqua" });
+        let appearance: Id = send1(class(c"NSAppearance"), c"appearanceNamed:", name.0);
+        send1::<(), Id>(window, c"setAppearance:", appearance);
+        send1::<(), Id>(window, c"setBackgroundColor:", srgb_color(spec.strip));
+    }
+    apply_tree_look();
+}
+
+// --- what the system says --------------------------------------------------------------------------------------------
+
+/// Files opened with the program from Finder or the Dock while it runs (or that started it): they open as the files dropped on the window do.
+extern "C" fn delegate_open_files(_this: Id, _sel: Sel, app: Id, files: Id) {
+    let paths: Vec<PathBuf> = array_items(files).into_iter().map(|s| PathBuf::from(rust_string(s))).collect();
+    if !paths.is_empty() {
+        dispatch(Event::Drop(paths));
+    }
+    // NSApplicationDelegateReplySuccess.
+    send1::<(), u64>(app, c"replyToOpenOrPrint:", 0);
+}
+
+/// The system's look changed (dark or light, the accent colour, more contrast): the system is asked again a moment later, when it has settled.
+extern "C" fn delegate_system_changed(this: Id, _sel: Sel, _note: Id) {
+    let look = sel(c"systemLook");
+    send3::<(), Id, Sel, Id>(class(c"NSObject"), c"cancelPreviousPerformRequestsWithTarget:selector:object:", this, look, null_mut());
+    send3::<(), Sel, Id, f64>(this, c"performSelector:withObject:afterDelay:", look, null_mut(), 0.3);
+}
+
+extern "C" fn delegate_system_look(_this: Id, _sel: Sel) {
+    dispatch(Event::SystemDark(system_uses_dark()));
+    dispatch(Event::SystemAccent(system_accent()));
+    dispatch(Event::HighContrast(high_contrast()));
+}
+
+/// Asks to be told when the system's look changes.
+fn observe_system(delegate: Id) {
+    let note = sel(c"systemChanged:");
+    let distributed: Id = send0(class(c"NSDistributedNotificationCenter"), c"defaultCenter");
+    for name in ["AppleInterfaceThemeChangedNotification", "AppleColorPreferencesChangedNotification"] {
+        let name = cfstr(name);
+        send4::<(), Id, Sel, Id, Id>(distributed, c"addObserver:selector:name:object:", delegate, note, name.0, null_mut());
+    }
+    let workspace: Id = send0(class(c"NSWorkspace"), c"sharedWorkspace");
+    let center: Id = send0(workspace, c"notificationCenter");
+    let name = cfstr("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
+    send4::<(), Id, Sel, Id, Id>(center, c"addObserver:selector:name:object:", delegate, note, name.0, null_mut());
+}
+
 // --- starting up -----------------------------------------------------------------------------------------------------
 
 /// Wakes the window's loop from any thread (the engine's thread uses it). Holds the delegate, which lives as long as the program.
@@ -1984,9 +2708,9 @@ impl Waker {
     }
 }
 
-/// Make the window and run it until it is closed (see `win32::run`). The saved place and `remember` are not used yet.
-/// TODO(macos): keep the window's place between runs.
-pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _remember: bool, make: impl FnOnce(Waker) -> Box<dyn Handler>) -> i32 {
+/// Make the window and run it until it is closed (see `win32::run`). The window's place (in points from the top left of the main screen) is
+/// put back from `saved` where it can be seen, and kept at `Action::Quit` if `remember`.
+pub fn run(title: &str, client: Option<(i32, i32)>, saved: Option<Placement>, remember: bool, make: impl FnOnce(Waker) -> Box<dyn Handler>) -> i32 {
     // SAFETY: the pool lives to the end of this function, which is where the program's main thread leaves its work.
     let pool = unsafe { objc_autoreleasePoolPush() };
     let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
@@ -2030,7 +2754,17 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
     let files = cfstr("NSFilenamesPboardType");
     let kinds = cf_array(&[files.0]);
     send1::<(), Id>(view, c"registerForDraggedTypes:", kinds.0);
-    send0::<()>(window, c"center");
+    send1::<(), u64>(window, c"setCollectionBehavior:", 1 << 7);
+    // Where the window was when it was last closed, if that can still be seen; else the middle of the screen.
+    let mut maximized = false;
+    match saved.filter(|_| client.is_none()).and_then(|p| placement::restore(p, &work_areas())) {
+        Some(at) => {
+            let whole = CgRect { x: f64::from(at.x), y: main_screen_height() - f64::from(at.y + at.h), w: f64::from(at.w), h: f64::from(at.h) };
+            send2::<(), CgRect, bool>(window, c"setFrame:display:", whole, false);
+            maximized = at.maximized;
+        }
+        None => send0::<()>(window, c"center"),
+    }
     // SAFETY: a Core Graphics constant.
     let space = unsafe { CGColorSpaceCreateWithName(kCGColorSpaceSRGB) };
     with_mac(|m| {
@@ -2040,7 +2774,13 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
         m.space = space as usize;
         m.scale = screen_scale;
         m.field_class = field_class as usize;
+        m.remember = remember;
     });
+    note_place();
+    if maximized {
+        with_mac(|m| m.normal = saved.map(|p| Placement { maximized: true, ..p }).or(m.normal));
+    }
+    observe_system(delegate);
     install_menus(&[]);
 
     let handler = make(Waker(delegate as usize));
@@ -2057,6 +2797,9 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
 
     send1::<(), Id>(window, c"makeKeyAndOrderFront:", null_mut());
     send1::<(), Id>(window, c"makeFirstResponder:", view);
+    if maximized {
+        send1::<(), Id>(window, c"zoom:", null_mut());
+    }
     send1::<(), bool>(app, c"activateIgnoringOtherApps:", true);
     send0::<()>(app, c"run");
 
@@ -2124,16 +2867,60 @@ pub fn peak_working_set() -> u64 {
 /// A macOS program started from a terminal has its console already.
 pub fn attach_console() {}
 
-/// TODO(macos): one window for all the files (the Windows reader finds the first copy by a mutex and hands files over by a message).
-pub fn first_copy() -> bool {
-    true
+/// The identifier of the bundle this program runs from (empty when it is not in an `.app`, as when run from the build folder).
+fn bundle_id() -> String {
+    let bundle: Id = send0(class(c"NSBundle"), c"mainBundle");
+    rust_string(send0(bundle, c"bundleIdentifier"))
 }
 
-pub fn hand_over(_paths: &[PathBuf]) -> bool {
-    false
+/// One window for all the files, as on Windows. For the `.app` Launch Services is what makes it one program (opening a file in a running copy sends it
+/// `application:openFiles:`); this is for the program started by hand from inside the bundle: it looks for another copy by the bundle identifier. A program
+/// that is not in a bundle has none to look for: it is always the first.
+pub fn first_copy() -> bool {
+    let id = bundle_id();
+    if id.is_empty() {
+        return true;
+    }
+    let name = cfstr(&id);
+    let apps: Id = send1(class(c"NSRunningApplication"), c"runningApplicationsWithBundleIdentifier:", name.0);
+    // SAFETY: no arguments; the id of this process.
+    let me = unsafe { getpid() };
+    !array_items(apps).into_iter().any(|a| send0::<i32>(a, c"processIdentifier") != me)
+}
+
+/// Gives the files to the copy that is running (Launch Services sends it the same message a Finder double click does); false if there is none.
+pub fn hand_over(paths: &[PathBuf]) -> bool {
+    let id = bundle_id();
+    if id.is_empty() || first_copy() {
+        return false;
+    }
+    let urls: Vec<Cf> = paths
+        .iter()
+        .map(|p| {
+            let s = cfstr(&p.to_string_lossy());
+            let url: Id = send1(class(c"NSURL"), c"fileURLWithPath:", s.0);
+            // SAFETY: a live (autoreleased) object; the retain is the one the `Cf` releases.
+            Cf(unsafe { CFRetain(url) })
+        })
+        .collect();
+    let list = cf_array(&urls.iter().map(|u| u.0).collect::<Vec<_>>());
+    let name = cfstr(&id);
+    let workspace: Id = send0(class(c"NSWorkspace"), c"sharedWorkspace");
+    // 0x10000 is NSWorkspaceLaunchAsync; no extra descriptor and no launch identifiers wanted.
+    send5::<i8, Id, Id, u64, Id, *mut Id>(workspace, c"openURLs:withAppBundleIdentifier:options:additionalEventParamDescriptor:launchIdentifiers:", list.0, name.0, 0x10000, null_mut(), null_mut()) != 0
 }
 
 pub fn system_uses_dark() -> bool {
+    // What the application looks like now (it follows the system, also when it changes by itself at night).
+    let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+    let appearance: Id = if app.is_null() { null_mut() } else { send0(app, c"effectiveAppearance") };
+    if !appearance.is_null() {
+        let names = cf_array_of_strings(&["NSAppearanceNameAqua".to_string(), "NSAppearanceNameDarkAqua".to_string()]);
+        let best = rust_string(send1(appearance, c"bestMatchFromAppearancesWithNames:", names.0));
+        if !best.is_empty() {
+            return best.contains("Dark");
+        }
+    }
     let defaults: Id = send0(class(c"NSUserDefaults"), c"standardUserDefaults");
     let key = cfstr("AppleInterfaceStyle");
     let style: Id = send1(defaults, c"stringForKey:", key.0);
@@ -2153,8 +2940,18 @@ pub fn system_accent() -> Option<Rgb> {
     Some(byte(r) << 16 | byte(g) << 8 | byte(b))
 }
 
+/// "Increase contrast" of the system's accessibility settings: black on white, or white on black when the system is dark, with the accent for the selection.
 pub fn high_contrast() -> Option<Contrast> {
-    None
+    let workspace: Id = send0(class(c"NSWorkspace"), c"sharedWorkspace");
+    if send0::<i8>(workspace, c"accessibilityDisplayShouldIncreaseContrast") == 0 {
+        return None;
+    }
+    let accent = system_accent().unwrap_or(0x0A84FF);
+    Some(if system_uses_dark() {
+        Contrast { window: 0x000000, text: 0xFFFFFF, gray: 0xB0B0B0, highlight: accent, highlight_text: 0x000000, face: 0x000000 }
+    } else {
+        Contrast { window: 0xFFFFFF, text: 0x000000, gray: 0x505050, highlight: accent, highlight_text: 0xFFFFFF, face: 0xFFFFFF }
+    })
 }
 
 /// The size of the part of the main screen the windows may use, in pixels.
@@ -2216,6 +3013,19 @@ mod tests {
         assert_eq!(clean_label("&Open...\tCtrl+O"), "Open...");
         assert_eq!(clean_label("打开(&O)...\tCtrl+O"), "打开...");
         assert_eq!(clean_label("Fish && &Chips"), "Fish & Chips");
+    }
+
+    #[test]
+    fn shortcuts_become_key_equivalents_only_where_a_box_cannot_lose_a_key() {
+        assert_eq!(shortcut("&Open...\tCtrl+O"), Some(("o".to_string(), 1 << 20)));
+        assert_eq!(shortcut("Zoom &in\tCtrl++"), Some(("+".to_string(), 1 << 20)));
+        assert_eq!(shortcut("Find p&revious\tShift+F3"), Some(("\u{F706}".to_string(), 1 << 17)));
+        assert_eq!(shortcut("Show &sidebar\tF4"), Some(("\u{F707}".to_string(), 0)));
+        assert_eq!(shortcut("N&ext tab\tCtrl+Tab"), Some(("\t".to_string(), 1 << 18)));
+        assert_eq!(shortcut("&Delete\tDel"), None);
+        assert_eq!(shortcut("&Copy\tCtrl+C"), None);
+        assert_eq!(shortcut("Move &Up a Level\tShift+Tab"), None);
+        assert_eq!(shortcut("No shortcut"), None);
     }
 
     #[test]

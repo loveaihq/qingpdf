@@ -2734,3 +2734,17 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - 拖动与双击：`nc_hit` 说是标题区的地方，按下就 `performWindowDragWithEvent:`；双击按系统设置 `AppleActionOnDoubleClick`（放大/缩小到 Dock/无动作）。标签和按钮照常收到点击。
 - 应用图标：启动时把“轻”标志画进 256 像素的 NSImage，设为 `applicationIconImage`，Dock 和密码等对话框都用它。
 - **真窗口里试过之后的修改（2026-11-03）：** 三个窗口按钮离左边和上下一样远（约 13 点），按钮间距 20 点，左边留白从 68 点加到 80 点；没打包成 `.app` 时对话框的 `applicationIconImage` 不起作用，所以每个对话框自己设“轻”字图标；菜单栏加了四个隐藏的标准项（剪切、复制、粘贴、全选，不指定目标），系统输入框里 Cmd+X/C/V/A 才能用，页面上没人接它们，按键照旧作为 `Event::Key` 交给阅读器。用户在真窗口里确认：密码框能弹出、能粘贴、密码对了能打开。还没解决：安全输入框里 Option+i 打不出 ô（可能要打包成 `.app` 才有完整的输入支持，以后再查）。
+
+## Mac 版第四步（2026-11-03）
+
+只改了 `crates/qingpdf-view-mac/` 和本文件，共享库没动。
+
+- **`.app`**：`crates/qingpdf-view-mac/make-app.sh` 编译 release，生成 `target/release/qingpdf.app`（标识 `org.qingpdf.reader`，名字 qingpdf，高分屏，最低系统 11.0，登记为 PDF 的查看器，Finder 的“打开方式”和拖到 Dock 图标都能用），最后 ad-hoc 签名（`codesign -s -`，只在本机能用；给别的 Mac 要真证书加公证）。图标由程序自己画：隐藏参数 `--write-icon <png>` 用 `set_app_icon` 的同一段绘制出 1024 像素的 PNG，脚本用 `sips` 缩成各尺寸、`iconutil` 合成 `.icns`。图标铺满画布，没有 macOS 图标常见的留白。大小约 3.25 MB，二进制 3.16 MB，在 4.0 MB 上限内。
+- **从 Finder/Dock 打开文件**：委托实现 `application:openFiles:`，交给阅读器的 `Event::Drop`（与拖入窗口同一条路），再回复系统。命令行里以 `-` 开头的参数（系统可能加的 `-psn_…` 等）不再当成文件。
+- **单实例**：选了最简单的办法。`.app` 由 Launch Services 保证只有一个进程，再次打开文件走 `openFiles:`。直接运行包里的可执行文件时，`first_copy` 用 `NSRunningApplication` 按包标识找别的进程，`hand_over` 用 `NSWorkspace openURLs:withAppBundleIdentifier:` 把文件交给它（和 Finder 双击同一条路），然后本进程退出（已实测：第二次启动退出码 0，只剩一个进程）。不在包里运行（如 `cargo run`）时没有包标识，永远是第一个，不去找别的。
+- **动作**（语义照 win32）：`Outline`/`Sidebar`/`OutlineRename`：`NSScrollView` 里放 `NSOutlineView`（单列，数据源是委托，项目是装着节点序号的 NSNumber），按 `Sidebar` 的矩形摆，矩形为空就藏起来；`Outline` 重建并按 `open` 展开、选中 `select`，没有 `select` 时保持滚动位置。事件：`OutlineClick`（鼠标点击，点完键盘还给页面；用键盘上下移动选中也算点击）、`OutlineExpand`（阅读器自己填的时候不发）、`OutlineMenu`（右键，先选中该行，菜单由阅读器用 `ContextMenu` 画）、`OutlineRename`（只有阅读器要求时才允许改名，回车确认才发）、`OutlineDrop`（拖放，落在行上=`Inside`，行与行之间=`Before`/`After`，不许落进自己的分支）。`ContextMenu`/`ShowMenu`：`NSMenu popUpMenuPositioningItem`，选中项发 `Event::Command`（`ShowMenu` 把菜单栏的各菜单作为子菜单，靠右对齐）；`Choose`：同样弹出，发 `Event::Chosen`（取消是 `None`）。`HideCursor`：`setHiddenUntilMouseMoves`。`FullScreen`：`toggleFullScreen:`；用户用绿色按钮或系统快捷键进出全屏时，补发一个 F11 键让阅读器的状态跟上。`Theme`：窗口深/浅外观、窗口底色用标题条的颜色、树的底色和文字色。`Find` 上一步已做。
+- **窗口位置**：照 win32 用 `Placement` 和 `placement::restore`，单位是点，原点在主屏左上；`Action::Quit` 时存进设置（不是全屏时的位置；放大状态记为 `maximized`，下次启动后 `zoom:`）。
+- **系统外观**：观察 `AppleInterfaceThemeChangedNotification`、`AppleColorPreferencesChangedNotification`（分布式通知）和辅助功能显示选项的变化，等 0.3 秒系统稳定后发 `SystemDark`、`SystemAccent`、`HighContrast`。`system_uses_dark` 改看 `NSApp.effectiveAppearance`（定时自动切换也算）。`HighContrast`：系统“增强对比度”打开时给黑白（深色系统为白字黑底）加强调色。
+- **菜单快捷键显示**：标签后面的 `Ctrl+O` 等变成 `NSMenuItem` 的键等价（Ctrl 换成 Command；Tab 用 Control，因为 Command+Tab 归系统），按下时 `delegate_menu_item` 把当前按键事件原样作为 `Event::Key` 交给阅读器，所以不会吞键、语义和没显示时一样。只有带 Command/Control 或功能键的才设键等价；Del、Tab、Shift+Tab 这类裸键如果设了，菜单会从文本框里抢走它们，所以只把快捷键文字写在标题后面。Ctrl+C 不设（留给文本框自己的复制）。
+- **没做**：`AskForm`、打印（`ChoosePrinter`/`Print`）、识别文字；全屏时标签条左边给红黄绿按钮留的空位还在；窗口放大状态下关闭，位置记的是放大之前的。
+- **第四步之后的修改和测试（2026-11-04）：** 图标按 Apple 的图标网格留边（圆角方块占画布约 80%，居中），Dock 里和别的图标一样大；全屏时三个窗口按钮不在了，左边留白随之变成 0，出全屏再恢复（Mac 程序把阅读器包一层 `MacReader`，只做这一件事，共用代码不动）；退出时系统先问窗口能不能关，原来一律答“不”，AppleScript 和注销时的退出因此被当成“用户取消”，现在阅读器已经退出时答“是”，`applicationShouldTerminate:` 同样在阅读器退出后答“马上退出”。命令行测过：`.app` 能开文件；第二次打开把文件交给已经开着的那一个（始终只有一个进程）；`--write-icon` 的图标留边正确；AppleScript 退出连续 10 次里 9 次成功，失败的那一次总是重新签名后的第一次启动（那时退出请求正赶上阅读器在处理别的事件，被当成取消，有一次还因为 Objective-C 异常穿过 Rust 而中止），平常不会碰到，先记下。拖动、右键菜单、书签操作、深色模式切换这些要在真窗口里点，还没测。
