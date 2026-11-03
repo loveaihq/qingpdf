@@ -1451,15 +1451,38 @@ fn save_panel(title: &str, filters: &[(String, String)], name: &str) -> Option<P
 }
 
 /// A box with buttons; the number (from 0) of the one pressed.
+/// The words of the buttons of the system's boxes, in the system's language (as Windows' own boxes are).
+struct ButtonWords {
+    ok: &'static str,
+    cancel: &'static str,
+    yes: &'static str,
+    no: &'static str,
+    save: &'static str,
+    dont_save: &'static str,
+}
+
+fn button_words() -> ButtonWords {
+    if qingpdf_view::i18n::Lang::from_langid(ui_language()) == qingpdf_view::i18n::Lang::Zh {
+        ButtonWords { ok: "好", cancel: "取消", yes: "是", no: "否", save: "存储", dont_save: "不存储" }
+    } else {
+        ButtonWords { ok: "OK", cancel: "Cancel", yes: "Yes", no: "No", save: "Save", dont_save: "Don't Save" }
+    }
+}
+
 fn alert(title: &str, text: &str, buttons: &[&str]) -> usize {
     let alert = new_object(c"NSAlert");
     set_alert_icon(alert);
     let (t, m) = (cfstr(title), cfstr(text));
     send1::<(), Id>(alert, c"setMessageText:", t.0);
     send1::<(), Id>(alert, c"setInformativeText:", m.0);
+    let cancel = button_words().cancel;
     for button in buttons {
         let b = cfstr(button);
-        let _: Id = send1(alert, c"addButtonWithTitle:", b.0);
+        let made: Id = send1(alert, c"addButtonWithTitle:", b.0);
+        if *button == cancel {
+            let escape = cfstr("\u{1b}");
+            send1::<(), Id>(made, c"setKeyEquivalent:", escape.0);
+        }
     }
     let pressed: i64 = send0(alert, c"runModal");
     release(alert);
@@ -1513,15 +1536,17 @@ fn perform(action: Action) {
         Action::PickFolder { title } => dispatch(Event::FolderPicked(open_panel(&title, &[], false, true).into_iter().next())),
         Action::PickSavePath { title, filters, name } => dispatch(Event::SavePicked(save_panel(&title, &filters, &name))),
         Action::Message { title, text } => {
-            alert(&title, &text, &["OK"]);
+            alert(&title, &text, &[button_words().ok]);
         }
         Action::Confirm { tag, title, text } => {
-            // TODO(macos): the words of the buttons are English whatever the language of the reader is.
-            let yes = alert(&title, &text, &["Yes", "No"]) == 0;
+            // No is first, so that it is the button Return presses (as on Windows).
+            let w = button_words();
+            let yes = alert(&title, &text, &[w.no, w.yes]) == 1;
             dispatch(Event::Confirmed { tag, yes });
         }
         Action::AskSave { tag, title, text } => {
-            let choice = match alert(&title, &text, &["Save", "Don't Save", "Cancel"]) {
+            let w = button_words();
+            let choice = match alert(&title, &text, &[w.save, w.dont_save, w.cancel]) {
                 0 => SaveChoice::Save,
                 1 => SaveChoice::Discard,
                 _ => SaveChoice::Cancel,
@@ -3170,9 +3195,16 @@ fn ask_form(spec: &FormSpec) -> Option<FormAnswer> {
                 } else {
                     send1(class(c"NSTextField"), c"labelWithString:", text.0)
                 };
-                if item.kind == FormKind::Group {
-                    let bold: Id = send1::<Id, f64>(class(c"NSFont"), c"boldSystemFontOfSize:", 13.0);
-                    send1::<(), Id>(label, c"setFont:", bold);
+                // The layout is made for the 12-pixel font of the Windows boxes; the system's 13 points would cut words like "Middle".
+                let font: Id = send1::<Id, f64>(class(c"NSFont"), if item.kind == FormKind::Group { c"boldSystemFontOfSize:" } else { c"systemFontOfSize:" }, 12.0);
+                send1::<(), Id>(label, c"setFont:", font);
+                send1::<(), bool>(label, c"setAllowsDefaultTighteningForTruncation:", true);
+                // A line of words wider than its place is set a little smaller (down to 10 points) rather than cut.
+                let fits: CgSize = send0(label, c"fittingSize");
+                if r.3 <= qingpdf_view::dlgstyle::LABEL_H && fits.w > f64::from(r.2) && fits.w > 0.0 {
+                    let size = (12.0 * f64::from(r.2) / fits.w).max(10.0);
+                    let smaller: Id = send1::<Id, f64>(class(c"NSFont"), if item.kind == FormKind::Group { c"boldSystemFontOfSize:" } else { c"systemFontOfSize:" }, size);
+                    send1::<(), Id>(label, c"setFont:", smaller);
                 }
                 send1::<(), CgRect>(label, c"setFrame:", frame(r, None));
                 label
