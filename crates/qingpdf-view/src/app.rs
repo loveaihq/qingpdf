@@ -448,6 +448,8 @@ app_fields! {
         bare: bool,
         /// How the frame of the window is: drawn by the reader (with the system's buttons over its right end, this wide) or the system's own.
         frame_custom: bool,
+        /// Room kept free at the left end of the title strip (the Mac's window buttons), at 96 dots per inch; 0 on Windows.
+        left_inset: i64,
         caption_w: i64,
         /// The accent the person chose, the one Windows has, the colours of a high-contrast theme, and whether the window is dark.
         accent_choice: AccentChoice,
@@ -654,6 +656,7 @@ impl App {
             welcome_focus: None,
             bare: cfg!(test),
             frame_custom: true,
+            left_inset: 0,
             caption_w: 138,
             accent_choice: AccentChoice::Qing,
             system_accent: None,
@@ -713,6 +716,11 @@ impl App {
     /// Open this file once the window has its size.
     pub fn open_when_ready(&mut self, path: PathBuf) {
         self.queue.push_back(path);
+    }
+
+    /// Keep `dp` units (pixels at 96 dots per inch, scaled like the rest) free at the left end of the title strip, where the Mac's window buttons sit.
+    pub fn set_left_inset(&mut self, dp: i64) {
+        self.left_inset = dp.max(0);
     }
 
     /// The memory goal handed to the engine for all the files together, in bytes (200 MB by default; the speed test of the tabs makes it small, to see

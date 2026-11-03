@@ -188,8 +188,14 @@ pub struct Strip {
 
 impl Strip {
     pub fn new(count: usize, dpi: u32, right: i64) -> Strip {
+        Strip::with_inset(count, dpi, right, 0)
+    }
+
+    /// As `new`, with `inset` pixels kept free at the left edge (the Mac's window buttons); the mark and the tabs move right by it.
+    pub fn with_inset(count: usize, dpi: u32, right: i64, inset: i64) -> Strip {
         let s = |v: i64| v * i64::from(dpi.max(1)) / 96;
-        let first = s(MARK_X + MARK + 10);
+        let inset = inset.max(0);
+        let first = inset + s(MARK_X + MARK + 10);
         let n = i64::try_from(count).unwrap_or(0);
         let reserved = if n > 0 { s(PLUS + PLUS_GAP) } else { 0 };
         let room = (right - first - reserved - (n - 1).max(0) * s(TAB_GAP)).max(0);
@@ -199,7 +205,7 @@ impl Strip {
         let height = s(TITLE_H) - top;
         let end = if n > 0 { first + n * (width + s(TAB_GAP)) - s(TAB_GAP) } else { first };
         let plus = (n > 0).then(|| (end + s(PLUS_GAP), top + (height - s(PLUS)) / 2, s(PLUS)));
-        Strip { mark: (s(MARK_X), (s(TITLE_H) - s(MARK)) / 2, s(MARK)), first, top, height, width, xs, plus, close: (s(CLOSE_SIDE), s(CLOSE_EDGE)) }
+        Strip { mark: (inset + s(MARK_X), (s(TITLE_H) - s(MARK)) / 2, s(MARK)), first, top, height, width, xs, plus, close: (s(CLOSE_SIDE), s(CLOSE_EDGE)) }
     }
 
     /// The close button of tab `i`: left, top, side.
@@ -434,6 +440,19 @@ mod tests {
         let (px, _, side) = two.plus.unwrap();
         assert_eq!((px, side), (two.xs[1] + two.width + PLUS_GAP, PLUS));
         assert!(Strip::new(0, 96, right).plus.is_none());
+    }
+
+    #[test]
+    fn a_left_inset_moves_the_mark_and_the_tabs_and_zero_changes_nothing() {
+        let plain = Strip::new(3, 96, 1000);
+        assert_eq!(Strip::with_inset(3, 96, 1000, 0), plain);
+        assert_eq!(plain.mark.0, MARK_X);
+        assert_eq!(plain.first, MARK_X + MARK + 10);
+        let moved = Strip::with_inset(3, 96, 1000, 70);
+        assert_eq!(moved.mark.0, MARK_X + 70);
+        assert_eq!(moved.first, plain.first + 70);
+        assert_eq!(moved.xs.first().copied(), plain.xs.first().map(|x| x + 70));
+        assert_eq!(hit(&moved, plain.first + 5, 20, |_| true), Hit::Nothing, "the inset is not a tab");
     }
 
     #[test]

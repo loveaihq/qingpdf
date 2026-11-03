@@ -89,7 +89,7 @@ impl App {
 
     /// Where the parts of the strip are.
     pub(super) fn strip(&self) -> Strip {
-        Strip::new(self.tabs.len(), self.dpi, self.client_w - self.caption_px() - self.px(tabs::DRAG_MIN))
+        Strip::with_inset(self.tabs.len(), self.dpi, self.client_w - self.caption_px() - self.px(tabs::DRAG_MIN), self.px(self.left_inset))
     }
 
     /// Does tab `i` show its close button? The shown one does, the one under the pointer does, and so does any that is wide enough.

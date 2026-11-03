@@ -137,6 +137,8 @@ pub fn main() {
         app.set_clock(sys::local_date);
         app.set_local_time(sys::local_time);
         app.set_random(sys::random_bytes);
+        // The window's own buttons (red, yellow, green) sit at the left end of the title strip.
+        app.set_left_inset(sys::BUTTONS_ROOM);
         if let Some(file) = bench_file {
             app.bench = Some(Bench::new(&file.to_string_lossy(), bench_size));
             if bench_thumbs {

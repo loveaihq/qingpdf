@@ -51,6 +51,8 @@ unsafe extern "C" {
     fn objc_registerClassPair(class: Id);
     fn class_addMethod(class: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> bool;
     fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn class_getMethodImplementation(class: Id, sel: Sel) -> *const c_void;
+    fn sel_getName(sel: Sel) -> *const c_char;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
@@ -113,6 +115,9 @@ unsafe extern "C" {
     fn CGContextSetInterpolationQuality(ctx: Id, quality: i32);
     fn CGContextDrawImage(ctx: Id, rect: CgRect, image: Id);
     fn CGContextSetTextPosition(ctx: Id, x: f64, y: f64);
+    fn CGContextSaveGState(ctx: Id);
+    fn CGContextRestoreGState(ctx: Id);
+    fn CGContextClipToMask(ctx: Id, rect: CgRect, mask: Id);
     fn CGDataProviderCreateWithData(info: *mut c_void, data: *const c_void, size: usize, release: *const c_void) -> Id;
     fn CGDataProviderRelease(provider: Id);
     fn CGImageCreate(
@@ -397,6 +402,19 @@ struct Mac {
     told_dpi: u32,
     buffer: Option<Buffer>,
     timers: HashMap<u32, usize>,
+    /// The text boxes over the pages (made when first needed): the find box, the page pill's, and the ones of a form field (one line, several).
+    search: usize,
+    pill: usize,
+    field_single: usize,
+    field_multi: usize,
+    field_class: usize,
+    /// The box of a form field now in use (0: none) and its most characters.
+    field_active: usize,
+    field_max: usize,
+    pill_open: bool,
+    search_on: bool,
+    /// The colours of the reader's theme: the words, the ground of a box typed in.
+    theme: Option<(Rgb, Rgb)>,
 }
 
 /// What the callbacks need to know, copied out so that nothing is held while Cocoa is called.
@@ -486,6 +504,7 @@ fn sync_size() {
     if s.view == 0 || s.window == 0 {
         return;
     }
+    place_buttons();
     let bounds = send_rect(s.view as Id, c"bounds");
     let scale: f64 = send0(s.window as Id, c"backingScaleFactor");
     let scale = if scale >= 1.0 { scale } else { 1.0 };
@@ -562,12 +581,48 @@ fn present() {
 // --- the painter -----------------------------------------------------------------------------------------------------
 
 struct MacPainter {
+    scale: f64,
     ctx: Id,
     space: Id,
     h: i32,
     fonts: [Id; 4],
     attrs: [Cf; 4],
     font: usize,
+}
+
+/// The SF Symbol that stands for a letter of the icon font of Windows (Segoe Fluent Icons / Segoe MDL2 Assets), for every letter the reader draws.
+fn symbol_for(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        '\u{E70D}' => "chevron.down",
+        '\u{E76C}' => "chevron.right",
+        '\u{E8A0}' => "sidebar.left",
+        '\u{E838}' => "folder",
+        '\u{E74E}' => "square.and.arrow.down",
+        '\u{E749}' => "printer",
+        '\u{E8B0}' => "cursorarrow",
+        '\u{E7E6}' => "highlighter",
+        '\u{E70B}' => "note.text",
+        '\u{EE56}' => "pencil.tip",
+        '\u{E739}' => "square.on.circle",
+        '\u{E8AC}' => "textbox",
+        '\u{E8A8}' => "rectangle.dashed",
+        '\u{E8DC}' => "underline",
+        '\u{EDE0}' => "strikethrough",
+        '\u{EDC6}' => "scribble.variable",
+        '\u{E8EC}' => "seal",
+        '\u{EA3A}' => "circle",
+        '\u{E72A}' => "line.diagonal",
+        '\u{E90A}' => "text.bubble",
+        '\u{E9A6}' => "arrow.up.left.and.arrow.down.right",
+        '\u{E721}' => "magnifyingglass",
+        '\u{E712}' => "ellipsis",
+        _ => return None,
+    })
+}
+
+/// The symbols that are drawn small (the arrows of the menus and of the tree) and a little bolder.
+fn symbol_is_small(name: &str) -> bool {
+    name.starts_with("chevron.")
 }
 
 fn font_index(font: Font) -> usize {
@@ -582,7 +637,7 @@ fn font_index(font: Font) -> usize {
 impl MacPainter {
     fn new(ctx: Id, space: Id, h: i32, scale: f64) -> MacPainter {
         // The system font (kCTFontUIFontSystem = 2, emphasized = 3); CoreText falls back to other fonts for the letters it lacks (Chinese).
-        // TODO(macos): the icon font (Segoe Fluent Icons) has no counterpart; the buttons' pictures need drawing as shapes or SF Symbols.
+        // The icon font (Segoe Fluent Icons) has no counterpart: `glyph` draws SF Symbols (see `symbol_for`); this font is only the fallback.
         let sizes = [(2, 13.0), (3, 13.0), (3, 22.0), (2, 16.0)];
         let fonts = sizes.map(|(kind, size)| {
             // SAFETY: plain numbers and a null language (the default).
@@ -603,12 +658,45 @@ impl MacPainter {
                 )
             })
         });
-        MacPainter { ctx, space, h, fonts, attrs, font: 0 }
+        MacPainter { scale, ctx, space, h, fonts, attrs, font: 0 }
     }
 
     /// The y of the bottom edge of a rectangle that has its top at `y`, in the context's own coordinates (y up).
     fn cg_rect(&self, r: Rect) -> CgRect {
         CgRect { x: f64::from(r.x), y: f64::from(self.h - r.y - r.h), w: f64::from(r.w), h: f64::from(r.h) }
+    }
+
+    /// An SF Symbol in the middle of `r`, in `color` (the symbol is a mask: its shape is filled with the colour). False if the system has no such symbol.
+    fn draw_symbol(&self, r: Rect, name: &str, color: Rgb) -> bool {
+        let title = cfstr(name);
+        let image: Id = send2(class(c"NSImage"), c"imageWithSystemSymbolName:accessibilityDescription:", title.0, null_mut::<c_void>());
+        if image.is_null() {
+            return false;
+        }
+        // The size is in pixels of the back buffer (the symbol is made as big as the point size says, one unit to a pixel).
+        let (points, weight) = if symbol_is_small(name) { (10.0, 0.4) } else { (15.0, 0.0) };
+        let config: Id = send3::<Id, f64, f64, i64>(class(c"NSImageSymbolConfiguration"), c"configurationWithPointSize:weight:scale:", points * self.scale, weight, 2);
+        let sized: Id = if config.is_null() { image } else { send1(image, c"imageWithSymbolConfiguration:", config) };
+        let size: CgPoint = send0(if sized.is_null() { image } else { sized }, c"size");
+        let (w, h) = (size.x.ceil(), size.y.ceil());
+        if w < 1.0 || h < 1.0 || w > 512.0 || h > 512.0 {
+            return false;
+        }
+        let mut proposed = CgRect { x: 0.0, y: 0.0, w, h };
+        let cg: Id = send3::<Id, *mut CgRect, Id, Id>(if sized.is_null() { image } else { sized }, c"CGImageForProposedRect:context:hints:", &mut proposed, null_mut(), null_mut());
+        if cg.is_null() {
+            return false;
+        }
+        let dest = CgRect { x: f64::from(r.x) + (f64::from(r.w) - w) / 2.0, y: self.fy(f64::from(r.y) + (f64::from(r.h) + h) / 2.0), w, h };
+        self.set_fill(color, 255);
+        // SAFETY: a live context and image (the image belongs to the NSImage, which lives through this call); the state saved is the one restored.
+        unsafe {
+            CGContextSaveGState(self.ctx);
+            CGContextClipToMask(self.ctx, dest, cg);
+            CGContextFillRect(self.ctx, dest);
+            CGContextRestoreGState(self.ctx);
+        }
+        true
     }
 
     fn fy(&self, y: f64) -> f64 {
@@ -744,6 +832,20 @@ impl Painter for MacPainter {
         self.font = font_index(font);
     }
 
+    fn glyph(&mut self, r: Rect, ch: char, color: Rgb) {
+        if let Some(name) = symbol_for(ch)
+            && self.draw_symbol(r, name, color)
+        {
+            return;
+        }
+        // No picture for this letter: its own text (a box, if the system font lacks it).
+        self.set_font(Font::Icon);
+        let s = ch.to_string();
+        let (w, h) = (self.text_width(&s), self.line_height());
+        self.text(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, &s, color);
+        self.set_font(Font::Body);
+    }
+
     fn fill_shape(&mut self, r: Rect, radii: [i32; 4], color: Rgb, alpha: u8) {
         if self.round_path(r, radii) {
             self.set_fill(color, alpha);
@@ -858,8 +960,123 @@ extern "C" fn view_mouse_down(_this: Id, _sel: Sel, event: Id) {
     let (x, y) = pointer(event);
     let (ctrl, shift) = flags(event);
     let clicks: i64 = send0(event, c"clickCount");
+    if with_handler(|h| h.nc_hit(x, y)) == Some(NcHit::Caption) {
+        title_bar_click(event, clicks);
+        return;
+    }
     dispatch(Event::MouseDown { x, y, ctrl, shift, clicks: clicks.clamp(1, 3) as u8 });
     update_cursor(x, y);
+}
+
+/// A press on the empty part of the title strip: a double click does what the system is set to do with the title bar's (zoom, minimise or nothing), and a
+/// single press drags the window.
+fn title_bar_click(event: Id, clicks: i64) {
+    let s = snap();
+    if s.window == 0 {
+        return;
+    }
+    let window = s.window as Id;
+    if clicks >= 2 {
+        let defaults: Id = send0(class(c"NSUserDefaults"), c"standardUserDefaults");
+        let key = cfstr("AppleActionOnDoubleClick");
+        let action = rust_string(send1(defaults, c"stringForKey:", key.0));
+        match action.as_str() {
+            "None" => {}
+            "Minimize" => send1::<(), Id>(window, c"performMiniaturize:", null_mut()),
+            _ => send1::<(), Id>(window, c"performZoom:", null_mut()),
+        }
+    } else {
+        send1::<(), Id>(window, c"performWindowDragWithEvent:", event);
+    }
+}
+
+/// How far the window's buttons reach from the left edge of the title strip, in points at 96 dots per inch (the reader keeps this much free).
+pub const BUTTONS_ROOM: i64 = 80;
+
+/// The height of the title strip, in points (the reader's `TITLE_H`).
+const STRIP_H: f64 = 40.0;
+
+/// Makes the window's title bar as tall as the reader's title strip and puts the three buttons in the middle of it. The system lays the buttons out
+/// again (on a resize, in full screen), so this is done whenever the view is sized or drawn; it moves nothing that is already in place.
+fn place_buttons() {
+    let s = snap();
+    if s.window == 0 {
+        return;
+    }
+    let window = s.window as Id;
+    let style: u64 = send0(window, c"styleMask");
+    if style & (1 << 14) != 0 {
+        return;
+    }
+    let frame = send_rect(window, c"frame");
+    for kind in 0..3_i64 {
+        let button: Id = send1(window, c"standardWindowButton:", kind);
+        if button.is_null() {
+            continue;
+        }
+        let bar: Id = send0(button, c"superview");
+        let container: Id = if bar.is_null() { null_mut() } else { send0(bar, c"superview") };
+        if kind == 0 && !container.is_null() {
+            let want = CgRect { x: 0.0, y: frame.h - STRIP_H, w: frame.w, h: STRIP_H };
+            let have = send_rect(container, c"frame");
+            if (have.y - want.y).abs() > 0.5 || (have.h - want.h).abs() > 0.5 || (have.w - want.w).abs() > 0.5 {
+                send1::<(), CgRect>(container, c"setFrame:", want);
+            }
+            let inner = CgRect { x: 0.0, y: 0.0, w: frame.w, h: STRIP_H };
+            let have = send_rect(bar, c"frame");
+            if (have.h - inner.h).abs() > 0.5 || (have.w - inner.w).abs() > 0.5 {
+                send1::<(), CgRect>(bar, c"setFrame:", inner);
+            }
+        }
+        let b = send_rect(button, c"frame");
+        // As far from the left edge as from the top and bottom, then the system's 20 points from one button to the next.
+        let y = ((STRIP_H - b.h) / 2.0).round();
+        let x = y + 20.0 * kind as f64;
+        if (b.y - y).abs() > 0.5 || (b.x - x).abs() > 0.5 {
+            send1::<(), CgPoint>(button, c"setFrameOrigin:", CgPoint { x, y });
+        }
+    }
+}
+
+/// The reader's mark as the application's icon, so that the Dock and the boxes (password, save) show it and not a generic folder.
+fn set_app_icon() {
+    const SIDE: i32 = 256;
+    let s = snap();
+    let Some(buffer) = make_buffer(s.space as Id, SIDE, SIDE) else { return };
+    let mut painter = MacPainter::new(buffer.ctx, s.space as Id, SIDE, 1.0);
+    let r = Rect { x: 0, y: 0, w: SIDE, h: SIDE };
+    let k = SIDE as f32 / 100.0;
+    painter.fill_shape(r, [(qingpdf_view::logo::RADIUS * k).round() as i32; 4], qingpdf_view::accent::QING_LIGHT.base, 255);
+    for stroke in qingpdf_view::logo::strokes(SIDE) {
+        let points: Vec<(f32, f32)> = stroke.pts.iter().map(|&(x, y)| (x * k, y * k)).collect();
+        painter.polyline(&points, stroke.width * k, 0xFFFFFF, 255);
+    }
+    // SAFETY: the buffer's context is live until `buffer` goes at the end of this function; the image is a copy made now and released below.
+    let image = unsafe { CGBitmapContextCreateImage(buffer.ctx) };
+    if image.is_null() {
+        return;
+    }
+    let allocated: Id = send0(class(c"NSImage"), c"alloc");
+    let icon: Id = send2(allocated, c"initWithCGImage:size:", image, CgPoint { x: f64::from(SIDE), y: f64::from(SIDE) });
+    // SAFETY: the image was made above and is no longer needed: the NSImage holds its own reference.
+    unsafe { CGImageRelease(image) };
+    if !icon.is_null() {
+        let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+        send1::<(), Id>(app, c"setApplicationIconImage:", icon);
+        // Kept for the life of the program: the boxes set it as their icon (an NSAlert of a program with no bundle shows a folder otherwise).
+        APP_ICON.store(icon as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The application's icon made by `set_app_icon` (0 until then); never released.
+static APP_ICON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Gives a box the application's icon.
+fn set_alert_icon(alert: Id) {
+    let icon = APP_ICON.load(std::sync::atomic::Ordering::Relaxed) as Id;
+    if !icon.is_null() {
+        send1::<(), Id>(alert, c"setIcon:", icon);
+    }
 }
 
 extern "C" fn view_mouse_dragged(_this: Id, _sel: Sel, event: Id) {
@@ -981,7 +1198,7 @@ extern "C" fn delegate_menu_item(_this: Id, _sel: Sel, item: Id) {
     }
 }
 
-fn register_classes() -> (Id, Id) {
+fn register_classes() -> (Id, Id, Id) {
     let view = make_class(
         c"QingpdfView",
         c"NSView",
@@ -1016,9 +1233,13 @@ fn register_classes() -> (Id, Id) {
             (c"timerFired:", delegate_timer as *const c_void, c"v@:@"),
             (c"wakeUp", delegate_wake as *const c_void, c"v@:"),
             (c"menuItem:", delegate_menu_item as *const c_void, c"v@:@"),
+            (c"control:textView:doCommandBySelector:", delegate_command as *const c_void, c"c@:@@:"),
+            (c"controlTextDidChange:", delegate_text_changed as *const c_void, c"v@:@"),
+            (c"controlTextDidEndEditing:", delegate_text_ended as *const c_void, c"v@:@"),
         ],
     );
-    (view, delegate)
+    let field = make_class(c"QingpdfField", c"NSTextField", &[(c"becomeFirstResponder", field_become as *const c_void, c"c@:")]);
+    (view, delegate, field)
 }
 
 extern "C" fn view_true_arg(_this: Id, _sel: Sel, _sender: Id) -> i8 {
@@ -1103,6 +1324,7 @@ fn save_panel(title: &str, filters: &[(String, String)], name: &str) -> Option<P
 /// A box with buttons; the number (from 0) of the one pressed.
 fn alert(title: &str, text: &str, buttons: &[&str]) -> usize {
     let alert = new_object(c"NSAlert");
+    set_alert_icon(alert);
     let (t, m) = (cfstr(title), cfstr(text));
     send1::<(), Id>(alert, c"setMessageText:", t.0);
     send1::<(), Id>(alert, c"setInformativeText:", m.0);
@@ -1215,10 +1437,424 @@ fn perform(action: Action) {
             send2::<(), Id, bool>(app, c"postEvent:atStart:", event, true);
         }
         Action::SetMenus(menus) => install_menus(&menus),
-        // TODO(macos): the rest of the actions: AskText, AskForm, Outline*, Sidebar, Find, SearchBox, PillEdit, ChoosePrinter, Print, FieldEdit,
-        // FieldMove, Choose, ContextMenu, ShowMenu, Theme, FullScreen, HideCursor.
+        Action::AskText { tag, title, prompt, secret, initial, ok, cancel } => {
+            let text = ask_text(&title, &prompt, secret, &initial, &ok, &cancel);
+            dispatch(Event::Text { tag, text });
+        }
+        Action::SearchBox(b) => set_search_box(b),
+        Action::Find(rect) => show_find(rect),
+        Action::PillEdit(b) => set_pill_edit(b),
+        Action::FieldEdit(Some(b)) => show_field(&b),
+        Action::FieldEdit(None) => hide_field(),
+        Action::FieldMove(r) => {
+            let active = read_mac(|m| m.field_active).unwrap_or(0);
+            if active != 0 {
+                place(active as Id, r);
+            }
+        }
+        Action::Theme(t) => with_mac(|m| m.theme = Some((t.text, t.field_bg))),
+        // TODO(macos): the rest of the actions: AskForm, Outline*, Sidebar, ChoosePrinter, Print, Choose, ContextMenu, ShowMenu, FullScreen, HideCursor.
         _ => {}
     }
+}
+
+// --- the boxes typed in ----------------------------------------------------------------------------------------------
+
+fn read_mac<R>(f: impl FnOnce(&Mac) -> R) -> Option<R> {
+    MAC.with(|m| m.try_borrow().ok().map(|m| f(&m)))
+}
+
+/// Asks for a line of text in a box with two buttons (the line is dots if `secret`); none if it was cancelled.
+fn ask_text(title: &str, prompt: &str, secret: bool, initial: &str, ok: &str, cancel: &str) -> Option<String> {
+    let alert = new_object(c"NSAlert");
+    set_alert_icon(alert);
+    let (t, m) = (cfstr(title), cfstr(prompt));
+    send1::<(), Id>(alert, c"setMessageText:", t.0);
+    send1::<(), Id>(alert, c"setInformativeText:", m.0);
+    let (ok, cancel) = (cfstr(if ok.is_empty() { "OK" } else { ok }), cfstr(if cancel.is_empty() { "Cancel" } else { cancel }));
+    let _: Id = send1(alert, c"addButtonWithTitle:", ok.0);
+    let _: Id = send1(alert, c"addButtonWithTitle:", cancel.0);
+    let allocated: Id = send0(class(if secret { c"NSSecureTextField" } else { c"NSTextField" }), c"alloc");
+    let field: Id = send1(allocated, c"initWithFrame:", CgRect { x: 0.0, y: 0.0, w: 300.0, h: 24.0 });
+    let start = cfstr(initial);
+    send1::<(), Id>(field, c"setStringValue:", start.0);
+    send1::<(), Id>(alert, c"setAccessoryView:", field);
+    send0::<()>(alert, c"layout");
+    let window: Id = send0(alert, c"window");
+    send1::<(), Id>(window, c"setInitialFirstResponder:", field);
+    let pressed: i64 = send0(alert, c"runModal");
+    let answer = (pressed == 1000).then(|| rust_string(send0(field, c"stringValue")));
+    // What was typed (a password) is wiped from the box before it goes.
+    let empty = cfstr("");
+    send1::<(), Id>(field, c"setStringValue:", empty.0);
+    release(field);
+    release(alert);
+    answer
+}
+
+/// The text box of `kind` (0 the find box, 1 the page pill's, 2 a field of one line, 3 a field of several), made when first needed.
+fn text_box(kind: usize) -> Id {
+    let existing = read_mac(|m| [m.search, m.pill, m.field_single, m.field_multi].get(kind).copied().unwrap_or(0)).unwrap_or(0);
+    if existing != 0 {
+        return existing as Id;
+    }
+    let s = snap();
+    let (class, theme) = (read_mac(|m| m.field_class).unwrap_or(0) as Id, read_mac(|m| m.theme).flatten());
+    if class.is_null() || s.view == 0 {
+        return null_mut();
+    }
+    let allocated: Id = send0(class, c"alloc");
+    let field: Id = send1(allocated, c"initWithFrame:", CgRect::default());
+    if field.is_null() {
+        return null_mut();
+    }
+    let font: Id = send1::<Id, f64>(self::class(c"NSFont"), c"systemFontOfSize:", 13.0);
+    send1::<(), Id>(field, c"setFont:", font);
+    send1::<(), bool>(field, c"setBordered:", false);
+    // No ring: the reader draws the box under this one.
+    send1::<(), i64>(field, c"setFocusRingType:", 1);
+    let boxed = kind >= 2;
+    send1::<(), bool>(field, c"setDrawsBackground:", boxed);
+    if let Some((text, ground)) = theme {
+        send1::<(), Id>(field, c"setTextColor:", srgb_color(text));
+        if boxed {
+            send1::<(), Id>(field, c"setBackgroundColor:", srgb_color(ground));
+        }
+    }
+    let cell: Id = send0(field, c"cell");
+    if kind == 3 {
+        send1::<(), bool>(cell, c"setWraps:", true);
+        send1::<(), bool>(cell, c"setScrollable:", false);
+    } else {
+        send1::<(), bool>(cell, c"setWraps:", false);
+        send1::<(), bool>(cell, c"setScrollable:", true);
+    }
+    send1::<(), Id>(field, c"setDelegate:", s.delegate as Id);
+    send1::<(), bool>(field, c"setHidden:", true);
+    send1::<(), Id>(s.view as Id, c"addSubview:", field);
+    // The view holds the box now; this reference is the box's own for good.
+    with_mac(|m| match kind {
+        0 => m.search = field as usize,
+        1 => m.pill = field as usize,
+        2 => m.field_single = field as usize,
+        _ => m.field_multi = field as usize,
+    });
+    field
+}
+
+fn srgb_color(color: Rgb) -> Id {
+    let (r, g, b) = rgb_f(color);
+    send4::<Id, f64, f64, f64, f64>(class(c"NSColor"), c"colorWithSRGBRed:green:blue:alpha:", r, g, b, 1.0)
+}
+
+/// Puts a box at a place of the window (pixels, y from the top); a rectangle with no size puts it away.
+fn place(field: Id, r: Rect) {
+    if r.w <= 0 || r.h <= 0 {
+        send1::<(), bool>(field, c"setHidden:", true);
+        return;
+    }
+    let s = snap();
+    let k = 1.0 / s.scale.max(1.0);
+    let frame = CgRect { x: f64::from(r.x) * k, y: s.pts.1 - f64::from(r.y + r.h) * k, w: f64::from(r.w) * k, h: f64::from(r.h) * k };
+    send1::<(), CgRect>(field, c"setFrame:", frame);
+    send1::<(), bool>(field, c"setHidden:", false);
+}
+
+fn is_editing(field: Id) -> bool {
+    let editor: Id = send0(field, c"currentEditor");
+    !editor.is_null()
+}
+
+/// The keyboard goes back to the pages.
+fn focus_view() {
+    let s = snap();
+    if s.window != 0 && s.view != 0 {
+        send1::<bool, Id>(s.window as Id, c"makeFirstResponder:", s.view as Id);
+    }
+}
+
+fn set_text(field: Id, text: &str) {
+    let t = cfstr(text);
+    send1::<(), Id>(field, c"setStringValue:", t.0);
+}
+
+fn set_search_box(b: Option<SearchBox>) {
+    match b {
+        Some(b) => {
+            let field = text_box(0);
+            if field.is_null() {
+                return;
+            }
+            with_mac(|m| m.search_on = true);
+            let hint = cfstr(&b.hint);
+            send1::<(), Id>(field, c"setPlaceholderString:", hint.0);
+            send1::<(), bool>(field, c"setEnabled:", b.enabled);
+            place(field, b.rect);
+        }
+        None => {
+            with_mac(|m| m.search_on = false);
+            let field = read_mac(|m| m.search).unwrap_or(0) as Id;
+            if !field.is_null() {
+                if is_editing(field) {
+                    focus_view();
+                }
+                send1::<(), bool>(field, c"setHidden:", true);
+            }
+        }
+    }
+}
+
+/// The find box gets the keyboard (with everything selected), at `rect` if the command bar's is not in use; or it is given up.
+fn show_find(rect: Option<Rect>) {
+    let on = read_mac(|m| m.search_on).unwrap_or(false);
+    match rect {
+        Some(r) => {
+            let field = text_box(0);
+            if field.is_null() {
+                return;
+            }
+            if !on {
+                place(field, r);
+            }
+            if !is_editing(field) {
+                send1::<bool, Id>(field, c"selectText:", null_mut());
+            }
+        }
+        None => {
+            let field = read_mac(|m| m.search).unwrap_or(0) as Id;
+            if field.is_null() {
+                return;
+            }
+            if is_editing(field) {
+                focus_view();
+            }
+            if !on {
+                send1::<(), bool>(field, c"setHidden:", true);
+            }
+        }
+    }
+}
+
+fn set_pill_edit(b: Option<(Rect, String)>) {
+    match b {
+        Some((r, text)) => {
+            let field = text_box(1);
+            if field.is_null() {
+                return;
+            }
+            with_mac(|m| m.pill_open = true);
+            set_text(field, &text);
+            place(field, r);
+            send1::<bool, Id>(field, c"selectText:", null_mut());
+        }
+        None => {
+            let mut was_open = false;
+            with_mac(|m| was_open = std::mem::replace(&mut m.pill_open, false));
+            let field = read_mac(|m| m.pill).unwrap_or(0) as Id;
+            if was_open && !field.is_null() {
+                focus_view();
+                send1::<(), bool>(field, c"setHidden:", true);
+            }
+        }
+    }
+}
+
+/// The box over the page pill is left: Enter (`taken`) hands over what is in it, Esc gives it up; a click outside (`focus` false) gives it up too.
+fn finish_pill(taken: bool, focus: bool) {
+    let mut was_open = false;
+    with_mac(|m| was_open = std::mem::replace(&mut m.pill_open, false));
+    let field = read_mac(|m| m.pill).unwrap_or(0) as Id;
+    if !was_open || field.is_null() {
+        return;
+    }
+    let text = taken.then(|| rust_string(send0(field, c"stringValue")).chars().take(32).collect::<String>());
+    if focus {
+        focus_view();
+    }
+    send1::<(), bool>(field, c"setHidden:", true);
+    dispatch(Event::PillEdit(text));
+}
+
+fn show_field(b: &FieldBox) {
+    let field = text_box(if b.multiline { 3 } else { 2 });
+    if field.is_null() {
+        return;
+    }
+    let other = read_mac(|m| if b.multiline { m.field_single } else { m.field_multi }).unwrap_or(0) as Id;
+    // The box that was in use before is put away without telling the reader: it has moved on to this one already.
+    with_mac(|m| {
+        m.field_active = field as usize;
+        m.field_max = b.max_len as usize;
+    });
+    if !other.is_null() {
+        send1::<(), bool>(other, c"setHidden:", true);
+    }
+    set_text(field, &b.text);
+    place(field, b.rect);
+    send1::<bool, Id>(field, c"selectText:", null_mut());
+}
+
+/// The box is put away, keeping nothing: the reader has asked for that.
+fn hide_field() {
+    let mut active = 0;
+    with_mac(|m| active = std::mem::replace(&mut m.field_active, 0));
+    if active != 0 {
+        if is_editing(active as Id) {
+            focus_view();
+        }
+        send1::<(), bool>(active as Id, c"setHidden:", true);
+    }
+}
+
+/// The person has left the box: its text goes to the reader, with how it was left, and the box is put away.
+fn finish_field(exit: FieldExit) {
+    let mut active = 0;
+    with_mac(|m| active = std::mem::replace(&mut m.field_active, 0));
+    if active == 0 {
+        return;
+    }
+    let text = rust_string(send0(active as Id, c"stringValue")).replace("\r\n", "\n").replace('\r', "\n");
+    if exit != FieldExit::Blur {
+        focus_view();
+    }
+    send1::<(), bool>(active as Id, c"setHidden:", true);
+    dispatch(Event::FieldDone { text, exit });
+}
+
+/// Which box a control is: 0 the find box, 1 the page pill's, 2 the field of a form; none for another control.
+fn which_box(control: Id) -> Option<usize> {
+    if control.is_null() {
+        return None;
+    }
+    let at = control as usize;
+    read_mac(|m| {
+        if at == m.search {
+            Some(0)
+        } else if at == m.pill {
+            Some(1)
+        } else if at != 0 && at == m.field_active {
+            Some(2)
+        } else {
+            None
+        }
+    })
+    .flatten()
+}
+
+/// Control and Shift held now (Command counts as Control), as the event being handled says.
+fn current_flags() -> (bool, bool) {
+    let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
+    let event: Id = send0(app, c"currentEvent");
+    if event.is_null() { (false, false) } else { flags(event) }
+}
+
+/// What a box does with a command of the text system (Enter, Esc, Tab): true if it was taken.
+fn box_command(which: usize, name: &str, multiline: bool, text_view: Id) -> bool {
+    let (ctrl, shift) = current_flags();
+    match which {
+        // Enter and Esc go to the reader (it runs the search, or leaves the box).
+        0 => match name {
+            "insertNewline:" => {
+                dispatch(Event::Key { vk: vk::RETURN, ctrl, shift });
+                true
+            }
+            "cancelOperation:" => {
+                dispatch(Event::Key { vk: vk::ESCAPE, ctrl, shift });
+                true
+            }
+            _ => false,
+        },
+        1 => match name {
+            "insertNewline:" => {
+                finish_pill(true, true);
+                true
+            }
+            "cancelOperation:" => {
+                finish_pill(false, true);
+                true
+            }
+            _ => false,
+        },
+        _ => match name {
+            "cancelOperation:" => {
+                finish_field(FieldExit::Cancel);
+                true
+            }
+            "insertTab:" => {
+                finish_field(FieldExit::Next);
+                true
+            }
+            "insertBacktab:" => {
+                finish_field(FieldExit::Prev);
+                true
+            }
+            // A field of one line ends with Enter; one of several with Control+Enter, and Enter is a new line.
+            "insertNewline:" if !multiline || ctrl => {
+                finish_field(FieldExit::Commit);
+                true
+            }
+            "insertNewline:" => {
+                send1::<(), Id>(text_view, c"insertNewlineIgnoringFieldEditor:", null_mut());
+                true
+            }
+            "insertLineBreak:" | "insertNewlineIgnoringFieldEditor:" if ctrl => {
+                finish_field(FieldExit::Commit);
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+extern "C" fn delegate_command(_this: Id, _sel: Sel, control: Id, text_view: Id, command: Sel) -> i8 {
+    let Some(which) = which_box(control) else { return 0 };
+    // SAFETY: the runtime gives the name of the selector as a zero-terminated string that lives as long as the selector does (for good).
+    let name = unsafe { CStr::from_ptr(sel_getName(command)) }.to_str().unwrap_or("");
+    let multiline = read_mac(|m| m.field_active == m.field_multi && m.field_multi != 0).unwrap_or(false);
+    i8::from(box_command(which, name, multiline, text_view))
+}
+
+extern "C" fn delegate_text_changed(_this: Id, _sel: Sel, note: Id) {
+    let control: Id = send0(note, c"object");
+    match which_box(control) {
+        Some(0) => dispatch(Event::FindText(rust_string(send0(control, c"stringValue")))),
+        Some(2) => {
+            let max = read_mac(|m| m.field_max).unwrap_or(0);
+            if max > 0 {
+                let text = rust_string(send0(control, c"stringValue"));
+                if text.chars().count() > max {
+                    set_text(control, &text.chars().take(max).collect::<String>());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+extern "C" fn delegate_text_ended(_this: Id, _sel: Sel, note: Id) {
+    let control: Id = send0(note, c"object");
+    match which_box(control) {
+        // The keyboard went elsewhere (a click outside): the pill's text is not taken, the field's is kept.
+        Some(1) => finish_pill(false, false),
+        Some(2) => finish_field(FieldExit::Blur),
+        _ => {}
+    }
+}
+
+/// The find box has been given the keyboard (a click, or Tab).
+extern "C" fn field_become(this: Id, command: Sel) -> i8 {
+    // SAFETY: the method of the class we are made from, called with the arguments and the result type it has.
+    let ok = unsafe {
+        let imp = class_getMethodImplementation(class(c"NSTextField"), command);
+        if imp.is_null() {
+            return 0;
+        }
+        std::mem::transmute::<*const c_void, unsafe extern "C" fn(Id, Sel) -> i8>(imp)(this, command)
+    };
+    if ok != 0 && read_mac(|m| m.search == this as usize && this as usize != 0).unwrap_or(false) {
+        dispatch(Event::FindFocus);
+    }
+    ok
 }
 
 /// A menu label as the menu bar shows it: no `&` mnemonics (`&Open`, `打开(&O)`) and no accelerator text (after the tab).
@@ -1296,6 +1932,20 @@ fn install_menus(menus: &[Menu]) {
     let quit: Id = send3(allocated, c"initWithTitle:action:keyEquivalent:", quit_title.0, sel(c"terminate:"), quit_key.0);
     send1::<(), Id>(app_menu, c"addItem:", quit);
     release(quit);
+    // Cut, copy, paste and select all for the system's text boxes (password, search, page number, form fields): they go to whatever box has the
+    // keyboard (no target), so they work only there; over the page no one takes them, the items are off and the keys go to the reader as
+    // `Event::Key` as before. They are hidden (the reader's own Edit menu is what people see) but keep their keys.
+    for (title, action, key) in [("Cut", c"cut:", "x"), ("Copy", c"copy:", "c"), ("Paste", c"paste:", "v"), ("Select All", c"selectAll:", "a")] {
+        let (title, key) = (cfstr(title), cfstr(key));
+        let allocated: Id = send0(item_class, c"alloc");
+        let item: Id = send3(allocated, c"initWithTitle:action:keyEquivalent:", title.0, sel(action), key.0);
+        if send1::<bool, Sel>(item, c"respondsToSelector:", sel(c"setAllowsKeyEquivalentWhenHidden:")) {
+            send1::<(), bool>(item, c"setAllowsKeyEquivalentWhenHidden:", true);
+            send1::<(), bool>(item, c"setHidden:", true);
+        }
+        send1::<(), Id>(app_menu, c"addItem:", item);
+        release(item);
+    }
     let (name, empty) = (cfstr("qingpdf"), cfstr(""));
     let allocated: Id = send0(item_class, c"alloc");
     let app_item: Id = send3(allocated, c"initWithTitle:action:keyEquivalent:", name.0, null::<c_void>(), empty.0);
@@ -1341,8 +1991,8 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
     let pool = unsafe { objc_autoreleasePoolPush() };
     let app: Id = send0(class(c"NSApplication"), c"sharedApplication");
     send1::<i8, i64>(app, c"setActivationPolicy:", 0);
-    let (view_class, delegate_class) = register_classes();
-    if view_class.is_null() || delegate_class.is_null() {
+    let (view_class, delegate_class, field_class) = register_classes();
+    if view_class.is_null() || delegate_class.is_null() || field_class.is_null() {
         return 1;
     }
     let delegate: Id = send0(send0(delegate_class, c"alloc"), c"init");
@@ -1359,11 +2009,15 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
     let frame = CgRect { x: 0.0, y: 0.0, w: cw, h: ch };
     // Titled, closable, miniaturizable, resizable; buffered.
     let allocated: Id = send0(class(c"NSWindow"), c"alloc");
-    let window: Id = send4::<Id, CgRect, u64, u64, bool>(allocated, c"initWithContentRect:styleMask:backing:defer:", frame, 15, 2, false);
+    // Titled, closable, miniaturizable, resizable and full size content (1 << 15): the reader's tab strip is the title bar, the window's buttons sit in it.
+    let window: Id = send4::<Id, CgRect, u64, u64, bool>(allocated, c"initWithContentRect:styleMask:backing:defer:", frame, 15 | (1 << 15), 2, false);
     let allocated: Id = send0(view_class, c"alloc");
     let view: Id = send1(allocated, c"initWithFrame:", frame);
     let name = cfstr(title);
     send1::<(), Id>(window, c"setTitle:", name.0);
+    send1::<(), bool>(window, c"setTitlebarAppearsTransparent:", true);
+    // NSWindowTitleHidden; the title is still set for Mission Control and the Window menu.
+    send1::<(), i64>(window, c"setTitleVisibility:", 1);
     send1::<(), Id>(window, c"setDelegate:", delegate);
     send1::<(), Id>(window, c"setContentView:", view);
     send1::<(), bool>(window, c"setAcceptsMouseMovedEvents:", true);
@@ -1385,6 +2039,7 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
         m.delegate = delegate as usize;
         m.space = space as usize;
         m.scale = screen_scale;
+        m.field_class = field_class as usize;
     });
     install_menus(&[]);
 
@@ -1393,9 +2048,12 @@ pub fn run(title: &str, client: Option<(i32, i32)>, _saved: Option<Placement>, _
     let scale: f64 = send0(window, c"backingScaleFactor");
     dispatch(Event::Dpi((96.0 * scale.max(1.0)).round() as u32));
     dispatch(Event::Motion(true));
-    dispatch(Event::Frame { custom: false, caption: 0 });
+    // The reader draws the title strip; the window's buttons are the system's, at the left (kept free by `BUTTONS_ROOM`), none at the right.
+    dispatch(Event::Frame { custom: true, caption: 0 });
+    set_app_icon();
     with_mac(|m| m.told_dpi = (96.0 * scale.max(1.0)).round() as u32);
     sync_size();
+    place_buttons();
 
     send1::<(), Id>(window, c"makeKeyAndOrderFront:", null_mut());
     send1::<(), Id>(window, c"makeFirstResponder:", view);
@@ -1528,6 +2186,16 @@ pub fn open_recognizer(_chinese: bool) -> Result<Box<dyn Recognizer>, OcrError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_letter_of_the_icon_font_the_reader_draws_has_a_symbol() {
+        // The buttons of the command bar, and the arrows of the menus, the tree and the drop-down boxes.
+        for ch in qingpdf_view::cmdbar::BUTTONS.iter().map(|d| d.glyph).chain(['\u{E70D}', '\u{E76C}', '\u{E8DC}', '\u{EDE0}', '\u{EDC6}', '\u{E8EC}', '\u{EA3A}', '\u{E72A}', '\u{E90A}', '\u{E9A6}', '\u{E721}', '\u{E712}']) {
+            assert!(symbol_for(ch).is_some(), "{ch:?}");
+        }
+        assert_eq!(symbol_for('a'), None);
+        assert!(symbol_is_small("chevron.down") && !symbol_is_small("folder"));
+    }
 
     #[test]
     fn mac_key_codes_become_the_windows_ones() {

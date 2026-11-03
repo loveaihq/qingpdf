@@ -2717,3 +2717,20 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - 已经能用：一个 NSWindow 加一个自定义 NSView；后备缓冲是 CGBitmapContext（单位是像素，Dpi 事件给 96×backing scale）；`Painter` 的全部方法（文字用 CoreText 系统字体，中文靠系统回退；`text_width`/`line_height` 是真实度量）；事件：Size、Dpi、鼠标（含点击次数、右键、中键、悬停）、滚轮（触控板精确增量换成 Windows 每格 120）、捏合缩放（当作 Ctrl+滚轮）、键盘（macOS 键码换成 Windows VK，Cmd 当 Ctrl）、Timer、Wake（`Waker` 从任意线程发到主线程）、CloseRequested、文件拖入；动作：Invalidate、SetTitle、SetTimer/KillTimer、PickFile/PickFiles/PickSavePath/PickFolder、Message/Confirm/AskSave（NSAlert）、SetClipboard、OpenUri、Quit、SetMenus（真正的菜单栏，条目发 `Event::Command`）。
 - 还没做（代码里都有 `TODO(macos)`）：图标字体（按钮图标现在显示为方框）、AskText/AskForm/FieldEdit/SearchBox/PillEdit/Choose/ContextMenu/ShowMenu/Outline/Sidebar/Find、打印、Theme/全屏/HideCursor、菜单快捷键显示、窗口位置记忆、单实例（`first_copy`/`hand_over`）、按钮文字的本地化、`open_recognizer`（现在返回错误）。
 - **测试：** Mac 上 `qingpdf-view` 有 7 个测试写死了 Windows 路径（`C:\...`），在 Mac 上失败；它们属于 Windows 版，没有改。`qingpdf-view-mac` 自己的 6 个测试通过。
+
+## Mac 版第二步（2026-11-03）
+
+只改了 `crates/qingpdf-view-mac/`，共享库和 Windows 版没动。
+
+- **图标**：共享代码只通过 `Painter::glyph` 画图标（Windows 图标字体的码点）。Mac 版重写 `glyph`：码点查表（`symbol_for`）得到 SF Symbol 名，用 `NSImage imageWithSystemSymbolName` 取图，`CGImageForProposedRect` 转成 CGImage，当作蒙版（`CGContextClipToMask`）填上要求的颜色，居中画进后备缓冲。箭头类（chevron）用小号、较粗；其余 15pt。查不到的码点回退成原来的文字。不带字体文件。
+- **码点对照**：E70D chevron.down、E76C chevron.right、E8A0 sidebar.left、E838 folder、E74E square.and.arrow.down、E749 printer、E8B0 cursorarrow、E7E6 highlighter、E70B note.text、EE56 pencil.tip、E739 square.on.circle、E8AC textbox、E8A8 rectangle.dashed、E8DC underline、EDE0 strikethrough、EDC6 scribble.variable、E8EC seal、EA3A circle、E72A line.diagonal、E90A text.bubble、E9A6 arrow.up.left.and.arrow.down.right、E721 magnifyingglass、E712 ellipsis。共享代码用到的码点全部有对应，没有漏的；测试对照 `cmdbar::BUTTONS` 检查。
+- **文字输入**：AskText 用 `NSAlert` 加输入框（`secret` 用 `NSSecureTextField`，取值后清空）；SearchBox、PillEdit、FieldEdit/FieldMove 是主视图上的原生 `NSTextField` 子视图（子类 `QingpdfField` 用来在获得键盘时发 `FindFocus`）。事件语义照 win32：查找框的 Enter/Esc 转成 `Event::Key` 交给阅读器，文字变化发 `FindText`；页码框 Enter 发 `PillEdit(Some)`，Esc 或点到别处发 `PillEdit(None)`；表单框 Enter/Ctrl+Enter（多行框里 Enter 是换行）、Tab/Shift+Tab、Esc、点到别处分别对应 `Commit`、`Next`/`Prev`、`Cancel`、`Blur`，并按 `max_len` 截断。`Theme` 只用来取文字色和输入框底色。
+- **没做/没验证**：查找框里的 F3/F4/F11 等功能键不转给阅读器；密码框和表单框没有在界面上实际点过（沙盒里截屏、辅助功能都不可用）；多行框的 Ctrl+Enter 按键绑定未实测。
+
+## Mac 版第三步（2026-11-03）
+
+- 标题栏和标签栏合成一条（像 Safari/Chrome）：窗口用全尺寸内容（`NSWindowStyleMaskFullSizeContentView`），标题栏透明、标题不显示（标题仍设置，给调度中心和“窗口”菜单用）。红黄绿三个按钮被移到 40 pt 高的标签栏正中间（窗口缩放、全屏进出后重新摆一次）。
+- 共享代码只加了最小的一处（用户批准）：`App::set_left_inset(dp)` 在标题条左端留出空位，`Strip::with_inset` 把标志和标签右移；默认 0，Windows 的布局不变（有测试）。`Event::Frame` 没改：Mac 发 `custom: true, caption: 0`（右边没有按钮要让）。留 68 pt 给三个按钮。
+- 拖动与双击：`nc_hit` 说是标题区的地方，按下就 `performWindowDragWithEvent:`；双击按系统设置 `AppleActionOnDoubleClick`（放大/缩小到 Dock/无动作）。标签和按钮照常收到点击。
+- 应用图标：启动时把“轻”标志画进 256 像素的 NSImage，设为 `applicationIconImage`，Dock 和密码等对话框都用它。
+- **真窗口里试过之后的修改（2026-11-03）：** 三个窗口按钮离左边和上下一样远（约 13 点），按钮间距 20 点，左边留白从 68 点加到 80 点；没打包成 `.app` 时对话框的 `applicationIconImage` 不起作用，所以每个对话框自己设“轻”字图标；菜单栏加了四个隐藏的标准项（剪切、复制、粘贴、全选，不指定目标），系统输入框里 Cmd+X/C/V/A 才能用，页面上没人接它们，按键照旧作为 `Event::Key` 交给阅读器。用户在真窗口里确认：密码框能弹出、能粘贴、密码对了能打开。还没解决：安全输入框里 Option+i 打不出 ô（可能要打包成 `.app` 才有完整的输入支持，以后再查）。
