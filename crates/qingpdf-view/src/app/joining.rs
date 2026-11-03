@@ -474,7 +474,10 @@ impl App {
                 let warnings = if warnings.is_empty() { String::new() } else { format!("{}\n\n", warnings.join("\n")) };
                 let text = t(lang, Msg::JnDone).replace("{n}", &made.pages.to_string()).replace("{warnings}", &warnings);
                 self.jn.made = Some(path);
-                vec![Action::Confirm { tag: TAG_JOIN_OPEN, title: t(lang, if self.jn.kind == Kind::Merge { Msg::MgTitle } else { Msg::ImTitle }).to_string(), text }]
+                // The percentage is taken off before the question (which waits for the person), not after it.
+                let mut actions = self.sync_sticky();
+                actions.push(Action::Confirm { tag: TAG_JOIN_OPEN, title: t(lang, if self.jn.kind == Kind::Merge { Msg::MgTitle } else { Msg::ImTitle }).to_string(), text });
+                actions
             }
             (Err(Failure::SameFile), _) => self.fail(t(lang, Msg::JnSame).to_string()),
             (Err(Failure::Text(m)), _) => self.fail(format!("{}\n{m}", t(lang, Msg::JnFailed))),
