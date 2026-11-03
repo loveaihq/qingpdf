@@ -59,7 +59,8 @@ impl Look {
 /// System fonts to try, best first (file, number in the collection): the look wanted first, then the Chinese, Japanese and Korean
 /// fonts that also hold Latin, then the symbols.
 fn candidates(look: Look) -> Vec<(&'static str, usize)> {
-    let cjk: [(&str, usize); 11] = [
+    // The last two are macOS's (Songti there forbids embedding, Hiragino Sans GB is CFF); Windows has no files of those names.
+    let cjk: [(&str, usize); 13] = [
         ("msyh.ttc", 0),
         ("simsun.ttc", 0),
         ("simhei.ttf", 0),
@@ -71,6 +72,8 @@ fn candidates(look: Look) -> Vec<(&'static str, usize)> {
         ("batang.ttc", 0),
         ("arialuni.ttf", 0),
         ("seguisym.ttf", 0),
+        ("STHeiti Light.ttc", 0),
+        ("Arial Unicode.ttf", 0),
     ];
     let first: &[(&str, usize)] = match look {
         Look::Sans => &[("arial.ttf", 0), ("segoeui.ttf", 0), ("LiberationSans-Regular.ttf", 0), ("DejaVuSans.ttf", 0)],

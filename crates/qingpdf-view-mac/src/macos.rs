@@ -15,10 +15,13 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use qingpdf_view::ocr::{OcrError, Recognizer};
+use qingpdf_view::ocr::{GrayImage, OcrError, Recognizer};
 use qingpdf_view::placement::{self, Placement};
 use qingpdf_core::bookmarks::Place;
+use qingpdf_core::view::{MAX_WORDS_PER_PAGE, OcrLine, OcrWord};
 use qingpdf_view::theme::Contrast;
 use qingpdf_view::ui::*;
 
@@ -89,6 +92,7 @@ unsafe extern "C" {
     fn CFDictionaryCreate(alloc: Id, keys: *const Id, values: *const Id, count: isize, key_cb: *const c_void, value_cb: *const c_void) -> Id;
     fn CFAttributedStringCreate(alloc: Id, string: Id, attributes: Id) -> Id;
     fn CFLocaleCopyPreferredLanguages() -> Id;
+    fn CFDataCreate(alloc: Id, bytes: *const u8, len: isize) -> Id;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -121,6 +125,8 @@ unsafe extern "C" {
     fn CGContextClipToMask(ctx: Id, rect: CgRect, mask: Id);
     fn CGDataProviderCreateWithData(info: *mut c_void, data: *const c_void, size: usize, release: *const c_void) -> Id;
     fn CGDataProviderRelease(provider: Id);
+    fn CGDataProviderCreateWithCFData(data: Id) -> Id;
+    fn CGColorSpaceCreateDeviceGray() -> Id;
     fn CGImageCreate(
         w: usize,
         h: usize,
@@ -148,6 +154,9 @@ unsafe extern "C" {
     fn CTLineDraw(line: Id, ctx: Id);
     fn CTLineGetTypographicBounds(line: Id, ascent: *mut f64, descent: *mut f64, leading: *mut f64) -> f64;
 }
+
+#[link(name = "Vision", kind = "framework")]
+unsafe extern "C" {}
 
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
@@ -2978,14 +2987,319 @@ pub fn fatal_box(title: &str, text: &str) {
     }
 }
 
-/// TODO(macos): text recognition (Vision) is not there yet.
-pub fn open_recognizer(_chinese: bool) -> Result<Box<dyn Recognizer>, OcrError> {
-    Err(OcrError::Failed("text recognition is not available on macOS yet".to_string()))
+// --- text recognition (5c): Vision -------------------------------------------------------------------------------------
+//
+// `VNRecognizeTextRequest` (macOS 10.15; the list of its languages needs 12) at the accurate level, run synchronously on the
+// recogniser's worker thread (`qingpdf_view::ocr::Worker`), which is the only thread that touches these objects, except that a
+// watcher thread of `recognize` may send `cancel` to the request, which Vision allows from any thread. Each call has its own
+// autorelease pool. Vision gives lines (observations) with a string; the words are cut out of it here (a Han, kana or Hangul
+// character is a word of its own, as the Windows recogniser gives Chinese; other text is cut at white space) and each word's box is
+// asked of Vision (`boundingBoxForRange:error:`), or, when Vision has none, is the word's share of the line's box.
+
+/// The largest side of a picture given to Vision (no limit is documented; this holds an A4 page at 350 dpi, and the memory of one picture
+/// to 16 MB).
+const VISION_MAX_SIDE: u32 = 4096;
+/// Most lines taken from one page (as `win32.rs`).
+const VISION_MAX_LINES: usize = 10_000;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NsRange {
+    location: usize,
+    length: usize,
+}
+
+/// The objects made in it are let go when it goes.
+struct Pool(*mut c_void);
+
+impl Pool {
+    fn new() -> Pool {
+        // SAFETY: no arguments; popped once, by `drop`, on the same thread.
+        Pool(unsafe { objc_autoreleasePoolPush() })
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // SAFETY: the pool pushed by `new` on this thread, popped once; each
+        // lives in one scope (so they are popped in reverse order of pushing).
+        unsafe { objc_autoreleasePoolPop(self.0) };
+    }
+}
+
+struct VisionRecognizer {
+    /// The languages asked for, best first (an NSArray of NSStrings).
+    languages: Cf,
+    language: String,
+}
+
+/// The languages Vision recognises at the accurate level, as tags (`zh-Hans`, `en-US`).
+fn vision_languages() -> Result<Vec<String>, OcrError> {
+    if class(c"VNRecognizeTextRequest").is_null() {
+        return Err(OcrError::Failed("the text recogniser of macOS (Vision) is not there".to_string()));
+    }
+    let request = new_object(c"VNRecognizeTextRequest");
+    send1::<(), i64>(request, c"setRecognitionLevel:", 0);
+    let list: Id = if send1::<i8, Sel>(request, c"respondsToSelector:", sel(c"supportedRecognitionLanguagesAndReturnError:")) != 0 {
+        send1(request, c"supportedRecognitionLanguagesAndReturnError:", null_mut::<Id>())
+    } else {
+        null_mut()
+    };
+    let languages: Vec<String> = array_items(list).into_iter().map(rust_string).filter(|s| !s.is_empty()).collect();
+    release(request);
+    Ok(languages)
+}
+
+/// What to ask Vision for: Chinese (Simplified first) with English when `chinese`, else the person's own languages that Vision has.
+fn pick_languages(chinese: bool, available: &[String], preferred: &[String]) -> Vec<String> {
+    let has = |tag: &str| available.iter().any(|a| a == tag);
+    let mut out: Vec<String> = Vec::new();
+    if chinese {
+        if let Some(zh) = ["zh-Hans", "zh-Hant"].into_iter().find(|t| has(t)) {
+            out.push(zh.to_string());
+            if has("en-US") {
+                out.push("en-US".to_string());
+            }
+        }
+        return out;
+    }
+    let primary = |tag: &str| tag.split('-').next().unwrap_or("").to_ascii_lowercase();
+    for p in preferred {
+        // The same tag, else one of the same language with the script the person's tag names (zh-Hans-AU is zh-Hans), else the first
+        // of the same language (en-AU is en-US).
+        let found = available
+            .iter()
+            .find(|a| *a == p)
+            .or_else(|| available.iter().find(|a| p.starts_with(&format!("{a}-"))))
+            .or_else(|| available.iter().find(|a| primary(a) == primary(p) && !a.starts_with("zh") && !a.starts_with("yue")));
+        if let Some(a) = found
+            && !out.contains(a)
+        {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// Make the recogniser: for Chinese when `chinese` (and say so if Vision has none), else for the languages the person uses.
+pub fn open_recognizer(chinese: bool) -> Result<Box<dyn Recognizer>, OcrError> {
+    let _pool = Pool::new();
+    let available = vision_languages()?;
+    // SAFETY: no arguments; the array is ours (a copy) and `Cf` releases it.
+    let preferred = Cf(unsafe { CFLocaleCopyPreferredLanguages() });
+    let preferred: Vec<String> = array_items(preferred.0).into_iter().map(rust_string).collect();
+    let languages = pick_languages(chinese, &available, &preferred);
+    let Some(first) = languages.first().cloned() else {
+        return Err(OcrError::NoLanguage { chinese, available });
+    };
+    Ok(Box::new(VisionRecognizer { languages: cf_array_of_strings(&languages), language: first }))
+}
+
+/// A Han, kana, Hangul or full-width character: a word of its own.
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x2E80..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF)
+}
+
+/// The words of a line: their text and where they are in it, in UTF-16 units (what `NSRange` counts), and in characters.
+fn split_words(line: &str) -> Vec<(String, NsRange, (usize, usize))> {
+    let mut words = Vec::new();
+    let (mut start16, mut pos16, mut start_ch) = (0usize, 0usize, 0usize);
+    let mut current = String::new();
+    let flush = |current: &mut String, start16: usize, end16: usize, start_ch: usize, end_ch: usize, words: &mut Vec<_>| {
+        if !current.is_empty() {
+            words.push((std::mem::take(current), NsRange { location: start16, length: end16 - start16 }, (start_ch, end_ch)));
+        }
+    };
+    for (i, c) in line.chars().enumerate() {
+        let len16 = c.len_utf16();
+        if c.is_whitespace() {
+            flush(&mut current, start16, pos16, start_ch, i, &mut words);
+        } else if is_cjk(c) {
+            flush(&mut current, start16, pos16, start_ch, i, &mut words);
+            words.push((c.to_string(), NsRange { location: pos16, length: len16 }, (i, i + 1)));
+        } else {
+            if current.is_empty() {
+                start16 = pos16;
+                start_ch = i;
+            }
+            current.push(c);
+        }
+        pos16 += len16;
+    }
+    let chars = line.chars().count();
+    flush(&mut current, start16, pos16, start_ch, chars, &mut words);
+    words
+}
+
+/// A box of Vision's (from 0 to 1, from the bottom left) in pixels of a `width` by `height` picture from the top left.
+fn vision_box(r: CgRect, width: u32, height: u32) -> [f32; 4] {
+    let (w, h) = (f64::from(width), f64::from(height));
+    let clamp = |v: f64| v.clamp(0.0, 1.0);
+    [(clamp(r.x) * w) as f32, (clamp(1.0 - r.y - r.h) * h) as f32, (clamp(r.x + r.w) * w) as f32, (clamp(1.0 - r.y) * h) as f32]
+}
+
+/// The picture as a grey CGImage that owns a copy of the pixels (ours: one reference).
+fn gray_cgimage(image: &GrayImage) -> Id {
+    // SAFETY: the pixels are live and `len` long and are copied into the CFData; the provider and the colour space are released here
+    // after the image has taken its own references; the image is width x height of 8-bit grey with `width` bytes a row, no alpha, which
+    // is what `GrayImage` holds (checked by the caller).
+    unsafe {
+        let data = CFDataCreate(null_mut(), image.pixels.as_ptr(), image.pixels.len() as isize);
+        if data.is_null() {
+            return null_mut();
+        }
+        let provider = CGDataProviderCreateWithCFData(data);
+        CFRelease(data);
+        if provider.is_null() {
+            return null_mut();
+        }
+        let space = CGColorSpaceCreateDeviceGray();
+        let w = image.width as usize;
+        let cg = CGImageCreate(w, image.height as usize, 8, 8, w, space, 0, provider, null(), false, 0);
+        CGColorSpaceRelease(space);
+        CGDataProviderRelease(provider);
+        cg
+    }
+}
+
+impl Recognizer for VisionRecognizer {
+    fn language(&self) -> String {
+        self.language.clone()
+    }
+
+    fn max_dimension(&self) -> u32 {
+        VISION_MAX_SIDE
+    }
+
+    fn recognize(&mut self, image: &GrayImage, cancel: &AtomicBool, timeout: Duration) -> Result<Vec<OcrLine>, OcrError> {
+        if image.width == 0 || image.height == 0 || image.width > VISION_MAX_SIDE || image.height > VISION_MAX_SIDE || image.pixels.len() != image.width as usize * image.height as usize {
+            return Err(OcrError::Failed("the picture is not a size the recogniser takes".to_string()));
+        }
+        let _pool = Pool::new();
+        let cg = gray_cgimage(image);
+        if cg.is_null() {
+            return Err(OcrError::Failed("the picture could not be made into an image".to_string()));
+        }
+        let options = new_object(c"NSDictionary");
+        let handler: Id = send2(send0(class(c"VNImageRequestHandler"), c"alloc"), c"initWithCGImage:options:", cg, options);
+        // SAFETY: the image is ours; the handler keeps its own reference.
+        unsafe { CGImageRelease(cg) };
+        release(options);
+        if handler.is_null() {
+            return Err(OcrError::Failed("the recogniser did not take the picture".to_string()));
+        }
+        let request = new_object(c"VNRecognizeTextRequest");
+        send1::<(), i64>(request, c"setRecognitionLevel:", 0);
+        send1::<(), Id>(request, c"setRecognitionLanguages:", self.languages.0);
+        send1::<(), bool>(request, c"setUsesLanguageCorrection:", true);
+        let requests = cf_array(&[request]);
+
+        // The watcher cancels the request when the person stops the run or the time is up; it ends as soon as the work does, and the
+        // scope waits for it, so the request is still live whenever it is sent `cancel`.
+        let done = AtomicBool::new(false);
+        let timed_out = AtomicBool::new(false);
+        let mut error: Id = null_mut();
+        let ok = std::thread::scope(|scope| {
+            let request_addr = request as usize;
+            let (done, timed_out) = (&done, &timed_out);
+            scope.spawn(move || {
+                let start = Instant::now();
+                while !done.load(Ordering::Acquire) {
+                    let late = start.elapsed() >= timeout;
+                    if late || cancel.load(Ordering::Relaxed) {
+                        timed_out.store(late, Ordering::Relaxed);
+                        let _pool = Pool::new();
+                        send0::<()>(request_addr as Id, c"cancel");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            let ok = send2::<i8, Id, *mut Id>(handler, c"performRequests:error:", requests.0, &mut error) != 0;
+            done.store(true, Ordering::Release);
+            ok
+        });
+        let result = if cancel.load(Ordering::Relaxed) {
+            Err(OcrError::Cancelled)
+        } else if timed_out.load(Ordering::Relaxed) {
+            Err(OcrError::TimedOut)
+        } else if !ok {
+            let why = rust_string(send0(error, c"localizedDescription"));
+            Err(OcrError::Failed(if why.is_empty() { "the recogniser failed".to_string() } else { why }))
+        } else {
+            read_observations(send0(request, c"results"), image.width, image.height)
+        };
+        drop(requests);
+        release(request);
+        release(handler);
+        result
+    }
+}
+
+/// The lines and words of Vision's observations, in the order Vision gives them.
+fn read_observations(results: Id, width: u32, height: u32) -> Result<Vec<OcrLine>, OcrError> {
+    let (mut out, mut words_in_all) = (Vec::new(), 0usize);
+    for observation in array_items(results).into_iter().take(VISION_MAX_LINES) {
+        let candidates: Id = send1(observation, c"topCandidates:", 1usize);
+        let Some(&best) = array_items(candidates).first() else { continue };
+        let text = rust_string(send0(best, c"string"));
+        let line_box = send_rect(observation, c"boundingBox");
+        let chars = text.chars().count().max(1) as f64;
+        let mut line_words = Vec::new();
+        for (word, range, (from, to)) in split_words(&text) {
+            words_in_all += 1;
+            if words_in_all > MAX_WORDS_PER_PAGE {
+                return Err(OcrError::Failed("the page has too many words".to_string()));
+            }
+            let found: Id = send2(best, c"boundingBoxForRange:error:", range, null_mut::<Id>());
+            let r = if found.is_null() {
+                let (a, b) = (from as f64 / chars, to as f64 / chars);
+                CgRect { x: line_box.x + line_box.w * a, y: line_box.y, w: line_box.w * (b - a), h: line_box.h }
+            } else {
+                send_rect(found, c"boundingBox")
+            };
+            line_words.push(OcrWord { text: word, rect: vision_box(r, width, height) });
+        }
+        if !line_words.is_empty() {
+            out.push(OcrLine { words: line_words });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_of_vision_is_cut_into_words_with_their_utf16_places() {
+        let words: Vec<(String, usize, usize, (usize, usize))> = split_words("PDF \u{4e2d}\u{6587}ok \u{1F600}x").into_iter().map(|(w, r, c)| (w, r.location, r.length, c)).collect();
+        assert_eq!(
+            words,
+            vec![
+                ("PDF".to_string(), 0, 3, (0, 3)),
+                ("\u{4e2d}".to_string(), 4, 1, (4, 5)),
+                ("\u{6587}".to_string(), 5, 1, (5, 6)),
+                ("ok".to_string(), 6, 2, (6, 8)),
+                ("\u{1F600}x".to_string(), 9, 3, (9, 11)),
+            ]
+        );
+        assert!(split_words("  ").is_empty());
+    }
+
+    #[test]
+    fn the_languages_asked_of_vision_are_chinese_with_english_or_the_persons_own() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let available = s(&["en-US", "fr-FR", "zh-Hans", "zh-Hant", "yue-Hans"]);
+        assert_eq!(pick_languages(true, &available, &s(&["en-AU"])), s(&["zh-Hans", "en-US"]));
+        assert_eq!(pick_languages(true, &s(&["en-US"]), &s(&["en-AU"])), Vec::<String>::new());
+        assert_eq!(pick_languages(false, &available, &s(&["en-AU", "zh-Hant-TW", "fr-CA", "de-DE"])), s(&["en-US", "zh-Hant", "fr-FR"]));
+    }
+
+    #[test]
+    fn a_box_of_vision_is_turned_into_pixels_from_the_top_left() {
+        assert_eq!(vision_box(CgRect { x: 0.25, y: 0.5, w: 0.5, h: 0.25 }, 400, 200), [100.0, 50.0, 300.0, 100.0]);
+    }
 
     #[test]
     fn every_letter_of_the_icon_font_the_reader_draws_has_a_symbol() {

@@ -2754,3 +2754,13 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - 能用后台 computer use 控制 `.app`（截图、点击、菜单栏）。试过：打开文件、标签页、侧栏、书签树（显示、展开）、菜单栏、深色外观切换，都正常。
 - 发现并修好：“显示”菜单里除了阅读器自己的“全屏”，系统还自动加了一个“进入全屏幕”。启动时把 `NSFullScreenMenuItemEverywhere` 设成 NO，系统就不再加。
 - 后台方式做不到、还没测：右键菜单（会把程序推到前台，要全屏控制）、真实鼠标点书签跳页（后台点击走的是辅助功能的“选中”，不算鼠标点击）、拖动书签。
+
+## Mac 版：识别文字（Vision，2026-11-04）
+
+- `open_recognizer` 用 Vision 的 `VNRecognizeTextRequest`（精确档、开语言校正），在识别文字的工作线程上同步运行。语言：要中文时用 `zh-Hans`（没有就 `zh-Hant`）加 `en-US`，Vision 没有中文就报“没有语言”并列出它有的；不要中文时，用系统偏好语言里 Vision 有的（同标签，或同语言同文字，或同语言第一个，如 en-AU 用 en-US）。语言列表要 macOS 12（`supportedRecognitionLanguagesAndReturnError:`），更早的系统列表为空，会报“没有语言”。
+- **词**：Vision 只给行。汉字、假名、谚文、全角字符各算一个词（和 Windows 识别中文时一样），其余按空白切开。每个词的框问 Vision（`boundingBoxForRange:error:`，范围按 UTF-16 计）；问不到时按字数在行框里平分。Vision 的框是 0～1、原点在左下，换成图片像素、原点在左上。
+- **停止和超时**：`performRequests:error:` 会一直等到做完，所以另起一个看守线程，发现用户停止或超过 30 秒就向请求发 `cancel`（Vision 允许从别的线程发）；工作做完看守线程就结束，`thread::scope` 等它结束才释放请求。
+- 图片的最大边定为 4096 像素（Vision 没写上限；够 A4 的 350 dpi，一张图最多 16 MB）。
+- **文字层的字体**（改了共用的 `fontsub.rs`）：候选字体原来只有 Windows 的文件名，Mac 上找不到，识别出的汉字都被丢掉。加了 `STHeiti Light.ttc`（允许嵌入）和 `Arial Unicode.ttf`（可编辑嵌入），放在 Windows 字体后面；Windows 上没有这两个文件名，不受影响。Mac 的宋体（Songti.ttc）禁止嵌入，冬青黑体（Hiragino Sans GB）是 CFF，都没加。
+- **实测**（release，`--ocr-test`，1954 年国务院公报扫描件前 3 页，繁体）：1013 个词，全部进了文字层；第一页 12.3 秒（Vision 第一次加载模型），之后每页 0.14～0.31 秒；内存峰值 162 MB。抽出的文字顺序和页面一致，有少量识别错字（“人口”认成“入口”）。在窗口里点“识别文字”、搜索识别出的词还没试（屏幕锁了）。
+- `qingpdf-core` 的 `many_content_streams_and_empty_strings_…` 测试在 Mac 上失败，撤掉这次改动也一样失败，是原来就有的，没查。
