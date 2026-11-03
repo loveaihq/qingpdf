@@ -93,6 +93,7 @@ pub const COLUMN: i32 = 480;
 pub const ROW: i32 = 52;
 const BUTTON_W: i32 = 168;
 const BUTTON_H: i32 = 40;
+const LINK_W: i32 = 150;
 const MARGIN: i32 = 24;
 const CARD_PAD: i32 = 6;
 pub const CARD_RADIUS: i32 = 12;
@@ -105,6 +106,9 @@ pub struct Layout {
     pub tagline_y: i32,
     pub hint_y: i32,
     pub button: Rect,
+    /// The two smaller buttons under it: merge PDF files, make a PDF of pictures.
+    pub merge: Rect,
+    pub images: Rect,
     /// The heading of the list (its top), the card the rows stand on, and the rows that fit.
     pub heading_y: i32,
     pub card: Rect,
@@ -118,7 +122,8 @@ pub fn layout(area: Rect, dpi: u32, entries: usize, title_h: i32, line_h: i32) -
     let s = |v: i32| (i64::from(v) * i64::from(dpi.max(1)) / 96) as i32;
     let (logo, margin, row) = (s(LOGO), s(MARGIN), s(ROW));
     let (button_w, button_h) = (s(BUTTON_W), s(BUTTON_H));
-    let head = logo + s(16) + title_h + s(4) + line_h + s(24) + button_h + s(12) + line_h;
+    let link_h = line_h + s(10);
+    let head = logo + s(16) + title_h + s(4) + line_h + s(24) + button_h + s(10) + link_h + s(12) + line_h;
     let list_head = s(32) + line_h + s(8);
     let pad = s(CARD_PAD);
     let room = (area.h - 2 * margin - head - list_head - 2 * pad).max(0);
@@ -134,17 +139,22 @@ pub fn layout(area: Rect, dpi: u32, entries: usize, title_h: i32, line_h: i32) -
     let title_y = top + logo + s(16);
     let tagline_y = title_y + title_h + s(4);
     let button = Rect { x: cx - button_w / 2, y: tagline_y + line_h + s(24), w: button_w, h: button_h };
-    let hint_y = button.y + button_h + s(12);
+    let (link_y, link_w, gap) = (button.y + button_h + s(10), s(LINK_W), s(6));
+    let merge = Rect { x: cx - gap - link_w, y: link_y, w: link_w, h: link_h };
+    let images = Rect { x: cx + gap, y: link_y, w: link_w, h: link_h };
+    let hint_y = link_y + link_h + s(12);
     let heading_y = hint_y + line_h + s(32);
     let card = Rect { x: left, y: heading_y + line_h + s(8), w: column, h: if rows > 0 { rows * row + 2 * pad } else { 0 } };
     let rects = (0..rows).map(|i| Rect { x: card.x + pad, y: card.y + pad + i * row, w: column - 2 * pad, h: row }).collect();
-    Layout { logo: logo_r, title_y, tagline_y, hint_y, button, heading_y, card, rows: rects }
+    Layout { logo: logo_r, title_y, tagline_y, hint_y, button, merge, images, heading_y, card, rows: rects }
 }
 
 /// What a place of the page is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Open,
+    Merge,
+    Images,
     Row(usize),
 }
 
@@ -156,6 +166,12 @@ fn inside(r: Rect, x: i32, y: i32) -> bool {
 pub fn hit(l: &Layout, entries: usize, x: i32, y: i32) -> Option<Hit> {
     if inside(l.button, x, y) {
         return Some(Hit::Open);
+    }
+    if inside(l.merge, x, y) {
+        return Some(Hit::Merge);
+    }
+    if inside(l.images, x, y) {
+        return Some(Hit::Images);
     }
     l.rows.iter().take(entries).position(|r| inside(*r, x, y)).map(Hit::Row)
 }
@@ -256,7 +272,7 @@ mod tests {
         // The logo and the button are centred across the page; everything is in order from the top.
         assert_eq!(l.logo.x + l.logo.w / 2, 600);
         assert_eq!(l.button.x + l.button.w / 2, 600);
-        assert!(l.logo.y >= AREA.y && l.title_y > l.logo.y + 72 && l.tagline_y > l.title_y && l.button.y > l.tagline_y && l.hint_y > l.button.y && l.heading_y > l.hint_y && l.card.y > l.heading_y);
+        assert!(l.logo.y >= AREA.y && l.title_y > l.logo.y + 72 && l.tagline_y > l.title_y && l.button.y > l.tagline_y && l.merge.y > l.button.y + l.button.h && l.hint_y > l.merge.y + l.merge.h && l.heading_y > l.hint_y && l.card.y > l.heading_y);
         assert_eq!((l.logo.w, l.button.h, l.card.w), (72, 40, 480));
         // 700 high: not all ten rows fit; those that do are in the card, one under the other, and the card ends before the page does.
         assert!(!l.rows.is_empty() && l.rows.len() < 10, "{}", l.rows.len());
@@ -299,6 +315,7 @@ mod tests {
     fn a_place_is_on_the_button_on_a_row_that_holds_a_file_or_on_nothing() {
         let l = layout(AREA, 96, 10, 36, 20);
         assert_eq!(hit(&l, 10, l.button.x + 10, l.button.y + 10), Some(Hit::Open));
+        assert_eq!((hit(&l, 10, l.merge.x + 5, l.merge.y + 5), hit(&l, 10, l.images.x + 5, l.images.y + 5)), (Some(Hit::Merge), Some(Hit::Images)));
         for (i, r) in l.rows.iter().enumerate() {
             assert_eq!(hit(&l, 10, r.x + r.w / 2, r.y + r.h / 2), Some(Hit::Row(i)));
         }

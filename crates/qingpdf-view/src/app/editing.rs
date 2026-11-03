@@ -839,6 +839,9 @@ impl App {
         if let Some(actions) = self.compress_picked(path.clone()) {
             return actions;
         }
+        if let Some(actions) = self.join_picked(path.clone()) {
+            return actions;
+        }
         if let Some(actions) = self.redact_picked(path.clone()) {
             return actions;
         }

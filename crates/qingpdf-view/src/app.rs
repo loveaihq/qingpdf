@@ -22,7 +22,9 @@ mod cmdbarui;
 mod compress;
 mod cropping;
 mod editing;
+mod filelist;
 mod forms;
+mod joining;
 mod looks;
 mod menus;
 mod motion;
@@ -159,6 +161,9 @@ pub const CMD_UNCROP: u32 = 192;
 pub const CMD_EXPORT_IMAGES: u32 = 193;
 pub const CMD_EXTRACT_IMAGES: u32 = 194;
 pub const CMD_PROPERTIES: u32 = 195;
+/// File > Merge PDFs, File > Images to PDF.
+pub const CMD_MERGE: u32 = 196;
+pub const CMD_IMAGES_PDF: u32 = 197;
 /// The colours (from here, one for each) and the line widths.
 pub const CMD_COLOR_BASE: u32 = 50;
 pub const CMD_WIDTH_BASE: u32 = 60;
@@ -232,6 +237,9 @@ const TAG_EXPORT_IMAGES: u32 = 20;
 const TAG_EXTRACT_IMAGES: u32 = 21;
 const TAG_PROPS: u32 = 22;
 const TAG_EXPORT_REPLACE: u32 = 23;
+const TAG_JOIN: u32 = 24;
+const TAG_JOIN_PASSWORD: u32 = 25;
+const TAG_JOIN_OPEN: u32 = 26;
 
 // Timers.
 /// The view has stopped moving.
@@ -499,6 +507,8 @@ app_fields! {
         thumb_target: Option<usize>,
         thumb_nav: bool,
         cz: compress::Squeeze,
+        /// Merging PDF files and making a PDF of pictures (2026-11-03).
+        jn: joining::Join,
         /// Redaction (2026-10-20): the box that asks where to write is answered, the engine is making the file.
         rd: redact::Redacting,
         /// The look of the window (2026-10-20): what the person chose in View > Interface, whether Windows is set to dark apps, the colours in use, and
@@ -681,6 +691,7 @@ impl App {
             thumb_target: None,
             thumb_nav: false,
             cz: compress::Squeeze::new(),
+            jn: joining::Join::new(),
             rd: redact::Redacting::new(),
             theme_choice: ThemeChoice::System,
             system_dark: false,
@@ -1057,6 +1068,7 @@ impl App {
             actions.push(Action::Invalidate);
         }
         actions.extend(self.pump_ocr());
+        actions.extend(self.pump_join());
         actions
     }
 
@@ -1261,6 +1273,8 @@ impl App {
             CMD_INS_PAGENUM => self.ask_pagenum(),
             CMD_PROTECT => self.ask_protect(),
             CMD_COMPRESS => self.ask_compress(),
+            CMD_MERGE => self.ask_merge(),
+            CMD_IMAGES_PDF => self.ask_images(Vec::new()),
             CMD_TOOL_REDACT => self.toggle_tool(Tool::Shape(ShapeKind::Redact)),
             CMD_REDACT_SELECTION => self.redact_selection(),
             CMD_REDACT_FIND => self.ask_redact_find(),
@@ -1767,6 +1781,7 @@ impl App {
                     self.open_path(&path, "")
                 }
             }
+            Event::FilesPicked(files) => self.join_files_picked(files),
             Event::FilePicked(None) => {
                 self.edit.forms.picking = false;
                 Vec::new()
@@ -1790,6 +1805,7 @@ impl App {
                 }
             },
             Event::Text { tag: TAG_SRC_PASSWORD, text } => self.source_password_answered(text),
+            Event::Text { tag: TAG_JOIN_PASSWORD, text } => self.join_password_answered(text),
             Event::Text { tag: TAG_NOTE, text } => self.note_answered(text),
             Event::Text { tag: TAG_NOTE_EDIT, text } => self.note_edit_answered(text),
             Event::Text { tag: TAG_AUTHOR, text } => self.author_answered(text),
@@ -1802,6 +1818,7 @@ impl App {
             Event::Form { tag: TAG_PAGENUM, answer } => self.pagenum_answered(answer),
             Event::Form { tag: TAG_PROTECT, answer } => self.protect_answered(answer),
             Event::Form { tag: TAG_COMPRESS, answer } => self.compress_answered(answer),
+            Event::Form { tag: TAG_JOIN, answer } => self.join_answered(answer),
             Event::Form { tag: TAG_REDACT_FIND, answer } => self.redact_find_answered(answer),
             Event::Form { tag: TAG_REDACT_APPLY, answer } => self.redact_apply_answered(answer),
             Event::Form { tag: TAG_CROP, answer } => self.crop_answered(answer),
@@ -1847,6 +1864,7 @@ impl App {
             Event::Confirmed { tag: TAG_BM_AUTO, yes } => self.bm_auto_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_SAVE, yes } => self.compress_save_answered(yes),
             Event::Confirmed { tag: TAG_COMPRESS_OPEN, yes } => self.compress_open_answered(yes),
+            Event::Confirmed { tag: TAG_JOIN_OPEN, yes } => self.join_open_answered(yes),
             Event::Confirmed { tag: TAG_EXPORT_REPLACE, yes } => self.export_replace_answered(yes),
             Event::Confirmed { .. } => Vec::new(),
             Event::Printer(setup) => self.printer_chosen(setup),

@@ -338,6 +338,10 @@ impl App {
     /// Files were dropped on the window (or handed over by another copy of the program): those that are PDF files are opened, each in a tab; for
     /// the others a message says which they are, and nothing else is done.
     pub(super) fn dropped(&mut self, mut files: Vec<PathBuf>) -> Vec<Action> {
+        // Pictures only: they are not opened, they are made into a PDF.
+        if !files.is_empty() && files.iter().all(|f| super::filelist::is_image(f)) {
+            return self.ask_images(files);
+        }
         // (A few dozen are looked at, all at once and with a time to answer in: a file that does not answer is not waited for.)
         let over = files.len().saturating_sub(crate::tabs::MAX_DROPPED);
         files.truncate(crate::tabs::MAX_DROPPED);

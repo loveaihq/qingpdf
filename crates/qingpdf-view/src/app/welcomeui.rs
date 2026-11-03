@@ -81,6 +81,15 @@ impl App {
         let (w, h) = (p.text_width(label), p.line_height());
         p.text(l.button.x + (l.button.w - w) / 2, l.button.y + (l.button.h - h) / 2, label, pal.on_accent);
         p.set_font(Font::Body);
+        let radius = clamp32(self.px(8));
+        for (hot_kind, r, msg) in [(Hot::Merge, l.merge, Msg::WelcomeMerge), (Hot::Images, l.images, Msg::WelcomeImages)] {
+            if self.hot == Some(hot_kind) {
+                self.hover_fill(p, r, radius, self.pressed == Some(hot_kind), 255);
+            }
+            let label = t(self.lang, msg);
+            let (w, h) = (p.text_width(label), p.line_height());
+            p.text(r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, label, pal.accent);
+        }
         centered(p, l.hint_y, t(self.lang, Msg::WelcomeDrop), pal.dim_fg);
         if l.card.h == 0 {
             return;

@@ -815,6 +815,7 @@ const OFN_PATHMUSTEXIST: u32 = 0x800;
 const OFN_FILEMUSTEXIST: u32 = 0x1000;
 const OFN_NOCHANGEDIR: u32 = 0x8;
 const OFN_EXPLORER: u32 = 0x8_0000;
+const OFN_ALLOWMULTISELECT: u32 = 0x200;
 const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
 const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
@@ -1337,11 +1338,15 @@ fn run_actions(state: &WindowState, actions: Vec<Action>) {
                 unsafe { KillTimer(hwnd, id as usize) };
             }
             Action::PickFile { title, filters } => {
-                let picked = file_dialog(hwnd, &title, &filters, None);
+                let picked = file_dialog(hwnd, &title, &filters, None, false).into_iter().next();
                 queue.extend(deliver(state, Event::FilePicked(picked)));
             }
+            Action::PickFiles { title, filters } => {
+                let picked = file_dialog(hwnd, &title, &filters, None, true);
+                queue.extend(deliver(state, Event::FilesPicked(picked)));
+            }
             Action::PickSavePath { title, filters, name } => {
-                let picked = file_dialog(hwnd, &title, &filters, Some(&name));
+                let picked = file_dialog(hwnd, &title, &filters, Some(&name), false).into_iter().next();
                 queue.extend(deliver(state, Event::SavePicked(picked)));
             }
             Action::PickFolder { title } => {
@@ -2927,8 +2932,9 @@ fn line_height(dc: isize) -> i32 {
 // --- boxes -------------------------------------------------------------------------------------------------------
 
 /// The box that picks a file: to open (`save_name` is `None`) or to write (`Some(name)`, the name the box starts with; it asks before
-/// it replaces a file, and a name without an extension gets `.pdf`, or `.docx` when the name it starts with ends in that).
-fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_name: Option<&str>) -> Option<PathBuf> {
+/// it replaces a file, and a name without an extension gets `.pdf`, or `.docx` when the name it starts with ends in that). With `many` (to open
+/// only) several files may be chosen. The files chosen, none if the box was cancelled (one for a box that is not `many`).
+fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_name: Option<&str>, many: bool) -> Vec<PathBuf> {
     let mut filter: Vec<u16> = Vec::new();
     for (name, pattern) in filters {
         filter.extend(name.encode_utf16());
@@ -2961,7 +2967,7 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
         max_file_title: 0,
         initial_dir: null(),
         title: title.as_ptr(),
-        flags: if save_name.is_some() { OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER } else { OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER },
+        flags: if save_name.is_some() { OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_EXPLORER } else { OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER | if many { OFN_ALLOWMULTISELECT } else { 0 } },
         file_offset: 0,
         file_extension: 0,
         def_ext: if save_name.is_some() { def_ext.as_ptr() } else { null() },
@@ -2977,10 +2983,18 @@ fn file_dialog(owner: isize, title: &str, filters: &[(String, String)], save_nam
     // keeps none of the pointers after it returns.
     let chosen = unsafe { if save_name.is_some() { GetSaveFileNameW(&mut ofn) } else { GetOpenFileNameW(&mut ofn) } } != 0;
     if !chosen {
-        return None;
+        return Vec::new();
     }
-    let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    Some(PathBuf::from(OsString::from_wide(file.get(..len).unwrap_or(&[]))))
+    split_chosen(&file)
+}
+
+/// What the open box left in its buffer: one path, or (with several files chosen) the folder and then the names, each ended by a zero and the
+/// last by two.
+fn split_chosen(buffer: &[u16]) -> Vec<PathBuf> {
+    let mut parts = buffer.split(|&c| c == 0).take_while(|p| !p.is_empty()).map(|p| PathBuf::from(OsString::from_wide(p)));
+    let Some(first) = parts.next() else { return Vec::new() };
+    let names: Vec<PathBuf> = parts.collect();
+    if names.is_empty() { vec![first] } else { names.into_iter().map(|n| first.join(n)).collect() }
 }
 
 /// The box that picks a folder (the shell's tree of folders, with a button to make a new one).
@@ -5760,6 +5774,23 @@ impl Recognizer for Recogniser {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_files_the_open_box_leaves_are_one_path_or_a_folder_and_names() {
+        let units = |parts: &[&str]| -> Vec<u16> {
+            let mut v: Vec<u16> = Vec::new();
+            for p in parts {
+                v.extend(p.encode_utf16());
+                v.push(0);
+            }
+            v.resize(v.len() + 8, 0);
+            v
+        };
+        let path = std::path::PathBuf::from;
+        assert_eq!(split_chosen(&units(&["C:\\docs\\a.pdf"])), vec![path("C:\\docs\\a.pdf")]);
+        assert_eq!(split_chosen(&units(&["C:\\docs", "a.pdf", "\u{4e2d}.pdf"])), vec![path("C:\\docs\\a.pdf"), path("C:\\docs\\\u{4e2d}.pdf")]);
+        assert!(split_chosen(&units(&[])).is_empty());
+    }
+
     #[test]
     fn a_menu_item_of_the_systems_own_kind_is_greyed_ticked_or_dotted_as_it_is_asked() {
         assert_eq!(standard_item(true, false, false), (MF_STRING, None));

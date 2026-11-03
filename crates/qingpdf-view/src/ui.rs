@@ -170,6 +170,8 @@ pub enum Event {
     Timer(u32),
     /// The answer to [`Action::PickFile`]: the file chosen, or none.
     FilePicked(Option<PathBuf>),
+    /// The answer to [`Action::PickFiles`]: the files chosen (none if it was cancelled), in the order the box gave them.
+    FilesPicked(Vec<PathBuf>),
     /// The answer to [`Action::AskText`]: what was typed, or none if it was cancelled.
     Text { tag: u32, text: Option<String> },
     /// The left button went down, moved (with it down) or came up, at this place in the client area.
@@ -438,6 +440,8 @@ pub enum Action {
     KillTimer(u32),
     /// Show the open-file box; the answer comes as [`Event::FilePicked`]. `filters`: (name, pattern) pairs.
     PickFile { title: String, filters: Vec<(String, String)> },
+    /// Show the open-file box with several files allowed; the answer comes as [`Event::FilesPicked`].
+    PickFiles { title: String, filters: Vec<(String, String)> },
     /// Show the save-as box (asking before it replaces a file); the answer comes as [`Event::SavePicked`]. `name` is the file name it
     /// starts with.
     PickSavePath { title: String, filters: Vec<(String, String)>, name: String },

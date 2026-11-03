@@ -29,6 +29,8 @@ pub(super) enum Hot {
     More,
     Pill(Part),
     Open,
+    Merge,
+    Images,
     Row(usize),
     BarV,
     BarH,
@@ -579,6 +581,8 @@ impl App {
         if self.welcome_shown() {
             return match crate::welcome::hit(&self.welcome_layout(), self.recent.len(), clamp32(x), clamp32(y)) {
                 Some(crate::welcome::Hit::Open) => Some(Hot::Open),
+                Some(crate::welcome::Hit::Merge) => Some(Hot::Merge),
+                Some(crate::welcome::Hit::Images) => Some(Hot::Images),
                 Some(crate::welcome::Hit::Row(i)) => Some(Hot::Row(i)),
                 None => None,
             };
@@ -615,7 +619,7 @@ impl App {
             Hot::Pill(part) => self.pill_layout().parts.iter().find(|(p, _)| *p == part).map(|(_, r)| down(*r, top)),
             Hot::BarV => Some(down(self.bar_zone(true), top)),
             Hot::BarH => Some(down(self.bar_zone(false), top)),
-            Hot::Open | Hot::Row(_) => None,
+            Hot::Open | Hot::Merge | Hot::Images | Hot::Row(_) => None,
         }
     }
 
@@ -643,7 +647,7 @@ impl App {
                 },
             )),
             Hot::Row(i) => self.recent.get(i).map(|e| e.path.clone()),
-            Hot::Open | Hot::BarV | Hot::BarH => None,
+            Hot::Open | Hot::Merge | Hot::Images | Hot::BarV | Hot::BarH => None,
         }
     }
 
@@ -738,7 +742,7 @@ impl App {
                     actions.extend(self.bar_down(false, x, py));
                     return Some(actions);
                 }
-                Some(hot @ (Hot::Pill(_) | Hot::Open | Hot::Row(_))) => {
+                Some(hot @ (Hot::Pill(_) | Hot::Open | Hot::Merge | Hot::Images | Hot::Row(_))) => {
                     self.hot = Some(hot);
                     self.pressed = Some(hot);
                     self.chrome_press = true;
@@ -809,6 +813,8 @@ impl App {
             Hot::More => self.open_menu(false),
             Hot::Pill(part) => self.pill_click(part),
             Hot::Open => self.run_command(CMD_OPEN),
+            Hot::Merge => self.run_command(CMD_MERGE),
+            Hot::Images => self.run_command(CMD_IMAGES_PDF),
             Hot::Row(i) => self.open_recent(i),
             Hot::Plus => self.run_command(CMD_OPEN),
             Hot::Close(i) => self.close_tab(i),
