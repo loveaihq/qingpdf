@@ -352,6 +352,7 @@ impl App {
             match answer {
                 Ok(true) => self.queue.push_back(file),
                 Ok(false) => skipped.push(name),
+                Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => skipped.push(format!("{name} ({})", t(self.lang, Msg::AFolder))),
                 Err(e) => skipped.push(format!("{name} ({e})")),
             }
         }
@@ -954,7 +955,8 @@ mod tests {
         assert!(app.title().starts_with("b.pdf"), "the last one is shown: {}", app.title());
         // A folder is not a file either, and nothing else happens.
         let more = app.event(Event::Drop(vec![dir.clone()]));
-        assert!(more.iter().any(|a| matches!(a, Action::Message { .. })) && app.tabs.len() == 2);
+        let said = more.iter().find_map(|a| if let Action::Message { text, .. } = a { Some(text.clone()) } else { None }).expect("a message");
+        assert!(said.contains("a folder, not a file") && !said.contains("os error") && app.tabs.len() == 2, "{said}");
         // The same file again shows its tab.
         app.event(Event::Drop(vec![a.clone()]));
         pump(&mut app, "the tab", |a| a.title().starts_with("a.pdf") && a.has_document() && !a.activating);

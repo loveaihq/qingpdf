@@ -266,6 +266,10 @@ pub fn looks_like_pdf(path: &Path) -> std::io::Result<bool> {
     if is_device_path(path) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file"));
     }
+    // A folder is told apart from a file that cannot be read (opening one fails on Windows and succeeds elsewhere).
+    if std::fs::metadata(path)?.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::IsADirectory, "a folder"));
+    }
     let mut head = Vec::new();
     std::fs::File::open(path)?.take(1024).read_to_end(&mut head)?;
     Ok(head.windows(5).any(|w| w == b"%PDF-"))

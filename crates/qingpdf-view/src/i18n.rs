@@ -105,6 +105,7 @@ pub enum Msg {
     NoticeFailed,
     CannotRead,
     NotPdf,
+    AFolder,
     TooLarge,
     PageWord,
     InternalErrorTitle,
@@ -524,7 +525,7 @@ pub enum Msg {
 
 /// Every message, for the tests.
 #[cfg(test)]
-pub const ALL: [Msg; 466] = [
+pub const ALL: [Msg; 467] = [
     Msg::File,
     Msg::Open,
     Msg::Recent,
@@ -576,6 +577,7 @@ pub const ALL: [Msg; 466] = [
     Msg::NoticeFailed,
     Msg::CannotRead,
     Msg::NotPdf,
+    Msg::AFolder,
     Msg::TooLarge,
     Msg::PageWord,
     Msg::InternalErrorTitle,
@@ -1046,6 +1048,7 @@ pub fn t(lang: Lang, m: Msg) -> &'static str {
         Msg::NoticeFailed => ("This page cannot be drawn.", "这一页画不出来。"),
         Msg::CannotRead => ("The file cannot be read:", "读不了这个文件："),
         Msg::NotPdf => ("This is not a PDF file, or it is too damaged to open.", "这不是 PDF 文件，或者损坏得太厉害，打不开。"),
+        Msg::AFolder => ("a folder, not a file", "是文件夹，不是文件"),
         Msg::TooLarge => ("This file is too big for the reader (the most is 100 MB).", "这个文件太大，阅读器打不开（上限 100 MB）。"),
         Msg::PageWord => ("Page", "第"),
         Msg::InternalErrorTitle => ("qingpdf - internal error", "qingpdf - 内部错误"),
@@ -1545,7 +1548,7 @@ mod tests {
                 assert!(!t(Lang::Zh, m).is_ascii() || t(Lang::Zh, m) == t(Lang::En, m), "{m:?}");
             }
         }
-        assert_eq!(ALL.len(), 466);
+        assert_eq!(ALL.len(), 467);
         // No message is listed twice.
         for (i, a) in ALL.iter().enumerate() {
             assert!(!ALL[i + 1..].contains(a), "{a:?} twice");
