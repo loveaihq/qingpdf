@@ -4,6 +4,13 @@ A small, fast, offline PDF tool with its own engine, written in Rust. *Qīng* (�
 
 User guide: [English](docs/USER-GUIDE.md) · [中文](docs/使用说明.md)
 
+## Download
+
+From [Releases](https://github.com/loveaihq/qingpdf/releases):
+
+- **Windows** (64-bit): `qingpdf-<version>-windows-x64.zip` in the latest release.
+- **Mac** (Apple silicon, M1 and later; preview): `qingpdf-mac-arm64.zip` in [0.3.2](https://github.com/loveaihq/qingpdf/releases/tag/v0.3.2). It is not signed with an Apple Developer ID, so the first time macOS blocks it: open *System Settings → Privacy & Security* and click *Open Anyway* (the release notes say more). Intel Macs are not supported yet.
+
 Most PDF tools today are hundreds of megabytes. qingpdf is one small program (the 3.95 MB reader) that needs nothing installed, never go online, and are built to do Chinese PDFs right.
 
 **Status: early (layers 1, 1.5 and 2 done; layer 3 in progress).** What works today is reading, repairing and rewriting PDFs, the page operations below, text extraction (Chinese, Japanese and Korean, vertical text included), and drawing pages to PNG with `render`, and putting and changing text on pages. There is no conversion yet; see [the plan](PLAN.md). Password-protected PDFs open and the commands keep their protection (RC4 40/128-bit, AES-128, AES-256); only `decrypt` takes it off, and `encrypt` sets or changes it (AES-256 or AES-128; RC4 is read but never written). Certificate (public-key) encryption is not supported.
@@ -80,7 +87,7 @@ cargo build --release
 cargo test --release
 ```
 
-The executable is `target/release/qingpdf.exe`. The qpdf checks in the tests look for qpdf in `QINGPDF_QPDF`, then `C:\Dev\tools\qpdf\bin\qpdf.exe`, then `PATH`; without it those checks are skipped with a note.
+The executable is `target/release/qingpdf.exe`. The Mac reader is its own package: `crates/qingpdf-view-mac/make-app.sh` builds `target/release/qingpdf.app` (Command Line Tools are enough, no Xcode); test on the Mac with `cargo test --release --workspace --exclude qingpdf-view-bin`. The qpdf checks in the tests look for qpdf in `QINGPDF_QPDF`, then `C:\Dev\tools\qpdf\bin\qpdf.exe`, then `PATH`; without it those checks are skipped with a note.
 
 ## Licence
 
@@ -91,6 +98,8 @@ Third-party software and data, with their licence texts, are listed in [THIRD-PA
 ---
 
 ## 中文简介
+
+下载：在 [Releases](https://github.com/loveaihq/qingpdf/releases) 里。Windows 版是最新版本里的 `qingpdf-<版本>-windows-x64.zip`；Mac 版（预览，只支持 Apple 芯片 M1 及以后）是 [0.3.2](https://github.com/loveaihq/qingpdf/releases/tag/v0.3.2) 里的 `qingpdf-mac-arm64.zip`，没有 Apple 开发者签名，第一次打开会被拦，到“系统设置 → 隐私与安全性”点“仍要打开”。
 
 qingpdf 是一个小、快、离线的 PDF 工具，引擎用 Rust 从头写，目标是把中文 PDF 做到最好。现在已经能查看信息、合并、拆分、删页、旋转、图片转 PDF，能修复常见的损坏文件；加密文件（密码、RC4、AES）也能打开，输出保留原来的加密，`decrypt` 命令可以去掉加密，`encrypt` 命令可以加密码、关权限（AES-256，或兼容旧软件的 AES-128；整个文件重写，有签名的文件拒绝），阅读器的“文件 → 密码和权限…”也能做；还能提取文字，支持中文、日文、韩文和竖排。`render` 可以把页面画成 PNG，嵌入字体由自己的代码读取，没嵌字体的中文公文用系统自带的宋体、黑体、楷体、仿宋来画；透明、渐变还没做。`watermark`、`stamp`、`addtext` 三个命令可以给页面加水印（文字或图片，平铺、旋转、半透明）、图片和中文文字，写进页面自己的内容，用增量方式追加，原文件的字节不动。`replace` 命令可以改页面上已有的文字（旧字真的从内容里去掉，新字用原字体，缺字时用相近的系统字体子集）。`docx` 命令把 PDF 转成可以编辑的 Word 文件（.docx）：行合成段落，大字和粗体变标题，项目符号和编号变 Word 列表，两栏按阅读顺序，有框线的表格变 Word 表格，图片按位置放进去，页眉页脚和页码放进 Word 的页眉页脚，中文保留宋体、黑体、楷体、仿宋，竖排页变竖排分节；阅读器的"文件"菜单里有"导出为 Word"。没有框线的表格（银行流水、财务报表）按文字的对齐找列，也会变成 Word 表格。`xlsx` 命令把 PDF 里的表格转成 Excel 文件（.xlsx），一个表格一个工作表（"第3页-表1"）：有框线的表格按线拼，没框线的按文字的对齐找列，折成两行的单元格合成一格，跨列的标题合并单元格；整数、小数、千分位、负数（`-12`、`(12)`）、百分比、带货币符号的金额存成数字并保留原来的格式，日期（`2024-05-01`、`2024年5月1日`）存成日期，身份证号、手机号、以 0 开头的编号、超过 15 位的数字保持文本；整个文件没有表格时把各页文字按行放进一个工作表并提示；阅读器的"文件"菜单里有"导出为 Excel"（能取消）。阅读器的"工具"菜单可以识别扫描页的文字：用 Windows 自带的文字识别（不联网、不下载），整页按约 300 dpi 一页一页在后台识别，识别出的字写成盖在图上的看不见的文字层（一个共用的字体子集，每个词拉伸到识别框的宽度），之后这个阅读器的查找、选字、复制，别的软件和"导出为 Word"都能用；撤销一步去掉，保存是增量追加；有签名或不许修改的文件只在本窗口里用、不保存。中文要装 Windows 的中文识别（设置 → 时间和语言 → 语言和区域），没装会提示并列出现有的语言。只认横排，竖排的古籍识别出来是跨栏的横行。阅读界面（含批注、填表和"插入"菜单，菜单里有"改页面上的文字"，"文件"菜单里有"导出为 Word"）在 Windows 版里。菜单下面有工具栏（打开、打印、上一页和下一页、可以输入页码的页码框、缩放、适合宽度和整页、回车找下一处的搜索框、高亮和便签和手写工具，"视图 → 工具栏"可以隐藏；图标是运行时从 Windows 的图标字体画的，没有这种字体就让按钮写字）；页面上右键有复制、高亮所选文字、在此添加便签、选择本页全部文字；双击选词（中文是到标点为止的一整段），三击选行；"视图 → 语言"可选跟随系统、中文、English，马上生效；书签栏的边可以拖着改宽窄；窗口的大小、位置、是否最大化，工具栏、语言和书签栏的宽度记在 `%APPDATA%\qingpdf\author.txt` 里（第一行仍是批注人的名字）。整体计划见 [PLAN.md](PLAN.md)，设计上的取舍见 [docs/decisions.md](docs/decisions.md)。
 

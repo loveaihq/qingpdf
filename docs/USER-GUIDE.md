@@ -19,6 +19,8 @@ Both programs are only a few MB each. For now, only Windows is supported.
 
 The first time you run it, Windows may show "Windows protected your PC". This is because the program is not signed with a paid certificate, not because the program is faulty. Click "More info", then "Run anyway".
 
+**On a Mac** (preview; Apple silicon, M1 and later): extract `qingpdf-mac-arm64.zip` (double-click it) and drag **qingpdf.app** into Applications. The first time, macOS says it cannot be opened, because the program is not signed with a paid Apple certificate; click Done, open System Settings → Privacy & Security, scroll down and click "Open Anyway" next to the message about qingpdf, and confirm. After that it opens normally. On the Mac the shortcuts use ⌘ where this guide says Ctrl, text recognition uses the Mac's built-in Vision, and the settings are kept in `~/Library/Application Support/qingpdf`.
+
 If the menus are in English and you want Chinese, click View → Language, choose 中文 (Chinese), and the change takes effect at once. The window size and position, the language, the command bar, the sidebar tab and width, the appearance, the accent colour and the page colours are remembered the next time you open the program.
 
 ## 3. Using the reader
