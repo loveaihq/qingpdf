@@ -27,12 +27,19 @@ const MAX_FILE_BYTES: u64 = 4096;
 /// The widths of the bookmarks that are kept, at 96 dpi.
 pub const SIDEBAR_RANGE: std::ops::RangeInclusive<i32> = 120..=800;
 
-/// The folder the reader keeps its files in: `%APPDATA%\qingpdf` (none if there is no `APPDATA`). In the unit tests it is a folder of the
-/// temporary files instead (one for each run of the tests), so that no test reads or changes the person's own files.
-#[cfg(not(test))]
+/// The folder the reader keeps its files in: `%APPDATA%\qingpdf` on Windows, `~/Library/Application Support/qingpdf` on the Mac (none
+/// if there is no `APPDATA` or `HOME`). In the unit tests it is a folder of the temporary files instead (one for each run of the
+/// tests), so that no test reads or changes the person's own files.
+#[cfg(all(not(test), windows))]
 pub fn data_dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").filter(|b| !b.is_empty())?;
     Some(PathBuf::from(base).join("qingpdf"))
+}
+
+#[cfg(all(not(test), not(windows)))]
+pub fn data_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join("Library").join("Application Support").join("qingpdf"))
 }
 
 #[cfg(test)]

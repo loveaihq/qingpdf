@@ -109,7 +109,7 @@ pub fn forget(list: &mut Vec<Entry>, path: &str) {
     list.retain(|e| !same_file(&e.path, path));
 }
 
-/// Where the list is kept: `%APPDATA%\qingpdf\recent.txt` (none if there is no `APPDATA`).
+/// Where the list is kept: `recent.txt` in the reader's folder (`settings::data_dir`; none if there is none).
 pub fn file_path() -> Option<PathBuf> {
     Some(crate::settings::data_dir()?.join("recent.txt"))
 }

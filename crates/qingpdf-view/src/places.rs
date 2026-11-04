@@ -192,7 +192,7 @@ impl Places {
     }
 }
 
-/// Where the places are kept: `%APPDATA%\qingpdf\places.txt` (none if there is no `APPDATA`). In the unit tests there is no such file: the places of
+/// Where the places are kept: `places.txt` in the reader's folder (`settings::data_dir`; none if there is none). In the unit tests there is no such file: the places of
 /// the tests that open the same files would otherwise be each other's (a test that wants a file says which).
 #[cfg(not(test))]
 pub fn file_path() -> Option<PathBuf> {
