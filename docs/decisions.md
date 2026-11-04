@@ -2785,3 +2785,13 @@ AES-256（修订版 5、6）的规范原文拿不到，下面凡是写"按 pdf.j
 - **是/否框默认“否”**：Windows 的确认框回车按的是“否”（`MB_DEFBUTTON2`），Mac 原来第一个按钮是“是”，回车就确认了。现在“否”放第一个（回车按它），和 Windows 一致。
 - **表单框的字**：共用的布局按 Windows 框里 12 像素的字排，Mac 系统字 13 点会把 “Middle” 截成 “Middl”。表单框的文字改成 12 点，一行放不下的再缩小（最小 10 点）。真窗口里看到过截断，缩小以后还没看（屏幕又锁了）。
 - 后台 computer use 能打开表单框、截图，但不能点框里的控件（它把 NSAlert 里的控件当成别的进程的），所以示意图随输入变化、额外按钮、确定后的结果要手动试。
+
+## 在 Mac 上跑全部测试（2026-11-04）
+
+在 Mac 上跑 `cargo test --release --workspace --exclude qingpdf-view-bin`（`qingpdf-view-bin` 只在 Windows 上编译），有 9 个测试不过。原因都在测试本身或机器，引擎没有错：
+
+- `many_content_streams_…`：测试里纵坐标用 `u32` 算，4 万个内容流时减到负数。release 下溢出不报错、只是绕回成很大的数，所以 Windows 上一直没发现；debug 下直接报错。改用 `i64`，版面不变（超出页面下沿的行原来就在页面外）。
+- 命令行加密：命令行只在 Windows 上有随机数来源，Mac 上加密一律失败。改为 Windows 以外读 `/dev/urandom`（macOS 上和 `SecRandomCopyBytes` 是同一个来源），用标准库读文件，不加 `unsafe`，硬规矩里给 `BCryptGenRandom` 的那条例外不变。
+- `qingpdf-view` 的 6 个测试用的是 Windows 的路径写法（盘符、反斜杠、不分大小写），只在 Windows 上成立，加 `#[cfg(windows)]`。
+- 全语料取文字：要求超过 50 万字，这个数是按 Dell 上的 `local`/`private` 语料定的；只有 `public` 语料时约 22 万字。没有本地语料时不查字数，每个文件照样查。
+- 计价器校准：Apple M 系列 Mac 比定常数的机器快 3～8 倍，「计价 / 实际纳秒」到了 7～8，超过上限 5。上限放宽到 12；计价偏高只会让工作提前停下，是安全的一边，下限（防止计价偏低）不动。

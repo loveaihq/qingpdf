@@ -230,6 +230,7 @@ mod tests {
         Place { path: path.to_string(), stamp: STAMP, page, mode: MODE_CUSTOM, zoom: 1500, across: 250, down: 640, rotation: 90, layout: Some(Spread::Pair) }
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn paths_that_name_one_file_are_spelled_alike() {
         assert_eq!(normalize(Path::new("C:\\Docs\\A.PDF")), "c:\\docs\\a.pdf");

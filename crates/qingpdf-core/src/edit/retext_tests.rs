@@ -491,7 +491,7 @@ fn many_content_streams_and_empty_strings_do_not_take_time_or_memory_the_page_do
         b.obj(3, &format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [{list}] /Resources << /Font << /F1 5 0 R >> >> >>"));
         b.obj(5, HELV);
         for i in 0..streams {
-            b.stream_obj(10 + i, "", format!("BT /F1 12 Tf {} {} Td ({}) Tj ET", 20 + (i % 40) * 14, 780 - (i / 40) * 2, if i % 2 == 0 { 'e' } else { 'x' }).as_bytes());
+            b.stream_obj(10 + i, "", format!("BT /F1 12 Tf {} {} Td ({}) Tj ET", 20 + (i % 40) * 14, 780 - i64::from(i / 40) * 2, if i % 2 == 0 { 'e' } else { 'x' }).as_bytes());
         }
         let doc = Document::from_bytes(b.finish_classic(10 + streams, "/Root 1 0 R")).unwrap();
         let started = std::time::Instant::now();

@@ -1007,9 +1007,10 @@ mod calibration {
                 let objects = apply_metered(&doc, &pages, &mark, "", &work, 1 << 30).unwrap();
                 let took = started.elapsed().as_nanos() as f64;
                 println!("{name}, {count} pages: {} objects, charged {:.0} units, took {took:.0} ns (charged / took = {:.2})", objects.len(), work.used(), work.used() / took);
-                // (Measured 0.85 to 1.3 on the machine the constants were set on; the bounds leave room for a slow or a fast one.)
+                // (Measured 0.85 to 1.3 on the machine the constants were set on, 2.4 to 4.2 on an Apple M-series Mac; the bounds leave
+                // room for a slow or a fast one. Charging too much only stops work early; the lower bound is the one that guards.)
                 if !cfg!(debug_assertions) {
-                    assert!((0.05..=5.0).contains(&(work.used() / took)), "{name}, {count} pages: the meter is charged {:.0} units for {took:.0} ns", work.used());
+                    assert!((0.05..=12.0).contains(&(work.used() / took)), "{name}, {count} pages: the meter is charged {:.0} units for {took:.0} ns", work.used());
                 }
             }
         }
@@ -1029,8 +1030,9 @@ mod calibration {
         let objects = apply_metered(&doc, &pages, &mark, "", &work, 1 << 30).unwrap();
         let took = started.elapsed().as_nanos() as f64;
         println!("bare pages, 25000 pages: {} objects, charged {:.0} units, took {took:.0} ns (charged / took = {:.2})", objects.len(), work.used(), work.used() / took);
+        // (7 to 8 on an Apple M-series Mac, where a bare page is cheaper than the constants assume.)
         if !cfg!(debug_assertions) {
-            assert!((0.15..=5.0).contains(&(work.used() / took)), "bare pages: the meter is charged {:.0} units for {took:.0} ns", work.used());
+            assert!((0.15..=12.0).contains(&(work.used() / took)), "bare pages: the meter is charged {:.0} units for {took:.0} ns", work.used());
         }
     }
 }

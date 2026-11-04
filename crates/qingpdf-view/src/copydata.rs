@@ -178,6 +178,7 @@ mod tests {
         assert!(!keep_waiting(&mut Vec::new(), some(2), 0));
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn the_command_line_gives_whole_paths_without_repeats_and_leaves_the_options_out() {
         let args = ["--bench", "C:\\a.pdf", "C:\\a.pdf", "b.pdf", "--x"].map(OsString::from);

@@ -360,6 +360,7 @@ mod tests {
         assert_eq!((t.len(), t.active()), (MAX_TABS, Some(MAX_TABS - 1)));
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn a_file_that_is_open_is_found_by_any_spelling_of_its_path() {
         let t = tabs(&["a", "b", "c"]);
@@ -407,6 +408,7 @@ mod tests {
         assert!(t.close(0).is_none());
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn the_tabs_with_changes_are_found() {
         let mut t = tabs(&["a", "b", "c"]);
@@ -527,6 +529,7 @@ mod tests {
         assert!(look_all(Vec::new(), Duration::from_secs(1)).is_empty());
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn a_name_is_cut_with_an_ellipsis_to_fit_and_left_alone_when_it_fits() {
         let by_chars = |max: usize| move |s: &str| s.chars().count() <= max;

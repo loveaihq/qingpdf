@@ -1,5 +1,5 @@
 //! Random bytes from the operating system, for the seed of an encryption (`encrypt`). This is the one module of the command line
-//! that calls Windows (everything else in the crate is `deny(unsafe_code)`; the engine takes the bytes from its caller and never
+//! that calls Windows, and outside Windows reads `/dev/urandom` (everything else in the crate is `deny(unsafe_code)`; the engine takes the bytes from its caller and never
 //! looks for a source of its own, and is `forbid`). The declaration is written here by hand.
 
 #![allow(unsafe_code)]
@@ -33,7 +33,13 @@ fn fill(buffer: &mut [u8]) -> Result<(), String> {
     if status == 0 { Ok(()) } else { Err(format!("Windows gave no random bytes (status 0x{:08x}); nothing was encrypted", status as u32)) }
 }
 
+/// Elsewhere (macOS, Linux) the system's generator is the device file `/dev/urandom`, read with the standard library: no call
+/// to the system is declared here. On macOS it is the same generator `SecRandomCopyBytes` reads.
 #[cfg(not(windows))]
-fn fill(_buffer: &mut [u8]) -> Result<(), String> {
-    Err("this build has no source of random bytes for encryption; nothing was encrypted".to_string())
+fn fill(buffer: &mut [u8]) -> Result<(), String> {
+    use std::io::Read;
+
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut device| device.read_exact(buffer))
+        .map_err(|e| format!("the system gave no random bytes ({e}); nothing was encrypted"))
 }

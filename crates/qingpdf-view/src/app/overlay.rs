@@ -1187,6 +1187,7 @@ mod tests {
         assert!(app.scroll_y > before, "{before} -> {}", app.scroll_y);
     }
 
+    #[cfg(windows)] // Windows spellings of paths (drive letters, `\`, any case): only Windows reads them as such.
     #[test]
     fn the_tip_of_a_tab_with_a_long_path_is_cut_to_the_window_and_never_panics_however_narrow_it_is() {
         let mut app = app_with_pages("longtip", 3);
